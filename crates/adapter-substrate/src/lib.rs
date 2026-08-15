@@ -16,6 +16,10 @@
 //! Invariant: decoding is a pure function of (bytes, runtime context, decoder
 //! version). No I/O, no clocks, no network in the decode path.
 
+/// Live fetch side (subxt) — see `SubstrateSource`. Decode stays pure below.
+#[cfg(feature = "live")]
+pub mod source;
+
 use canonical::{CanonicalBlock, CanonicalEvent, CanonicalTransaction, Lineage};
 use serde::{Deserialize, Serialize};
 

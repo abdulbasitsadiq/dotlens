@@ -13,8 +13,9 @@ name = "dotlens-node"
 path = "src/main.rs"
 
 [features]
-default = ["pg"]
+default = ["pg", "live"]
 pg = ["dep:sqlx", "ingest/pg", "api/pg"]
+live = ["adapter-substrate/live"]
 
 [dependencies]
 registry.workspace = true
@@ -31,3 +32,4 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 serde_json.workspace = true
 sqlx = { workspace = true, optional = true }
+async-trait.workspace = true

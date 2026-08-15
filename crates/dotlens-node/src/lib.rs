@@ -6,3 +6,6 @@ pub mod pipeline;
 
 #[cfg(feature = "pg")]
 pub mod registry_sync;
+
+#[cfg(feature = "pg")]
+pub mod runtime_versions;

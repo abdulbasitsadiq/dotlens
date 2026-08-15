@@ -26,7 +26,8 @@ anyhow = "1"
 hex = "0.4"
 blake2 = "0.10"
 chrono = { version = "0.4", features = ["serde"] }
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "net"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "net", "time", "sync"] }
+subxt = "0.50"
 dotenvy = "0.15"
 axum = "0.8"
 tower = { version = "0.5", features = ["util"] }

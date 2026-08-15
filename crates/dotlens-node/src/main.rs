@@ -1,20 +1,27 @@
 //! dotlens-node: wires registry → raw store → decode → index → API.
 //!
 //! With DATABASE_URL set (and the default `pg` feature): migrations run,
-//! registry seeds sync into `core`, and checkpoints/blocks/receipts are all
-//! Postgres-backed — restart-safe end to end. Without it, everything runs
-//! in memory (Phase 0 mode: fixtures + API, no persistence).
+//! registry seeds sync into `core`, and checkpoints/blocks/receipts/runtime
+//! lineage are all Postgres-backed — restart-safe end to end. Without it,
+//! everything runs in memory (fixtures + API, nothing persists).
 //!
-//! The backends are chosen as a SET, never mixed: durable checkpoints with an
+//! Backends are chosen as a SET, never mixed: durable checkpoints with an
 //! in-memory block index would "resume" past blocks nobody stored.
 //!
 //! Usage:
-//!   dotlens-node            # run everything
-//!   dotlens-node migrate    # run migrations only, then exit
+//!   dotlens-node                              # fixtures + API (+ live, see below)
+//!   dotlens-node migrate                      # run migrations only, then exit
+//!   dotlens-node backfill <chain> <from> <to> # raw backfill a height range
+//!
+//! Live ingestion (`live` feature + LIVE_INGEST=1 + DATABASE_URL): every
+//! registered chain with rpc endpoints and the `blocks` module gets a follower
+//! task ingesting finalized heads raw-first (no decode yet — that's the
+//! frame-decode slice). POLL_INTERVAL_SECS tunes the poll (default 6).
 
 use anyhow::{Context, Result};
 use api::{AppState, BlockIndex, MemoryBlockIndex};
 use dotlens_node::pipeline::ingest_fixtures;
+use ingest::live::{NoopRuntimeVersionSink, RuntimeVersionSink};
 use ingest::{CheckpointStore, MemoryCheckpointStore, NoopReceiptSink, ReceiptSink};
 use raw_store::{FsRawStore, RawStore};
 use registry::Registry;
@@ -25,6 +32,8 @@ struct Backends {
     checkpoints: Arc<dyn CheckpointStore>,
     receipts: Arc<dyn ReceiptSink>,
     blocks: Arc<dyn BlockIndex>,
+    runtime_versions: Arc<dyn RuntimeVersionSink>,
+    persistent: bool,
 }
 
 fn memory_backends() -> Backends {
@@ -32,11 +41,43 @@ fn memory_backends() -> Backends {
         checkpoints: Arc::new(MemoryCheckpointStore::new()),
         receipts: Arc::new(NoopReceiptSink),
         blocks: Arc::new(MemoryBlockIndex::new()),
+        runtime_versions: Arc::new(NoopRuntimeVersionSink),
+        persistent: false,
     }
 }
 
 fn env_or(key: &str, default: &str) -> String {
     std::env::var(key).unwrap_or_else(|_| default.to_string())
+}
+
+fn env_flag(key: &str) -> bool {
+    matches!(
+        std::env::var(key).unwrap_or_default().as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
+
+enum Command {
+    Run,
+    Migrate,
+    Backfill { chain: String, from: u64, to: u64 },
+}
+
+fn parse_args() -> Result<Command> {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    match args.first().map(String::as_str) {
+        None => Ok(Command::Run),
+        Some("migrate") => Ok(Command::Migrate),
+        Some("backfill") => {
+            let usage = "usage: dotlens-node backfill <chain> <from> <to>";
+            let chain = args.get(1).context(usage)?.clone();
+            let from: u64 = args.get(2).context(usage)?.parse().context(usage)?;
+            let to: u64 = args.get(3).context(usage)?.parse().context(usage)?;
+            anyhow::ensure!(from <= to, "backfill: from must be <= to");
+            Ok(Command::Backfill { chain, from, to })
+        }
+        Some(other) => anyhow::bail!("unknown command: {other}"),
+    }
 }
 
 #[tokio::main]
@@ -49,7 +90,7 @@ async fn main() -> Result<()> {
         )
         .init();
 
-    let migrate_only = std::env::args().nth(1).as_deref() == Some("migrate");
+    let command = parse_args()?;
 
     // -- registry -------------------------------------------------------------
     let seeds_dir = env_or("REGISTRY_SEEDS", "registry-seeds");
@@ -70,11 +111,12 @@ async fn main() -> Result<()> {
     #[cfg(feature = "pg")]
     if let Ok(db_url) = std::env::var("DATABASE_URL") {
         use api::pg::PgBlockIndex;
+        use dotlens_node::runtime_versions::PgRuntimeVersionSink;
         use ingest::pg::{PgCheckpointStore, PgReceiptSink};
         use sqlx::postgres::PgPoolOptions;
 
         let pool = PgPoolOptions::new()
-            .max_connections(5)
+            .max_connections(10)
             .connect(&db_url)
             .await
             .context("connecting to postgres")?;
@@ -83,9 +125,10 @@ async fn main() -> Result<()> {
             .await
             .context("running migrations")?;
         tracing::info!("migrations up to date");
-        if migrate_only {
+        if matches!(command, Command::Migrate) {
             return Ok(());
         }
+        // registry sync BEFORE any worker: substrate.runtime_versions FKs core.chains
         dotlens_node::registry_sync::sync_registry(&pool, registry.as_ref())
             .await
             .context("registry → DB sync")?;
@@ -94,10 +137,12 @@ async fn main() -> Result<()> {
         backends = Some(Backends {
             checkpoints: Arc::new(PgCheckpointStore::new(pool.clone())),
             receipts: Arc::new(PgReceiptSink::new(pool.clone())),
-            blocks: Arc::new(PgBlockIndex::new(pool)),
+            blocks: Arc::new(PgBlockIndex::new(pool.clone())),
+            runtime_versions: Arc::new(PgRuntimeVersionSink::new(pool)),
+            persistent: true,
         });
     }
-    if migrate_only {
+    if matches!(command, Command::Migrate) {
         // reachable only without pg feature or without DATABASE_URL
         anyhow::bail!("`migrate` requires the `pg` feature and DATABASE_URL");
     }
@@ -110,10 +155,19 @@ async fn main() -> Result<()> {
         memory_backends()
     });
 
-    // -- raw store + fixture ingestion (checkpointed, idempotent) -------------
     let raw_root = env_or("RAW_STORE_PATH", "./data/raw");
     let raw: Arc<dyn RawStore> = Arc::new(FsRawStore::new(&raw_root));
 
+    // -- backfill subcommand: run the range, report, exit ---------------------
+    if let Command::Backfill { chain, from, to } = &command {
+        anyhow::ensure!(
+            backends.persistent,
+            "backfill requires DATABASE_URL (raw receipts + checkpoints must persist)"
+        );
+        return run_backfill(&registry, &backends, raw.as_ref(), chain, *from, *to).await;
+    }
+
+    // -- fixture ingestion (checkpointed, idempotent) -------------------------
     let fixtures_dir = env_or("FIXTURES_PATH", "fixtures/synthetic");
     let processed = ingest_fixtures(
         Path::new(&fixtures_dir),
@@ -130,6 +184,10 @@ async fn main() -> Result<()> {
         "fixture ingestion complete"
     );
 
+    // -- live followers -------------------------------------------------------
+    let backends = Arc::new(backends);
+    spawn_live_followers(&registry, &backends, &raw);
+
     // -- API ------------------------------------------------------------------
     let bind = env_or("API_BIND", "127.0.0.1:8080");
     let app = api::router(AppState {
@@ -142,6 +200,107 @@ async fn main() -> Result<()> {
     tracing::info!(%bind, "dotlens api listening");
     axum_serve(listener, app).await?;
     Ok(())
+}
+
+#[cfg(feature = "live")]
+fn spawn_live_followers(
+    registry: &Arc<Registry>,
+    backends: &Arc<Backends>,
+    raw: &Arc<dyn RawStore>,
+) {
+    use adapter_substrate::source::SubstrateSource;
+
+    if !env_flag("LIVE_INGEST") {
+        tracing::info!("live ingestion disabled (set LIVE_INGEST=1 to enable)");
+        return;
+    }
+    if !backends.persistent {
+        tracing::warn!("LIVE_INGEST=1 but no DATABASE_URL — refusing to live-ingest into memory");
+        return;
+    }
+    let poll = std::time::Duration::from_secs(
+        env_or("POLL_INTERVAL_SECS", "6").parse().unwrap_or(6),
+    );
+    let now = chrono::Utc::now();
+    for chain in registry.chains() {
+        let live = chain.status_at(now) == Some(registry::LifecycleStatus::Live);
+        if !live || !chain.has_module("blocks") || chain.endpoints.rpc.is_empty() {
+            tracing::debug!(chain = %chain.id, "not eligible for live ingestion — skipped");
+            continue;
+        }
+        let source = match SubstrateSource::new(&chain.id, chain.endpoints.rpc.clone()) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(chain = %chain.id, error = %e, "live follower not started");
+                continue;
+            }
+        };
+        let chain_id = chain.id.clone();
+        let backends = backends.clone();
+        let raw = raw.clone();
+        tokio::spawn(async move {
+            tracing::info!(chain = %chain_id, "live follower started");
+            let deps = ingest::live::IngestDeps {
+                raw: raw.as_ref(),
+                checkpoints: backends.checkpoints.as_ref(),
+                receipts: backends.receipts.as_ref(),
+                runtime_versions: backends.runtime_versions.as_ref(),
+            };
+            ingest::live::follow(&chain_id, &source, &deps, poll).await;
+        });
+    }
+}
+
+#[cfg(not(feature = "live"))]
+fn spawn_live_followers(_: &Arc<Registry>, _: &Arc<Backends>, _: &Arc<dyn RawStore>) {
+    if env_flag("LIVE_INGEST") {
+        tracing::warn!("built without the `live` feature — LIVE_INGEST is IGNORED");
+    }
+}
+
+#[cfg(feature = "live")]
+async fn run_backfill(
+    registry: &Registry,
+    backends: &Backends,
+    raw: &dyn RawStore,
+    chain: &str,
+    from: u64,
+    to: u64,
+) -> Result<()> {
+    use adapter_substrate::source::SubstrateSource;
+
+    let cfg = registry
+        .chain(chain)
+        .with_context(|| format!("unknown chain: {chain}"))?;
+    let source = SubstrateSource::new(&cfg.id, cfg.endpoints.rpc.clone())
+        .map_err(|e| anyhow::anyhow!(e))?;
+    let deps = ingest::live::IngestDeps {
+        raw,
+        checkpoints: backends.checkpoints.as_ref(),
+        receipts: backends.receipts.as_ref(),
+        runtime_versions: backends.runtime_versions.as_ref(),
+    };
+    // per-range checkpoint module: disjoint ranges never fight each other,
+    // and re-running the same range resumes exactly where it stopped
+    let module = format!("{}:{from}-{to}", ingest::live::MODULE_BACKFILL);
+    let n = ingest::live::ingest_range(&cfg.id, &source, &deps, &module, from, to, &mut None)
+        .await
+        .with_context(|| format!("backfill {chain} {from}..={to}"))?;
+    tracing::info!(chain, from, to, processed = n, "backfill complete");
+    println!("backfill {chain} {from}..={to}: processed {n} blocks");
+    Ok(())
+}
+
+#[cfg(not(feature = "live"))]
+async fn run_backfill(
+    _: &Registry,
+    _: &Backends,
+    _: &dyn RawStore,
+    _: &str,
+    _: u64,
+    _: u64,
+) -> Result<()> {
+    anyhow::bail!("backfill requires the `live` feature")
 }
 
 async fn axum_serve(listener: tokio::net::TcpListener, app: axum::Router) -> Result<()> {

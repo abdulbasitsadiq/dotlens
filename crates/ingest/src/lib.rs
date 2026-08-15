@@ -5,6 +5,8 @@
 //! (ARCHITECTURE.md §9/§15). The contract is async end-to-end since Phase 1 so
 //! the Postgres backend is a first-class implementation, not a bolt-on.
 
+pub mod live;
+
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use raw_store::IngestReceipt;

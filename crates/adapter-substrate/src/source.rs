@@ -1,0 +1,228 @@
+//! SubstrateSource: the live fetch side of the Substrate adapter.
+//! Implements `ingest::live::ChainSource` over the legacy JSON-RPC surface via
+//! subxt, with multi-endpoint failover (registry endpoints, rotated on error).
+//!
+//! Parachain differences are CONFIG, not code: this source works unchanged for
+//! the relay, system chains, and any Substrate parachain (Invariant 2).
+//!
+//! subxt 0.50 note: the legacy RPC surface lives in the `subxt-rpcs` crate
+//! (re-exported as `subxt::rpcs`); `LegacyRpcMethods` is parameterized over
+//! `subxt_rpcs::RpcConfig`, satisfied via the `RpcConfigFor<Config>` adapter.
+
+use async_trait::async_trait;
+use ingest::live::{ChainSource, FetchedBlock, RawArtifact, SourceError};
+use subxt::config::RpcConfigFor;
+use subxt::rpcs::{LegacyRpcMethods, RpcClient};
+use subxt::PolkadotConfig;
+use tokio::sync::Mutex;
+
+/// twox128("System") ++ twox128("Events") — the storage key of System.Events.
+/// Substrate-protocol knowledge; allowed here (adapters only — Invariant 4).
+const SYSTEM_EVENTS_KEY: [u8; 32] = [
+    0x26, 0xaa, 0x39, 0x4e, 0xea, 0x56, 0x30, 0xe0, 0x7c, 0x48, 0xae, 0x0c, 0x95, 0x58, 0xce,
+    0xf7, 0x80, 0xd4, 0x1e, 0x5e, 0x16, 0x05, 0x67, 0x65, 0xbc, 0x84, 0x61, 0x85, 0x10, 0x72,
+    0xc9, 0xd7,
+];
+
+type Methods = LegacyRpcMethods<RpcConfigFor<PolkadotConfig>>;
+
+struct Connection {
+    endpoint_index: usize,
+    /// RpcClient is cheaply Clone; LegacyRpcMethods is rebuilt from it per
+    /// call (avoids relying on a Clone impl for Methods).
+    client: RpcClient,
+}
+
+pub struct SubstrateSource {
+    chain_id: String,
+    endpoints: Vec<String>,
+    /// Current connection; None = will (re)connect on next use, starting at
+    /// `next_index`. Rotated on any RPC failure.
+    conn: Mutex<Option<Connection>>,
+    next_index: std::sync::atomic::AtomicUsize,
+}
+
+impl SubstrateSource {
+    pub fn new(chain_id: impl Into<String>, endpoints: Vec<String>) -> Result<Self, SourceError> {
+        let chain_id = chain_id.into();
+        if endpoints.is_empty() {
+            return Err(SourceError::Exhausted(format!(
+                "chain {chain_id} has no rpc endpoints in the registry"
+            )));
+        }
+        Ok(Self {
+            chain_id,
+            endpoints,
+            conn: Mutex::new(None),
+            next_index: std::sync::atomic::AtomicUsize::new(0),
+        })
+    }
+
+    /// Run `op` against a connected endpoint; on failure rotate and retry until
+    /// every endpoint has been tried once this call. All-fail → `Exhausted`.
+    async fn with_failover<T, F, Fut>(&self, what: &str, op: F) -> Result<T, SourceError>
+    where
+        F: Fn(Methods) -> Fut,
+        Fut: std::future::Future<Output = Result<T, subxt::rpcs::Error>>,
+    {
+        let mut last_err = String::new();
+        for _attempt in 0..self.endpoints.len() {
+            // connect (or reuse) under the lock, then release before the call
+            let methods = {
+                let mut guard = self.conn.lock().await;
+                if guard.is_none() {
+                    let idx = self
+                        .next_index
+                        .load(std::sync::atomic::Ordering::Relaxed)
+                        % self.endpoints.len();
+                    let url = &self.endpoints[idx];
+                    match RpcClient::from_url(url).await {
+                        Ok(client) => {
+                            tracing::info!(chain = %self.chain_id, %url, "rpc connected");
+                            *guard = Some(Connection {
+                                endpoint_index: idx,
+                                client,
+                            });
+                        }
+                        Err(e) => {
+                            last_err = format!("{url}: connect: {e}");
+                            tracing::warn!(chain = %self.chain_id, %url, error = %e, "rpc connect failed — rotating");
+                            self.next_index
+                                .store(idx + 1, std::sync::atomic::Ordering::Relaxed);
+                            continue;
+                        }
+                    }
+                }
+                LegacyRpcMethods::new(guard.as_ref().expect("just ensured").client.clone())
+            };
+
+            match op(methods).await {
+                Ok(v) => return Ok(v),
+                Err(e) => {
+                    let mut guard = self.conn.lock().await;
+                    if let Some(conn) = guard.take() {
+                        let url = &self.endpoints[conn.endpoint_index];
+                        last_err = format!("{url}: {what}: {e}");
+                        tracing::warn!(chain = %self.chain_id, %url, error = %e, "rpc call failed — rotating endpoint");
+                        self.next_index
+                            .store(conn.endpoint_index + 1, std::sync::atomic::Ordering::Relaxed);
+                    } else {
+                        last_err = format!("{what}: {e}");
+                    }
+                }
+            }
+        }
+        Err(SourceError::Exhausted(format!(
+            "chain {}: {last_err}",
+            self.chain_id
+        )))
+    }
+
+    async fn hash_at(&self, height: u64) -> Result<subxt::utils::H256, SourceError> {
+        self.with_failover("chain_getBlockHash", |m| async move {
+            m.chain_get_block_hash(Some(height.into())).await
+        })
+        .await?
+        .ok_or(SourceError::NotFound(height))
+    }
+}
+
+fn hex32(h: &subxt::utils::H256) -> String {
+    format!("0x{}", hex::encode(h.as_ref()))
+}
+
+#[async_trait]
+impl ChainSource for SubstrateSource {
+    async fn finalized_height(&self) -> Result<u64, SourceError> {
+        let hash = self
+            .with_failover("chain_getFinalizedHead", |m| async move {
+                m.chain_get_finalized_head().await
+            })
+            .await?;
+        let header = self
+            .with_failover("chain_getHeader", |m| async move {
+                m.chain_get_header(Some(hash)).await
+            })
+            .await?
+            .ok_or_else(|| SourceError::Rpc("finalized head has no header".into()))?;
+        Ok(header.number as u64)
+    }
+
+    async fn fetch_block(&self, height: u64) -> Result<FetchedBlock, SourceError> {
+        let hash = self.hash_at(height).await?;
+
+        let block = self
+            .with_failover("chain_getBlock", |m| async move {
+                m.chain_get_block(Some(hash)).await
+            })
+            .await?
+            .ok_or(SourceError::NotFound(height))?;
+
+        let runtime = self
+            .with_failover("state_getRuntimeVersion", |m| async move {
+                m.state_get_runtime_version(Some(hash)).await
+            })
+            .await?;
+
+        let events = self
+            .with_failover("state_getStorage(System.Events)", |m| async move {
+                m.state_get_storage(&SYSTEM_EVENTS_KEY, Some(hash)).await
+            })
+            .await?;
+
+        // Raw block artifact: deterministic JSON envelope; extrinsic bytes are
+        // the SCALE hex exactly as returned by the node. (The JSON-RPC layer is
+        // what "as received" means over this transport — noted in ARCHITECTURE §6.)
+        let header = &block.block.header;
+        let block_json = serde_json::json!({
+            "chain_id": self.chain_id,
+            "height": height,
+            "hash": hex32(&hash),
+            "parent_hash": hex32(&header.parent_hash),
+            "state_root": hex32(&header.state_root),
+            "extrinsics_root": hex32(&header.extrinsics_root),
+            "spec_version": runtime.spec_version,
+            "finalized": true,
+            "extrinsics": block
+                .block
+                .extrinsics
+                .iter()
+                .map(|xt| format!("0x{}", hex::encode(&xt.0)))
+                .collect::<Vec<_>>(),
+        });
+        let mut artifacts = vec![RawArtifact {
+            item: "block.json".into(),
+            bytes: serde_json::to_vec(&block_json)
+                .map_err(|e| SourceError::Rpc(format!("serializing block envelope: {e}")))?,
+        }];
+        if let Some(ev) = events {
+            artifacts.push(RawArtifact {
+                item: "events.scale".into(),
+                bytes: ev,
+            });
+        }
+
+        Ok(FetchedBlock {
+            height,
+            hash: hex32(&hash),
+            parent_hash: hex32(&header.parent_hash),
+            runtime_version: runtime.spec_version,
+            transaction_version: Some(runtime.transaction_version),
+            artifacts,
+        })
+    }
+
+    async fn metadata_at(&self, height: u64) -> Result<Vec<u8>, SourceError> {
+        let hash = self.hash_at(height).await?;
+        // state_getMetadata returns the highest version this path supports
+        // (v14 on modern runtimes). v15/v16 via the Metadata runtime API is a
+        // known debt for the frame-decode slice — the version byte we record
+        // makes the difference visible, never guessed.
+        let bytes = self
+            .with_failover("state_getMetadata", |m| async move {
+                m.state_get_metadata(Some(hash)).await
+            })
+            .await?;
+        Ok(bytes.into_raw())
+    }
+}

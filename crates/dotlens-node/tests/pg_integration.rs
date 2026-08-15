@@ -226,6 +226,144 @@ async fn receipts_persist_once_first_fetch_wins() {
     db.drop_db().await;
 }
 
+// ---------------------------------------------------------------- live (raw)
+
+/// Minimal scripted source for the LIVE raw pipeline: two runtime eras
+/// (v100 → v101 at height 6). No subxt, no network — the generic worker plus
+/// real Pg sinks is exactly what this proves.
+struct MockSource {
+    finalized: u64,
+}
+
+#[async_trait::async_trait]
+impl ingest::live::ChainSource for MockSource {
+    async fn finalized_height(&self) -> Result<u64, ingest::live::SourceError> {
+        Ok(self.finalized)
+    }
+    async fn fetch_block(
+        &self,
+        height: u64,
+    ) -> Result<ingest::live::FetchedBlock, ingest::live::SourceError> {
+        if height > self.finalized {
+            return Err(ingest::live::SourceError::NotFound(height));
+        }
+        Ok(ingest::live::FetchedBlock {
+            height,
+            hash: format!("0x{height:064x}"),
+            parent_hash: format!("0x{:064x}", height.saturating_sub(1)),
+            runtime_version: if height <= 5 { 100 } else { 101 },
+            transaction_version: Some(1),
+            artifacts: vec![
+                ingest::live::RawArtifact {
+                    item: "block.json".into(),
+                    bytes: format!("{{\"h\":{height}}}").into_bytes(),
+                },
+                ingest::live::RawArtifact {
+                    item: "events.scale".into(),
+                    bytes: vec![height as u8],
+                },
+            ],
+        })
+    }
+    async fn metadata_at(&self, height: u64) -> Result<Vec<u8>, ingest::live::SourceError> {
+        let v: u32 = if height <= 5 { 100 } else { 101 };
+        let mut blob = b"meta".to_vec();
+        blob.push(15);
+        blob.extend_from_slice(&v.to_le_bytes());
+        Ok(blob)
+    }
+}
+
+#[tokio::test]
+async fn live_raw_pipeline_persists_lineage_and_resumes() {
+    let Some(db) = TestDb::create().await else { return };
+    let reg = seeds();
+    sync_registry(&db.pool, &reg).await.expect("registry sync");
+
+    let raw_dir = tmp_raw("live");
+    let raw = FsRawStore::new(&raw_dir);
+    let checkpoints = PgCheckpointStore::new(db.pool.clone());
+    let receipts = PgReceiptSink::new(db.pool.clone());
+    let versions = dotlens_node::runtime_versions::PgRuntimeVersionSink::new(db.pool.clone());
+    let deps = ingest::live::IngestDeps {
+        raw: &raw,
+        checkpoints: &checkpoints,
+        receipts: &receipts,
+        runtime_versions: &versions,
+    };
+    let source = MockSource { finalized: 10 };
+
+    // use a registered chain id so the runtime_versions FK to core.chains holds
+    let n = ingest::live::ingest_range(
+        "polkadot", &source, &deps, ingest::live::MODULE_BACKFILL, 1, 10, &mut None,
+    )
+    .await
+    .expect("live range");
+    assert_eq!(n, 10);
+
+    // runtime lineage rows: one per era, correct boundaries + metadata info
+    let rows: Vec<(i64, Option<i64>, Option<i32>, Option<String>, Option<i64>)> = sqlx::query_as(
+        "select spec_version, transaction_version, metadata_version, \
+                metadata_blob_location, first_block \
+         from substrate.runtime_versions where chain_id = 'polkadot' \
+         order by spec_version",
+    )
+    .fetch_all(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].0, 100);
+    assert_eq!(rows[0].4, Some(1)); // first observed at height 1
+    assert_eq!(rows[0].2, Some(15));
+    assert!(rows[0].3.as_deref().unwrap().contains("/meta/100/"));
+    assert_eq!(rows[1].0, 101);
+    assert_eq!(rows[1].4, Some(6)); // era boundary detected
+
+    // receipts: 2 artifacts × 10 blocks + 2 metadata blobs
+    let (receipts_n,): (i64,) = sqlx::query_as("select count(*) from core.ingest_receipts")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(receipts_n, 22);
+
+    // re-run: clean no-op (checkpoint resume, no new receipts)
+    let n = ingest::live::ingest_range(
+        "polkadot", &source, &deps, ingest::live::MODULE_BACKFILL, 1, 10, &mut None,
+    )
+    .await
+    .expect("re-run");
+    assert_eq!(n, 0);
+
+    // "restart" with fresh sink instances: sink upserts stay idempotent and
+    // first_block never regresses upward
+    let versions2 = dotlens_node::runtime_versions::PgRuntimeVersionSink::new(db.pool.clone());
+    let checkpoints2 = PgCheckpointStore::new(db.pool.clone());
+    let deps2 = ingest::live::IngestDeps {
+        raw: &raw,
+        checkpoints: &checkpoints2,
+        receipts: &receipts,
+        runtime_versions: &versions2,
+    };
+    let source2 = MockSource { finalized: 15 };
+    let n = ingest::live::ingest_range(
+        "polkadot", &source2, &deps2, ingest::live::MODULE_BACKFILL, 1, 15, &mut None,
+    )
+    .await
+    .expect("extended range");
+    assert_eq!(n, 5, "resumes at 11, not 1");
+    let (first_block,): (Option<i64>,) = sqlx::query_as(
+        "select first_block from substrate.runtime_versions \
+         where chain_id = 'polkadot' and spec_version = 101",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(first_block, Some(6), "first_block must not regress upward");
+
+    let _ = std::fs::remove_dir_all(&raw_dir);
+    db.drop_db().await;
+}
+
 #[tokio::test]
 async fn end_to_end_pg_pipeline_is_restart_safe() {
     let Some(db) = TestDb::create().await else { return };

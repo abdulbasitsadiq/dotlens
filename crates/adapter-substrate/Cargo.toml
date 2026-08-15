@@ -4,6 +4,11 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+default = []
+# live fetch side (subxt). Decode stays pure and dependency-light without it.
+live = ["dep:subxt", "dep:ingest", "dep:async-trait", "dep:tokio", "dep:tracing"]
+
 [dependencies]
 canonical.workspace = true
 serde.workspace = true
@@ -12,3 +17,8 @@ thiserror.workspace = true
 chrono.workspace = true
 hex.workspace = true
 blake2.workspace = true
+subxt = { workspace = true, optional = true }
+ingest = { workspace = true, optional = true }
+async-trait = { workspace = true, optional = true }
+tokio = { workspace = true, optional = true }
+tracing = { workspace = true, optional = true }
