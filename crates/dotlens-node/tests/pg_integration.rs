@@ -13,7 +13,7 @@ use dotlens_node::pipeline::ingest_fixtures;
 use dotlens_node::registry_sync::sync_registry;
 use ingest::pg::{PgCheckpointStore, PgReceiptSink};
 use ingest::{should_process, Checkpoint, CheckpointStore, IngestOutcome, ReceiptSink};
-use raw_store::FsRawStore;
+use raw_store::{FsRawStore, RawStore};
 use registry::Registry;
 use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
@@ -563,5 +563,201 @@ async fn end_to_end_pg_pipeline_is_restart_safe() {
     assert_eq!(in_default, 0, "block should be routed to its chain partition");
 
     let _ = std::fs::remove_dir_all(&raw_dir);
+    db.drop_db().await;
+}
+
+// -------------------------------------------------------- account labeling
+
+#[tokio::test]
+async fn account_labels_derive_from_registry_metadata_and_seeds() {
+    use api::LabelIndex;
+
+    let Some(db) = TestDb::create().await else { return };
+    let reg = seeds();
+    sync_registry(&db.pool, &reg).await.expect("registry sync");
+
+    // stage archived metadata for AH exactly as live ingestion would have:
+    // blob in the raw store + a substrate.runtime_versions row pointing at it
+    let raw_dir = tmp_raw("labels");
+    let raw = FsRawStore::new(&raw_dir);
+    let meta_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../fixtures/real/polkadot-asset-hub-19498783/metadata.scale");
+    let metadata_staged = match std::fs::read(&meta_path) {
+        Ok(blob) => {
+            let key = raw_store::keys::metadata("polkadot-asset-hub", 2_003_002);
+            raw.put(&key, &blob, "test").expect("stage metadata blob");
+            sqlx::query(
+                "insert into substrate.runtime_versions \
+                     (chain_id, spec_version, metadata_version, metadata_blob_location) \
+                 values ($1, $2, 14, $3) on conflict do nothing",
+            )
+            .bind("polkadot-asset-hub")
+            .bind(2_003_002i64)
+            .bind(&key)
+            .execute(&db.pool)
+            .await
+            .expect("runtime_versions row");
+            true
+        }
+        Err(_) => {
+            eprintln!("NOTE: real fixture metadata absent — pallet-label assertions skipped");
+            false
+        }
+    };
+
+    let r1 = dotlens_node::labels::sync_labels(&db.pool, &reg, &raw)
+        .await
+        .expect("first label sync");
+    assert!(r1.sovereign_labels >= 1, "AH para sovereign expected");
+    assert_eq!(r1.seeded_labels, 2, "the two seeded AH treasury accounts");
+    let (count1,): (i64,) = sqlx::query_as("select count(*) from core.account_labels")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+
+    // idempotent: second sync changes nothing
+    dotlens_node::labels::sync_labels(&db.pool, &reg, &raw)
+        .await
+        .expect("second label sync");
+    let (count2,): (i64,) = sqlx::query_as("select count(*) from core.account_labels")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(count1, count2, "label sync must be idempotent");
+
+    // AH's para sovereign is labeled ON THE RELAY with the ECOSYSTEM.md golden
+    let (ss58,): (Option<String>,) = sqlx::query_as(
+        "select ss58 from core.account_labels \
+         where kind = 'para_sovereign' and chain_scope = 'polkadot' and derivation = 'para:1000'",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .expect("para sovereign row on the relay");
+    assert_eq!(
+        ss58.as_deref(),
+        Some("13YMK2edbuhwMBxeUWm9c643A2wyYHwSVh1bCM7tShtg7Dtk")
+    );
+
+    if metadata_staged {
+        // THE exit-criterion label: Treasury (py/trsry), named, on AH
+        let (label, ss58): (String, Option<String>) = sqlx::query_as(
+            "select label, ss58 from core.account_labels \
+             where kind = 'pallet' and chain_scope = 'polkadot-asset-hub' \
+               and derivation = 'modl:py/trsry'",
+        )
+        .fetch_one(&db.pool)
+        .await
+        .expect("treasury pallet label on AH");
+        assert!(label.ends_with("(py/trsry)"), "named label, got: {label}");
+        assert_eq!(
+            ss58.as_deref(),
+            Some("13UVJyLnbVp9RBZYFwFGyDvVd1y27Tt8tkntv6Q7JVPhFsTB")
+        );
+
+        // and it surfaces through the API's label index
+        let idx = api::pg::PgLabelIndex::new(db.pool.clone());
+        let treasury = adapter_substrate::accounts::pallet_account(b"py/trsry");
+        let labels = idx
+            .labels_for("polkadot-asset-hub", &treasury)
+            .await
+            .expect("labels_for");
+        assert!(labels.iter().any(|l| l.label.ends_with("(py/trsry)")));
+    }
+
+    // verification recording round-trips
+    let rows = dotlens_node::labels::labels_for_chain(&db.pool, "polkadot")
+        .await
+        .expect("labels for relay");
+    assert!(!rows.is_empty());
+    dotlens_node::labels::record_verification(&db.pool, &rows[0], 12_345, true)
+        .await
+        .expect("record verification");
+    let (note, block): (Option<String>, Option<i64>) = sqlx::query_as(
+        "select verified_note, verified_block from core.account_labels \
+         where account_id = $1 and kind = $2 and chain_scope = $3",
+    )
+    .bind(&rows[0].account_id[..])
+    .bind(&rows[0].kind)
+    .bind(&rows[0].chain_scope)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(note.as_deref(), Some("exists"));
+    assert_eq!(block, Some(12_345));
+
+    let _ = std::fs::remove_dir_all(&raw_dir);
+    db.drop_db().await;
+}
+
+#[tokio::test]
+async fn sibling_sovereign_labels_appear_when_a_chain_registers() {
+    let Some(db) = TestDb::create().await else { return };
+
+    // real seeds + one synthetic parachain — the plug-and-play path: adding a
+    // chain is config only, and its sovereigns appear everywhere automatically
+    let dir = std::env::temp_dir().join(format!("dotlens-labels-reg-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../registry-seeds");
+    for entry in std::fs::read_dir(&src).unwrap() {
+        let p = entry.unwrap().path();
+        if p.extension().map(|e| e == "yaml").unwrap_or(false) {
+            std::fs::copy(&p, dir.join(p.file_name().unwrap())).unwrap();
+        }
+    }
+    std::fs::write(
+        dir.join("test-para.yaml"),
+        "id: test-para\nname: Test Para\nfamily: substrate\nrelay: polkadot\n\
+         para_id: 2034\nnetwork: polkadot\nss58_prefix: 0\n",
+    )
+    .unwrap();
+    let reg = Registry::load_from_dir(&dir).expect("temp registry loads");
+    sync_registry(&db.pool, &reg).await.expect("registry sync");
+
+    let raw_dir = tmp_raw("sibl");
+    let raw = FsRawStore::new(&raw_dir);
+    dotlens_node::labels::sync_labels(&db.pool, &reg, &raw)
+        .await
+        .expect("label sync");
+
+    let exists = |kind: &'static str, scope: &'static str, derivation: &'static str| {
+        let pool = db.pool.clone();
+        async move {
+            let (n,): (i64,) = sqlx::query_as(
+                "select count(*) from core.account_labels \
+                 where kind = $1 and chain_scope = $2 and derivation = $3",
+            )
+            .bind(kind)
+            .bind(scope)
+            .bind(derivation)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            n == 1
+        }
+    };
+    // test-para's sovereign: on the relay (para) and on AH (sibl)
+    assert!(exists("para_sovereign", "polkadot", "para:2034").await);
+    assert!(exists("sibl_sovereign", "polkadot-asset-hub", "sibl:2034").await);
+    // and AH's sibling sovereign appears on test-para — both directions
+    assert!(exists("sibl_sovereign", "test-para", "sibl:1000").await);
+
+    // ss58 agrees with the adapter's own derivation (self-consistency)
+    let expected = adapter_substrate::frame_decoder::ss58_encode(
+        0,
+        &adapter_substrate::accounts::sibling_sovereign(2034),
+    );
+    let (ss58,): (Option<String>,) = sqlx::query_as(
+        "select ss58 from core.account_labels \
+         where kind = 'sibl_sovereign' and chain_scope = 'polkadot-asset-hub' \
+           and derivation = 'sibl:2034'",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(ss58.as_deref(), Some(expected.as_str()));
+
+    let _ = std::fs::remove_dir_all(&raw_dir);
+    let _ = std::fs::remove_dir_all(&dir);
     db.drop_db().await;
 }

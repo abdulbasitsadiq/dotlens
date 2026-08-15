@@ -9,3 +9,6 @@ pub mod registry_sync;
 
 #[cfg(feature = "pg")]
 pub mod runtime_versions;
+
+#[cfg(feature = "pg")]
+pub mod labels;

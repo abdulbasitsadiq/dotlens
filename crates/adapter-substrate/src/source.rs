@@ -125,6 +125,29 @@ impl SubstrateSource {
         .await?
         .ok_or(SourceError::NotFound(height))
     }
+
+    /// Block hash at `height` — public so callers probing many keys at one
+    /// height resolve the hash once (review catch: avoids N+1 RPC).
+    pub async fn block_hash(&self, height: u64) -> Result<subxt::utils::H256, SourceError> {
+        self.hash_at(height).await
+    }
+
+    /// Does `key` exist in storage at block `hash`? Existence only (Some vs
+    /// None) — used by verify-labels to confirm derived system accounts
+    /// on-chain without needing to decode AccountInfo.
+    pub async fn storage_contains_at(
+        &self,
+        key: &[u8],
+        hash: subxt::utils::H256,
+    ) -> Result<bool, SourceError> {
+        let value = self
+            .with_failover("state_getStorage", |m| {
+                let key = key.to_vec();
+                async move { m.state_get_storage(&key, Some(hash)).await }
+            })
+            .await?;
+        Ok(value.is_some())
+    }
 }
 
 fn hex32(h: &subxt::utils::H256) -> String {

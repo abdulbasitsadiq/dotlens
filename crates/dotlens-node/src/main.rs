@@ -12,6 +12,8 @@
 //!   dotlens-node                              # fixtures + API (+ live, see below)
 //!   dotlens-node migrate                      # run migrations only, then exit
 //!   dotlens-node backfill <chain> <from> <to> # raw backfill a height range
+//!   dotlens-node sync-labels                  # derive + project account labels, exit
+//!   dotlens-node verify-labels <chain>        # probe labels on-chain, record, exit
 //!
 //! Live ingestion (`live` feature + LIVE_INGEST=1 + DATABASE_URL): every
 //! registered chain with rpc endpoints and the `blocks` module gets a follower
@@ -32,7 +34,11 @@ struct Backends {
     checkpoints: Arc<dyn CheckpointStore>,
     receipts: Arc<dyn ReceiptSink>,
     blocks: Arc<dyn BlockIndex>,
+    labels: Arc<dyn api::LabelIndex>,
     runtime_versions: Arc<dyn RuntimeVersionSink>,
+    /// Kept for label sync/verify (they need direct SQL, not a trait).
+    #[cfg(feature = "pg")]
+    pool: Option<sqlx::PgPool>,
     persistent: bool,
 }
 
@@ -41,7 +47,10 @@ fn memory_backends() -> Backends {
         checkpoints: Arc::new(MemoryCheckpointStore::new()),
         receipts: Arc::new(NoopReceiptSink),
         blocks: Arc::new(MemoryBlockIndex::new()),
+        labels: Arc::new(api::MemoryLabelIndex::new()),
         runtime_versions: Arc::new(NoopRuntimeVersionSink),
+        #[cfg(feature = "pg")]
+        pool: None,
         persistent: false,
     }
 }
@@ -63,6 +72,8 @@ enum Command {
     Backfill { chain: String, from: u64, to: u64 },
     DecodeRange { chain: String, from: u64, to: u64 },
     CaptureFixture { chain: String, height: u64 },
+    SyncLabels,
+    VerifyLabels { chain: String },
 }
 
 fn parse_args() -> Result<Command> {
@@ -90,6 +101,12 @@ fn parse_args() -> Result<Command> {
             let chain = args.get(1).context(usage)?.clone();
             let height: u64 = args.get(2).context(usage)?.parse().context(usage)?;
             Ok(Command::CaptureFixture { chain, height })
+        }
+        Some("sync-labels") => Ok(Command::SyncLabels),
+        Some("verify-labels") => {
+            let usage = "usage: dotlens-node verify-labels <chain>";
+            let chain = args.get(1).context(usage)?.clone();
+            Ok(Command::VerifyLabels { chain })
         }
         Some(other) => anyhow::bail!("unknown command: {other}"),
     }
@@ -153,7 +170,9 @@ async fn main() -> Result<()> {
             checkpoints: Arc::new(PgCheckpointStore::new(pool.clone())),
             receipts: Arc::new(PgReceiptSink::new(pool.clone())),
             blocks: Arc::new(PgBlockIndex::new(pool.clone())),
-            runtime_versions: Arc::new(PgRuntimeVersionSink::new(pool)),
+            labels: Arc::new(api::pg::PgLabelIndex::new(pool.clone())),
+            runtime_versions: Arc::new(PgRuntimeVersionSink::new(pool.clone())),
+            pool: Some(pool),
             persistent: true,
         });
     }
@@ -191,6 +210,33 @@ async fn main() -> Result<()> {
     if let Command::CaptureFixture { chain, height } = &command {
         return run_capture_fixture(&registry, chain, *height).await;
     }
+    if matches!(command, Command::SyncLabels) {
+        #[cfg(feature = "pg")]
+        if let Some(pool) = &backends.pool {
+            let report =
+                dotlens_node::labels::sync_labels(pool, registry.as_ref(), raw.as_ref()).await?;
+            println!("label sync: {report:?}");
+            return Ok(());
+        }
+        anyhow::bail!("sync-labels requires the `pg` feature and DATABASE_URL");
+    }
+    if let Command::VerifyLabels { chain } = &command {
+        return run_verify_labels(&registry, &backends, chain).await;
+    }
+
+    // -- account labels: derive + project on every start (idempotent) ---------
+    #[cfg(feature = "pg")]
+    if let Some(pool) = &backends.pool {
+        let report =
+            dotlens_node::labels::sync_labels(pool, registry.as_ref(), raw.as_ref()).await?;
+        tracing::info!(
+            sovereigns = report.sovereign_labels,
+            pallets = report.pallet_labels,
+            seeded = report.seeded_labels,
+            missing_metadata = ?report.chains_missing_metadata,
+            "account labels synced"
+        );
+    }
 
     // -- fixture ingestion (checkpointed, idempotent) -------------------------
     let fixtures_dir = env_or("FIXTURES_PATH", "fixtures/synthetic");
@@ -219,6 +265,12 @@ async fn main() -> Result<()> {
     let app = api::router(AppState {
         registry,
         blocks: backends.blocks.clone(),
+        labels: backends.labels.clone(),
+        // family-encoded address parsing is adapter-owned (Invariant 4); with
+        // more families this becomes registry-driven dispatch
+        parse_account: Arc::new(|s| {
+            adapter_substrate::accounts::parse_account(s).map(|a| a.to_vec())
+        }),
     });
     let listener = tokio::net::TcpListener::bind(&bind)
         .await
@@ -436,6 +488,68 @@ async fn run_capture_fixture(registry: &Registry, chain: &str, height: u64) -> R
 #[cfg(not(feature = "live"))]
 async fn run_capture_fixture(_: &Registry, _: &str, _: u64) -> Result<()> {
     anyhow::bail!("capture-fixture requires the `live` feature")
+}
+
+/// verify-labels <chain>: probe System.Account for every label scoped to the
+/// chain at the current finalized head and record exists/absent. This is the
+/// ROADMAP step that resolves ECOSYSTEM.md's UNVERIFIED addresses as DATA.
+#[cfg(all(feature = "pg", feature = "live"))]
+async fn run_verify_labels(registry: &Registry, backends: &Backends, chain: &str) -> Result<()> {
+    use adapter_substrate::{accounts, source::SubstrateSource};
+    use ingest::live::ChainSource;
+
+    let pool = backends
+        .pool
+        .as_ref()
+        .context("verify-labels requires DATABASE_URL")?;
+    let cfg = registry
+        .chain(chain)
+        .with_context(|| format!("unknown chain: {chain}"))?;
+    let source = SubstrateSource::new(&cfg.id, cfg.endpoints.rpc.clone())
+        .map_err(|e| anyhow::anyhow!(e))?;
+    let height = source
+        .finalized_height()
+        .await
+        .map_err(|e| anyhow::anyhow!(e))?;
+    // one hash for the whole probe batch (avoid N+1 chain_getBlockHash)
+    let at_hash = source.block_hash(height).await.map_err(|e| anyhow::anyhow!(e))?;
+
+    let rows = dotlens_node::labels::labels_for_chain(pool, &cfg.id).await?;
+    anyhow::ensure!(
+        !rows.is_empty(),
+        "no labels scoped to {chain} — run sync-labels (or a normal node start) first"
+    );
+    let (mut exists_n, mut absent_n) = (0u32, 0u32);
+    for row in &rows {
+        let key = accounts::system_account_key(&row.account_id);
+        let exists = source
+            .storage_contains_at(&key, at_hash)
+            .await
+            .map_err(|e| anyhow::anyhow!(e))?;
+        dotlens_node::labels::record_verification(pool, row, height, exists).await?;
+        if exists {
+            exists_n += 1;
+        } else {
+            absent_n += 1;
+        }
+        println!(
+            "{:6} {:15} {} — {}",
+            if exists { "EXISTS" } else { "absent" },
+            row.kind,
+            row.ss58.as_deref().unwrap_or("?"),
+            row.label
+        );
+    }
+    println!(
+        "verify-labels {chain} at #{height}: {exists_n} exist, {absent_n} absent \
+         (absent = no System.Account entry — honest data, not an error)"
+    );
+    Ok(())
+}
+
+#[cfg(not(all(feature = "pg", feature = "live")))]
+async fn run_verify_labels(_: &Registry, _: &Backends, _: &str) -> Result<()> {
+    anyhow::bail!("verify-labels requires the `pg` and `live` features")
 }
 
 async fn axum_serve(listener: tokio::net::TcpListener, app: axum::Router) -> Result<()> {

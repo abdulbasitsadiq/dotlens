@@ -76,6 +76,23 @@ pub struct Endpoints {
     pub rpc: Vec<String>,
 }
 
+/// A well-known account that CANNOT be derived (location-derived treasury
+/// accounts, exchange hot wallets, ...). Derivable accounts (modl/para/sibl)
+/// must never be seeded here — the labeling engine generates those
+/// (ECOSYSTEM.md §6: generate, don't curate).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AccountSeed {
+    /// SS58 or 0x-hex. Checksum-validated at label sync (fails loudly there —
+    /// this crate stays free of family-specific address logic).
+    pub address: String,
+    pub label: String,
+    /// pallet|para_sovereign|sibl_sovereign|treasury|bounty|multisig|proxy|
+    /// exchange|user_tagged (core.account_labels.kind).
+    pub kind: String,
+    #[serde(default)]
+    pub note: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChainConfig {
     pub id: String,
@@ -99,6 +116,9 @@ pub struct ChainConfig {
     /// Enabled domain modules for this chain.
     #[serde(default)]
     pub modules: Vec<String>,
+    /// Well-known non-derivable accounts to label (source = "registry").
+    #[serde(default)]
+    pub accounts: Vec<AccountSeed>,
 }
 
 impl ChainConfig {
@@ -304,6 +324,9 @@ mod tests {
         assert!(ah.has_capability("governance"));
         assert!(ah.has_capability("assets"));
         assert!(!reg.chain("polkadot").unwrap().has_capability("governance"));
+        // seeded well-known accounts (non-derivable only) parse from YAML
+        assert_eq!(ah.accounts.len(), 2);
+        assert!(ah.accounts.iter().all(|a| a.kind == "treasury"));
     }
 
     #[test]

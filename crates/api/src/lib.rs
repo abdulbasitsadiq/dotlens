@@ -10,7 +10,7 @@ use axum::{
     routing::get,
     Router,
 };
-use canonical::CanonicalBlock;
+use canonical::{AccountLabel, CanonicalBlock};
 use chrono::{DateTime, Utc};
 use registry::Registry;
 use serde::Deserialize;
@@ -59,6 +59,61 @@ impl BlockIndex for MemoryBlockIndex {
     async fn count(&self) -> Result<u64, IndexError> {
         let map = self.inner.read().map_err(|e| IndexError(e.to_string()))?;
         Ok(map.len() as u64)
+    }
+}
+
+// ------------------------------------------------------------------ labels
+
+/// Read side of `core.account_labels`. `chain_id` scoping: rows scoped to the
+/// chain OR to every chain ('*') are both returned.
+#[async_trait]
+pub trait LabelIndex: Send + Sync {
+    async fn labels_for(
+        &self,
+        chain_id: &str,
+        account_id: &[u8],
+    ) -> Result<Vec<AccountLabel>, IndexError>;
+}
+
+/// Family-encoded address string → raw account bytes. Injected by the node
+/// (adapter-owned parsing — the API crate stays family-agnostic, Invariant 4).
+pub type AccountParser = Arc<dyn Fn(&str) -> Result<Vec<u8>, String> + Send + Sync>;
+
+#[derive(Default)]
+pub struct MemoryLabelIndex {
+    /// key: (chain_scope, account_id) — '*' scope applies everywhere.
+    inner: RwLock<HashMap<(String, Vec<u8>), Vec<AccountLabel>>>,
+}
+
+impl MemoryLabelIndex {
+    pub fn new() -> Self {
+        Self::default()
+    }
+    pub fn insert(&self, chain_scope: &str, account_id: &[u8], label: AccountLabel) {
+        self.inner
+            .write()
+            .expect("label lock")
+            .entry((chain_scope.to_string(), account_id.to_vec()))
+            .or_default()
+            .push(label);
+    }
+}
+
+#[async_trait]
+impl LabelIndex for MemoryLabelIndex {
+    async fn labels_for(
+        &self,
+        chain_id: &str,
+        account_id: &[u8],
+    ) -> Result<Vec<AccountLabel>, IndexError> {
+        let map = self.inner.read().map_err(|e| IndexError(e.to_string()))?;
+        let mut out = Vec::new();
+        for scope in [chain_id, "*"] {
+            if let Some(ls) = map.get(&(scope.to_string(), account_id.to_vec())) {
+                out.extend(ls.iter().cloned());
+            }
+        }
+        Ok(out)
     }
 }
 
@@ -247,12 +302,73 @@ pub mod pg {
             Ok(n as u64)
         }
     }
+
+    /// Postgres-backed label reads over `core.account_labels`.
+    pub struct PgLabelIndex {
+        pool: PgPool,
+    }
+
+    impl PgLabelIndex {
+        pub fn new(pool: PgPool) -> Self {
+            Self { pool }
+        }
+    }
+
+    #[async_trait]
+    impl super::LabelIndex for PgLabelIndex {
+        async fn labels_for(
+            &self,
+            chain_id: &str,
+            account_id: &[u8],
+        ) -> Result<Vec<canonical::AccountLabel>, IndexError> {
+            let rows: Vec<(
+                String,
+                String,
+                Option<String>,
+                String,
+                Option<String>,
+                Option<DateTime<Utc>>,
+                Option<i64>,
+                Option<String>,
+            )> = sqlx::query_as(
+                "select kind, label, derivation, source, ss58, \
+                        verified_at, verified_block, verified_note \
+                 from core.account_labels \
+                 where account_id = $1 and (chain_scope = $2 or chain_scope = '*') \
+                 order by kind, label",
+            )
+            .bind(account_id)
+            .bind(chain_id)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| IndexError(e.to_string()))?;
+            Ok(rows
+                .into_iter()
+                .map(
+                    |(kind, label, derivation, source, ss58, verified_at, verified_block, verified_note)| {
+                        canonical::AccountLabel {
+                            kind,
+                            label,
+                            derivation,
+                            source,
+                            ss58,
+                            verified_at,
+                            verified_block: verified_block.map(|b| b as u64),
+                            verified_note,
+                        }
+                    },
+                )
+                .collect())
+        }
+    }
 }
 
 #[derive(Clone)]
 pub struct AppState {
     pub registry: Arc<Registry>,
     pub blocks: Arc<dyn BlockIndex>,
+    pub labels: Arc<dyn LabelIndex>,
+    pub parse_account: AccountParser,
 }
 
 pub fn router(state: AppState) -> Router {
@@ -260,6 +376,7 @@ pub fn router(state: AppState) -> Router {
         .route("/health", get(health))
         .route("/v1/chains", get(list_chains))
         .route("/v1/blocks/{chain}/{height}", get(get_block))
+        .route("/v1/accounts/{chain}/{account}/labels", get(get_labels))
         .route("/v1/domains/{network}/{domain}", get(resolve_domain))
         .with_state(state)
 }
@@ -304,6 +421,35 @@ async fn get_block(
         ),
         Err(e) => error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     }
+}
+
+/// Account labels: `{account}` is SS58 or 0x-hex (adapter-injected parser).
+/// The Phase 1 exit-criterion surface: system accounts appear NAMED here.
+async fn get_labels(
+    State(state): State<AppState>,
+    Path((chain, account)): Path<(String, String)>,
+) -> Response {
+    if state.registry.chain(&chain).is_none() {
+        return error(StatusCode::NOT_FOUND, format!("unknown chain: {chain}"));
+    }
+    let account_id = match (state.parse_account)(&account) {
+        Ok(bytes) => bytes,
+        Err(e) => return error(StatusCode::BAD_REQUEST, format!("bad account '{account}': {e}")),
+    };
+    match state.labels.labels_for(&chain, &account_id).await {
+        Ok(labels) => Json(serde_json::json!({
+            "chain": chain,
+            "account_id": format!("0x{}", hex_lower(&account_id)),
+            "labels": labels,
+        }))
+        .into_response(),
+        Err(e) => error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    }
+}
+
+/// Tiny local hex (avoids a dep for one call site).
+fn hex_lower(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 #[derive(Deserialize)]
@@ -353,7 +499,32 @@ mod tests {
                 .expect("decode");
         blocks.insert(block).await.expect("insert");
 
-        AppState { registry, blocks }
+        // one derived label so the labels surface is testable end to end
+        let labels = Arc::new(MemoryLabelIndex::new());
+        let treasury = adapter_substrate::accounts::pallet_account(b"py/trsry");
+        labels.insert(
+            "polkadot-asset-hub",
+            &treasury,
+            canonical::AccountLabel {
+                kind: "pallet".into(),
+                label: "Treasury (py/trsry)".into(),
+                derivation: Some("modl:py/trsry".into()),
+                source: "derived".into(),
+                ss58: Some(adapter_substrate::frame_decoder::ss58_encode(0, &treasury)),
+                verified_at: None,
+                verified_block: None,
+                verified_note: None,
+            },
+        );
+
+        AppState {
+            registry,
+            blocks,
+            labels,
+            parse_account: Arc::new(|s| {
+                adapter_substrate::accounts::parse_account(s).map(|a| a.to_vec())
+            }),
+        }
     }
 
     async fn get_json(app: &Router, uri: &str) -> (StatusCode, serde_json::Value) {
@@ -405,6 +576,38 @@ mod tests {
         let (_, after) =
             get_json(&app, "/v1/domains/polkadot/governance?at=2026-01-27T12:00:00Z").await;
         assert_eq!(after["chain"], "polkadot-asset-hub");
+    }
+
+    #[tokio::test]
+    async fn treasury_account_appears_named_by_ss58_and_hex() {
+        let app = router(test_state().await);
+        // by SS58 (the ECOSYSTEM.md golden address)
+        let (status, json) = get_json(
+            &app,
+            "/v1/accounts/polkadot-asset-hub/13UVJyLnbVp9RBZYFwFGyDvVd1y27Tt8tkntv6Q7JVPhFsTB/labels",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["labels"][0]["label"], "Treasury (py/trsry)");
+        assert_eq!(json["labels"][0]["kind"], "pallet");
+
+        // same account by 0x-hex resolves identically
+        let hex_addr = json["account_id"].as_str().unwrap().to_string();
+        let (s2, j2) =
+            get_json(&app, &format!("/v1/accounts/polkadot-asset-hub/{hex_addr}/labels")).await;
+        assert_eq!(s2, StatusCode::OK);
+        assert_eq!(j2["labels"], json["labels"]);
+
+        // corrupted address → 400, unknown-but-valid account → empty labels
+        let (s3, _) = get_json(&app, "/v1/accounts/polkadot-asset-hub/13UVJyLnbVpXXX/labels").await;
+        assert_eq!(s3, StatusCode::BAD_REQUEST);
+        let (s4, j4) = get_json(
+            &app,
+            &format!("/v1/accounts/polkadot/{hex_addr}/labels"),
+        )
+        .await;
+        assert_eq!(s4, StatusCode::OK);
+        assert_eq!(j4["labels"].as_array().unwrap().len(), 0);
     }
 
     #[tokio::test]

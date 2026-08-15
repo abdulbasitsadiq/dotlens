@@ -23,6 +23,10 @@ pub mod source;
 /// Real SCALE decoding against archived metadata (decoder_version 2).
 pub mod frame_decoder;
 
+/// System-account derivation + labeling primitives (modl/para/sibl, SS58
+/// decode, PalletId extraction from metadata). Pure — no I/O.
+pub mod accounts;
+
 use canonical::{CanonicalBlock, CanonicalEvent, CanonicalTransaction, Lineage};
 use serde::{Deserialize, Serialize};
 

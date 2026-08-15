@@ -67,6 +67,28 @@ pub struct CanonicalEvent {
     pub data: serde_json::Value,
 }
 
+/// A label attached to an account (core.account_labels row, minus the key).
+/// Mostly DERIVED (modl/para/sibl); `source` says how it got here; the
+/// verified_* fields record the on-chain existence probe (verify-labels).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AccountLabel {
+    /// pallet|para_sovereign|sibl_sovereign|treasury|bounty|multisig|proxy|
+    /// exchange|user_tagged.
+    pub kind: String,
+    /// Human name, e.g. "Treasury (py/trsry)".
+    pub label: String,
+    /// How it derives, e.g. "modl:py/trsry", "para:1000". None for seeded.
+    pub derivation: Option<String>,
+    /// derived | registry | user.
+    pub source: String,
+    /// Family-encoded human address (SS58 for Substrate), if computed.
+    pub ss58: Option<String>,
+    pub verified_at: Option<DateTime<Utc>>,
+    pub verified_block: Option<u64>,
+    /// "exists" | "absent" (existence of the account in on-chain state).
+    pub verified_note: Option<String>,
+}
+
 impl CanonicalBlock {
     pub fn block_ref(&self) -> BlockRef {
         BlockRef {
