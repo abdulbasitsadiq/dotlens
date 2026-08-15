@@ -19,6 +19,7 @@ live = ["adapter-substrate/live"]
 
 [dependencies]
 registry.workspace = true
+canonical.workspace = true
 raw-store.workspace = true
 ingest.workspace = true
 adapter-substrate.workspace = true

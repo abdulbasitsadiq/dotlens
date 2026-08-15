@@ -256,7 +256,12 @@ impl ingest::live::ChainSource for MockSource {
             artifacts: vec![
                 ingest::live::RawArtifact {
                     item: "block.json".into(),
-                    bytes: format!("{{\"h\":{height}}}").into_bytes(),
+                    // decode worker peeks spec_version; MockBlockDecoder reads height
+                    bytes: format!(
+                        "{{\"chain_id\":\"polkadot\",\"height\":{height},\"spec_version\":{}}}",
+                        if height <= 5 { 100 } else { 101 }
+                    )
+                    .into_bytes(),
                 },
                 ingest::live::RawArtifact {
                     item: "events.scale".into(),
@@ -359,6 +364,131 @@ async fn live_raw_pipeline_persists_lineage_and_resumes() {
     .await
     .unwrap();
     assert_eq!(first_block, Some(6), "first_block must not regress upward");
+
+    let _ = std::fs::remove_dir_all(&raw_dir);
+    db.drop_db().await;
+}
+
+/// Decode worker → PgBlockIndex sink: raw landed by the live pipeline gets
+/// decoded (mock decoder — real SCALE is covered by adapter fixture tests)
+/// into core tables with decoder_version-2 lineage, idempotently.
+struct MockBlockDecoder;
+
+impl ingest::decode::RawBlockDecoder for MockBlockDecoder {
+    fn decode(
+        &self,
+        chain_id: &str,
+        envelope: &[u8],
+        _events: Option<&[u8]>,
+        _metadata: &[u8],
+        spec_version: u32,
+        raw_location: &str,
+    ) -> Result<canonical::CanonicalBlock, String> {
+        let v: serde_json::Value = serde_json::from_slice(envelope).map_err(|e| e.to_string())?;
+        let height = v["height"].as_u64().ok_or("no height")?;
+        Ok(canonical::CanonicalBlock {
+            chain_id: chain_id.to_string(),
+            height,
+            hash: format!("0x{height:064x}"),
+            parent_hash: format!("0x{:064x}", height.saturating_sub(1)),
+            timestamp: None,
+            finalized: true,
+            lineage: canonical::Lineage {
+                runtime_version: spec_version,
+                decoder_version: 2,
+                raw_location: raw_location.to_string(),
+            },
+            transactions: vec![],
+            events: vec![],
+        })
+    }
+}
+
+#[tokio::test]
+async fn decode_worker_lands_canonical_rows_in_pg() {
+    let Some(db) = TestDb::create().await else { return };
+    let reg = seeds();
+    sync_registry(&db.pool, &reg).await.expect("registry sync");
+
+    // stage 1: raw ingest 1..=6 via the live pipeline (mock source, real Pg)
+    let raw_dir = tmp_raw("decode");
+    let raw = FsRawStore::new(&raw_dir);
+    let checkpoints = PgCheckpointStore::new(db.pool.clone());
+    let receipts = PgReceiptSink::new(db.pool.clone());
+    let versions = dotlens_node::runtime_versions::PgRuntimeVersionSink::new(db.pool.clone());
+    let live_deps = ingest::live::IngestDeps {
+        raw: &raw,
+        checkpoints: &checkpoints,
+        receipts: &receipts,
+        runtime_versions: &versions,
+    };
+    let source = MockSource { finalized: 6 };
+    ingest::live::ingest_range(
+        "polkadot", &source, &live_deps, ingest::live::MODULE_LIVE, 1, 6, &mut None,
+    )
+    .await
+    .expect("raw ingest");
+
+    // stage 2: decode 1..=6 through the generic worker into PgBlockIndex
+    let index: std::sync::Arc<dyn BlockIndex> =
+        std::sync::Arc::new(PgBlockIndex::new(db.pool.clone()));
+    let sink = dotlens_node::pipeline::BlockIndexSink(index.clone());
+    let decode_deps = ingest::decode::DecodeDeps {
+        raw: &raw,
+        checkpoints: &checkpoints,
+        sink: &sink,
+    };
+    let n = ingest::decode::decode_range("polkadot", &MockBlockDecoder, &decode_deps, 1, 6)
+        .await
+        .expect("decode range");
+    assert_eq!(n, 6);
+
+    // canonical rows exist with decoder-2 lineage, in the chain partition
+    let (rows, specs): ((i64,), Vec<(i64, i32)>) = (
+        sqlx::query_as("select count(*) from core.blocks where chain_id = 'polkadot'")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap(),
+        sqlx::query_as(
+            "select runtime_version, decoder_version from core.blocks \
+             where chain_id = 'polkadot' order by height",
+        )
+        .fetch_all(&db.pool)
+        .await
+        .unwrap(),
+    );
+    assert_eq!(rows.0, 6);
+    assert_eq!(specs[0], (100, 2)); // era v100 (heights 1..=5)
+    assert_eq!(specs[5], (101, 2)); // era v101 (height 6)
+
+    // decode tick chases the raw checkpoint: raw advances to 9 → decode follows
+    let source2 = MockSource { finalized: 9 };
+    ingest::live::ingest_range(
+        "polkadot", &source2, &live_deps, ingest::live::MODULE_LIVE, 7, 9, &mut None,
+    )
+    .await
+    .expect("raw advance");
+    let n = ingest::decode::decode_tick("polkadot", &MockBlockDecoder, &decode_deps)
+        .await
+        .expect("decode tick");
+    assert_eq!(n, 3);
+
+    // re-run both: clean no-ops
+    assert_eq!(
+        ingest::decode::decode_range("polkadot", &MockBlockDecoder, &decode_deps, 1, 9)
+            .await
+            .unwrap(),
+        0
+    );
+    // blocks checkpoint at 9, distinct from raw_blocks
+    let (h,): (i64,) = sqlx::query_as(
+        "select last_height from core.indexer_state \
+         where chain_id = 'polkadot' and module = 'blocks'",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(h, 9);
 
     let _ = std::fs::remove_dir_all(&raw_dir);
     db.drop_db().await;

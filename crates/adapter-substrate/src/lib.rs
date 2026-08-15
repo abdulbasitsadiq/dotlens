@@ -20,6 +20,9 @@
 #[cfg(feature = "live")]
 pub mod source;
 
+/// Real SCALE decoding against archived metadata (decoder_version 2).
+pub mod frame_decoder;
+
 use canonical::{CanonicalBlock, CanonicalEvent, CanonicalTransaction, Lineage};
 use serde::{Deserialize, Serialize};
 

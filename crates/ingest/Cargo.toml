@@ -14,6 +14,8 @@ chrono.workspace = true
 serde.workspace = true
 async-trait.workspace = true
 raw-store.workspace = true
+canonical.workspace = true
+serde_json.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 sqlx = { workspace = true, optional = true }

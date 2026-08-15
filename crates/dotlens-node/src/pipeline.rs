@@ -5,10 +5,30 @@
 
 use anyhow::{Context, Result};
 use api::BlockIndex;
+use ingest::live::SinkError;
 use ingest::{should_process, Checkpoint, CheckpointStore, IngestOutcome, ReceiptSink};
 use raw_store::{keys, RawStore};
 use registry::Registry;
 use std::path::Path;
+use std::sync::Arc;
+
+/// Adapts the API's BlockIndex to the generic CanonicalSink contract
+/// (ingest must not depend on the api crate).
+pub struct BlockIndexSink(pub Arc<dyn BlockIndex>);
+
+#[async_trait::async_trait]
+impl ingest::decode::CanonicalSink for BlockIndexSink {
+    async fn insert(&self, block: canonical::CanonicalBlock) -> Result<(), SinkError> {
+        self.0.insert(block).await.map_err(|e| SinkError(e.to_string()))
+    }
+    async fn contains(&self, chain_id: &str, height: u64) -> Result<bool, SinkError> {
+        self.0
+            .get(chain_id, height)
+            .await
+            .map(|b| b.is_some())
+            .map_err(|e| SinkError(e.to_string()))
+    }
+}
 
 /// Ingest every fixture envelope in `dir`. Order: durable rows first, the
 /// checkpoint LAST — a crash between the two re-processes the block (harmless,

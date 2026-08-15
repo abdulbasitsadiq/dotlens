@@ -6,19 +6,26 @@ license.workspace = true
 
 [features]
 default = []
-# live fetch side (subxt). Decode stays pure and dependency-light without it.
-live = ["dep:subxt", "dep:ingest", "dep:async-trait", "dep:tokio", "dep:tracing"]
+# live fetch side (subxt). Decode (incl. frame_decoder) has no network deps.
+live = ["dep:subxt", "dep:async-trait", "dep:tokio", "dep:tracing"]
 
 [dependencies]
 canonical.workspace = true
+ingest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 chrono.workspace = true
 hex.workspace = true
 blake2.workspace = true
+# pure decode stack
+frame-metadata.workspace = true
+frame-decode.workspace = true
+scale-value.workspace = true
+scale-info.workspace = true
+parity-scale-codec.workspace = true
+bs58.workspace = true
 subxt = { workspace = true, optional = true }
-ingest = { workspace = true, optional = true }
 async-trait = { workspace = true, optional = true }
 tokio = { workspace = true, optional = true }
 tracing = { workspace = true, optional = true }

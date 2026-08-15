@@ -61,20 +61,35 @@ enum Command {
     Run,
     Migrate,
     Backfill { chain: String, from: u64, to: u64 },
+    DecodeRange { chain: String, from: u64, to: u64 },
+    CaptureFixture { chain: String, height: u64 },
 }
 
 fn parse_args() -> Result<Command> {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    let range = |usage: &'static str| -> Result<(String, u64, u64)> {
+        let chain = args.get(1).context(usage)?.clone();
+        let from: u64 = args.get(2).context(usage)?.parse().context(usage)?;
+        let to: u64 = args.get(3).context(usage)?.parse().context(usage)?;
+        anyhow::ensure!(from <= to, "from must be <= to");
+        Ok((chain, from, to))
+    };
     match args.first().map(String::as_str) {
         None => Ok(Command::Run),
         Some("migrate") => Ok(Command::Migrate),
         Some("backfill") => {
-            let usage = "usage: dotlens-node backfill <chain> <from> <to>";
-            let chain = args.get(1).context(usage)?.clone();
-            let from: u64 = args.get(2).context(usage)?.parse().context(usage)?;
-            let to: u64 = args.get(3).context(usage)?.parse().context(usage)?;
-            anyhow::ensure!(from <= to, "backfill: from must be <= to");
+            let (chain, from, to) = range("usage: dotlens-node backfill <chain> <from> <to>")?;
             Ok(Command::Backfill { chain, from, to })
+        }
+        Some("decode-range") => {
+            let (chain, from, to) = range("usage: dotlens-node decode-range <chain> <from> <to>")?;
+            Ok(Command::DecodeRange { chain, from, to })
+        }
+        Some("capture-fixture") => {
+            let usage = "usage: dotlens-node capture-fixture <chain> <height>";
+            let chain = args.get(1).context(usage)?.clone();
+            let height: u64 = args.get(2).context(usage)?.parse().context(usage)?;
+            Ok(Command::CaptureFixture { chain, height })
         }
         Some(other) => anyhow::bail!("unknown command: {other}"),
     }
@@ -158,13 +173,23 @@ async fn main() -> Result<()> {
     let raw_root = env_or("RAW_STORE_PATH", "./data/raw");
     let raw: Arc<dyn RawStore> = Arc::new(FsRawStore::new(&raw_root));
 
-    // -- backfill subcommand: run the range, report, exit ---------------------
+    // -- one-shot subcommands: run, report, exit ------------------------------
     if let Command::Backfill { chain, from, to } = &command {
         anyhow::ensure!(
             backends.persistent,
             "backfill requires DATABASE_URL (raw receipts + checkpoints must persist)"
         );
         return run_backfill(&registry, &backends, raw.as_ref(), chain, *from, *to).await;
+    }
+    if let Command::DecodeRange { chain, from, to } = &command {
+        anyhow::ensure!(
+            backends.persistent,
+            "decode-range requires DATABASE_URL (canonical rows must persist)"
+        );
+        return run_decode_range(&registry, &backends, raw.as_ref(), chain, *from, *to).await;
+    }
+    if let Command::CaptureFixture { chain, height } = &command {
+        return run_capture_fixture(&registry, chain, *height).await;
     }
 
     // -- fixture ingestion (checkpointed, idempotent) -------------------------
@@ -184,9 +209,10 @@ async fn main() -> Result<()> {
         "fixture ingestion complete"
     );
 
-    // -- live followers -------------------------------------------------------
+    // -- live + decode followers ----------------------------------------------
     let backends = Arc::new(backends);
     spawn_live_followers(&registry, &backends, &raw);
+    spawn_decode_followers(&registry, &backends, &raw);
 
     // -- API ------------------------------------------------------------------
     let bind = env_or("API_BIND", "127.0.0.1:8080");
@@ -301,6 +327,115 @@ async fn run_backfill(
     _: u64,
 ) -> Result<()> {
     anyhow::bail!("backfill requires the `live` feature")
+}
+
+/// Decode followers: chase each chain's raw_blocks checkpoint, decoding with
+/// spec-correct archived metadata into the canonical tables. Pure decode — no
+/// network — so this needs only the `pg` feature, not `live`.
+fn spawn_decode_followers(
+    registry: &Arc<Registry>,
+    backends: &Arc<Backends>,
+    raw: &Arc<dyn RawStore>,
+) {
+    use adapter_substrate::frame_decoder::SubstrateFrameDecoder;
+
+    if !env_flag("DECODE_FOLLOW") {
+        tracing::info!("decode follower disabled (set DECODE_FOLLOW=1 to enable)");
+        return;
+    }
+    if !backends.persistent {
+        tracing::warn!("DECODE_FOLLOW=1 but no DATABASE_URL — refusing to decode into memory");
+        return;
+    }
+    let poll = std::time::Duration::from_secs(
+        env_or("POLL_INTERVAL_SECS", "6").parse().unwrap_or(6),
+    );
+    for chain in registry.chains() {
+        if !chain.has_module("blocks") {
+            continue;
+        }
+        let decoder = SubstrateFrameDecoder::new(chain.ss58_prefix.unwrap_or(42));
+        let chain_id = chain.id.clone();
+        let backends = backends.clone();
+        let raw = raw.clone();
+        tokio::spawn(async move {
+            tracing::info!(chain = %chain_id, "decode follower started");
+            let sink = dotlens_node::pipeline::BlockIndexSink(backends.blocks.clone());
+            let deps = ingest::decode::DecodeDeps {
+                raw: raw.as_ref(),
+                checkpoints: backends.checkpoints.as_ref(),
+                sink: &sink,
+            };
+            ingest::decode::decode_follow(&chain_id, &decoder, &deps, poll).await;
+        });
+    }
+}
+
+async fn run_decode_range(
+    registry: &Registry,
+    backends: &Backends,
+    raw: &dyn RawStore,
+    chain: &str,
+    from: u64,
+    to: u64,
+) -> Result<()> {
+    use adapter_substrate::frame_decoder::SubstrateFrameDecoder;
+
+    let cfg = registry
+        .chain(chain)
+        .with_context(|| format!("unknown chain: {chain}"))?;
+    let decoder = SubstrateFrameDecoder::new(cfg.ss58_prefix.unwrap_or(42));
+    let sink = dotlens_node::pipeline::BlockIndexSink(backends.blocks.clone());
+    let deps = ingest::decode::DecodeDeps {
+        raw,
+        checkpoints: backends.checkpoints.as_ref(),
+        sink: &sink,
+    };
+    let n = ingest::decode::decode_range(&cfg.id, &decoder, &deps, from, to)
+        .await
+        .with_context(|| format!("decode-range {chain} {from}..={to}"))?;
+    tracing::info!(chain, from, to, decoded = n, "decode-range complete");
+    println!("decode-range {chain} {from}..={to}: decoded {n} blocks");
+    Ok(())
+}
+
+/// Snapshot one real block (+ events + metadata) into fixtures/real/ so the
+/// decode tests exercise genuine SCALE. Network-touching → `live` feature.
+#[cfg(feature = "live")]
+async fn run_capture_fixture(registry: &Registry, chain: &str, height: u64) -> Result<()> {
+    use adapter_substrate::source::SubstrateSource;
+    use ingest::live::ChainSource;
+
+    let cfg = registry
+        .chain(chain)
+        .with_context(|| format!("unknown chain: {chain}"))?;
+    let source = SubstrateSource::new(&cfg.id, cfg.endpoints.rpc.clone())
+        .map_err(|e| anyhow::anyhow!(e))?;
+    let fetched = source.fetch_block(height).await.map_err(|e| anyhow::anyhow!(e))?;
+    let metadata = source.metadata_at(height).await.map_err(|e| anyhow::anyhow!(e))?;
+
+    let dir = std::path::PathBuf::from(env_or("FIXTURES_REAL_PATH", "fixtures/real"))
+        .join(format!("{}-{height}", cfg.id));
+    std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+    for artifact in &fetched.artifacts {
+        std::fs::write(dir.join(&artifact.item), &artifact.bytes)?;
+    }
+    std::fs::write(dir.join("metadata.scale"), &metadata)?;
+    println!(
+        "captured {}/{height} (spec {}, {} artifacts + metadata {} bytes) → {}",
+        cfg.id,
+        fetched.runtime_version,
+        fetched.artifacts.len(),
+        metadata.len(),
+        dir.display()
+    );
+    println!("commit fixtures/real so decode tests cover this block permanently");
+    Ok(())
+}
+
+#[cfg(not(feature = "live"))]
+async fn run_capture_fixture(_: &Registry, _: &str, _: u64) -> Result<()> {
+    anyhow::bail!("capture-fixture requires the `live` feature")
 }
 
 async fn axum_serve(listener: tokio::net::TcpListener, app: axum::Router) -> Result<()> {

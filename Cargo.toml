@@ -28,6 +28,13 @@ blake2 = "0.10"
 chrono = { version = "0.4", features = ["serde"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "net", "time", "sync"] }
 subxt = "0.50"
+# pure decode stack (no network): versions may need bumping at first compile
+frame-metadata = { version = "23", features = ["current", "decode"] }
+frame-decode = "0.18"
+scale-value = { version = "0.18", features = ["serde"] }
+scale-info = "2"
+parity-scale-codec = "3"
+bs58 = "0.5"
 dotenvy = "0.15"
 axum = "0.8"
 tower = { version = "0.5", features = ["util"] }
