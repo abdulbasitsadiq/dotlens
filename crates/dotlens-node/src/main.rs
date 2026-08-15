@@ -14,6 +14,8 @@
 //!   dotlens-node backfill <chain> <from> <to> # raw backfill a height range
 //!   dotlens-node sync-labels                  # derive + project account labels, exit
 //!   dotlens-node verify-labels <chain>        # probe labels on-chain, record, exit
+//!   dotlens-node balances-range <chain> <a> <b>       # map deltas over a range, exit
+//!   dotlens-node anchor-balance <chain> <acct> <h>    # record absolute balance anchor
 //!
 //! Live ingestion (`live` feature + LIVE_INGEST=1 + DATABASE_URL): every
 //! registered chain with rpc endpoints and the `blocks` module gets a follower
@@ -35,6 +37,7 @@ struct Backends {
     receipts: Arc<dyn ReceiptSink>,
     blocks: Arc<dyn BlockIndex>,
     labels: Arc<dyn api::LabelIndex>,
+    balances: Arc<dyn api::BalanceIndex>,
     runtime_versions: Arc<dyn RuntimeVersionSink>,
     /// Kept for label sync/verify (they need direct SQL, not a trait).
     #[cfg(feature = "pg")]
@@ -48,6 +51,7 @@ fn memory_backends() -> Backends {
         receipts: Arc::new(NoopReceiptSink),
         blocks: Arc::new(MemoryBlockIndex::new()),
         labels: Arc::new(api::MemoryLabelIndex::new()),
+        balances: Arc::new(api::MemoryBalanceIndex::new()),
         runtime_versions: Arc::new(NoopRuntimeVersionSink),
         #[cfg(feature = "pg")]
         pool: None,
@@ -74,6 +78,8 @@ enum Command {
     CaptureFixture { chain: String, height: u64 },
     SyncLabels,
     VerifyLabels { chain: String },
+    BalancesRange { chain: String, from: u64, to: u64 },
+    AnchorBalance { chain: String, account: String, height: u64 },
 }
 
 fn parse_args() -> Result<Command> {
@@ -107,6 +113,17 @@ fn parse_args() -> Result<Command> {
             let usage = "usage: dotlens-node verify-labels <chain>";
             let chain = args.get(1).context(usage)?.clone();
             Ok(Command::VerifyLabels { chain })
+        }
+        Some("balances-range") => {
+            let (chain, from, to) = range("usage: dotlens-node balances-range <chain> <from> <to>")?;
+            Ok(Command::BalancesRange { chain, from, to })
+        }
+        Some("anchor-balance") => {
+            let usage = "usage: dotlens-node anchor-balance <chain> <account> <height>";
+            let chain = args.get(1).context(usage)?.clone();
+            let account = args.get(2).context(usage)?.clone();
+            let height: u64 = args.get(3).context(usage)?.parse().context(usage)?;
+            Ok(Command::AnchorBalance { chain, account, height })
         }
         Some(other) => anyhow::bail!("unknown command: {other}"),
     }
@@ -171,6 +188,7 @@ async fn main() -> Result<()> {
             receipts: Arc::new(PgReceiptSink::new(pool.clone())),
             blocks: Arc::new(PgBlockIndex::new(pool.clone())),
             labels: Arc::new(api::pg::PgLabelIndex::new(pool.clone())),
+            balances: Arc::new(api::pg::PgBalanceIndex::new(pool.clone())),
             runtime_versions: Arc::new(PgRuntimeVersionSink::new(pool.clone())),
             pool: Some(pool),
             persistent: true,
@@ -223,6 +241,17 @@ async fn main() -> Result<()> {
     if let Command::VerifyLabels { chain } = &command {
         return run_verify_labels(&registry, &backends, chain).await;
     }
+    if let Command::BalancesRange { chain, from, to } = &command {
+        anyhow::ensure!(
+            backends.persistent,
+            "balances-range requires DATABASE_URL (canonical events + deltas must persist)"
+        );
+        return run_balances_range(&registry, &backends, chain, *from, *to).await;
+    }
+    if let Command::AnchorBalance { chain, account, height } = &command {
+        return run_anchor_balance(&registry, &backends, raw.as_ref(), chain, account, *height)
+            .await;
+    }
 
     // -- account labels: derive + project on every start (idempotent) ---------
     #[cfg(feature = "pg")]
@@ -259,6 +288,7 @@ async fn main() -> Result<()> {
     let backends = Arc::new(backends);
     spawn_live_followers(&registry, &backends, &raw);
     spawn_decode_followers(&registry, &backends, &raw);
+    spawn_balances_followers(&registry, &backends);
 
     // -- API ------------------------------------------------------------------
     let bind = env_or("API_BIND", "127.0.0.1:8080");
@@ -266,6 +296,7 @@ async fn main() -> Result<()> {
         registry,
         blocks: backends.blocks.clone(),
         labels: backends.labels.clone(),
+        balances: backends.balances.clone(),
         // family-encoded address parsing is adapter-owned (Invariant 4); with
         // more families this becomes registry-driven dispatch
         parse_account: Arc::new(|s| {
@@ -550,6 +581,188 @@ async fn run_verify_labels(registry: &Registry, backends: &Backends, chain: &str
 #[cfg(not(all(feature = "pg", feature = "live")))]
 async fn run_verify_labels(_: &Registry, _: &Backends, _: &str) -> Result<()> {
     anyhow::bail!("verify-labels requires the `pg` and `live` features")
+}
+
+/// Balances followers: chase each chain's decode checkpoint, mapping canonical
+/// events into balance deltas. Pure mapping over Pg — no network, `pg` only.
+/// Eligibility is registry data: the chain must enable the `balances` module.
+fn spawn_balances_followers(registry: &Arc<Registry>, backends: &Arc<Backends>) {
+    if !env_flag("BALANCES_FOLLOW") {
+        tracing::info!("balances follower disabled (set BALANCES_FOLLOW=1 to enable)");
+        return;
+    }
+    if !backends.persistent {
+        tracing::warn!("BALANCES_FOLLOW=1 but no DATABASE_URL — refusing to map into memory");
+        return;
+    }
+    #[cfg(feature = "pg")]
+    {
+        use adapter_substrate::balances::SubstrateDeltaMapper;
+
+        let poll = std::time::Duration::from_secs(
+            env_or("POLL_INTERVAL_SECS", "6").parse().unwrap_or(6),
+        );
+        for chain in registry.chains() {
+            if !chain.has_module("balances") {
+                continue;
+            }
+            if chain.family != registry::ChainFamily::Substrate {
+                tracing::debug!(chain = %chain.id, "no delta mapper for this family — skipped");
+                continue;
+            }
+            let Some(pool) = backends.pool.clone() else { continue };
+            let chain_id = chain.id.clone();
+            let backends = backends.clone();
+            tokio::spawn(async move {
+                tracing::info!(chain = %chain_id, "balances follower started");
+                let source = dotlens_node::balances_pg::PgEventSource::new(pool.clone());
+                let sink = dotlens_node::balances_pg::PgDeltaSink::new(pool);
+                let deps = ingest::balances::BalancesDeps {
+                    checkpoints: backends.checkpoints.as_ref(),
+                    source: &source,
+                    sink: &sink,
+                };
+                ingest::balances::balances_follow(&chain_id, &SubstrateDeltaMapper, &deps, poll)
+                    .await;
+            });
+        }
+    }
+}
+
+#[cfg(feature = "pg")]
+async fn run_balances_range(
+    registry: &Registry,
+    backends: &Backends,
+    chain: &str,
+    from: u64,
+    to: u64,
+) -> Result<()> {
+    use adapter_substrate::balances::SubstrateDeltaMapper;
+
+    let cfg = registry
+        .chain(chain)
+        .with_context(|| format!("unknown chain: {chain}"))?;
+    anyhow::ensure!(
+        cfg.family == registry::ChainFamily::Substrate,
+        "no delta mapper for family {:?}",
+        cfg.family
+    );
+    let pool = backends.pool.as_ref().context("balances-range requires DATABASE_URL")?;
+    let source = dotlens_node::balances_pg::PgEventSource::new(pool.clone());
+    let sink = dotlens_node::balances_pg::PgDeltaSink::new(pool.clone());
+    let deps = ingest::balances::BalancesDeps {
+        checkpoints: backends.checkpoints.as_ref(),
+        source: &source,
+        sink: &sink,
+    };
+    let n = ingest::balances::balances_range(&cfg.id, &SubstrateDeltaMapper, &deps, from, to)
+        .await
+        .with_context(|| format!("balances-range {chain} {from}..={to}"))?;
+    tracing::info!(chain, from, to, mapped = n, "balances-range complete");
+    println!("balances-range {chain} {from}..={to}: mapped {n} blocks");
+    Ok(())
+}
+
+#[cfg(not(feature = "pg"))]
+async fn run_balances_range(_: &Registry, _: &Backends, _: &str, _: u64, _: u64) -> Result<()> {
+    anyhow::bail!("balances-range requires the `pg` feature")
+}
+
+/// anchor-balance <chain> <account> <height>: read System.Account from state
+/// at `height`, decode against block-correct metadata, record an absolute
+/// anchor. Anchors seed running totals — and are the honest bridge across
+/// events we can't see (the Nov 2025 migration's bulk moves).
+#[cfg(all(feature = "pg", feature = "live"))]
+async fn run_anchor_balance(
+    registry: &Registry,
+    backends: &Backends,
+    raw: &dyn RawStore,
+    chain: &str,
+    account: &str,
+    height: u64,
+) -> Result<()> {
+    use adapter_substrate::{accounts, balances as ab, source::SubstrateSource};
+    use ingest::live::ChainSource;
+
+    let pool = backends
+        .pool
+        .as_ref()
+        .context("anchor-balance requires DATABASE_URL")?;
+    let cfg = registry
+        .chain(chain)
+        .with_context(|| format!("unknown chain: {chain}"))?;
+    let account_id = accounts::parse_account(account)
+        .map_err(|e| anyhow::anyhow!("bad account '{account}': {e}"))?;
+    let source = SubstrateSource::new(&cfg.id, cfg.endpoints.rpc.clone())
+        .map_err(|e| anyhow::anyhow!(e))?;
+    let hash = source.block_hash(height).await.map_err(|e| anyhow::anyhow!(e))?;
+    let spec = source
+        .runtime_version_at(hash)
+        .await
+        .map_err(|e| anyhow::anyhow!(e))?;
+
+    // metadata: archived blob if we have it, else fetch AND archive (so the
+    // anchor's lineage is reproducible from the raw store forever)
+    let meta_key = raw_store::keys::metadata(&cfg.id, spec);
+    let metadata = match raw.get(&meta_key) {
+        Ok(blob) => blob,
+        Err(raw_store::RawStoreError::NotFound(_)) => {
+            let blob = source.metadata_at(height).await.map_err(|e| anyhow::anyhow!(e))?;
+            raw.put(&meta_key, &blob, "anchor-balance")?;
+            tracing::info!(chain = %cfg.id, spec, "metadata archived while anchoring");
+            blob
+        }
+        Err(e) => return Err(e.into()),
+    };
+
+    let key = accounts::system_account_key(&account_id);
+    let (balances, note) = match source
+        .storage_at(&key, hash)
+        .await
+        .map_err(|e| anyhow::anyhow!(e))?
+    {
+        Some(bytes) => (
+            ab::decode_account_info(&metadata, &bytes).map_err(|e| anyhow::anyhow!(e))?,
+            None,
+        ),
+        None => (
+            // absent from state = balance zero; recorded honestly as such
+            ab::AccountBalances { free: 0, reserved: 0, frozen: None },
+            Some("absent"),
+        ),
+    };
+    dotlens_node::balances_pg::insert_anchor(
+        pool,
+        &cfg.id,
+        &account_id,
+        "native",
+        height,
+        &balances,
+        Some(spec),
+        "anchor-balance",
+        note,
+    )
+    .await?;
+    println!(
+        "anchor {chain}/{account} at #{height} (spec {spec}): free={} reserved={} total={}{}",
+        balances.free,
+        balances.reserved,
+        balances.total(),
+        note.map(|n| format!(" [{n}]")).unwrap_or_default()
+    );
+    Ok(())
+}
+
+#[cfg(not(all(feature = "pg", feature = "live")))]
+async fn run_anchor_balance(
+    _: &Registry,
+    _: &Backends,
+    _: &dyn RawStore,
+    _: &str,
+    _: &str,
+    _: u64,
+) -> Result<()> {
+    anyhow::bail!("anchor-balance requires the `pg` and `live` features")
 }
 
 async fn axum_serve(listener: tokio::net::TcpListener, app: axum::Router) -> Result<()> {

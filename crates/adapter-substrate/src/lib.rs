@@ -27,6 +27,10 @@ pub mod frame_decoder;
 /// decode, PalletId extraction from metadata). Pure — no I/O.
 pub mod accounts;
 
+/// Balances semantics: event→delta mapping + AccountInfo (anchor) decoding.
+/// Pure — no I/O.
+pub mod balances;
+
 use canonical::{CanonicalBlock, CanonicalEvent, CanonicalTransaction, Lineage};
 use serde::{Deserialize, Serialize};
 

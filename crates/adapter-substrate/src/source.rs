@@ -132,6 +132,19 @@ impl SubstrateSource {
         self.hash_at(height).await
     }
 
+    /// Raw storage value at block `hash` (None = key absent in state).
+    pub async fn storage_at(
+        &self,
+        key: &[u8],
+        hash: subxt::utils::H256,
+    ) -> Result<Option<Vec<u8>>, SourceError> {
+        self.with_failover("state_getStorage", |m| {
+            let key = key.to_vec();
+            async move { m.state_get_storage(&key, Some(hash)).await }
+        })
+        .await
+    }
+
     /// Does `key` exist in storage at block `hash`? Existence only (Some vs
     /// None) — used by verify-labels to confirm derived system accounts
     /// on-chain without needing to decode AccountInfo.
@@ -140,13 +153,21 @@ impl SubstrateSource {
         key: &[u8],
         hash: subxt::utils::H256,
     ) -> Result<bool, SourceError> {
-        let value = self
-            .with_failover("state_getStorage", |m| {
-                let key = key.to_vec();
-                async move { m.state_get_storage(&key, Some(hash)).await }
+        Ok(self.storage_at(key, hash).await?.is_some())
+    }
+
+    /// spec_version at block `hash` — anchors record the runtime they were
+    /// decoded against (lineage).
+    pub async fn runtime_version_at(
+        &self,
+        hash: subxt::utils::H256,
+    ) -> Result<u32, SourceError> {
+        let rv = self
+            .with_failover("state_getRuntimeVersion", |m| async move {
+                m.state_get_runtime_version(Some(hash)).await
             })
             .await?;
-        Ok(value.is_some())
+        Ok(rv.spec_version)
     }
 }
 

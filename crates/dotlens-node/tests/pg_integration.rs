@@ -761,3 +761,158 @@ async fn sibling_sovereign_labels_appear_when_a_chain_registers() {
     let _ = std::fs::remove_dir_all(&dir);
     db.drop_db().await;
 }
+
+// ------------------------------------------------------------- balances
+
+#[tokio::test]
+async fn balances_worker_maps_deltas_and_survives_the_boundary_filter() {
+    use adapter_substrate::accounts::{pallet_account, para_sovereign};
+    use adapter_substrate::balances::SubstrateDeltaMapper;
+    use api::BalanceIndex as _;
+    use canonical::{CanonicalBlock, CanonicalEvent, Lineage};
+
+    let Some(db) = TestDb::create().await else { return };
+    let reg = seeds();
+    sync_registry(&db.pool, &reg).await.expect("registry sync");
+
+    let treasury = pallet_account(b"py/trsry");
+    let peer = para_sovereign(1000);
+    let acct_json = |a: &[u8; 32]| serde_json::json!([a.to_vec()]);
+    let block = |chain: &str, height: u64, ts: &str, events: Vec<CanonicalEvent>| CanonicalBlock {
+        chain_id: chain.into(),
+        height,
+        hash: format!("0x{height:064x}"),
+        parent_hash: format!("0x{:064x}", height - 1),
+        timestamp: Some(ts.parse().unwrap()),
+        finalized: true,
+        lineage: Lineage {
+            runtime_version: 100,
+            decoder_version: 2,
+            raw_location: format!("raw/{chain}/test/{height}"),
+        },
+        transactions: vec![],
+        events,
+    };
+    let ev = |index: u32, name: &str, data: serde_json::Value| CanonicalEvent {
+        index,
+        transaction_index: Some(0),
+        name: name.into(),
+        data,
+    };
+
+    // relay block BEFORE the migration boundary: a >u64 transfer out of treasury
+    let big = "36893488147419103232"; // 2^65 — must survive as numeric, not float
+    let relay_block = block(
+        "polkadot",
+        100,
+        "2025-06-01T00:00:00Z",
+        vec![
+            ev(0, "balances.Transfer", serde_json::json!({
+                "from": acct_json(&treasury), "to": acct_json(&peer), "amount": big,
+            })),
+            ev(1, "system.ExtrinsicSuccess", serde_json::json!({})),
+        ],
+    );
+    // AH block AFTER the boundary: a fee withdraw from the same account
+    let ah_block = block(
+        "polkadot-asset-hub",
+        200,
+        "2026-01-01T00:00:00Z",
+        vec![ev(0, "balances.Withdraw", serde_json::json!({
+            "who": acct_json(&treasury), "amount": 160000000u64,
+        }))],
+    );
+    let index = PgBlockIndex::new(db.pool.clone());
+    index.insert(relay_block).await.expect("insert relay block");
+    index.insert(ah_block).await.expect("insert ah block");
+
+    // map both chains through the real worker + Pg backends
+    let checkpoints = PgCheckpointStore::new(db.pool.clone());
+    let source = dotlens_node::balances_pg::PgEventSource::new(db.pool.clone());
+    let sink = dotlens_node::balances_pg::PgDeltaSink::new(db.pool.clone());
+    let deps = ingest::balances::BalancesDeps {
+        checkpoints: &checkpoints,
+        source: &source,
+        sink: &sink,
+    };
+    let n1 = ingest::balances::balances_range("polkadot", &SubstrateDeltaMapper, &deps, 100, 100)
+        .await
+        .expect("relay range");
+    let n2 = ingest::balances::balances_range(
+        "polkadot-asset-hub", &SubstrateDeltaMapper, &deps, 200, 200,
+    )
+    .await
+    .expect("ah range");
+    assert_eq!((n1, n2), (1, 1));
+
+    // double-entry landed with exact numerics, in the chain partition
+    let rows: Vec<(Vec<u8>, String, String)> = sqlx::query_as(
+        "select account_id, delta::text, reason from balances.balance_changes \
+         where chain_id = 'polkadot' order by delta",
+    )
+    .fetch_all(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0], (treasury.to_vec(), format!("-{big}"), "transfer_out".into()));
+    assert_eq!(rows[1], (peer.to_vec(), big.to_string(), "transfer_in".into()));
+    let (in_default,): (i64,) =
+        sqlx::query_as("select count(*) from balances.balance_changes_default")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!(in_default, 0, "deltas must route to per-chain partitions");
+
+    // idempotent: re-running the ranges changes nothing
+    ingest::balances::balances_range("polkadot", &SubstrateDeltaMapper, &deps, 100, 100)
+        .await
+        .expect("relay rerun");
+    let (total,): (i64,) = sqlx::query_as("select count(*) from balances.balance_changes")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(total, 3);
+
+    // the API's index respects the migration boundary timestamp per chain
+    let idx = api::pg::PgBalanceIndex::new(db.pool.clone());
+    let boundary: chrono::DateTime<chrono::Utc> = "2025-11-04T00:00:00Z".parse().unwrap();
+    let pre = idx
+        .changes("polkadot", &treasury, "native", None, Some(boundary))
+        .await
+        .unwrap();
+    assert_eq!(pre.len(), 1);
+    assert_eq!(pre[0].delta, format!("-{big}"));
+    assert!(idx
+        .changes("polkadot", &treasury, "native", Some(boundary), None)
+        .await
+        .unwrap()
+        .is_empty());
+    let post = idx
+        .changes("polkadot-asset-hub", &treasury, "native", Some(boundary), None)
+        .await
+        .unwrap();
+    assert_eq!(post.len(), 1);
+    assert_eq!(post[0].delta, "-160000000");
+
+    // anchors: insert + read back (frozen None → null; insert-ignore on rerun)
+    let ab = adapter_substrate::balances::AccountBalances {
+        free: 500_000_000_000,
+        reserved: 5_000_000_000,
+        frozen: None,
+    };
+    for _ in 0..2 {
+        dotlens_node::balances_pg::insert_anchor(
+            &db.pool, "polkadot-asset-hub", &treasury, "native", 150,
+            &ab, Some(2_003_002), "test", None,
+        )
+        .await
+        .expect("anchor");
+    }
+    let anchors = idx.anchors("polkadot-asset-hub", &treasury, "native").await.unwrap();
+    assert_eq!(anchors.len(), 1);
+    assert_eq!(anchors[0].total, "505000000000");
+    assert_eq!(anchors[0].free, "500000000000");
+    assert!(anchors[0].note.is_none());
+
+    db.drop_db().await;
+}

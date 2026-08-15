@@ -12,3 +12,6 @@ pub mod runtime_versions;
 
 #[cfg(feature = "pg")]
 pub mod labels;
+
+#[cfg(feature = "pg")]
+pub mod balances_pg;

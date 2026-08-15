@@ -115,10 +115,15 @@ pub async fn sync_registry(pool: &PgPool, registry: &Registry) -> Result<()> {
     // Partition DDL outside the transaction: a failure here (rows already in
     // the default partition) must not roll back the registry rows.
     for c in &chains {
-        for table in ["blocks", "transactions", "events"] {
-            let part = format!("core.{table}_p_{}", c.id.replace('-', "_"));
+        for (schema, table) in [
+            ("core", "blocks"),
+            ("core", "transactions"),
+            ("core", "events"),
+            ("balances", "balance_changes"),
+        ] {
+            let part = format!("{schema}.{table}_p_{}", c.id.replace('-', "_"));
             let ddl = format!(
-                "create table if not exists {part} partition of core.{table} for values in ('{}')",
+                "create table if not exists {part} partition of {schema}.{table} for values in ('{}')",
                 c.id
             );
             if let Err(e) = sqlx::query(&ddl).execute(pool).await {

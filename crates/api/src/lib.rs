@@ -117,6 +117,125 @@ impl LabelIndex for MemoryLabelIndex {
     }
 }
 
+// ------------------------------------------------------------------ balances
+
+/// One balance change, query-shaped (numeric as text — plancks exceed u64/f64).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct BalanceChangeRow {
+    pub height: u64,
+    pub timestamp: Option<DateTime<Utc>>,
+    pub event_index: u32,
+    /// Signed decimal string, plancks.
+    pub delta: String,
+    pub reason: String,
+    /// 0x-hex peer account, if any.
+    pub counterparty: Option<String>,
+}
+
+/// An absolute balance read from state at the END of `height`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct BalanceAnchorRow {
+    pub height: u64,
+    pub free: String,
+    pub reserved: String,
+    pub total: String,
+    pub spec_version: Option<u64>,
+    pub source: String,
+    pub note: Option<String>,
+}
+
+/// Read side of the balances schema, per chain.
+#[async_trait]
+pub trait BalanceIndex: Send + Sync {
+    async fn changes(
+        &self,
+        chain_id: &str,
+        account_id: &[u8],
+        asset: &str,
+        from: Option<DateTime<Utc>>,
+        to: Option<DateTime<Utc>>,
+    ) -> Result<Vec<BalanceChangeRow>, IndexError>;
+    async fn anchors(
+        &self,
+        chain_id: &str,
+        account_id: &[u8],
+        asset: &str,
+    ) -> Result<Vec<BalanceAnchorRow>, IndexError>;
+}
+
+#[derive(Default)]
+pub struct MemoryBalanceIndex {
+    changes: RwLock<HashMap<(String, Vec<u8>, String), Vec<BalanceChangeRow>>>,
+    anchors: RwLock<HashMap<(String, Vec<u8>, String), Vec<BalanceAnchorRow>>>,
+}
+
+impl MemoryBalanceIndex {
+    pub fn new() -> Self {
+        Self::default()
+    }
+    pub fn insert_change(&self, chain: &str, account: &[u8], asset: &str, row: BalanceChangeRow) {
+        self.changes
+            .write()
+            .expect("lock")
+            .entry((chain.into(), account.to_vec(), asset.into()))
+            .or_default()
+            .push(row);
+    }
+    pub fn insert_anchor(&self, chain: &str, account: &[u8], asset: &str, row: BalanceAnchorRow) {
+        self.anchors
+            .write()
+            .expect("lock")
+            .entry((chain.into(), account.to_vec(), asset.into()))
+            .or_default()
+            .push(row);
+    }
+}
+
+#[async_trait]
+impl BalanceIndex for MemoryBalanceIndex {
+    async fn changes(
+        &self,
+        chain_id: &str,
+        account_id: &[u8],
+        asset: &str,
+        from: Option<DateTime<Utc>>,
+        to: Option<DateTime<Utc>>,
+    ) -> Result<Vec<BalanceChangeRow>, IndexError> {
+        let map = self.changes.read().map_err(|e| IndexError(e.to_string()))?;
+        let mut rows: Vec<BalanceChangeRow> = map
+            .get(&(chain_id.into(), account_id.to_vec(), asset.into()))
+            .map(|v| {
+                v.iter()
+                    .filter(|r| match r.timestamp {
+                        Some(ts) => {
+                            from.map(|f| ts >= f).unwrap_or(true)
+                                && to.map(|t| ts < t).unwrap_or(true)
+                        }
+                        None => from.is_none() && to.is_none(),
+                    })
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default();
+        rows.sort_by_key(|r| (r.height, r.event_index));
+        Ok(rows)
+    }
+    async fn anchors(
+        &self,
+        chain_id: &str,
+        account_id: &[u8],
+        asset: &str,
+    ) -> Result<Vec<BalanceAnchorRow>, IndexError> {
+        let map = self.anchors.read().map_err(|e| IndexError(e.to_string()))?;
+        let mut rows = map
+            .get(&(chain_id.into(), account_id.to_vec(), asset.into()))
+            .cloned()
+            .unwrap_or_default();
+        rows.sort_by_key(|r| r.height);
+        Ok(rows)
+    }
+}
+
 // -------------------------------------------------------------------- pg impl
 
 #[cfg(feature = "pg")]
@@ -303,6 +422,100 @@ pub mod pg {
         }
     }
 
+    /// Postgres-backed balance reads over `balances.*`. Numeric columns come
+    /// back as text (`::text`) — plancks routinely exceed u64.
+    pub struct PgBalanceIndex {
+        pool: PgPool,
+    }
+
+    impl PgBalanceIndex {
+        pub fn new(pool: PgPool) -> Self {
+            Self { pool }
+        }
+    }
+
+    #[async_trait]
+    impl super::BalanceIndex for PgBalanceIndex {
+        async fn changes(
+            &self,
+            chain_id: &str,
+            account_id: &[u8],
+            asset: &str,
+            from: Option<DateTime<Utc>>,
+            to: Option<DateTime<Utc>>,
+        ) -> Result<Vec<super::BalanceChangeRow>, IndexError> {
+            let rows: Vec<(i64, Option<DateTime<Utc>>, i32, String, String, Option<Vec<u8>>)> =
+                sqlx::query_as(
+                    "select c.block_height, b.timestamp, c.event_index, c.delta::text, \
+                            c.reason, c.counterparty \
+                     from balances.balance_changes c \
+                     left join core.blocks b \
+                       on b.chain_id = c.chain_id and b.height = c.block_height \
+                     where c.chain_id = $1 and c.account_id = $2 and c.asset = $3 \
+                       and ($4::timestamptz is null or b.timestamp >= $4) \
+                       and ($5::timestamptz is null or b.timestamp < $5) \
+                     order by c.block_height, c.event_index",
+                )
+                .bind(chain_id)
+                .bind(account_id)
+                .bind(asset)
+                .bind(from)
+                .bind(to)
+                .fetch_all(&self.pool)
+                .await
+                .map_err(|e| IndexError(e.to_string()))?;
+            Ok(rows
+                .into_iter()
+                .map(|(height, timestamp, event_index, delta, reason, cp)| {
+                    super::BalanceChangeRow {
+                        height: height as u64,
+                        timestamp,
+                        event_index: event_index as u32,
+                        delta,
+                        reason,
+                        counterparty: cp.map(|b| format!("0x{}", super::hex_lower(&b))),
+                    }
+                })
+                .collect())
+        }
+
+        async fn anchors(
+            &self,
+            chain_id: &str,
+            account_id: &[u8],
+            asset: &str,
+        ) -> Result<Vec<super::BalanceAnchorRow>, IndexError> {
+            let rows: Vec<(i64, String, String, String, Option<i64>, String, Option<String>)> =
+                sqlx::query_as(
+                    "select block_height, free::text, reserved::text, total::text, \
+                            spec_version, source, note \
+                     from balances.balance_anchors \
+                     where chain_id = $1 and account_id = $2 and asset = $3 \
+                     order by block_height",
+                )
+                .bind(chain_id)
+                .bind(account_id)
+                .bind(asset)
+                .fetch_all(&self.pool)
+                .await
+                .map_err(|e| IndexError(e.to_string()))?;
+            Ok(rows
+                .into_iter()
+                .map(|(height, free, reserved, total, spec, source, note)| {
+                    super::BalanceAnchorRow {
+                        height: height as u64,
+                        free,
+                        reserved,
+                        total,
+                        spec_version: spec.map(|s| s as u64),
+                        source,
+                        note,
+                    }
+                })
+                .collect())
+        }
+    }
+
     /// Postgres-backed label reads over `core.account_labels`.
     pub struct PgLabelIndex {
         pool: PgPool,
@@ -368,6 +581,7 @@ pub struct AppState {
     pub registry: Arc<Registry>,
     pub blocks: Arc<dyn BlockIndex>,
     pub labels: Arc<dyn LabelIndex>,
+    pub balances: Arc<dyn BalanceIndex>,
     pub parse_account: AccountParser,
 }
 
@@ -377,6 +591,7 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/chains", get(list_chains))
         .route("/v1/blocks/{chain}/{height}", get(get_block))
         .route("/v1/accounts/{chain}/{account}/labels", get(get_labels))
+        .route("/v1/balances/{network}/{account}/history", get(get_balance_history))
         .route("/v1/domains/{network}/{domain}", get(resolve_domain))
         .with_state(state)
 }
@@ -453,6 +668,115 @@ fn hex_lower(bytes: &[u8]) -> String {
 }
 
 #[derive(Deserialize)]
+struct AssetQuery {
+    asset: Option<String>,
+}
+
+/// THE migration-boundary surface (Phase 1 exit criterion): one account's
+/// balance history for a NETWORK, stitched across chains by domain residency.
+/// Pre-2025-11-04 changes come from the relay, later ones from Asset Hub —
+/// the caller never has to know the migration happened.
+///
+/// Running totals start from state anchors (balance read from System.Account
+/// at a block, end-of-block semantics): each change after an anchor carries
+/// `running_total`; changes with no preceding anchor carry null — coverage is
+/// shown honestly, never guessed.
+async fn get_balance_history(
+    State(state): State<AppState>,
+    Path((network, account)): Path<(String, String)>,
+    Query(q): Query<AssetQuery>,
+) -> Response {
+    let asset = q.asset.unwrap_or_else(|| "native".to_string());
+    let account_id = match (state.parse_account)(&account) {
+        Ok(bytes) => bytes,
+        Err(e) => return error(StatusCode::BAD_REQUEST, format!("bad account '{account}': {e}")),
+    };
+    let mut windows: Vec<&registry::ResidencyEntry> = state
+        .registry
+        .residency()
+        .iter()
+        .filter(|r| r.domain == "balances" && r.network == network)
+        .collect();
+    if windows.is_empty() {
+        return error(
+            StatusCode::NOT_FOUND,
+            format!("no 'balances' domain residency for network '{network}'"),
+        );
+    }
+    windows.sort_by_key(|r| r.from);
+
+    let mut segments = Vec::with_capacity(windows.len());
+    for w in windows {
+        let changes = match state
+            .balances
+            .changes(&w.chain, &account_id, &asset, Some(w.from), w.to)
+            .await
+        {
+            Ok(c) => c,
+            Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+        };
+        let anchors = match state.balances.anchors(&w.chain, &account_id, &asset).await {
+            Ok(a) => a,
+            Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+        };
+        segments.push(serde_json::json!({
+            "chain": w.chain,
+            "from": w.from,
+            "to": w.to,
+            "anchors": anchors,
+            "changes": changes_with_running_totals(&changes, &anchors),
+        }));
+    }
+    Json(serde_json::json!({
+        "network": network,
+        "account_id": format!("0x{}", hex_lower(&account_id)),
+        "asset": asset,
+        "segments": segments,
+    }))
+    .into_response()
+}
+
+/// Attach running totals: anchors are end-of-block balances, so an anchor at
+/// height H seeds the running value for changes at heights > H. Changes before
+/// the first anchor get null (no anchor = no absolute truth to sum from).
+fn changes_with_running_totals(
+    changes: &[BalanceChangeRow],
+    anchors: &[BalanceAnchorRow], // sorted ascending by height
+) -> Vec<serde_json::Value> {
+    let mut ai = 0usize;
+    let mut running: Option<i128> = None;
+    changes
+        .iter()
+        .map(|c| {
+            while ai < anchors.len() && anchors[ai].height < c.height {
+                running = anchors[ai].total.parse::<i128>().ok();
+                ai += 1;
+            }
+            // a BalanceSet marker means the absolute value changed without a
+            // derivable delta — running totals are unknowable until re-anchored
+            if c.reason == "balance_set_unquantified" {
+                running = None;
+            }
+            if let Some(r) = running.as_mut() {
+                match c.delta.parse::<i128>() {
+                    Ok(d) => *r += d,
+                    Err(_) => running = None,
+                }
+            }
+            serde_json::json!({
+                "height": c.height,
+                "timestamp": c.timestamp,
+                "event_index": c.event_index,
+                "delta": c.delta,
+                "reason": c.reason,
+                "counterparty": c.counterparty,
+                "running_total": running.map(|r| r.to_string()),
+            })
+        })
+        .collect()
+}
+
+#[derive(Deserialize)]
 struct AtQuery {
     /// RFC3339; defaults to now. The migration-aware knob.
     at: Option<DateTime<Utc>>,
@@ -517,10 +841,57 @@ mod tests {
             },
         );
 
+        // balance history spanning the Nov 2025 migration: relay changes
+        // before the boundary, AH changes (+ an anchor) after it
+        let balances = Arc::new(MemoryBalanceIndex::new());
+        let treasury = adapter_substrate::accounts::pallet_account(b"py/trsry");
+        let ts = |s: &str| s.parse::<DateTime<Utc>>().unwrap();
+        balances.insert_change(
+            "polkadot",
+            &treasury,
+            "native",
+            BalanceChangeRow {
+                height: 22_000_000,
+                timestamp: Some(ts("2025-06-01T00:00:00Z")),
+                event_index: 4,
+                delta: "-1000".into(),
+                reason: "transfer_out".into(),
+                counterparty: None,
+            },
+        );
+        balances.insert_anchor(
+            "polkadot-asset-hub",
+            &treasury,
+            "native",
+            BalanceAnchorRow {
+                height: 10_000_000,
+                free: "500".into(),
+                reserved: "0".into(),
+                total: "500".into(),
+                spec_version: Some(2_000_006),
+                source: "test".into(),
+                note: None,
+            },
+        );
+        balances.insert_change(
+            "polkadot-asset-hub",
+            &treasury,
+            "native",
+            BalanceChangeRow {
+                height: 10_000_001,
+                timestamp: Some(ts("2026-01-01T00:00:00Z")),
+                event_index: 2,
+                delta: "200".into(),
+                reason: "transfer_in".into(),
+                counterparty: None,
+            },
+        );
+
         AppState {
             registry,
             blocks,
             labels,
+            balances,
             parse_account: Arc::new(|s| {
                 adapter_substrate::accounts::parse_account(s).map(|a| a.to_vec())
             }),
@@ -608,6 +979,46 @@ mod tests {
         .await;
         assert_eq!(s4, StatusCode::OK);
         assert_eq!(j4["labels"].as_array().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn balance_history_stitches_across_the_migration_boundary() {
+        let app = router(test_state().await);
+        let (status, json) = get_json(
+            &app,
+            "/v1/balances/polkadot/13UVJyLnbVp9RBZYFwFGyDvVd1y27Tt8tkntv6Q7JVPhFsTB/history",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let segments = json["segments"].as_array().unwrap();
+        // two residency windows: relay until 2025-11-04, AH after — in order
+        assert_eq!(segments.len(), 2);
+        assert_eq!(segments[0]["chain"], "polkadot");
+        assert_eq!(segments[1]["chain"], "polkadot-asset-hub");
+        assert_eq!(segments[0]["to"], "2025-11-04T00:00:00Z");
+
+        // relay-era change appears in the relay segment, no anchor → null running
+        let relay_changes = segments[0]["changes"].as_array().unwrap();
+        assert_eq!(relay_changes.len(), 1);
+        assert_eq!(relay_changes[0]["delta"], "-1000");
+        assert!(relay_changes[0]["running_total"].is_null());
+
+        // AH segment: anchor (end of 10_000_000, total 500) seeds the running
+        // total for the later change: 500 + 200 = 700
+        let ah = &segments[1];
+        assert_eq!(ah["anchors"][0]["total"], "500");
+        let ah_changes = ah["changes"].as_array().unwrap();
+        assert_eq!(ah_changes.len(), 1);
+        assert_eq!(ah_changes[0]["delta"], "200");
+        assert_eq!(ah_changes[0]["running_total"], "700");
+
+        // unknown network is a 404, not an empty guess
+        let (s2, _) = get_json(
+            &app,
+            "/v1/balances/nowhere/13UVJyLnbVp9RBZYFwFGyDvVd1y27Tt8tkntv6Q7JVPhFsTB/history",
+        )
+        .await;
+        assert_eq!(s2, StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
