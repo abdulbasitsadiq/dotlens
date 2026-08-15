@@ -1,12 +1,12 @@
 //! dotlens-node: wires registry → raw store → decode → index → API.
 //!
-//! Phase 0 behavior:
-//!   1. load registry seeds (./registry-seeds)
-//!   2. if DATABASE_URL is set (and `pg` feature on): run migrations
-//!   3. ingest fixture blocks (./fixtures/synthetic) into the raw store,
-//!      guarded by checkpoints (idempotent)
-//!   4. decode raw → canonical, index in memory
-//!   5. serve the REST API
+//! With DATABASE_URL set (and the default `pg` feature): migrations run,
+//! registry seeds sync into `core`, and checkpoints/blocks/receipts are all
+//! Postgres-backed — restart-safe end to end. Without it, everything runs
+//! in memory (Phase 0 mode: fixtures + API, no persistence).
+//!
+//! The backends are chosen as a SET, never mixed: durable checkpoints with an
+//! in-memory block index would "resume" past blocks nobody stored.
 //!
 //! Usage:
 //!   dotlens-node            # run everything
@@ -14,11 +14,26 @@
 
 use anyhow::{Context, Result};
 use api::{AppState, BlockIndex, MemoryBlockIndex};
-use ingest::{should_process, Checkpoint, CheckpointStore, IngestOutcome, MemoryCheckpointStore};
-use raw_store::{keys, FsRawStore, RawStore};
+use dotlens_node::pipeline::ingest_fixtures;
+use ingest::{CheckpointStore, MemoryCheckpointStore, NoopReceiptSink, ReceiptSink};
+use raw_store::{FsRawStore, RawStore};
 use registry::Registry;
 use std::path::Path;
 use std::sync::Arc;
+
+struct Backends {
+    checkpoints: Arc<dyn CheckpointStore>,
+    receipts: Arc<dyn ReceiptSink>,
+    blocks: Arc<dyn BlockIndex>,
+}
+
+fn memory_backends() -> Backends {
+    Backends {
+        checkpoints: Arc::new(MemoryCheckpointStore::new()),
+        receipts: Arc::new(NoopReceiptSink),
+        blocks: Arc::new(MemoryBlockIndex::new()),
+    }
+}
 
 fn env_or(key: &str, default: &str) -> String {
     std::env::var(key).unwrap_or_else(|_| default.to_string())
@@ -36,21 +51,6 @@ async fn main() -> Result<()> {
 
     let migrate_only = std::env::args().nth(1).as_deref() == Some("migrate");
 
-    // -- migrations (optional in Phase 0: node runs fully without a DB) -------
-    #[cfg(feature = "pg")]
-    if let Ok(db_url) = std::env::var("DATABASE_URL") {
-        run_migrations(&db_url).await?;
-        if migrate_only {
-            return Ok(());
-        }
-    } else if migrate_only {
-        anyhow::bail!("`migrate` requires DATABASE_URL");
-    }
-    #[cfg(not(feature = "pg"))]
-    if migrate_only {
-        anyhow::bail!("built without the `pg` feature");
-    }
-
     // -- registry -------------------------------------------------------------
     let seeds_dir = env_or("REGISTRY_SEEDS", "registry-seeds");
     let registry = Arc::new(
@@ -63,27 +63,78 @@ async fn main() -> Result<()> {
         "registry loaded"
     );
 
+    // -- backends: postgres when DATABASE_URL is set, memory otherwise --------
+    #[allow(unused_mut)]
+    let mut backends: Option<Backends> = None;
+
+    #[cfg(feature = "pg")]
+    if let Ok(db_url) = std::env::var("DATABASE_URL") {
+        use api::pg::PgBlockIndex;
+        use ingest::pg::{PgCheckpointStore, PgReceiptSink};
+        use sqlx::postgres::PgPoolOptions;
+
+        let pool = PgPoolOptions::new()
+            .max_connections(5)
+            .connect(&db_url)
+            .await
+            .context("connecting to postgres")?;
+        sqlx::migrate!("../../migrations")
+            .run(&pool)
+            .await
+            .context("running migrations")?;
+        tracing::info!("migrations up to date");
+        if migrate_only {
+            return Ok(());
+        }
+        dotlens_node::registry_sync::sync_registry(&pool, registry.as_ref())
+            .await
+            .context("registry → DB sync")?;
+        tracing::info!("registry synced to postgres");
+
+        backends = Some(Backends {
+            checkpoints: Arc::new(PgCheckpointStore::new(pool.clone())),
+            receipts: Arc::new(PgReceiptSink::new(pool.clone())),
+            blocks: Arc::new(PgBlockIndex::new(pool)),
+        });
+    }
+    if migrate_only {
+        // reachable only without pg feature or without DATABASE_URL
+        anyhow::bail!("`migrate` requires the `pg` feature and DATABASE_URL");
+    }
+    #[cfg(not(feature = "pg"))]
+    if std::env::var("DATABASE_URL").is_ok() {
+        tracing::warn!("built without the `pg` feature — DATABASE_URL is IGNORED");
+    }
+    let backends = backends.unwrap_or_else(|| {
+        tracing::warn!("no persistent backend — running in-memory (nothing persists)");
+        memory_backends()
+    });
+
     // -- raw store + fixture ingestion (checkpointed, idempotent) -------------
     let raw_root = env_or("RAW_STORE_PATH", "./data/raw");
     let raw: Arc<dyn RawStore> = Arc::new(FsRawStore::new(&raw_root));
-    let checkpoints = MemoryCheckpointStore::new();
-    let blocks: Arc<dyn BlockIndex> = Arc::new(MemoryBlockIndex::new());
 
     let fixtures_dir = env_or("FIXTURES_PATH", "fixtures/synthetic");
-    ingest_fixtures(
+    let processed = ingest_fixtures(
         Path::new(&fixtures_dir),
         registry.as_ref(),
         raw.as_ref(),
-        &checkpoints,
-        blocks.as_ref(),
-    )?;
-    tracing::info!(indexed = blocks.count(), "fixture ingestion complete");
+        backends.checkpoints.as_ref(),
+        backends.receipts.as_ref(),
+        backends.blocks.as_ref(),
+    )
+    .await?;
+    tracing::info!(
+        processed,
+        indexed = backends.blocks.count().await.map_err(|e| anyhow::anyhow!(e))?,
+        "fixture ingestion complete"
+    );
 
     // -- API ------------------------------------------------------------------
     let bind = env_or("API_BIND", "127.0.0.1:8080");
     let app = api::router(AppState {
         registry,
-        blocks,
+        blocks: backends.blocks.clone(),
     });
     let listener = tokio::net::TcpListener::bind(&bind)
         .await
@@ -100,90 +151,4 @@ async fn axum_serve(listener: tokio::net::TcpListener, app: axum::Router) -> Res
         })
         .await
         .context("api server")
-}
-
-/// Ingest every fixture envelope: raw-store put (write-once) → checkpoint guard
-/// → pure decode → index. Re-running is a no-op end to end.
-fn ingest_fixtures(
-    dir: &Path,
-    registry: &Registry,
-    raw: &dyn RawStore,
-    checkpoints: &dyn CheckpointStore,
-    blocks: &dyn BlockIndex,
-) -> Result<()> {
-    // read + peek everything first, then process in (chain, height) order so
-    // the high-water-mark checkpoint never silently drops an out-of-order file
-    let mut items: Vec<(String, u64, String, Vec<u8>)> = Vec::new();
-    for entry in std::fs::read_dir(dir)
-        .with_context(|| format!("reading fixtures dir {}", dir.display()))?
-    {
-        let path = entry?.path();
-        if !path.extension().map(|x| x == "json").unwrap_or(false) {
-            continue;
-        }
-        let bytes = std::fs::read(&path)?;
-        let peek: serde_json::Value = serde_json::from_slice(&bytes)
-            .with_context(|| format!("fixture {} is not valid JSON", path.display()))?;
-        let chain_id = peek["chain_id"].as_str().unwrap_or_default().to_string();
-        let height = peek["height"].as_u64().unwrap_or_default();
-        let hash = peek["hash"].as_str().unwrap_or_default().to_string();
-        if registry.chain(&chain_id).is_none() {
-            tracing::warn!(%chain_id, fixture = %path.display(), "fixture chain not in registry — skipped");
-            continue;
-        }
-        items.push((chain_id, height, hash, bytes));
-    }
-    items.sort_by(|a, b| (&a.0, a.1).cmp(&(&b.0, b.1)));
-
-    for (chain_id, height, hash, bytes) in items {
-        let key = keys::block(&chain_id, height, "block.json");
-        let receipt = raw
-            .put(&key, &bytes, "fixture")
-            .with_context(|| format!("raw put {key}"))?;
-        // receipts land in core.ingest_receipts when the pg write path arrives
-        // (Phase 1); until then they are at least observable
-        tracing::debug!(key = %receipt.key, bytes = receipt.byte_len, source = %receipt.source, "raw stored");
-
-        match should_process(checkpoints, &chain_id, "blocks", height)? {
-            IngestOutcome::AlreadyProcessed => {
-                tracing::debug!(%chain_id, height, "already processed — skipped");
-                continue;
-            }
-            IngestOutcome::Processed => {}
-        }
-
-        let block = adapter_substrate::decode_block(&bytes, &key)
-            .with_context(|| format!("decoding {key}"))?;
-        blocks.insert(block);
-
-        checkpoints.advance(Checkpoint {
-            chain_id: chain_id.clone(),
-            module: "blocks".into(),
-            last_height: height,
-            last_hash: hash,
-            updated_at: chrono_now(),
-        })?;
-        tracing::info!(%chain_id, height, "ingested");
-    }
-    Ok(())
-}
-
-fn chrono_now() -> chrono::DateTime<chrono::Utc> {
-    chrono::Utc::now()
-}
-
-#[cfg(feature = "pg")]
-async fn run_migrations(db_url: &str) -> Result<()> {
-    use sqlx::postgres::PgPoolOptions;
-    let pool = PgPoolOptions::new()
-        .max_connections(2)
-        .connect(db_url)
-        .await
-        .context("connecting to postgres")?;
-    sqlx::migrate!("../../migrations")
-        .run(&pool)
-        .await
-        .context("running migrations")?;
-    tracing::info!("migrations up to date");
-    Ok(())
 }

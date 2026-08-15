@@ -1,11 +1,13 @@
-//! Ingestion support: checkpoints and idempotent processing guards.
+//! Ingestion support: checkpoints, receipt sinks, and idempotent processing guards.
 //!
 //! Every module tracks its own checkpoint per chain (`indexer_state`), restarts
 //! resume from it, and re-processing an already-processed block is a no-op
-//! (ARCHITECTURE.md §9/§15). Live fetchers arrive in Phase 1; the checkpoint
-//! contract they'll run on is proven here.
+//! (ARCHITECTURE.md §9/§15). The contract is async end-to-end since Phase 1 so
+//! the Postgres backend is a first-class implementation, not a bolt-on.
 
+use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use raw_store::IngestReceipt;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -43,23 +45,50 @@ pub enum IngestOutcome {
     AlreadyProcessed,
 }
 
+#[async_trait]
 pub trait CheckpointStore: Send + Sync {
-    fn get(&self, chain_id: &str, module: &str) -> Result<Option<Checkpoint>, CheckpointError>;
+    async fn get(&self, chain_id: &str, module: &str)
+        -> Result<Option<Checkpoint>, CheckpointError>;
     /// Advance the checkpoint. Never moves backwards (returns `Regression`);
-    /// explicit rollback (reorg handling, Phase 1) will be a separate operation.
-    fn advance(&self, cp: Checkpoint) -> Result<(), CheckpointError>;
+    /// explicit rollback (reorg handling, later in Phase 1) will be a separate
+    /// operation.
+    async fn advance(&self, cp: Checkpoint) -> Result<(), CheckpointError>;
 }
 
 /// Idempotency guard shared by all modules: should `height` be processed?
-pub fn should_process(
+pub async fn should_process(
     store: &dyn CheckpointStore,
     chain_id: &str,
     module: &str,
     height: u64,
 ) -> Result<IngestOutcome, CheckpointError> {
-    match store.get(chain_id, module)? {
+    match store.get(chain_id, module).await? {
         Some(cp) if height <= cp.last_height => Ok(IngestOutcome::AlreadyProcessed),
         _ => Ok(IngestOutcome::Processed),
+    }
+}
+
+// ------------------------------------------------------------- receipt sinks
+
+#[derive(Debug, thiserror::Error)]
+#[error("receipt sink error: {0}")]
+pub struct ReceiptError(pub String);
+
+/// Where raw-store receipts get durably recorded (`core.ingest_receipts`).
+/// Provenance of the FIRST fetch wins: recording the same key again is a no-op.
+#[async_trait]
+pub trait ReceiptSink: Send + Sync {
+    async fn record(&self, receipt: &IngestReceipt) -> Result<(), ReceiptError>;
+}
+
+/// For DB-less runs (Phase 0 mode): receipts are observable in logs only.
+#[derive(Default)]
+pub struct NoopReceiptSink;
+
+#[async_trait]
+impl ReceiptSink for NoopReceiptSink {
+    async fn record(&self, _receipt: &IngestReceipt) -> Result<(), ReceiptError> {
+        Ok(())
     }
 }
 
@@ -76,13 +105,18 @@ impl MemoryCheckpointStore {
     }
 }
 
+#[async_trait]
 impl CheckpointStore for MemoryCheckpointStore {
-    fn get(&self, chain_id: &str, module: &str) -> Result<Option<Checkpoint>, CheckpointError> {
+    async fn get(
+        &self,
+        chain_id: &str,
+        module: &str,
+    ) -> Result<Option<Checkpoint>, CheckpointError> {
         let map = self.inner.lock().map_err(|e| CheckpointError::Storage(e.to_string()))?;
         Ok(map.get(&(chain_id.to_string(), module.to_string())).cloned())
     }
 
-    fn advance(&self, cp: Checkpoint) -> Result<(), CheckpointError> {
+    async fn advance(&self, cp: Checkpoint) -> Result<(), CheckpointError> {
         let mut map = self.inner.lock().map_err(|e| CheckpointError::Storage(e.to_string()))?;
         let key = (cp.chain_id.clone(), cp.module.clone());
         if let Some(existing) = map.get(&key) {
@@ -104,18 +138,14 @@ impl CheckpointStore for MemoryCheckpointStore {
 
 #[cfg(feature = "pg")]
 pub mod pg {
-    use super::{Checkpoint, CheckpointError};
+    use super::{Checkpoint, CheckpointError, ReceiptError, ReceiptSink};
+    use async_trait::async_trait;
     use chrono::{DateTime, Utc};
+    use raw_store::IngestReceipt;
     use sqlx::PgPool;
 
     /// Postgres-backed checkpoints over `core.indexer_state` (migration 0001).
     /// Runtime queries only — no compile-time DB needed.
-    ///
-    /// NOTE (Phase 0 honesty): this impl is async and therefore does NOT yet
-    /// implement the sync `CheckpointStore` trait — the Phase 0 node uses
-    /// `MemoryCheckpointStore`. When live ingestion lands in Phase 1 the
-    /// checkpoint contract becomes async end-to-end and this store gets wired
-    /// in as the persistent backend (with kill/restart integration tests).
     pub struct PgCheckpointStore {
         pool: PgPool,
     }
@@ -124,8 +154,11 @@ pub mod pg {
         pub fn new(pool: PgPool) -> Self {
             Self { pool }
         }
+    }
 
-        pub async fn get(
+    #[async_trait]
+    impl super::CheckpointStore for PgCheckpointStore {
+        async fn get(
             &self,
             chain_id: &str,
             module: &str,
@@ -148,7 +181,7 @@ pub mod pg {
             }))
         }
 
-        pub async fn advance(&self, cp: Checkpoint) -> Result<(), CheckpointError> {
+        async fn advance(&self, cp: Checkpoint) -> Result<(), CheckpointError> {
             // single-statement conditional upsert: never regress.
             // binds cp.updated_at so both impls of the contract agree.
             let res = sqlx::query(
@@ -169,8 +202,7 @@ pub mod pg {
             .await
             .map_err(|e| CheckpointError::Storage(e.to_string()))?;
             if res.rows_affected() == 0 {
-                let have = self
-                    .get(&cp.chain_id, &cp.module)
+                let have = super::CheckpointStore::get(self, &cp.chain_id, &cp.module)
                     .await?
                     .map(|c| c.last_height)
                     .unwrap_or(0);
@@ -181,6 +213,37 @@ pub mod pg {
                     attempted: cp.last_height,
                 });
             }
+            Ok(())
+        }
+    }
+
+    /// Durable provenance over `core.ingest_receipts` (migration 0001 + 0003).
+    /// First fetch wins: `on conflict do nothing` keeps original provenance.
+    pub struct PgReceiptSink {
+        pool: PgPool,
+    }
+
+    impl PgReceiptSink {
+        pub fn new(pool: PgPool) -> Self {
+            Self { pool }
+        }
+    }
+
+    #[async_trait]
+    impl ReceiptSink for PgReceiptSink {
+        async fn record(&self, receipt: &IngestReceipt) -> Result<(), ReceiptError> {
+            sqlx::query(
+                "insert into core.ingest_receipts (key, byte_len, source, content_hash, fetched_at) \
+                 values ($1, $2, $3, $4, $5) on conflict (key) do nothing",
+            )
+            .bind(&receipt.key)
+            .bind(receipt.byte_len as i64)
+            .bind(&receipt.source)
+            .bind(&receipt.content_hash)
+            .bind(receipt.fetched_at)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| ReceiptError(e.to_string()))?;
             Ok(())
         }
     }
@@ -200,66 +263,71 @@ mod tests {
         }
     }
 
-    #[test]
-    fn fresh_chain_processes_then_skips_duplicates() {
+    #[tokio::test]
+    async fn fresh_chain_processes_then_skips_duplicates() {
         let store = MemoryCheckpointStore::new();
         assert_eq!(
-            should_process(&store, "polkadot-asset-hub", "blocks", 100).unwrap(),
+            should_process(&store, "polkadot-asset-hub", "blocks", 100).await.unwrap(),
             IngestOutcome::Processed
         );
-        store.advance(cp("polkadot-asset-hub", "blocks", 100)).unwrap();
+        store.advance(cp("polkadot-asset-hub", "blocks", 100)).await.unwrap();
         // same block again → idempotent skip
         assert_eq!(
-            should_process(&store, "polkadot-asset-hub", "blocks", 100).unwrap(),
+            should_process(&store, "polkadot-asset-hub", "blocks", 100).await.unwrap(),
             IngestOutcome::AlreadyProcessed
         );
         // next block → processed
         assert_eq!(
-            should_process(&store, "polkadot-asset-hub", "blocks", 101).unwrap(),
+            should_process(&store, "polkadot-asset-hub", "blocks", 101).await.unwrap(),
             IngestOutcome::Processed
         );
     }
 
-    #[test]
-    fn checkpoints_are_per_module_and_per_chain() {
+    #[tokio::test]
+    async fn checkpoints_are_per_module_and_per_chain() {
         let store = MemoryCheckpointStore::new();
-        store.advance(cp("polkadot-asset-hub", "blocks", 500)).unwrap();
+        store.advance(cp("polkadot-asset-hub", "blocks", 500)).await.unwrap();
         assert_eq!(
-            should_process(&store, "polkadot-asset-hub", "governance", 100).unwrap(),
+            should_process(&store, "polkadot-asset-hub", "governance", 100).await.unwrap(),
             IngestOutcome::Processed
         );
         assert_eq!(
-            should_process(&store, "polkadot", "blocks", 100).unwrap(),
+            should_process(&store, "polkadot", "blocks", 100).await.unwrap(),
             IngestOutcome::Processed
         );
     }
 
-    #[test]
-    fn regression_is_refused() {
+    #[tokio::test]
+    async fn regression_is_refused() {
         let store = MemoryCheckpointStore::new();
-        store.advance(cp("polkadot", "blocks", 200)).unwrap();
+        store.advance(cp("polkadot", "blocks", 200)).await.unwrap();
         assert!(matches!(
-            store.advance(cp("polkadot", "blocks", 150)),
+            store.advance(cp("polkadot", "blocks", 150)).await,
             Err(CheckpointError::Regression { .. })
         ));
     }
 
     /// Simulated kill/restart: a new store view over the same state resumes
     /// exactly where the old one stopped. (With MemoryCheckpointStore the
-    /// state IS the store; the Pg impl gives real persistence in Phase 1 tests.)
-    #[test]
-    fn restart_resumes_from_checkpoint() {
+    /// state IS the store; the Pg integration tests in dotlens-node prove
+    /// real persistence across store instances.)
+    #[tokio::test]
+    async fn restart_resumes_from_checkpoint() {
         let store = MemoryCheckpointStore::new();
         for h in 1..=50u64 {
-            if should_process(&store, "polkadot", "blocks", h).unwrap() == IngestOutcome::Processed {
-                store.advance(cp("polkadot", "blocks", h)).unwrap();
+            if should_process(&store, "polkadot", "blocks", h).await.unwrap()
+                == IngestOutcome::Processed
+            {
+                store.advance(cp("polkadot", "blocks", h)).await.unwrap();
             }
         }
         // "restart": re-offer the whole range; only new heights process
         let mut processed_again = 0;
         for h in 1..=60u64 {
-            if should_process(&store, "polkadot", "blocks", h).unwrap() == IngestOutcome::Processed {
-                store.advance(cp("polkadot", "blocks", h)).unwrap();
+            if should_process(&store, "polkadot", "blocks", h).await.unwrap()
+                == IngestOutcome::Processed
+            {
+                store.advance(cp("polkadot", "blocks", h)).await.unwrap();
                 processed_again += 1;
             }
         }

@@ -8,3 +8,5 @@ license.workspace = true
 thiserror.workspace = true
 serde.workspace = true
 chrono.workspace = true
+blake2.workspace = true
+hex.workspace = true

@@ -12,4 +12,9 @@ pg = ["dep:sqlx"]
 thiserror.workspace = true
 chrono.workspace = true
 serde.workspace = true
+async-trait.workspace = true
+raw-store.workspace = true
 sqlx = { workspace = true, optional = true }
+
+[dev-dependencies]
+tokio.workspace = true

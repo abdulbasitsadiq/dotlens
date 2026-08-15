@@ -4,13 +4,17 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[lib]
+name = "dotlens_node"
+path = "src/lib.rs"
+
 [[bin]]
 name = "dotlens-node"
 path = "src/main.rs"
 
 [features]
 default = ["pg"]
-pg = ["dep:sqlx", "ingest/pg"]
+pg = ["dep:sqlx", "ingest/pg", "api/pg"]
 
 [dependencies]
 registry.workspace = true

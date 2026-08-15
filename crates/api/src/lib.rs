@@ -1,7 +1,8 @@
-//! REST API (Axum). Phase 0: read-only endpoints over an in-memory block index
-//! plus the registry. The block index becomes Postgres-backed in Phase 1 behind
-//! the same `BlockIndex` trait.
+//! REST API (Axum). Read-only endpoints over a block index plus the registry.
+//! The `BlockIndex` contract is async: Postgres-backed in real runs (`pg`
+//! feature), in-memory for DB-less runs and tests.
 
+use async_trait::async_trait;
 use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
@@ -16,11 +17,17 @@ use serde::Deserialize;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
-/// Storage abstraction the API reads blocks from.
+#[derive(Debug, thiserror::Error)]
+#[error("block index error: {0}")]
+pub struct IndexError(pub String);
+
+/// Storage abstraction the API reads blocks from. Inserts are idempotent:
+/// re-inserting an already-indexed (chain, height) is a no-op, never an error.
+#[async_trait]
 pub trait BlockIndex: Send + Sync {
-    fn get(&self, chain_id: &str, height: u64) -> Option<CanonicalBlock>;
-    fn insert(&self, block: CanonicalBlock);
-    fn count(&self) -> usize;
+    async fn get(&self, chain_id: &str, height: u64) -> Result<Option<CanonicalBlock>, IndexError>;
+    async fn insert(&self, block: CanonicalBlock) -> Result<(), IndexError>;
+    async fn count(&self) -> Result<u64, IndexError>;
 }
 
 #[derive(Default)]
@@ -34,21 +41,211 @@ impl MemoryBlockIndex {
     }
 }
 
+#[async_trait]
 impl BlockIndex for MemoryBlockIndex {
-    fn get(&self, chain_id: &str, height: u64) -> Option<CanonicalBlock> {
-        self.inner
-            .read()
-            .ok()?
-            .get(&(chain_id.to_string(), height))
-            .cloned()
+    async fn get(
+        &self,
+        chain_id: &str,
+        height: u64,
+    ) -> Result<Option<CanonicalBlock>, IndexError> {
+        let map = self.inner.read().map_err(|e| IndexError(e.to_string()))?;
+        Ok(map.get(&(chain_id.to_string(), height)).cloned())
     }
-    fn insert(&self, block: CanonicalBlock) {
-        if let Ok(mut map) = self.inner.write() {
-            map.insert((block.chain_id.clone(), block.height), block);
+    async fn insert(&self, block: CanonicalBlock) -> Result<(), IndexError> {
+        let mut map = self.inner.write().map_err(|e| IndexError(e.to_string()))?;
+        map.insert((block.chain_id.clone(), block.height), block);
+        Ok(())
+    }
+    async fn count(&self) -> Result<u64, IndexError> {
+        let map = self.inner.read().map_err(|e| IndexError(e.to_string()))?;
+        Ok(map.len() as u64)
+    }
+}
+
+// -------------------------------------------------------------------- pg impl
+
+#[cfg(feature = "pg")]
+pub mod pg {
+    use super::{BlockIndex, IndexError};
+    use async_trait::async_trait;
+    use canonical::{CanonicalBlock, CanonicalEvent, CanonicalTransaction, Lineage};
+    use chrono::{DateTime, Utc};
+    use sqlx::PgPool;
+
+    /// Postgres-backed block index over `core.blocks/transactions/events`.
+    /// One transaction per block insert; every row carries lineage
+    /// (Invariant 3). Conflicts are ignored: rows are immutable, re-ingesting
+    /// an identical block is a no-op (ARCHITECTURE.md §15).
+    pub struct PgBlockIndex {
+        pool: PgPool,
+    }
+
+    impl PgBlockIndex {
+        pub fn new(pool: PgPool) -> Self {
+            Self { pool }
         }
     }
-    fn count(&self) -> usize {
-        self.inner.read().map(|m| m.len()).unwrap_or(0)
+
+    #[async_trait]
+    impl BlockIndex for PgBlockIndex {
+        async fn get(
+            &self,
+            chain_id: &str,
+            height: u64,
+        ) -> Result<Option<CanonicalBlock>, IndexError> {
+            let err = |e: sqlx::Error| IndexError(e.to_string());
+            let head: Option<(String, String, Option<DateTime<Utc>>, bool, i64, i32, String)> =
+                sqlx::query_as(
+                    "select hash, parent_hash, timestamp, finalized, \
+                            runtime_version, decoder_version, raw_location \
+                     from core.blocks where chain_id = $1 and height = $2",
+                )
+                .bind(chain_id)
+                .bind(height as i64)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(err)?;
+            let Some((hash, parent_hash, timestamp, finalized, runtime_version, decoder_version, raw_location)) =
+                head
+            else {
+                return Ok(None);
+            };
+
+            let txs: Vec<(i32, Option<String>, Option<String>, String, serde_json::Value, bool)> =
+                sqlx::query_as(
+                    "select tx_index, hash, signer, call_name, args, success \
+                     from core.transactions where chain_id = $1 and block_height = $2 \
+                     order by tx_index",
+                )
+                .bind(chain_id)
+                .bind(height as i64)
+                .fetch_all(&self.pool)
+                .await
+                .map_err(err)?;
+
+            let events: Vec<(i32, Option<i32>, String, serde_json::Value)> = sqlx::query_as(
+                "select event_index, tx_index, name, data \
+                 from core.events where chain_id = $1 and block_height = $2 \
+                 order by event_index",
+            )
+            .bind(chain_id)
+            .bind(height as i64)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(err)?;
+
+            Ok(Some(CanonicalBlock {
+                chain_id: chain_id.to_string(),
+                height,
+                hash,
+                parent_hash,
+                timestamp,
+                finalized,
+                lineage: Lineage {
+                    runtime_version: runtime_version as u32,
+                    decoder_version: decoder_version as u32,
+                    raw_location,
+                },
+                transactions: txs
+                    .into_iter()
+                    .map(|(index, hash, signer, call, args, success)| CanonicalTransaction {
+                        index: index as u32,
+                        hash,
+                        signer,
+                        call,
+                        args,
+                        success,
+                    })
+                    .collect(),
+                events: events
+                    .into_iter()
+                    .map(|(index, tx, name, data)| CanonicalEvent {
+                        index: index as u32,
+                        transaction_index: tx.map(|t| t as u32),
+                        name,
+                        data,
+                    })
+                    .collect(),
+            }))
+        }
+
+        async fn insert(&self, block: CanonicalBlock) -> Result<(), IndexError> {
+            let err = |e: sqlx::Error| IndexError(e.to_string());
+            let mut tx = self.pool.begin().await.map_err(err)?;
+
+            sqlx::query(
+                "insert into core.blocks (chain_id, height, hash, parent_hash, timestamp, \
+                     finalized, runtime_version, decoder_version, raw_location) \
+                 values ($1, $2, $3, $4, $5, $6, $7, $8, $9) \
+                 on conflict (chain_id, height) do nothing",
+            )
+            .bind(&block.chain_id)
+            .bind(block.height as i64)
+            .bind(&block.hash)
+            .bind(&block.parent_hash)
+            .bind(block.timestamp)
+            .bind(block.finalized)
+            .bind(block.lineage.runtime_version as i64)
+            .bind(block.lineage.decoder_version as i32)
+            .bind(&block.lineage.raw_location)
+            .execute(&mut *tx)
+            .await
+            .map_err(err)?;
+
+            for t in &block.transactions {
+                sqlx::query(
+                    "insert into core.transactions (chain_id, block_height, tx_index, hash, \
+                         signer, call_name, args, success, \
+                         runtime_version, decoder_version, raw_location) \
+                     values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) \
+                     on conflict (chain_id, block_height, tx_index) do nothing",
+                )
+                .bind(&block.chain_id)
+                .bind(block.height as i64)
+                .bind(t.index as i32)
+                .bind(&t.hash)
+                .bind(&t.signer)
+                .bind(&t.call)
+                .bind(&t.args)
+                .bind(t.success)
+                .bind(block.lineage.runtime_version as i64)
+                .bind(block.lineage.decoder_version as i32)
+                .bind(&block.lineage.raw_location)
+                .execute(&mut *tx)
+                .await
+                .map_err(err)?;
+            }
+
+            for e in &block.events {
+                sqlx::query(
+                    "insert into core.events (chain_id, block_height, event_index, tx_index, \
+                         name, data, runtime_version, decoder_version) \
+                     values ($1, $2, $3, $4, $5, $6, $7, $8) \
+                     on conflict (chain_id, block_height, event_index) do nothing",
+                )
+                .bind(&block.chain_id)
+                .bind(block.height as i64)
+                .bind(e.index as i32)
+                .bind(e.transaction_index.map(|t| t as i32))
+                .bind(&e.name)
+                .bind(&e.data)
+                .bind(block.lineage.runtime_version as i64)
+                .bind(block.lineage.decoder_version as i32)
+                .execute(&mut *tx)
+                .await
+                .map_err(err)?;
+            }
+
+            tx.commit().await.map_err(err)
+        }
+
+        async fn count(&self) -> Result<u64, IndexError> {
+            let (n,): (i64,) = sqlx::query_as("select count(*) from core.blocks")
+                .fetch_one(&self.pool)
+                .await
+                .map_err(|e| IndexError(e.to_string()))?;
+            Ok(n as u64)
+        }
     }
 }
 
@@ -99,12 +296,13 @@ async fn get_block(
     if state.registry.chain(&chain).is_none() {
         return error(StatusCode::NOT_FOUND, format!("unknown chain: {chain}"));
     }
-    match state.blocks.get(&chain, height) {
-        Some(block) => Json(block).into_response(),
-        None => error(
+    match state.blocks.get(&chain, height).await {
+        Ok(Some(block)) => Json(block).into_response(),
+        Ok(None) => error(
             StatusCode::NOT_FOUND,
             format!("block {chain}/{height} not indexed"),
         ),
+        Err(e) => error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     }
 }
 
@@ -141,7 +339,7 @@ mod tests {
     use std::path::Path as FsPath;
     use tower::util::ServiceExt;
 
-    fn test_state() -> AppState {
+    async fn test_state() -> AppState {
         let seeds = FsPath::new(env!("CARGO_MANIFEST_DIR")).join("../../registry-seeds");
         let registry = Arc::new(Registry::load_from_dir(&seeds).expect("seeds"));
         let blocks: Arc<dyn BlockIndex> = Arc::new(MemoryBlockIndex::new());
@@ -153,7 +351,7 @@ mod tests {
         let block =
             adapter_substrate::decode_block(&bytes, "raw/polkadot-asset-hub/0001900/19000001/block.json")
                 .expect("decode");
-        blocks.insert(block);
+        blocks.insert(block).await.expect("insert");
 
         AppState { registry, blocks }
     }
@@ -176,7 +374,7 @@ mod tests {
 
     #[tokio::test]
     async fn fixture_block_roundtrips_with_lineage() {
-        let app = router(test_state());
+        let app = router(test_state().await);
         let (status, json) = get_json(&app, "/v1/blocks/polkadot-asset-hub/19000001").await;
         assert_eq!(status, StatusCode::OK);
         // THE Phase 0 exit criterion: lineage visible at the API surface
@@ -191,7 +389,7 @@ mod tests {
 
     #[tokio::test]
     async fn unknown_chain_and_missing_block_are_404() {
-        let app = router(test_state());
+        let app = router(test_state().await);
         let (s1, _) = get_json(&app, "/v1/blocks/no-such-chain/1").await;
         assert_eq!(s1, StatusCode::NOT_FOUND);
         let (s2, _) = get_json(&app, "/v1/blocks/polkadot/1").await;
@@ -200,7 +398,7 @@ mod tests {
 
     #[tokio::test]
     async fn domain_resolution_is_migration_aware_over_http() {
-        let app = router(test_state());
+        let app = router(test_state().await);
         let (_, before) =
             get_json(&app, "/v1/domains/polkadot/governance?at=2025-06-01T00:00:00Z").await;
         assert_eq!(before["chain"], "polkadot");
@@ -211,7 +409,7 @@ mod tests {
 
     #[tokio::test]
     async fn chains_list_reflects_registry_only() {
-        let app = router(test_state());
+        let app = router(test_state().await);
         let (status, json) = get_json(&app, "/v1/chains").await;
         assert_eq!(status, StatusCode::OK);
         let ids: Vec<&str> = json["chains"]

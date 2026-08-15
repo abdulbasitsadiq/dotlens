@@ -23,13 +23,23 @@ pub enum RawStoreError {
     InvalidKey(String),
 }
 
-/// A receipt recording provenance for every stored object (who/where/when).
+/// A receipt recording provenance for every stored object (who/where/when/what).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IngestReceipt {
     pub key: String,
     pub byte_len: u64,
     pub source: String, // e.g. endpoint URL or "fixture"
+    /// blake2b-256 of the stored bytes, 0x-hex — ARCHITECTURE.md §6 provenance.
+    pub content_hash: String,
     pub fetched_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// blake2b-256 of `bytes`, 0x-prefixed hex. The one hash used for receipts.
+pub fn content_hash(bytes: &[u8]) -> String {
+    use blake2::digest::{consts::U32, Digest};
+    let mut hasher = blake2::Blake2b::<U32>::new();
+    hasher.update(bytes);
+    format!("0x{}", hex::encode(hasher.finalize()))
 }
 
 pub trait RawStore: Send + Sync {
@@ -88,6 +98,7 @@ impl RawStore for FsRawStore {
                     key: key.to_string(),
                     byte_len: bytes.len() as u64,
                     source: source.to_string(),
+                    content_hash: content_hash(bytes),
                     fetched_at: chrono::Utc::now(),
                 });
             }
@@ -116,6 +127,7 @@ impl RawStore for FsRawStore {
             key: key.to_string(),
             byte_len: bytes.len() as u64,
             source: source.to_string(),
+            content_hash: content_hash(bytes),
             fetched_at: chrono::Utc::now(),
         })
     }
@@ -158,10 +170,12 @@ mod tests {
         let key = keys::block("polkadot", 12_345, "block.scale");
         assert_eq!(key, "raw/polkadot/0000001/12345/block.scale");
 
-        store.put(&key, b"raw-bytes", "fixture").unwrap();
+        let first = store.put(&key, b"raw-bytes", "fixture").unwrap();
         assert_eq!(store.get(&key).unwrap(), b"raw-bytes");
-        // identical re-put: fine (idempotent ingestion)
-        store.put(&key, b"raw-bytes", "fixture").unwrap();
+        assert!(first.content_hash.starts_with("0x") && first.content_hash.len() == 66);
+        // identical re-put: fine (idempotent ingestion), same content hash
+        let again = store.put(&key, b"raw-bytes", "fixture").unwrap();
+        assert_eq!(again.content_hash, first.content_hash);
         // different bytes at same key: refused (immutability)
         assert!(matches!(
             store.put(&key, b"tampered", "fixture"),
