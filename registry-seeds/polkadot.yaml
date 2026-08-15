@@ -1,0 +1,29 @@
+# Polkadot relay chain — the "minimal relay" post Asset Hub migration (RFC-0032)
+id: polkadot
+name: Polkadot
+family: substrate
+relay: null            # it IS a relay
+para_id: null
+network: polkadot
+ss58_prefix: 0
+lifecycle:
+  - status: live
+    from: "2020-05-26T00:00:00Z"
+endpoints:
+  rpc:
+    - wss://rpc.polkadot.io
+    - wss://polkadot-rpc.dwellir.com
+capabilities:
+  blocks: true
+  extrinsics: true
+  events: true
+  runtime_metadata: true
+  consensus: true          # relay-only: parachain validation, session keys
+  hrmp_admin: true
+  on_demand_coretime: true
+modules:
+  - blocks
+  - extrinsics
+  - events
+  - accounts
+  - balances               # historical only — balances domain resided here pre-2025-11-04

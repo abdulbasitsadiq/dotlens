@@ -1,0 +1,15 @@
+[package]
+name = "ingest"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+default = []
+pg = ["dep:sqlx"]
+
+[dependencies]
+thiserror.workspace = true
+chrono.workspace = true
+serde.workspace = true
+sqlx = { workspace = true, optional = true }

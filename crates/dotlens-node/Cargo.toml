@@ -1,0 +1,29 @@
+[package]
+name = "dotlens-node"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "dotlens-node"
+path = "src/main.rs"
+
+[features]
+default = ["pg"]
+pg = ["dep:sqlx", "ingest/pg"]
+
+[dependencies]
+registry.workspace = true
+raw-store.workspace = true
+ingest.workspace = true
+adapter-substrate.workspace = true
+api.workspace = true
+anyhow.workspace = true
+axum.workspace = true
+chrono.workspace = true
+dotenvy.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+serde_json.workspace = true
+sqlx = { workspace = true, optional = true }

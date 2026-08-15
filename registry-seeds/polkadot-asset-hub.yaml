@@ -1,0 +1,40 @@
+# Polkadot Asset Hub — "Polkadot Hub"; centre of activity since 2025-11-04
+id: polkadot-asset-hub
+name: Polkadot Asset Hub
+family: substrate
+relay: polkadot
+para_id: 1000
+network: polkadot
+ss58_prefix: 0
+lifecycle:
+  - status: live
+    from: "2021-06-01T00:00:00Z"   # Statemint-era launch, approximate — verify exact genesis date (ecosystem-verifier) before Phase 1
+endpoints:
+  rpc:
+    - wss://polkadot-asset-hub-rpc.polkadot.io
+    - wss://asset-hub-polkadot-rpc.dwellir.com
+capabilities:
+  blocks: true
+  extrinsics: true
+  events: true
+  runtime_metadata: true
+  assets:
+    instances: [trust_backed, foreign, pool]
+  governance: true
+  staking: true
+  treasury: true
+  contracts_revive:
+    from_spec: 2000005      # ref 1828 era, runtime 2.0.5 — verify exact spec_version on-chain
+  evm_rpc_view: true
+  xcm:
+    min_version: 2
+modules:
+  - blocks
+  - extrinsics
+  - events
+  - accounts
+  - balances
+  - assets
+  - governance
+  - treasury
+  - xcm

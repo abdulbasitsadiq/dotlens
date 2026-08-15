@@ -1,0 +1,54 @@
+# Which chain hosts which functional domain, over time. THE anti-migration table.
+# Facts verified Aug 2026 — see ../../ECOSYSTEM.md §1. Times are UTC.
+# Kusama entries will be added when Kusama chains are registered.
+residency:
+  - domain: governance
+    network: polkadot
+    chain: polkadot
+    from: "2020-05-26T00:00:00Z"
+    to: "2025-11-04T00:00:00Z"
+  - domain: governance
+    network: polkadot
+    chain: polkadot-asset-hub
+    from: "2025-11-04T00:00:00Z"
+    to: null
+
+  - domain: staking
+    network: polkadot
+    chain: polkadot
+    from: "2020-05-26T00:00:00Z"
+    to: "2025-11-04T00:00:00Z"
+  - domain: staking
+    network: polkadot
+    chain: polkadot-asset-hub
+    from: "2025-11-04T00:00:00Z"
+    to: null
+
+  - domain: balances_hub
+    network: polkadot
+    chain: polkadot
+    from: "2020-05-26T00:00:00Z"
+    to: "2025-11-04T00:00:00Z"
+  - domain: balances_hub
+    network: polkadot
+    chain: polkadot-asset-hub
+    from: "2025-11-04T00:00:00Z"
+    to: null
+
+  - domain: treasury
+    network: polkadot
+    chain: polkadot
+    from: "2020-05-26T00:00:00Z"
+    to: "2025-11-04T00:00:00Z"
+  - domain: treasury
+    network: polkadot
+    chain: polkadot-asset-hub
+    from: "2025-11-04T00:00:00Z"
+    to: null
+
+  # consensus never moved — and won't until JAM
+  - domain: consensus
+    network: polkadot
+    chain: polkadot
+    from: "2020-05-26T00:00:00Z"
+    to: null

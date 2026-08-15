@@ -1,0 +1,48 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/registry",
+    "crates/canonical",
+    "crates/raw-store",
+    "crates/ingest",
+    "crates/adapter-substrate",
+    "crates/api",
+    "crates/dotlens-node",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+
+[workspace.dependencies]
+# keep this list minimal and boring — every dep must earn its place
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+thiserror = "1"
+anyhow = "1"
+hex = "0.4"
+blake2 = "0.10"
+chrono = { version = "0.4", features = ["serde"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "net"] }
+dotenvy = "0.15"
+axum = "0.8"
+tower = { version = "0.5", features = ["util"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+sqlx = { version = "0.8", default-features = false, features = [
+    "runtime-tokio", "tls-rustls", "postgres", "migrate", "macros", "chrono", "json",
+] }
+
+# internal crates
+registry = { path = "crates/registry" }
+canonical = { path = "crates/canonical" }
+raw-store = { path = "crates/raw-store" }
+ingest = { path = "crates/ingest" }
+adapter-substrate = { path = "crates/adapter-substrate" }
+api = { path = "crates/api" }
+
+[profile.dev]
+# faster iterative builds; opt where it matters later
+debug = 1
