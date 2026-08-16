@@ -150,6 +150,64 @@ impl SubstrateSource {
         .await
     }
 
+    /// One page of storage KEYS under `prefix` at block `hash`. Paged because
+    /// a map can hold millions of entries; the caller loops with the last key
+    /// returned as `start_key` until a short page comes back.
+    ///
+    /// Enumerating keys is how the assets registry is built: with a concat
+    /// hasher the encoded asset id is IN the key, so listing keys under
+    /// `<Pallet>.Asset` yields every asset the chain holds, ids included,
+    /// without a single assumption about what those ids look like.
+    pub async fn storage_keys_paged(
+        &self,
+        prefix: &[u8],
+        count: u32,
+        start_key: Option<&[u8]>,
+        hash: subxt::utils::H256,
+    ) -> Result<Vec<Vec<u8>>, SourceError> {
+        self.with_failover("state_getKeysPaged", |m| {
+            let prefix = prefix.to_vec();
+            let start = start_key.map(|s| s.to_vec());
+            async move {
+                m.state_get_keys_paged(&prefix, count, start.as_deref(), Some(hash))
+                    .await
+            }
+        })
+        .await
+    }
+
+    /// MANY storage values at one block in ONE request (`state_queryStorageAt`).
+    /// Returns `(key, value)` pairs; a missing key comes back with `None`,
+    /// which is meaningful data — an account that holds none of an asset has
+    /// no storage entry at all, and that is a zero balance, not an error.
+    ///
+    /// This is what makes a treasury holdings snapshot cheap: every treasury
+    /// account × every registered asset is a few hundred keys, i.e. a couple
+    /// of round trips rather than a couple of thousand.
+    pub async fn storage_batch_at(
+        &self,
+        keys: &[Vec<u8>],
+        hash: subxt::utils::H256,
+    ) -> Result<Vec<(Vec<u8>, Option<Vec<u8>>)>, SourceError> {
+        if keys.is_empty() {
+            return Ok(vec![]);
+        }
+        let sets = self
+            .with_failover("state_queryStorageAt", |m| {
+                let keys = keys.to_vec();
+                async move {
+                    m.state_query_storage_at(keys.iter().map(|k| k.as_slice()), Some(hash))
+                        .await
+                }
+            })
+            .await?;
+        Ok(sets
+            .into_iter()
+            .flat_map(|set| set.changes)
+            .map(|(k, v)| (k.0, v.map(|b| b.0)))
+            .collect())
+    }
+
     /// Does `key` exist in storage at block `hash`? Existence only (Some vs
     /// None) — used by verify-labels to confirm derived system accounts
     /// on-chain without needing to decode AccountInfo.
@@ -159,6 +217,23 @@ impl SubstrateSource {
         hash: subxt::utils::H256,
     ) -> Result<bool, SourceError> {
         Ok(self.storage_at(key, hash).await?.is_some())
+    }
+
+    /// The node's chain properties (`tokenSymbol`, `tokenDecimals`, `ss58Format`).
+    ///
+    /// NOTE this is the only fact in the assets path that is NOT block-scoped:
+    /// `system_properties` reports the node's current view, with no block hash
+    /// to pin it to. It is how the NATIVE token gets a symbol and decimals at
+    /// all — without it, a treasury's DOT holding is an integer with no unit
+    /// while its USDT holding has one, which is a worse lie than having
+    /// neither. Rows written from it say `source = 'chain-properties'`.
+    pub async fn chain_properties(&self) -> Result<serde_json::Value, SourceError> {
+        let props = self
+            .with_failover("system_properties", |m| async move {
+                m.system_properties().await
+            })
+            .await?;
+        Ok(serde_json::Value::Object(props.into_iter().collect()))
     }
 
     /// spec_version at block `hash` — anchors record the runtime they were

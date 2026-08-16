@@ -81,6 +81,23 @@ residency:
     from: "2025-11-04T00:00:00Z"
     to: null
 
+  # Assets NEVER lived on the relay chain. This is the one domain whose window
+  # does not start at the relay's genesis, and saying so matters: querying an
+  # asset balance for 2023 must not send the caller to a chain that has never
+  # had a `pallet-assets`. The window opens at Asset Hub's own launch, not at
+  # the Nov-2025 migration — the migration moved balances/staking/governance
+  # TO a chain that had been holding assets since Statemint.
+  #
+  # The date below is the seed's lifecycle `from` and is APPROXIMATE, unlike
+  # the Collectives and People windows which were tightened to their chains'
+  # own block #1 timestamps in slice 4. Verify it the same way before treating
+  # it as a fact.
+  - domain: assets
+    network: polkadot
+    chain: polkadot-asset-hub
+    from: "2021-06-01T00:00:00Z"
+    to: null
+
   # consensus never moved — and won't until JAM
   - domain: consensus
     network: polkadot

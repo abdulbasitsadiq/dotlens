@@ -1833,3 +1833,345 @@ async fn unfinalized_rows_are_replaceable_finalized_rows_are_immutable() {
 
     db.drop_db().await;
 }
+
+/// Phase 2, slice 6 — WHERE THE MONEY IS.
+///
+/// Four claims, each of which was a real risk while authoring:
+///   1. asset deltas ride the EXISTING balances tables, through the existing
+///      worker, keyed by an asset string — no new pipeline
+///   2. the holdings read assembles anchor + deltas per (account, asset), and
+///      reports a pair it has only ever seen MOVING with a null amount rather
+///      than omitting it
+///   3. `treasury.spends.asset_location` survives the jsonb round trip well
+///      enough to JOIN `core.assets.location_key` — Postgres orders jsonb keys
+///      by length, we order them lexicographically, and the join only works
+///      because serde_json re-canonicalizes on the way out
+///   4. the treasury ACCOUNT list derives itself from the chain's own metadata
+#[tokio::test]
+async fn asset_balances_share_the_balances_tables_and_holdings_join_their_assets() {
+    use adapter_substrate::accounts::{pallet_account, para_sovereign};
+    use adapter_substrate::assets as aa;
+    use adapter_substrate::balances::SubstrateDeltaMapper;
+    use api::{AssetIndex as _, BalanceIndex as _, TreasuryIndex as _};
+    use canonical::{CanonicalBlock, CanonicalEvent, Lineage};
+
+    let Some(db) = TestDb::create().await else { return };
+    let reg = seeds();
+    sync_registry(&db.pool, &reg).await.expect("registry sync");
+
+    let treasury = pallet_account(b"py/trsry");
+    let peer = para_sovereign(2034);
+    let acct = |a: &[u8; 32]| serde_json::json!([a.to_vec()]);
+    let ev = |index: u32, name: &str, data: serde_json::Value| CanonicalEvent {
+        index,
+        transaction_index: Some(0),
+        name: name.into(),
+        data,
+    };
+    // 2^65 — an asset amount that has no business fitting in a u64 either
+    let big = "36893488147419103232";
+    let block = CanonicalBlock {
+        chain_id: "polkadot-asset-hub".into(),
+        height: 500,
+        hash: format!("0x{:064x}", 500),
+        parent_hash: format!("0x{:064x}", 499),
+        timestamp: Some("2026-08-01T00:00:00Z".parse().unwrap()),
+        finalized: true,
+        lineage: Lineage {
+            runtime_version: 2_003_002,
+            decoder_version: 2,
+            raw_location: "raw/polkadot-asset-hub/test/500".into(),
+        },
+        transactions: vec![],
+        events: vec![
+            // USDT out of the treasury
+            ev(0, "assets.Transferred", serde_json::json!({
+                "asset_id": 1984, "from": acct(&treasury), "to": acct(&peer), "amount": big,
+            })),
+            // a bridged asset minted to the treasury, named by an XCM location
+            // in the V4 NESTED-X1 spelling
+            ev(1, "foreignassets.Issued", serde_json::json!({
+                "asset_id": {"parents": 2, "interior": {"X1": [[
+                    {"GlobalConsensus": {"Ethereum": {"chain_id": 1}}}
+                ]]}},
+                "owner": acct(&treasury), "amount": 7u64,
+            })),
+            // status, not money
+            ev(2, "assets.Frozen", serde_json::json!({
+                "asset_id": 1984, "who": acct(&treasury),
+            })),
+            // and the NATIVE mapper still works in the same pass
+            ev(3, "balances.Withdraw", serde_json::json!({
+                "who": acct(&treasury), "amount": 160000000u64,
+            })),
+        ],
+    };
+    let index = PgBlockIndex::new(db.pool.clone());
+    index.insert(block).await.expect("insert block");
+
+    let checkpoints = PgCheckpointStore::new(db.pool.clone());
+    let source = dotlens_node::balances_pg::PgEventSource::new(db.pool.clone());
+    let sink = dotlens_node::balances_pg::PgDeltaSink::new(db.pool.clone());
+    let deps = ingest::balances::BalancesDeps {
+        checkpoints: &checkpoints,
+        source: &source,
+        sink: &sink,
+    };
+    ingest::balances::balances_range(
+        "polkadot-asset-hub",
+        &SubstrateDeltaMapper,
+        &deps,
+        500,
+        500,
+    )
+    .await
+    .expect("balances range");
+
+    // ---- 1. asset deltas landed in the balances tables ------------------
+    let rows: Vec<(String, String, String, i32)> = sqlx::query_as(
+        "select asset, delta::text, reason, mapper_version from balances.balance_changes \
+         where chain_id = 'polkadot-asset-hub' and account_id = $1 order by asset, delta",
+    )
+    .bind(&treasury[..])
+    .fetch_all(&db.pool)
+    .await
+    .expect("changes");
+    let by_asset: std::collections::BTreeMap<&str, &(String, String, String, i32)> =
+        rows.iter().map(|r| (r.0.as_str(), r)).collect();
+    assert_eq!(
+        by_asset["assets:1984"].1,
+        format!("-{big}"),
+        "the 2^65 asset amount survived as NUMERIC"
+    );
+    assert_eq!(by_asset["assets:1984"].2, "transfer_out");
+    assert_eq!(by_asset["assets:1984"].3, 2, "MAPPER_VERSION bumped to 2");
+    assert_eq!(by_asset["native"].1, "-160000000", "native mapping untouched");
+    let foreign = rows
+        .iter()
+        .find(|r| r.0.starts_with("foreign:"))
+        .expect("the foreign asset delta");
+    assert!(
+        foreign.0.contains("\"parents\":2"),
+        "canonical, version-stripped key: {}",
+        foreign.0
+    );
+    assert_eq!(foreign.1, "7");
+    // three assets, four rows (the USDT transfer is double entry, and the peer
+    // account holds the other leg), and NO row for the Frozen status event
+    let (frozen_rows,): (i64,) = sqlx::query_as(
+        "select count(*) from balances.balance_changes where reason like '%frozen%'",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(frozen_rows, 0, "a status change is not a balance change");
+
+    // ---- 2. the asset registry, including the constructed XCM name ------
+    let usdt_location = aa::local_asset_location(50, 1984);
+    let usdt_key = aa::canonical_location(&usdt_location).expect("canonical");
+    // the asset id EXACTLY as it sits inside the storage key
+    let usdt_id_bytes = 1984u32.to_le_bytes();
+    dotlens_node::assets_pg::upsert_asset(
+        &db.pool,
+        "polkadot-asset-hub",
+        "assets:1984",
+        "trust_backed",
+        Some("1984"),
+        Some(&usdt_location),
+        Some(&usdt_key),
+        Some(&usdt_id_bytes[..]),
+        &aa::AssetMeta {
+            name: Some("Tether USD".into()),
+            symbol: Some("USDT".into()),
+            decimals: Some(6),
+        },
+        &aa::AssetDetailsView {
+            supply: Some(1_000_000_000_000),
+            min_balance: Some(10_000),
+            is_sufficient: Some(true),
+            accounts: Some(42),
+            status: Some("Live".into()),
+        },
+        Some(2_003_002),
+        Some(500),
+        "test",
+    )
+    .await
+    .expect("upsert usdt");
+    // an OLDER read must not overwrite newer facts (the observed_height guard)
+    dotlens_node::assets_pg::upsert_asset(
+        &db.pool,
+        "polkadot-asset-hub",
+        "assets:1984",
+        "trust_backed",
+        Some("1984"),
+        None,
+        None,
+        None,
+        &aa::AssetMeta { name: None, symbol: Some("STALE".into()), decimals: Some(0) },
+        &Default::default(),
+        Some(2_000_000),
+        Some(100),
+        "test-older",
+    )
+    .await
+    .expect("upsert older");
+    let assets = api::pg::PgAssetIndex::new(db.pool.clone());
+    let listed = assets.assets("polkadot-asset-hub").await.expect("assets");
+    let usdt = listed.iter().find(|a| a.asset_key == "assets:1984").unwrap();
+    assert_eq!(usdt.symbol.as_deref(), Some("USDT"), "older read must not win");
+    assert_eq!(usdt.decimals, Some(6));
+    assert_eq!(usdt.location_key.as_deref(), Some(usdt_key.as_str()));
+
+    // ---- 3. treasury accounts, DERIVED from the chain's own metadata ----
+    let raw_dir = tmp_raw("holdings");
+    let raw = FsRawStore::new(&raw_dir);
+    let meta_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../fixtures/real/polkadot-asset-hub-19498783/metadata.scale");
+    let derived = match std::fs::read(&meta_path) {
+        Ok(blob) => {
+            let key = raw_store::keys::metadata("polkadot-asset-hub", 2_003_002);
+            raw.put(&key, &blob, "test").expect("stage metadata");
+            sqlx::query(
+                "insert into substrate.runtime_versions \
+                     (chain_id, spec_version, metadata_version, metadata_blob_location) \
+                 values ($1, $2, 14, $3) on conflict do nothing",
+            )
+            .bind("polkadot-asset-hub")
+            .bind(2_003_002i64)
+            .bind(&key)
+            .execute(&db.pool)
+            .await
+            .expect("runtime_versions row");
+            true
+        }
+        Err(_) => {
+            eprintln!("NOTE: real fixture metadata absent — derivation assertions skipped");
+            false
+        }
+    };
+    let report = dotlens_node::assets_pg::sync_treasury_accounts(&db.pool, &reg, &raw)
+        .await
+        .expect("treasury account sync");
+    assert_eq!(report.seeded, 2, "the two seeded AH treasury accounts");
+    if derived {
+        assert!(report.pots >= 1, "py/trsry derived from AH's own metadata");
+        let (label, instance, derivation): (String, Option<String>, Option<String>) =
+            sqlx::query_as(
+                "select label, instance, derivation from treasury.treasury_accounts \
+                 where chain_id = 'polkadot-asset-hub' and account_id = $1 and role = 'pot'",
+            )
+            .bind(&treasury[..])
+            .fetch_one(&db.pool)
+            .await
+            .expect("the treasury pot row");
+        assert_eq!(instance.as_deref(), Some("treasury"));
+        assert_eq!(derivation.as_deref(), Some("modl:py/trsry"));
+        assert!(label.contains("py/trsry"), "{label}");
+    }
+    // idempotent
+    let before: (i64,) = sqlx::query_as("select count(*) from treasury.treasury_accounts")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    dotlens_node::assets_pg::sync_treasury_accounts(&db.pool, &reg, &raw)
+        .await
+        .expect("second sync");
+    let after: (i64,) = sqlx::query_as("select count(*) from treasury.treasury_accounts")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(before, after, "treasury account sync must be idempotent");
+
+    // ---- 4. holdings: anchor + deltas, with the unanchored pair kept -----
+    dotlens_node::assets_pg::insert_asset_anchor(
+        &db.pool,
+        "polkadot-asset-hub",
+        &treasury[..],
+        "assets:1984",
+        499,
+        50_000_000_000,
+        Some("liquid"),
+        Some(2_003_002),
+        "test",
+        None,
+    )
+    .await
+    .expect("asset anchor");
+    let balances = api::pg::PgBalanceIndex::new(db.pool.clone());
+    let holdings = balances
+        .holdings("polkadot-asset-hub", &[treasury.to_vec()], None)
+        .await
+        .expect("holdings");
+    let usdt = holdings.iter().find(|h| h.asset == "assets:1984").unwrap();
+    // anchored at 499, then the block-500 transfer took 2^65 out of it
+    assert_eq!(usdt.anchor_total.as_deref(), Some("50000000000"));
+    assert_eq!(usdt.anchor_status.as_deref(), Some("liquid"));
+    assert_eq!(usdt.delta_count, 1);
+    assert_eq!(usdt.delta_sum, format!("-{big}"));
+    assert_eq!(usdt.basis(), "anchor+deltas");
+    assert_eq!(
+        usdt.amount().unwrap(),
+        (50_000_000_000i128 - 36_893_488_147_419_103_232i128).to_string()
+    );
+    // native and the foreign asset have deltas and NO anchor: present, null
+    let native = holdings.iter().find(|h| h.asset == "native").unwrap();
+    assert!(native.anchor_total.is_none() && native.amount().is_none());
+    assert_eq!(native.basis(), "deltas_only");
+    assert!(holdings.iter().any(|h| h.asset.starts_with("foreign:")));
+    // …and an `at_height` BEFORE the deltas sees the anchor alone
+    let earlier = balances
+        .holdings("polkadot-asset-hub", &[treasury.to_vec()], Some(499))
+        .await
+        .expect("holdings at 499");
+    let usdt_then = earlier.iter().find(|h| h.asset == "assets:1984").unwrap();
+    assert_eq!(usdt_then.delta_count, 0);
+    assert_eq!(usdt_then.amount().unwrap(), "50000000000");
+    assert_eq!(usdt_then.basis(), "anchor");
+    assert!(
+        !earlier.iter().any(|h| h.asset == "native"),
+        "a pair whose only rows are above the height must not appear at all"
+    );
+
+    // ---- 5. the jsonb round trip that makes the spend → asset join work --
+    sqlx::query(
+        "insert into treasury.spends \
+             (chain_id, instance, spend_kind, spend_id, status, amount, first_seen_height, \
+              status_height, status_event_index, runtime_version, mapper_version, \
+              asset_location, asset_key) \
+         values ('polkadot-asset-hub','treasury','asset_spend',265,'paid',20895000000::numeric, \
+                 500,500,0,2003002,2,$1,null)",
+    )
+    .bind(serde_json::json!({
+        "chain": {"parents": 0, "interior": []},
+        "asset": serde_json::from_str::<serde_json::Value>(&usdt_key).unwrap(),
+    }))
+    .execute(&db.pool)
+    .await
+    .expect("spend row");
+    let treasury_index = api::pg::PgTreasuryIndex::new(db.pool.clone());
+    let spend = treasury_index
+        .spend("polkadot-asset-hub", "treasury", "asset_spend", 265)
+        .await
+        .expect("spend read")
+        .expect("the spend");
+    let round_tripped = spend.asset_ref.as_ref().unwrap().pointer("/location/asset")
+        .expect("asset half")
+        .to_string();
+    assert_eq!(
+        round_tripped, usdt_key,
+        "jsonb orders keys by length, serde_json by bytes — the join depends on \
+         the round trip re-canonicalizing, so this is asserted, not assumed"
+    );
+    assert_eq!(
+        listed
+            .iter()
+            .find(|a| a.location_key.as_deref() == Some(round_tripped.as_str()))
+            .map(|a| a.symbol.clone())
+            .unwrap(),
+        Some("USDT".into()),
+        "and the join therefore names the unit: 20895000000 is 20,895 USDT"
+    );
+
+    db.drop_db().await;
+}

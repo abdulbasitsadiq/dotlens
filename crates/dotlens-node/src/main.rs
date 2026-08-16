@@ -55,6 +55,7 @@ struct Backends {
     balances: Arc<dyn api::BalanceIndex>,
     gov: Arc<dyn api::GovIndex>,
     treasury: Arc<dyn api::TreasuryIndex>,
+    assets: Arc<dyn api::AssetIndex>,
     runtime_versions: Arc<dyn RuntimeVersionSink>,
     /// Kept for label sync/verify (they need direct SQL, not a trait).
     #[cfg(feature = "pg")]
@@ -71,6 +72,7 @@ fn memory_backends() -> Backends {
         balances: Arc::new(api::MemoryBalanceIndex::new()),
         gov: Arc::new(api::MemoryGovIndex::new()),
         treasury: Arc::new(api::MemoryTreasuryIndex::new()),
+        assets: Arc::new(api::MemoryAssetIndex::new()),
         runtime_versions: Arc::new(NoopRuntimeVersionSink),
         #[cfg(feature = "pg")]
         pool: None,
@@ -104,6 +106,9 @@ enum Command {
     TreasuryRange { chain: String, from: u64, to: u64 },
     AnchorVoting { chain: String, account: String, track: u32, height: Option<u64> },
     SyncTracks,
+    SyncAssets { chain: String, height: Option<u64> },
+    SyncTreasuryAccounts,
+    TreasuryHoldings { chain: String, height: Option<u64> },
     FetchPreimage { chain: String, hash: String, len: u64, height: Option<u64> },
     DecodePreimages { chain: String, height: Option<u64> },
 }
@@ -179,6 +184,25 @@ fn parse_args() -> Result<Command> {
             Ok(Command::AnchorVoting { chain, account, track, height })
         }
         Some("sync-tracks") => Ok(Command::SyncTracks),
+        Some("sync-treasury-accounts") => Ok(Command::SyncTreasuryAccounts),
+        Some("sync-assets") => {
+            let usage = "usage: dotlens-node sync-assets <chain> [height]";
+            let chain = args.get(1).context(usage)?.clone();
+            let height = match args.get(2) {
+                Some(h) => Some(h.parse::<u64>().context(usage)?),
+                None => None,
+            };
+            Ok(Command::SyncAssets { chain, height })
+        }
+        Some("treasury-holdings") => {
+            let usage = "usage: dotlens-node treasury-holdings <chain> [height]";
+            let chain = args.get(1).context(usage)?.clone();
+            let height = match args.get(2) {
+                Some(h) => Some(h.parse::<u64>().context(usage)?),
+                None => None,
+            };
+            Ok(Command::TreasuryHoldings { chain, height })
+        }
         Some("fetch-preimage") => {
             let usage = "usage: dotlens-node fetch-preimage <chain> <hash> <len> [height]";
             let chain = args.get(1).context(usage)?.clone();
@@ -272,6 +296,7 @@ async fn main() -> Result<()> {
             balances: Arc::new(api::pg::PgBalanceIndex::new(pool.clone())),
             gov: Arc::new(api::pg::PgGovIndex::new(pool.clone())),
             treasury: Arc::new(api::pg::PgTreasuryIndex::new(pool.clone())),
+            assets: Arc::new(api::pg::PgAssetIndex::new(pool.clone())),
             runtime_versions: Arc::new(PgRuntimeVersionSink::new(pool.clone())),
             pool: Some(pool),
             persistent: true,
@@ -372,6 +397,26 @@ async fn main() -> Result<()> {
         }
         anyhow::bail!("sync-tracks requires the `pg` feature and DATABASE_URL");
     }
+    if matches!(command, Command::SyncTreasuryAccounts) {
+        #[cfg(feature = "pg")]
+        if let Some(pool) = &backends.pool {
+            let report = dotlens_node::assets_pg::sync_treasury_accounts(
+                pool,
+                registry.as_ref(),
+                raw.as_ref(),
+            )
+            .await?;
+            println!("treasury account sync: {report:?}");
+            return Ok(());
+        }
+        anyhow::bail!("sync-treasury-accounts requires the `pg` feature and DATABASE_URL");
+    }
+    if let Command::SyncAssets { chain, height } = &command {
+        return run_sync_assets(&registry, &backends, raw.as_ref(), chain, *height).await;
+    }
+    if let Command::TreasuryHoldings { chain, height } = &command {
+        return run_treasury_holdings(&registry, &backends, raw.as_ref(), chain, *height).await;
+    }
     if let Command::FetchPreimage { chain, hash, len, height } = &command {
         return run_fetch_preimage(&registry, &backends, raw.as_ref(), chain, hash, *len, *height)
             .await;
@@ -398,6 +443,21 @@ async fn main() -> Result<()> {
             tracks = tracks.tracks,
             skipped = ?tracks.chains_skipped,
             "governance tracks synced"
+        );
+        // the treasury ACCOUNT list, derived from the same metadata the labels
+        // came from — so a chain that gains a treasury pallet contributes its
+        // pot on the next start, with nothing typed by hand
+        let ta = dotlens_node::assets_pg::sync_treasury_accounts(
+            pool,
+            registry.as_ref(),
+            raw.as_ref(),
+        )
+        .await?;
+        tracing::info!(
+            pots = ta.pots,
+            seeded = ta.seeded,
+            missing_metadata = ?ta.chains_missing_metadata,
+            "treasury accounts synced"
         );
     }
 
@@ -437,6 +497,7 @@ async fn main() -> Result<()> {
         balances: backends.balances.clone(),
         gov: backends.gov.clone(),
         treasury: backends.treasury.clone(),
+        assets: backends.assets.clone(),
         // family-encoded address parsing is adapter-owned (Invariant 4); with
         // more families this becomes registry-driven dispatch
         parse_account: Arc::new(|s| {
@@ -1701,6 +1762,123 @@ async fn run_anchor_balance(
     _: u64,
 ) -> Result<()> {
     anyhow::bail!("anchor-balance requires the `pg` and `live` features")
+}
+
+/// Build the asset registry for a chain from its own storage. Idempotent:
+/// re-running at a later height refreshes supply/metadata and adds anything
+/// new, and never erases an asset that has stopped existing (a destroyed asset
+/// is history, not a mistake).
+#[cfg(all(feature = "pg", feature = "live"))]
+async fn run_sync_assets(
+    registry: &Registry,
+    backends: &Backends,
+    raw: &dyn RawStore,
+    chain: &str,
+    height: Option<u64>,
+) -> Result<()> {
+    use adapter_substrate::source::SubstrateSource;
+    let pool = backends
+        .pool
+        .as_ref()
+        .context("sync-assets requires DATABASE_URL")?;
+    let cfg = registry
+        .chain(chain)
+        .with_context(|| format!("unknown chain: {chain}"))?;
+    let source = SubstrateSource::new(&cfg.id, cfg.endpoints.rpc.clone())
+        .map_err(|e| anyhow::anyhow!(e))?;
+    let report =
+        dotlens_node::assets_pg::sync_assets(pool, raw, &source, &cfg.id, height).await?;
+    println!(
+        "asset sync {chain} @#{} (spec {}): {} assets {:?}{}{}",
+        report.height,
+        report.spec_version,
+        report.total(),
+        report.per_instance,
+        if report.unmapped_instances.is_empty() {
+            String::new()
+        } else {
+            format!(
+                " — EVENTS NOT MAPPED for instances {:?}",
+                report.unmapped_instances
+            )
+        },
+        if report.undecodable_ids == 0 {
+            String::new()
+        } else {
+            format!(" — {} undecodable id(s)", report.undecodable_ids)
+        }
+    );
+    Ok(())
+}
+
+#[cfg(not(all(feature = "pg", feature = "live")))]
+async fn run_sync_assets(
+    _: &Registry,
+    _: &Backends,
+    _: &dyn RawStore,
+    _: &str,
+    _: Option<u64>,
+) -> Result<()> {
+    anyhow::bail!("sync-assets requires the `pg` and `live` features")
+}
+
+/// Anchor every registered treasury account against every registered asset at
+/// ONE block — the "where the funds are" snapshot the holdings endpoint reads.
+#[cfg(all(feature = "pg", feature = "live"))]
+async fn run_treasury_holdings(
+    registry: &Registry,
+    backends: &Backends,
+    raw: &dyn RawStore,
+    chain: &str,
+    height: Option<u64>,
+) -> Result<()> {
+    use adapter_substrate::source::SubstrateSource;
+    let pool = backends
+        .pool
+        .as_ref()
+        .context("treasury-holdings requires DATABASE_URL")?;
+    let cfg = registry
+        .chain(chain)
+        .with_context(|| format!("unknown chain: {chain}"))?;
+    let source = SubstrateSource::new(&cfg.id, cfg.endpoints.rpc.clone())
+        .map_err(|e| anyhow::anyhow!(e))?;
+    let report =
+        dotlens_node::assets_pg::snapshot_holdings(pool, raw, &source, &cfg.id, height).await?;
+    println!(
+        "holdings {chain} @#{} (spec {}): {} accounts × assets = {} probes, \
+         {} non-zero{}",
+        report.height,
+        report.spec_version,
+        report.accounts,
+        report.assets_probed,
+        report.non_zero,
+        if report.skipped_no_key == 0 {
+            String::new()
+        } else {
+            format!(
+                " — {} asset(s) SKIPPED with no storage key (run sync-assets first)",
+                report.skipped_no_key
+            )
+        }
+    );
+    if report.accounts == 0 {
+        println!(
+            "note: no treasury accounts registered on {chain} — run \
+             `sync-treasury-accounts` (it needs archived metadata, so backfill first)"
+        );
+    }
+    Ok(())
+}
+
+#[cfg(not(all(feature = "pg", feature = "live")))]
+async fn run_treasury_holdings(
+    _: &Registry,
+    _: &Backends,
+    _: &dyn RawStore,
+    _: &str,
+    _: Option<u64>,
+) -> Result<()> {
+    anyhow::bail!("treasury-holdings requires the `pg` and `live` features")
 }
 
 async fn axum_serve(listener: tokio::net::TcpListener, app: axum::Router) -> Result<()> {

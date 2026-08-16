@@ -70,6 +70,19 @@ pub struct SpendFact {
     pub slashed: Option<u128>,
     /// VersionedLocatableAsset for modern spends; None = native token.
     pub asset_kind: Option<serde_json::Value>,
+    /// The same asset kind, NORMALIZED and split into the two things it
+    /// actually names: `{"chain": <Location>, "asset": <Location>}` — which
+    /// chain holds the asset, and which asset on it. Version-stripped, so the
+    /// relay's V3 `Concrete` spelling and Asset Hub's V4/V5 spelling of one
+    /// asset produce identical strings. This is the join handle to
+    /// `core.assets.location_key`, i.e. the difference between reporting
+    /// "20895000000" and reporting "20,895 USDT".
+    pub asset_location: Option<serde_json::Value>,
+    /// The resolved dotlens asset key, but ONLY where it can be resolved with
+    /// no metadata (an empty interior = the holding chain's native currency).
+    /// Everything else is resolved at read time; None here is "not resolvable
+    /// without the chain's pallet indices", never "not an asset".
+    pub asset_key: Option<String>,
     /// 32-byte beneficiary when derivable (legacy accounts, or a location whose
     /// junctions name an AccountId32).
     pub beneficiary: Option<Vec<u8>>,
@@ -276,6 +289,8 @@ mod tests {
             figure_kind: Some("flow".into()),
             slashed: None,
             asset_kind: None,
+            asset_location: None,
+            asset_key: None,
             beneficiary: None,
             beneficiary_location: None,
             payment_id: None,

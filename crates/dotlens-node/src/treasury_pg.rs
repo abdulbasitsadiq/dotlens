@@ -64,9 +64,9 @@ impl TreasurySink for PgSpendSink {
                      (chain_id, block_height, event_index, instance, spend_kind, spend_id, \
                       kind, amount, figure_kind, slashed, asset_kind, beneficiary, \
                       beneficiary_location, payment_id, valid_from, expire_at, attribution, \
-                      data, runtime_version, mapper_version) \
+                      data, runtime_version, mapper_version, asset_location, asset_key) \
                  values ($1,$2,$3,$4,$5,$6,$7,$8::numeric,$9,$10::numeric,$11,$12,$13,$14,$15, \
-                         $16,$17,$18,$19,$20) \
+                         $16,$17,$18,$19,$20,$21,$22) \
                  on conflict (chain_id, block_height, event_index) do nothing",
             )
             .bind(chain_id)
@@ -89,6 +89,8 @@ impl TreasurySink for PgSpendSink {
             .bind(&f.data)
             .bind(runtime_version as i64)
             .bind(mapper_version as i32)
+            .bind(&f.asset_location)
+            .bind(&f.asset_key)
             .execute(&mut *tx)
             .await
             .map_err(|e| e.to_string())?;
@@ -136,9 +138,9 @@ impl TreasurySink for PgSpendSink {
                       asset_kind, beneficiary, beneficiary_location, payment_id, \
                       payment_height, payment_event_index, valid_from, expire_at, \
                       first_seen_height, status_height, status_event_index, \
-                      runtime_version, mapper_version) \
+                      runtime_version, mapper_version, asset_location, asset_key) \
                  values ($1,$2,$3,$4,$5,$6::numeric,$7::numeric,$8,$9,$10,$11,$12,$13,$14,$15, \
-                         $16,$17,$18,$19,$20) \
+                         $16,$17,$18,$19,$20,$21,$22) \
                  on conflict (chain_id, instance, spend_kind, spend_id) do update set \
                      status = case when (excluded.status_height, excluded.status_event_index) \
                                         > (treasury.spends.status_height, \
@@ -195,6 +197,9 @@ impl TreasurySink for PgSpendSink {
                      expire_at = coalesce(treasury.spends.expire_at, excluded.expire_at), \
                      first_seen_height = least(excluded.first_seen_height, \
                                                treasury.spends.first_seen_height), \
+                     asset_location = coalesce(treasury.spends.asset_location, \
+                                               excluded.asset_location), \
+                     asset_key = coalesce(treasury.spends.asset_key, excluded.asset_key), \
                      updated_at = now()",
             )
             .bind(chain_id)
@@ -218,6 +223,8 @@ impl TreasurySink for PgSpendSink {
             .bind(*event_index as i32)
             .bind(runtime_version as i64)
             .bind(mapper_version as i32)
+            .bind(&f.asset_location)
+            .bind(&f.asset_key)
             .execute(&mut *tx)
             .await
             .map_err(|e| e.to_string())?;

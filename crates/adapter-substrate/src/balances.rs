@@ -10,13 +10,21 @@
 //!      Slashed/Suspended   → -amount(who)
 //!      DustLost            → -amount(account)
 //!      ReserveRepatriated  → -amount(from), +amount(to)
+//!      BurnedHeld          → -amount(who)          [held funds sit in reserved]
+//!      TransferOnHold      → -amount(source), +amount(dest)
+//!      TransferAndHold     → -transferred(source), +transferred(dest)
 //!      BalanceSet          → zero-magnitude MARKER (absolute value, no delta
 //!                            derivable — running totals invalidate until the
 //!                            next anchor)
 //!    Deliberately NO delta (total unchanged, or double-count):
 //!      Endowed (funds arrive via the paired Transfer/Deposit/Minted),
 //!      Reserved/Unreserved/Held/Released/Frozen/Thawed/Locked/Unlocked (intra-account),
-//!      Issued/Rescinded/TotalIssuanceForced (issuance, no account), Upgraded.
+//!      Issued/Rescinded/MintedCredit/BurnedDebt/TotalIssuanceForced (issuance,
+//!      no account), Upgraded, Unexpected (defensive, moves nothing).
+//!    COVERAGE is 100% of the 30 event variants pallet-balances declares in the
+//!    Polkadot/Asset Hub runtime at spec 2003002 (enumerated from the runtime's
+//!    own metadata, not from a hand list) — so the loud-halt arm below is
+//!    unreachable until a runtime upgrade adds a variant, which is the point.
 //!    UNKNOWN balances.* events are ERRORS — a runtime upgrade adding a
 //!    total-moving event must halt the mapper loudly, never drop money.
 //!    Fees are covered by Withdraw + Deposit events; XCM teleports by
@@ -36,7 +44,17 @@ use ingest::balances::{BalanceDelta, DeltaMapper};
 use parity_scale_codec::Decode;
 use scale_value::{Composite, Value, ValueDef};
 
-pub const MAPPER_VERSION: u32 = 1;
+/// Lineage for every row in `balances.balance_changes`. Bump on ANY rule
+/// change; rows rebuild from canonical events.
+///
+/// 1 → 2 (Phase 2, slice 6): this mapper now also carries the ASSETS pallets.
+/// The rules for `balances.*` did not change by a single byte, but the mapper's
+/// COVERAGE did, and a version that only moved when the native rules moved
+/// would say the pre-slice-6 rows are equivalent to today's. They are not:
+/// they are missing every USDT and USDC movement in their range. A rebuild is
+/// `balances-range` over the range again, and the version column is what tells
+/// you which ranges still need it.
+pub const MAPPER_VERSION: u32 = 2;
 
 pub struct SubstrateDeltaMapper;
 
@@ -91,6 +109,46 @@ pub fn deltas_for_event(event: &CanonicalEvent) -> Result<Vec<BalanceDelta>, Str
                 ]
             }
         }
+        // The HOLDS vocabulary (pallet-balances gained it with the fungible
+        // holds API). `Held`/`Released` are intra-account and stay ∅ below, but
+        // these three MOVE TOTAL and must not be mistaken for their neighbours:
+        // a hold sits in `reserved`, so burning it or moving it to another
+        // account changes free+reserved. Note the field ORDER — `reason` comes
+        // FIRST, so the positional fallbacks are 1/2 and 1/2/3, not 0/1.
+        "balances.BurnedHeld" => {
+            // "Held balance was burned from an account" — reserved shrinks,
+            // total shrinks with it. The only one-sided event of the three.
+            let who = field_account(data, "who", 1).ok_or_else(|| ctx("no who"))?;
+            let amount = field_amount(data, "amount", 2).ok_or_else(|| ctx("no amount"))?;
+            vec![d(who, amount, true, "burned_held", None)]
+        }
+        // "A transfer of `amount` on hold from `source` to `dest`" and "the
+        // `transferred` balance is placed on hold at the `dest` account" — both
+        // are double-entry between two accounts, exactly like
+        // ReserveRepatriated, and differ only in which field carries the amount.
+        "balances.TransferOnHold" | "balances.TransferAndHold" => {
+            let on_hold = event.name == "balances.TransferOnHold";
+            let from = field_account(data, "source", 1).ok_or_else(|| ctx("no source"))?;
+            let to = field_account(data, "dest", 2).ok_or_else(|| ctx("no dest"))?;
+            let amount = if on_hold {
+                field_amount(data, "amount", 3).ok_or_else(|| ctx("no amount"))?
+            } else {
+                field_amount(data, "transferred", 3).ok_or_else(|| ctx("no transferred"))?
+            };
+            let (out, into) = if on_hold {
+                ("transfer_on_hold_out", "transfer_on_hold_in")
+            } else {
+                ("transfer_and_hold_out", "transfer_and_hold_in")
+            };
+            if from == to {
+                vec![] // net zero, and both rows would collide on the PK
+            } else {
+                vec![
+                    d(from, amount, true, out, Some(to)),
+                    d(to, amount, false, into, Some(from)),
+                ]
+            }
+        }
         "balances.Deposit" | "balances.Minted" | "balances.Withdraw" | "balances.Burned"
         | "balances.Slashed" | "balances.DustLost" | "balances.Suspended"
         | "balances.Restored" => {
@@ -123,17 +181,37 @@ pub fn deltas_for_event(event: &CanonicalEvent) -> Result<Vec<BalanceDelta>, Str
         // arrive via the paired Transfer/Deposit/Minted), issuance-only events
         // Held/Released: the fungible holds API — free↔reserved within one
         // account (the hold sits in `reserved`), so total is unchanged
+        //
+        // MintedCredit/BurnedDebt are the IMBALANCE half of the same money the
+        // account-side events already carry, and they name NO account:
+        // "some credit was balanced and added to the TotalIssuance" and "some
+        // debt has been dropped from the Total Issuance". They are `Issued`
+        // and `Rescinded` in the fungible vocabulary, and counting them would
+        // double the account leg that sits beside them — verified on live data
+        // at AH #19542603, where `DustLost{account, 10000000}` is immediately
+        // followed by `BurnedDebt{10000000}` for the SAME dust.
+        //
+        // Unexpected(UnexpectedKind) is a DEFENSIVE event (emitted from
+        // update_locks/update_freezes when an invariant fails). It moves no
+        // money, so it maps to ∅ here — but its presence in a block is a
+        // runtime-level anomaly worth surfacing when a slice exists to do so.
         "balances.Endowed" | "balances.Reserved" | "balances.Unreserved"
         | "balances.Held" | "balances.Released"
         | "balances.Locked" | "balances.Unlocked" | "balances.Frozen"
         | "balances.Thawed" | "balances.Issued" | "balances.Rescinded"
+        | "balances.MintedCredit" | "balances.BurnedDebt" | "balances.Unexpected"
         | "balances.Upgraded" | "balances.TotalIssuanceForced" => vec![],
         // an UNKNOWN balances event is a mapper gap, never silently ∅ — a
         // runtime upgrade adding a total-moving event must halt us loudly
         name if name.starts_with("balances.") => {
             return Err(format!("unknown balances event {name} — mapper update required"))
         }
-        _ => vec![], // other pallets: not this mapper's money
+        // The ASSETS pallets are the same fact about a different asset, so
+        // they go through the same worker, the same tables and the same
+        // loud-halt discipline — just a different vocabulary. Delegated
+        // rather than inlined because the rules there are long and are
+        // pinned by their own tests (crate::assets).
+        _ => return crate::assets::deltas_for_assets_event(event),
     })
 }
 
@@ -143,7 +221,7 @@ pub fn deltas_for_event(event: &CanonicalEvent) -> Result<Vec<BalanceDelta>, Str
 // (decoder v2) or SS58 strings (decoder v1 fixtures); u128 amounts as numbers
 // when small, decimal strings when big.
 
-fn field<'a>(data: &'a serde_json::Value, name: &str, index: usize) -> Option<&'a serde_json::Value> {
+pub(crate) fn field<'a>(data: &'a serde_json::Value, name: &str, index: usize) -> Option<&'a serde_json::Value> {
     match data {
         serde_json::Value::Object(map) => map.get(name),
         serde_json::Value::Array(items) => items.get(index),
@@ -155,7 +233,7 @@ fn field<'a>(data: &'a serde_json::Value, name: &str, index: usize) -> Option<&'
 /// AccountId32 renders as [[b0..b31]] (newtype), sometimes deeper
 /// (MultiAddress). Decoder-version-1 rows (the fixture pipeline) render
 /// accounts as SS58 strings instead; accept those too (checksum-verified).
-fn json_account_bytes(v: &serde_json::Value) -> Option<[u8; 32]> {
+pub(crate) fn json_account_bytes(v: &serde_json::Value) -> Option<[u8; 32]> {
     if let serde_json::Value::String(s) = v {
         return crate::accounts::parse_account(s).ok();
     }
@@ -181,7 +259,7 @@ fn json_account_bytes(v: &serde_json::Value) -> Option<[u8; 32]> {
     }
 }
 
-fn json_u128(v: &serde_json::Value) -> Option<u128> {
+pub(crate) fn json_u128(v: &serde_json::Value) -> Option<u128> {
     match v {
         serde_json::Value::Number(n) => n.as_u64().map(u128::from),
         serde_json::Value::String(s) => s.parse().ok(),
@@ -189,11 +267,11 @@ fn json_u128(v: &serde_json::Value) -> Option<u128> {
     }
 }
 
-fn field_account(data: &serde_json::Value, name: &str, index: usize) -> Option<[u8; 32]> {
+pub(crate) fn field_account(data: &serde_json::Value, name: &str, index: usize) -> Option<[u8; 32]> {
     field(data, name, index).and_then(json_account_bytes)
 }
 
-fn field_amount(data: &serde_json::Value, name: &str, index: usize) -> Option<u128> {
+pub(crate) fn field_amount(data: &serde_json::Value, name: &str, index: usize) -> Option<u128> {
     field(data, name, index).and_then(json_u128)
 }
 
@@ -407,6 +485,85 @@ mod tests {
             );
             assert!(deltas_for_event(&e).unwrap().is_empty(), "{name} must map to ∅");
         }
+    }
+
+    /// The three holds-vocabulary events that DO move total. Their field order
+    /// puts `reason` FIRST, so this also pins the positional fallbacks — a
+    /// mapper that reused the 0/1 indices of the `Deposit` group would read the
+    /// hold reason as an account and halt (or worse, not).
+    #[test]
+    fn holds_that_move_total_are_double_entry_or_one_sided() {
+        let a = pallet_account(b"py/trsry");
+        let b = para_sovereign(1000);
+        let reason = serde_json::json!({"Revive": [{"AddressMapping": []}]});
+
+        let burned = ev(
+            "balances.BurnedHeld",
+            serde_json::json!({"reason": reason, "who": acct_json(&a), "amount": 700}),
+        );
+        let ds = deltas_for_event(&burned).unwrap();
+        assert_eq!(ds.len(), 1);
+        assert_eq!(ds[0].account, a.to_vec());
+        assert_eq!(ds[0].magnitude, 700);
+        assert!(ds[0].negative, "burning held funds shrinks reserved, so total");
+        assert_eq!(ds[0].reason, "burned_held");
+
+        // positional form, reason at 0 — source/dest/amount at 1/2/3
+        let on_hold = ev(
+            "balances.TransferOnHold",
+            serde_json::json!([reason, acct_json(&a), acct_json(&b), 900]),
+        );
+        let ds = deltas_for_event(&on_hold).unwrap();
+        assert_eq!(ds.len(), 2);
+        assert_eq!((ds[0].account.clone(), ds[0].negative, ds[0].magnitude), (a.to_vec(), true, 900));
+        assert_eq!((ds[1].account.clone(), ds[1].negative, ds[1].magnitude), (b.to_vec(), false, 900));
+        assert_eq!(ds[0].counterparty.as_deref(), Some(&b[..]));
+
+        // TransferAndHold carries the amount under a DIFFERENT name
+        let and_hold = ev(
+            "balances.TransferAndHold",
+            serde_json::json!({"reason": reason, "source": acct_json(&a), "dest": acct_json(&b), "transferred": 1234}),
+        );
+        let ds = deltas_for_event(&and_hold).unwrap();
+        assert_eq!(ds.len(), 2);
+        assert_eq!(ds[0].magnitude, 1234);
+        assert_eq!(ds[1].magnitude, 1234);
+        assert_eq!(ds[0].reason, "transfer_and_hold_out");
+
+        // and a self-move is ∅, not a PK collision
+        let self_move = ev(
+            "balances.TransferOnHold",
+            serde_json::json!({"reason": reason, "source": acct_json(&a), "dest": acct_json(&a), "amount": 5}),
+        );
+        assert!(deltas_for_event(&self_move).unwrap().is_empty());
+    }
+
+    /// The imbalance events name no account and must not double-count the
+    /// account leg beside them. Pinned to the REAL block that surfaced the gap:
+    /// asset-hub #19542603 ev5 `DustLost{account, 10000000}` is immediately
+    /// followed by ev6 `BurnedDebt{10000000}` — the same 10000000, once.
+    #[test]
+    fn imbalance_events_name_no_account_and_never_double_count() {
+        let who = para_sovereign(1000);
+        let dust = ev(
+            "balances.DustLost",
+            serde_json::json!({"account": acct_json(&who), "amount": 10_000_000u64}),
+        );
+        let debt = ev("balances.BurnedDebt", serde_json::json!({"amount": 10_000_000u64}));
+        let total: u128 = [dust, debt]
+            .iter()
+            .flat_map(|e| deltas_for_event(e).unwrap())
+            .map(|d| d.magnitude)
+            .sum();
+        assert_eq!(total, 10_000_000, "the dust must be counted once, not twice");
+
+        for name in ["balances.MintedCredit", "balances.BurnedDebt"] {
+            let e = ev(name, serde_json::json!({"amount": 5}));
+            assert!(deltas_for_event(&e).unwrap().is_empty(), "{name} must map to ∅");
+        }
+        // the defensive variant is a newtype over UnexpectedKind, not a balance
+        let e = ev("balances.Unexpected", serde_json::json!([{"Underflow": []}]));
+        assert!(deltas_for_event(&e).unwrap().is_empty());
     }
 
     #[test]

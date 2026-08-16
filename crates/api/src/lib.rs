@@ -149,6 +149,10 @@ pub struct BalanceAnchorRow {
     pub spec_version: Option<u64>,
     pub source: String,
     pub note: Option<String>,
+    /// liquid | frozen | blocked, for ASSET anchors only. A pallet-assets
+    /// account has one balance and a status where a native account has a
+    /// free/reserved split; null here means "native", not "unknown".
+    pub status: Option<String>,
 }
 
 /// Read side of the balances schema, per chain.
@@ -168,6 +172,18 @@ pub trait BalanceIndex: Send + Sync {
         account_id: &[u8],
         asset: &str,
     ) -> Result<Vec<BalanceAnchorRow>, IndexError>;
+    /// Every (account, asset) position on one chain, for a set of accounts.
+    ///
+    /// Pairs are taken from anchors UNION changes, not from anchors alone: an
+    /// account that has been moving an asset we never anchored still has to
+    /// appear, with a null amount. Reporting only what we anchored would make
+    /// coverage look complete by omitting what is missing.
+    async fn holdings(
+        &self,
+        chain_id: &str,
+        accounts: &[Vec<u8>],
+        at_height: Option<u64>,
+    ) -> Result<Vec<HoldingRow>, IndexError>;
 }
 
 #[derive(Default)]
@@ -241,6 +257,202 @@ impl BalanceIndex for MemoryBalanceIndex {
         rows.sort_by_key(|r| r.height);
         Ok(rows)
     }
+
+    async fn holdings(
+        &self,
+        chain_id: &str,
+        accounts: &[Vec<u8>],
+        at_height: Option<u64>,
+    ) -> Result<Vec<HoldingRow>, IndexError> {
+        let anchors = self.anchors.read().map_err(|e| IndexError(e.to_string()))?;
+        let changes = self.changes.read().map_err(|e| IndexError(e.to_string()))?;
+        let within = |h: u64| at_height.is_none_or(|at| h <= at);
+
+        // pairs from BOTH sides, same rule the SQL uses — INCLUDING the
+        // height filter. Filtering only the rows and not the pair would make
+        // this backend emit a null-amount row where the SQL emits nothing at
+        // all, and the two are required to agree (reviewer catch).
+        let mut pairs: std::collections::BTreeSet<(Vec<u8>, String)> =
+            std::collections::BTreeSet::new();
+        for (chain, account, asset) in anchors.keys().chain(changes.keys()) {
+            if chain != chain_id || !accounts.contains(account) {
+                continue;
+            }
+            let key = (chain.clone(), account.clone(), asset.clone());
+            let has_row = anchors
+                .get(&key)
+                .is_some_and(|rows| rows.iter().any(|a| within(a.height)))
+                || changes
+                    .get(&key)
+                    .is_some_and(|rows| rows.iter().any(|c| within(c.height)));
+            if has_row {
+                pairs.insert((account.clone(), asset.clone()));
+            }
+        }
+
+        let mut out = Vec::with_capacity(pairs.len());
+        for (account, asset) in pairs {
+            let key = (chain_id.to_string(), account.clone(), asset.clone());
+            let anchor = anchors
+                .get(&key)
+                .and_then(|rows| {
+                    rows.iter()
+                        .filter(|a| within(a.height))
+                        .max_by_key(|a| a.height)
+                })
+                .cloned();
+            let floor = anchor.as_ref().map(|a| a.height);
+            let relevant: Vec<&BalanceChangeRow> = changes
+                .get(&key)
+                .map(|rows| {
+                    rows.iter()
+                        .filter(|c| within(c.height) && floor.is_none_or(|f| c.height > f))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let delta_sum: i128 = relevant
+                .iter()
+                .filter_map(|c| c.delta.parse::<i128>().ok())
+                .sum();
+            out.push(HoldingRow {
+                account_id: account,
+                asset,
+                anchor_total: anchor.as_ref().map(|a| a.total.clone()),
+                anchor_height: anchor.as_ref().map(|a| a.height),
+                anchor_spec_version: anchor.as_ref().and_then(|a| a.spec_version),
+                anchor_source: anchor.as_ref().map(|a| a.source.clone()),
+                anchor_note: anchor.as_ref().and_then(|a| a.note.clone()),
+                anchor_status: anchor.as_ref().and_then(|a| a.status.clone()),
+                delta_sum: delta_sum.to_string(),
+                delta_count: relevant.len() as u64,
+                last_delta_height: relevant.iter().map(|c| c.height).max(),
+            });
+        }
+        Ok(out)
+    }
+}
+
+// --------------------------------------------------------------------- assets
+
+/// One asset REPRESENTATION on one chain (`core.assets`). `decimals` is the
+/// difference between "20895000000" and "20,895 USDT" — and it is Option
+/// because an asset whose metadata was never set genuinely has none, which the
+/// API must say rather than default to 0 (a default of 0 would render 20,895
+/// USDT as 20,895,000,000).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct AssetRow {
+    pub asset_key: String,
+    pub representation_kind: String,
+    pub symbol: Option<String>,
+    pub name: Option<String>,
+    pub decimals: Option<u32>,
+    pub supply: Option<String>,
+    /// Live | Frozen | Destroying. A non-Live asset's running totals cannot be
+    /// trusted forward of a destruction, so the holdings endpoint says so.
+    pub status: Option<String>,
+    /// Canonical (version-stripped) XCM name — the join handle to a treasury
+    /// spend's `asset_location`.
+    #[serde(skip_serializing)]
+    pub location_key: Option<String>,
+    pub xcm_location: Option<serde_json::Value>,
+}
+
+/// Read side of `core.assets`.
+#[async_trait]
+pub trait AssetIndex: Send + Sync {
+    async fn assets(&self, chain_id: &str) -> Result<Vec<AssetRow>, IndexError>;
+}
+
+#[derive(Default)]
+pub struct MemoryAssetIndex {
+    assets: RwLock<HashMap<String, Vec<AssetRow>>>,
+}
+
+impl MemoryAssetIndex {
+    pub fn new() -> Self {
+        Self::default()
+    }
+    pub fn insert(&self, chain: &str, row: AssetRow) {
+        self.assets
+            .write()
+            .expect("lock")
+            .entry(chain.into())
+            .or_default()
+            .push(row);
+    }
+}
+
+#[async_trait]
+impl AssetIndex for MemoryAssetIndex {
+    async fn assets(&self, chain_id: &str) -> Result<Vec<AssetRow>, IndexError> {
+        let map = self.assets.read().map_err(|e| IndexError(e.to_string()))?;
+        let mut rows = map.get(chain_id).cloned().unwrap_or_default();
+        rows.sort_by(|a, b| a.asset_key.cmp(&b.asset_key));
+        Ok(rows)
+    }
+}
+
+/// One (account, asset) position: the latest anchor at or before the query
+/// height, plus the deltas recorded after it.
+///
+/// EVERY FIELD HERE IS PROVENANCE except `amount`. That is deliberate — the
+/// Phase 2 exit criterion asks for "an itemized where the funds are WITH
+/// per-account provenance", and a number whose origin the reader has to take
+/// on trust is exactly what the incumbents already offer.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct HoldingRow {
+    pub account_id: Vec<u8>,
+    pub asset: String,
+    /// The anchored absolute balance, or null when this pair has only ever
+    /// been seen MOVING and never read from state — an honest "we know money
+    /// went through here and we do not know the balance".
+    pub anchor_total: Option<String>,
+    pub anchor_height: Option<u64>,
+    pub anchor_spec_version: Option<u64>,
+    pub anchor_source: Option<String>,
+    pub anchor_note: Option<String>,
+    pub anchor_status: Option<String>,
+    /// Sum of `balance_changes` strictly after the anchor (and within the
+    /// query height, if one was given).
+    pub delta_sum: String,
+    pub delta_count: u64,
+    pub last_delta_height: Option<u64>,
+}
+
+impl HoldingRow {
+    /// anchor + deltas, or None when there is no anchor to add them to.
+    /// Returned as a decimal STRING: asset units and plancks both exceed u64.
+    pub fn amount(&self) -> Option<String> {
+        let anchor: i128 = self.anchor_total.as_ref()?.parse().ok()?;
+        let delta: i128 = self.delta_sum.parse().unwrap_or(0);
+        Some((anchor + delta).to_string())
+    }
+    /// "anchor" when the anchor is the whole story, "anchor+deltas" when
+    /// events have moved it since, "deltas_only" when there is no anchor.
+    pub fn basis(&self) -> &'static str {
+        match (self.anchor_total.is_some(), self.delta_count > 0) {
+            (true, false) => "anchor",
+            (true, true) => "anchor+deltas",
+            (false, _) => "deltas_only",
+        }
+    }
+}
+
+/// One treasury account (`treasury.treasury_accounts`) — the WHY behind every
+/// holdings row.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct TreasuryAccountRow {
+    pub chain_id: String,
+    #[serde(skip_serializing)]
+    pub account_id: Vec<u8>,
+    pub role: String,
+    pub instance: Option<String>,
+    pub label: String,
+    /// 'modl:py/trsry' — how this account was DERIVED, or null when it came
+    /// from a reviewed registry seed because it cannot be derived.
+    pub derivation: Option<String>,
+    pub source: String,
+    pub ss58: Option<String>,
 }
 
 // ---------------------------------------------------------------------- gov
@@ -388,6 +600,12 @@ pub struct SpendRow {
     pub expire_at: Option<u64>,
     pub first_seen_height: u64,
     pub status_height: u64,
+    /// `{"location": {"chain": …, "asset": …}, "key": …}` — the normalized,
+    /// version-stripped name of what this spend is DENOMINATED in, and the
+    /// handle that resolves it to a symbol and decimals in `core.assets`.
+    /// Null on the legacy proposal flow (always native) and on rows written
+    /// before TREASURY_MAPPER_VERSION 2.
+    pub asset_ref: Option<serde_json::Value>,
 }
 
 /// One treasury event (a `treasury.spend_events` row) — a step in a spend's
@@ -438,17 +656,31 @@ pub trait TreasuryIndex: Send + Sync {
         instance: &str,
         limit: u64,
     ) -> Result<Vec<SpendEventRow>, IndexError>;
+    /// The treasury account list for a NETWORK, across every chain that holds
+    /// treasury money. Keyed by network rather than chain because "where is
+    /// the treasury" is a question about Polkadot, not about Asset Hub — the
+    /// rows say which chains the answer came from.
+    async fn accounts(&self, network: &str) -> Result<Vec<TreasuryAccountRow>, IndexError>;
 }
 
 #[derive(Default)]
 pub struct MemoryTreasuryIndex {
     spends: RwLock<HashMap<(String, String, String, u64), SpendRow>>,
     events: RwLock<HashMap<(String, String), Vec<(Option<(String, u64)>, SpendEventRow)>>>,
+    accounts: RwLock<HashMap<String, Vec<TreasuryAccountRow>>>,
 }
 
 impl MemoryTreasuryIndex {
     pub fn new() -> Self {
         Self::default()
+    }
+    pub fn insert_account(&self, network: &str, row: TreasuryAccountRow) {
+        self.accounts
+            .write()
+            .expect("lock")
+            .entry(network.into())
+            .or_default()
+            .push(row);
     }
     pub fn insert_spend(&self, chain: &str, row: SpendRow) {
         self.spends.write().expect("lock").insert(
@@ -559,6 +791,12 @@ impl TreasuryIndex for MemoryTreasuryIndex {
             .unwrap_or_default();
         rows.sort_by(|a, b| (b.height, b.event_index).cmp(&(a.height, a.event_index)));
         rows.truncate(limit as usize);
+        Ok(rows)
+    }
+    async fn accounts(&self, network: &str) -> Result<Vec<TreasuryAccountRow>, IndexError> {
+        let map = self.accounts.read().map_err(|e| IndexError(e.to_string()))?;
+        let mut rows = map.get(network).cloned().unwrap_or_default();
+        rows.sort_by(|a, b| (&a.chain_id, &a.role, &a.label).cmp(&(&b.chain_id, &b.role, &b.label)));
         Ok(rows)
     }
 }
@@ -1122,23 +1360,31 @@ pub mod pg {
             account_id: &[u8],
             asset: &str,
         ) -> Result<Vec<super::BalanceAnchorRow>, IndexError> {
-            let rows: Vec<(i64, String, String, String, Option<i64>, String, Option<String>)> =
-                sqlx::query_as(
-                    "select block_height, free::text, reserved::text, total::text, \
-                            spec_version, source, note \
+            let rows: Vec<(
+                i64,
+                String,
+                String,
+                String,
+                Option<i64>,
+                String,
+                Option<String>,
+                Option<String>,
+            )> = sqlx::query_as(
+                "select block_height, free::text, reserved::text, total::text, \
+                            spec_version, source, note, status \
                      from balances.balance_anchors \
                      where chain_id = $1 and account_id = $2 and asset = $3 \
                      order by block_height",
-                )
-                .bind(chain_id)
-                .bind(account_id)
-                .bind(asset)
-                .fetch_all(&self.pool)
-                .await
-                .map_err(|e| IndexError(e.to_string()))?;
+            )
+            .bind(chain_id)
+            .bind(account_id)
+            .bind(asset)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| IndexError(e.to_string()))?;
             Ok(rows
                 .into_iter()
-                .map(|(height, free, reserved, total, spec, source, note)| {
+                .map(|(height, free, reserved, total, spec, source, note, status)| {
                     super::BalanceAnchorRow {
                         height: height as u64,
                         free,
@@ -1147,8 +1393,183 @@ pub mod pg {
                         spec_version: spec.map(|s| s as u64),
                         source,
                         note,
+                        status,
                     }
                 })
+                .collect())
+        }
+
+        /// ONE query for the whole snapshot, in three steps:
+        ///
+        ///   `pairs`  every (account, asset) this chain has ever ANCHORED or
+        ///           MOVED for these accounts — the union is what stops the
+        ///           answer from looking complete by leaving out what we never
+        ///           anchored
+        ///   `anch`   the latest anchor at or before the query height per pair
+        ///           (`distinct on`, `nulls last` so a pair with no anchor
+        ///           survives the join instead of vanishing)
+        ///   lateral  the deltas strictly after that anchor — `coalesce(…, -1)`
+        ///           so a pair with no anchor sums its whole history
+        async fn holdings(
+            &self,
+            chain_id: &str,
+            accounts: &[Vec<u8>],
+            at_height: Option<u64>,
+        ) -> Result<Vec<super::HoldingRow>, IndexError> {
+            if accounts.is_empty() {
+                return Ok(vec![]);
+            }
+            type Row = (
+                Vec<u8>,
+                String,
+                Option<String>,
+                Option<i64>,
+                Option<i64>,
+                Option<String>,
+                Option<String>,
+                Option<String>,
+                Option<String>,
+                i64,
+                Option<i64>,
+            );
+            let rows: Vec<Row> = sqlx::query_as(
+                "with acct as (select unnest($2::bytea[]) as account_id), \
+                      pairs as ( \
+                        select a.account_id, a.asset from balances.balance_anchors a \
+                          join acct using (account_id) \
+                         where a.chain_id = $1 \
+                           and ($3::bigint is null or a.block_height <= $3) \
+                        union \
+                        select c.account_id, c.asset from balances.balance_changes c \
+                          join acct using (account_id) \
+                         where c.chain_id = $1 \
+                           and ($3::bigint is null or c.block_height <= $3) \
+                      ), \
+                      anch as ( \
+                        select distinct on (p.account_id, p.asset) \
+                               p.account_id, p.asset, a.total::text as total, \
+                               a.block_height, a.spec_version, a.source, a.note, a.status \
+                          from pairs p \
+                          left join balances.balance_anchors a \
+                            on a.chain_id = $1 and a.account_id = p.account_id \
+                           and a.asset = p.asset \
+                           and ($3::bigint is null or a.block_height <= $3) \
+                         order by p.account_id, p.asset, a.block_height desc nulls last \
+                      ) \
+                 select anch.account_id, anch.asset, anch.total, anch.block_height, \
+                        anch.spec_version, anch.source, anch.note, anch.status, \
+                        coalesce(d.delta_sum, '0') as delta_sum, \
+                        coalesce(d.delta_count, 0) as delta_count, d.last_height \
+                   from anch \
+                   left join lateral ( \
+                        select sum(c.delta)::text as delta_sum, count(*) as delta_count, \
+                               max(c.block_height) as last_height \
+                          from balances.balance_changes c \
+                         where c.chain_id = $1 and c.account_id = anch.account_id \
+                           and c.asset = anch.asset \
+                           and c.block_height > coalesce(anch.block_height, -1) \
+                           and ($3::bigint is null or c.block_height <= $3) \
+                   ) d on true \
+                  order by anch.account_id, anch.asset collate \"C\"",
+            )
+            .bind(chain_id)
+            .bind(accounts)
+            .bind(at_height.map(|h| h as i64))
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| IndexError(e.to_string()))?;
+            Ok(rows
+                .into_iter()
+                .map(
+                    |(
+                        account_id,
+                        asset,
+                        total,
+                        height,
+                        spec,
+                        source,
+                        note,
+                        status,
+                        delta_sum,
+                        delta_count,
+                        last_height,
+                    )| super::HoldingRow {
+                        account_id,
+                        asset,
+                        anchor_total: total,
+                        anchor_height: height.map(|h| h as u64),
+                        anchor_spec_version: spec.map(|s| s as u64),
+                        anchor_source: source,
+                        anchor_note: note,
+                        anchor_status: status,
+                        delta_sum: delta_sum.unwrap_or_else(|| "0".into()),
+                        delta_count: delta_count as u64,
+                        last_delta_height: last_height.map(|h| h as u64),
+                    },
+                )
+                .collect())
+        }
+    }
+
+    /// Postgres-backed asset registry reads over `core.assets`.
+    pub struct PgAssetIndex {
+        pool: PgPool,
+    }
+
+    impl PgAssetIndex {
+        pub fn new(pool: PgPool) -> Self {
+            Self { pool }
+        }
+    }
+
+    #[async_trait]
+    impl super::AssetIndex for PgAssetIndex {
+        async fn assets(&self, chain_id: &str) -> Result<Vec<super::AssetRow>, IndexError> {
+            type Row = (
+                String,
+                String,
+                Option<String>,
+                Option<String>,
+                Option<i32>,
+                Option<String>,
+                Option<String>,
+                Option<String>,
+                Option<serde_json::Value>,
+            );
+            let rows: Vec<Row> = sqlx::query_as(
+                "select asset_key, representation_kind, symbol, name, decimals, \
+                        supply::text, status, location_key, xcm_location \
+                 from core.assets where chain_id = $1 order by asset_key collate \"C\"",
+            )
+            .bind(chain_id)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| IndexError(e.to_string()))?;
+            Ok(rows
+                .into_iter()
+                .map(
+                    |(
+                        asset_key,
+                        representation_kind,
+                        symbol,
+                        name,
+                        decimals,
+                        supply,
+                        status,
+                        location_key,
+                        xcm_location,
+                    )| super::AssetRow {
+                        asset_key,
+                        representation_kind,
+                        symbol,
+                        name,
+                        decimals: decimals.map(|d| d as u32),
+                        supply,
+                        status,
+                        location_key,
+                        xcm_location,
+                    },
+                )
                 .collect())
         }
     }
@@ -1542,9 +1963,21 @@ pub mod pg {
         }
     }
 
+    /// `asset_ref` folds the slice-6 columns into ONE jsonb value rather than
+    /// two more tuple elements — sqlx's `FromRow` for tuples stops at 16, and a
+    /// spend row that cannot grow another column is a schema with a cliff in it.
+    ///
+    /// Note the round trip this relies on: `asset_location` is stored as jsonb,
+    /// whose key order is Postgres's (by length, then bytes), NOT ours. It
+    /// comes back through serde_json, whose Map is a BTreeMap, so re-rendering
+    /// it yields the SAME canonical string `core.assets.location_key` holds.
+    /// The pg integration test asserts that join rather than assuming it.
     const SPEND_COLS: &str = "instance, spend_kind, spend_id, status, amount::text, \
                               slashed::text, asset_kind, beneficiary, beneficiary_location, \
-                              payment_id, valid_from, expire_at, first_seen_height, status_height";
+                              payment_id, valid_from, expire_at, first_seen_height, status_height, \
+                              case when asset_location is null and asset_key is null then null \
+                                   else jsonb_build_object('location', asset_location, \
+                                                           'key', asset_key) end";
 
     type SpendTuple = (
         String,
@@ -1561,6 +1994,7 @@ pub mod pg {
         Option<i64>,
         i64,
         i64,
+        Option<serde_json::Value>,
     );
 
     fn spend_from_row(
@@ -1579,6 +2013,7 @@ pub mod pg {
             expire_at,
             first_seen_height,
             status_height,
+            asset_ref,
         ): SpendTuple,
     ) -> super::SpendRow {
         super::SpendRow {
@@ -1596,6 +2031,7 @@ pub mod pg {
             expire_at: expire_at.map(|v| v as u64),
             first_seen_height: first_seen_height as u64,
             status_height: status_height as u64,
+            asset_ref,
         }
     }
 
@@ -1718,6 +2154,48 @@ pub mod pg {
             .map_err(|e| IndexError(e.to_string()))?;
             Ok(rows.into_iter().map(spend_event_from_row).collect())
         }
+
+        async fn accounts(
+            &self,
+            network: &str,
+        ) -> Result<Vec<super::TreasuryAccountRow>, IndexError> {
+            type Row = (
+                String,
+                Vec<u8>,
+                String,
+                Option<String>,
+                String,
+                Option<String>,
+                String,
+                Option<String>,
+            );
+            let rows: Vec<Row> = sqlx::query_as(
+                "select chain_id, account_id, role, instance, label, derivation, source, ss58 \
+                 from treasury.treasury_accounts where network = $1 and active \
+                 order by chain_id, role, label",
+            )
+            .bind(network)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| IndexError(e.to_string()))?;
+            Ok(rows
+                .into_iter()
+                .map(
+                    |(chain_id, account_id, role, instance, label, derivation, source, ss58)| {
+                        super::TreasuryAccountRow {
+                            chain_id,
+                            account_id,
+                            role,
+                            instance,
+                            label,
+                            derivation,
+                            source,
+                            ss58,
+                        }
+                    },
+                )
+                .collect())
+        }
     }
 
     /// `gov.vote_positions` columns, in the order `vote_from_row` expects.
@@ -1789,6 +2267,7 @@ pub struct AppState {
     pub balances: Arc<dyn BalanceIndex>,
     pub gov: Arc<dyn GovIndex>,
     pub treasury: Arc<dyn TreasuryIndex>,
+    pub assets: Arc<dyn AssetIndex>,
     pub parse_account: AccountParser,
 }
 
@@ -1807,6 +2286,8 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/treasury/{network}/spends", get(list_treasury_spends))
         .route("/v1/treasury/{network}/spends/{id}", get(get_treasury_spend))
         .route("/v1/treasury/{network}/pot", get(get_treasury_pot))
+        .route("/v1/treasury/{network}/holdings", get(get_treasury_holdings))
+        .route("/v1/assets/{chain}", get(list_assets))
         .route("/v1/domains/{network}/{domain}", get(resolve_domain))
         .with_state(state)
 }
@@ -2495,6 +2976,7 @@ fn merge_spend(prev: SpendRow, later: SpendRow) -> SpendRow {
         payment_id: later.payment_id.or(prev.payment_id),
         valid_from: later.valid_from.or(prev.valid_from),
         expire_at: later.expire_at.or(prev.expire_at),
+        asset_ref: later.asset_ref.or(prev.asset_ref),
         first_seen_height: prev.first_seen_height.min(later.first_seen_height),
     }
 }
@@ -2621,15 +3103,125 @@ async fn get_treasury_spend(
             format!("treasury spend {network}/{instance}/{kind}/{id} not indexed"),
         );
     };
+    // WHAT WAS THIS DENOMINATED IN? The spend names its asset as an XCM
+    // location; `core.assets` knows that location's symbol and decimals. The
+    // resolution is a join, not a lookup table — and it is done here, at read
+    // time, because which chain's pallet index 50 is the assets pallet is a
+    // property of a runtime, not of a spend.
+    let asset = resolve_spend_asset(&state, &network, &windows, &spend).await;
+
     Json(serde_json::json!({
         "network": network,
         "instance": instance,
         "spend_kind": kind,
         "spend_id": id,
         "spend": spend,
+        // null with a reason, never a silently missing field: an unresolved
+        // asset is the difference between "20,895 USDT" and a number whose
+        // unit the reader has to guess
+        "asset": asset,
         "segments": segments,
     }))
     .into_response()
+}
+
+/// Resolve a spend's `asset_ref` against the asset registry of whichever chain
+/// the spend's own location names. Returns a resolution OBJECT even on
+/// failure, carrying the reason — a treasury page must be able to say "we do
+/// not know what unit this is in" out loud.
+async fn resolve_spend_asset(
+    state: &AppState,
+    network: &str,
+    windows: &[&registry::ResidencyEntry],
+    spend: &SpendRow,
+) -> serde_json::Value {
+    let unresolved = |reason: &str| serde_json::json!({"resolved": false, "reason": reason});
+    let Some(asset_ref) = spend.asset_ref.as_ref() else {
+        return if spend.spend_kind == "proposal" {
+            // the legacy flow had no asset concept at all — native by
+            // construction, not by assumption
+            serde_json::json!({
+                "resolved": true, "asset": "native", "symbol": null, "decimals": null,
+                "note": "legacy proposal flow: always the chain's native token",
+            })
+        } else {
+            unresolved("no asset_location on this row — re-run treasury-range \
+                        (mapper_version 1 predates it)")
+        };
+    };
+    let Some(asset_loc) = asset_ref.pointer("/location/asset") else {
+        return unresolved("asset_location names no asset");
+    };
+    // An EMPTY interior names the holding chain's own currency. The mapper
+    // resolves that to `native` only at parents 0; here we accept any parents,
+    // and say so — on a system parachain the parent's token IS the local one,
+    // and the day that stops being true (a chain with a token of its own,
+    // Phase 3) the registry has to say which token `parents: 1` means.
+    let native_named = asset_loc
+        .get("interior")
+        .and_then(|i| i.as_array())
+        .is_some_and(|j| j.is_empty());
+    // Re-render through serde_json (BTreeMap ⇒ sorted keys) so the string
+    // matches `core.assets.location_key` exactly, whatever order Postgres's
+    // jsonb chose to store it in.
+    let wanted = asset_loc.to_string();
+    // WHICH CHAIN holds it: the spend says `Parachain(N)` or `Here`. `Here`
+    // means the chain that emitted the event, so we look through this
+    // instance's own residency windows rather than assuming one.
+    let para = asset_ref
+        .pointer("/location/chain/interior")
+        .and_then(|i| i.as_array())
+        .and_then(|js| js.first())
+        .and_then(|j| j.get("Parachain"))
+        .and_then(|p| p.as_u64());
+    // …and the NETWORK matters: Kusama's Asset Hub is also para 1000, and
+    // `chains()` iterates a map, so without this filter which one answered
+    // would be nondeterministic the day Kusama is registered (reviewer catch).
+    let mut candidates: Vec<String> = match para {
+        Some(id) => state
+            .registry
+            .chains()
+            .filter(|c| c.para_id == Some(id as u32) && c.network == network)
+            .map(|c| c.id.clone())
+            .collect(),
+        None => windows.iter().map(|w| w.chain.clone()).collect(),
+    };
+    candidates.sort();
+    candidates.dedup();
+    for chain in &candidates {
+        let Ok(assets) = state.assets.assets(chain).await else {
+            continue;
+        };
+        if let Some(a) = assets.iter().find(|a| {
+            a.location_key.as_deref() == Some(wanted.as_str())
+                || (native_named && a.asset_key == "native")
+        }) {
+            return serde_json::json!({
+                "resolved": true,
+                "chain": chain,
+                "asset": a.asset_key,
+                "symbol": a.symbol,
+                "decimals": a.decimals,
+                "assumption": native_named.then_some(
+                    "an empty interior is read as the holding chain's own currency, \
+                     whatever its `parents` — true for a relay and its system \
+                     parachains, and registry data the day it is not"
+                ),
+                "display": spend
+                    .amount
+                    .as_deref()
+                    .zip(a.decimals)
+                    .and_then(|(amount, d)| format_units(amount, d)),
+            });
+        }
+    }
+    serde_json::json!({
+        "resolved": false,
+        "reason": "no asset in core.assets matches this location — run sync-assets \
+                   on the chain that holds it",
+        "looking_for": wanted,
+        "chains_tried": candidates,
+    })
 }
 
 /// Pot flows: money into and out of the treasury account that names no spend
@@ -2667,6 +3259,217 @@ async fn get_treasury_pot(
         "instance": instance,
         "note": "pot flows only — these name no spend; see /spends for what was promised",
         "segments": segments,
+    }))
+    .into_response()
+}
+
+// ------------------------------------------------------- assets + holdings
+
+/// Every asset representation dotlens knows about on one CHAIN (not network:
+/// assets are chain-local by definition — one logical USDC is several
+/// representations, and saying which chain you mean is half the answer).
+async fn list_assets(State(state): State<AppState>, Path(chain): Path<String>) -> Response {
+    match state.assets.assets(&chain).await {
+        Ok(assets) => Json(serde_json::json!({
+            "chain": chain,
+            "count": assets.len(),
+            "note": "one row per REPRESENTATION on this chain; the identity graph \
+                     linking representations of one logical asset across chains is \
+                     not built yet (ARCHITECTURE §8, Phase 5)",
+            "assets": assets,
+        }))
+        .into_response(),
+        Err(e) => error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    }
+}
+
+/// Render an integer amount in an asset's own units, WITHOUT floats: string
+/// surgery only, so 20895000000 at 6 decimals is exactly "20895.000000" and
+/// never 20894.999999999996. Returns None when we do not know the decimals,
+/// because a guess of 0 would misreport by a factor of a million.
+fn format_units(amount: &str, decimals: u32) -> Option<String> {
+    let (sign, digits) = match amount.strip_prefix('-') {
+        Some(rest) => ("-", rest),
+        None => ("", amount),
+    };
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let d = decimals as usize;
+    if d == 0 {
+        return Some(format!("{sign}{digits}"));
+    }
+    let padded = if digits.len() <= d {
+        format!("{}{}", "0".repeat(d - digits.len() + 1), digits)
+    } else {
+        digits.to_string()
+    };
+    let split = padded.len() - d;
+    Some(format!("{sign}{}.{}", &padded[..split], &padded[split..]))
+}
+
+/// THE PHASE 2 EXIT SURFACE: an itemized "where the funds are", per account,
+/// per asset, with the provenance of every number attached to it.
+///
+/// The shape of the answer is deliberate:
+///   * accounts come from `treasury.treasury_accounts`, each carrying HOW it
+///     was derived — a reader can re-derive `modl:py/trsry` themselves
+///   * amounts come from a state ANCHOR plus the deltas since, and every row
+///     says which block it was anchored at, against which spec_version, by
+///     which command, and whether events have moved it since (`basis`)
+///   * a pair we have only ever seen MOVING, never anchored, is reported with
+///     a null amount instead of being left out
+///   * `coverage` states what is NOT here. A treasury page that lists what it
+///     found and stays quiet about the rest is how every existing tool
+///     understates the treasury; ours says the words.
+async fn get_treasury_holdings(
+    State(state): State<AppState>,
+    Path(network): Path<String>,
+) -> Response {
+    let accounts = match state.treasury.accounts(&network).await {
+        Ok(a) => a,
+        Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    };
+
+    // group by chain, preserving the (chain, role, label) order the index gave
+    let mut chains: Vec<String> = Vec::new();
+    for a in &accounts {
+        if !chains.contains(&a.chain_id) {
+            chains.push(a.chain_id.clone());
+        }
+    }
+
+    let mut segments = Vec::with_capacity(chains.len());
+    let mut anchored_assets = 0usize;
+    let mut unanchored_pairs = 0usize;
+
+    for chain in &chains {
+        // ONE ROW PER ADDRESS. `treasury_accounts` is keyed (chain, account,
+        // role), so an address that is both a derived pot and a registry seed
+        // has two rows — and rendering both would report its balance twice and
+        // count its positions twice in `coverage` (reviewer catch). Roles are
+        // merged into a list instead.
+        let mut on_chain: Vec<(&TreasuryAccountRow, Vec<String>)> = Vec::new();
+        for a in accounts.iter().filter(|a| &a.chain_id == chain) {
+            match on_chain
+                .iter_mut()
+                .find(|(first, _)| first.account_id == a.account_id)
+            {
+                Some((_, roles)) => roles.push(a.role.clone()),
+                None => on_chain.push((a, vec![a.role.clone()])),
+            }
+        }
+        let ids: Vec<Vec<u8>> = on_chain.iter().map(|(a, _)| a.account_id.clone()).collect();
+
+        let holdings = match state.balances.holdings(chain, &ids, None).await {
+            Ok(h) => h,
+            Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+        };
+        let assets = match state.assets.assets(chain).await {
+            Ok(a) => a,
+            Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+        };
+        let asset_by_key: HashMap<&str, &AssetRow> =
+            assets.iter().map(|a| (a.asset_key.as_str(), a)).collect();
+
+        let mut account_rows = Vec::with_capacity(on_chain.len());
+        for (account, roles) in &on_chain {
+            let mut positions = Vec::new();
+            let mut zero_assets = 0usize;
+            for h in holdings.iter().filter(|h| h.account_id == account.account_id) {
+                let amount = h.amount();
+                // a zero position is not news; an UNKNOWN one is
+                if amount.as_deref() == Some("0") {
+                    zero_assets += 1;
+                    continue;
+                }
+                if amount.is_none() {
+                    unanchored_pairs += 1;
+                } else {
+                    anchored_assets += 1;
+                }
+                let asset = asset_by_key.get(h.asset.as_str());
+                let decimals = asset.and_then(|a| a.decimals);
+                positions.push(serde_json::json!({
+                    "asset": h.asset,
+                    "symbol": asset.and_then(|a| a.symbol.clone()),
+                    "decimals": decimals,
+                    // the exact integer, always — the rendered form only when
+                    // the chain told us how many decimals it has
+                    "amount": amount,
+                    "display": amount
+                        .as_deref()
+                        .zip(decimals)
+                        .and_then(|(a, d)| format_units(a, d)),
+                    "basis": h.basis(),
+                    "asset_status": asset.and_then(|a| a.status.clone()),
+                    "provenance": {
+                        "anchor_height": h.anchor_height,
+                        "anchor_total": h.anchor_total,
+                        "anchor_spec_version": h.anchor_spec_version,
+                        "anchor_source": h.anchor_source,
+                        "anchor_note": h.anchor_note,
+                        "account_status": h.anchor_status,
+                        "delta_sum_since_anchor": h.delta_sum,
+                        "delta_count_since_anchor": h.delta_count,
+                        "last_delta_height": h.last_delta_height,
+                    },
+                }));
+            }
+            account_rows.push(serde_json::json!({
+                "account_id": format!("0x{}", hex_lower(&account.account_id)),
+                "ss58": account.ss58,
+                "label": account.label,
+                "role": account.role,
+                "roles": roles,
+                "instance": account.instance,
+                "derivation": account.derivation,
+                "source": account.source,
+                "positions": positions,
+                "zero_balance_assets": zero_assets,
+            }));
+        }
+        segments.push(serde_json::json!({
+            "chain": chain,
+            "accounts": account_rows,
+            "assets_registered": assets.len(),
+        }));
+    }
+
+    Json(serde_json::json!({
+        "network": network,
+        "segments": segments,
+        "coverage": {
+            "accounts": accounts.len(),
+            "chains": chains,
+            "positions_with_an_anchor": anchored_assets,
+            "positions_without_an_anchor": unanchored_pairs,
+            "valuation": "none — quantities only. No price source is consulted, \
+                          so nothing here can be stale or unsourced; a USD view \
+                          is a later slice with its own provenance",
+            "not_covered": [
+                "bounty and child-bounty accounts — funding leaves the treasury \
+                 through the SpendFunds hook, which emits no treasury event at \
+                 all (see migration 0009); its own slice",
+                "positions on chains dotlens has not registered — notably the \
+                 Hydration DCA accounts, the Omnipool POL and the money-market \
+                 position (ECOSYSTEM §6 puts treasury assets across 7+ chains); \
+                 Hydration is registered in Phase 3",
+                "assets whose storage key has never been read by sync-assets: \
+                 they are listed with a null amount, never as zero",
+                "an asset being destroyed (status 'Destroying') zeroes holder \
+                 balances with no per-account event — re-anchor after one",
+                "NON-FUNGIBLES — this endpoint reads the pallet-assets \
+                 instances only, so collection items held by a treasury \
+                 account (pallet-nfts / pallet-uniques) are absent. The \
+                 Polkadot treasury pot does hold some; they are not fungible \
+                 value and are not counted as zero either, they are simply \
+                 out of scope until an NFT slice exists",
+            ],
+        },
+        "note": "amounts are anchor + deltas since; `basis` says which. Every \
+                 number carries the block it was read at and the runtime it was \
+                 decoded against.",
     }))
     .into_response()
 }
@@ -2766,6 +3569,7 @@ mod tests {
                 spec_version: Some(2_000_006),
                 source: "test".into(),
                 note: None,
+                status: None,
             },
         );
         balances.insert_change(
@@ -3059,6 +3863,17 @@ mod tests {
                 payment_id: None,
                 valid_from: Some(28_000_000),
                 expire_at: Some(28_900_000),
+                // the normalized halves the slice-6 mapper writes: USDT on
+                // Asset Hub, named from the RELAY (chain = Parachain(1000))
+                asset_ref: Some(serde_json::json!({
+                    "location": {
+                        "chain": {"parents": 0, "interior": [{"Parachain": 1000}]},
+                        "asset": {"parents": 0, "interior": [
+                            {"PalletInstance": 50}, {"GeneralIndex": 1984}
+                        ]},
+                    },
+                    "key": null,
+                })),
                 first_seen_height: 28_000_000,
                 status_height: 28_000_000,
             },
@@ -3095,6 +3910,7 @@ mod tests {
                 payment_id: Some("5551".into()),
                 valid_from: None,
                 expire_at: None,
+                asset_ref: None,
                 first_seen_height: 10_400_000,
                 status_height: 10_400_000,
             },
@@ -3140,8 +3956,109 @@ mod tests {
                 payment_id: None,
                 valid_from: None,
                 expire_at: None,
+                asset_ref: None,
                 first_seen_height: 5_100_000,
                 status_height: 5_100_500,
+            },
+        );
+
+        // ---- assets + treasury accounts (slice 6) -----------------------
+        // USDT as Asset Hub really names it: TrustBacked 1984, six decimals,
+        // and the XCM location a treasury spend refers to it BY.
+        let assets = Arc::new(MemoryAssetIndex::new());
+        assets.insert(
+            "polkadot-asset-hub",
+            AssetRow {
+                asset_key: "assets:1984".into(),
+                representation_kind: "trust_backed".into(),
+                symbol: Some("USDT".into()),
+                name: Some("Tether USD".into()),
+                decimals: Some(6),
+                supply: Some("100000000000".into()),
+                status: Some("Live".into()),
+                location_key: Some(
+                    adapter_substrate::assets::canonical_location(
+                        &adapter_substrate::assets::local_asset_location(50, 1984),
+                    )
+                    .expect("canonical"),
+                ),
+                xcm_location: Some(adapter_substrate::assets::local_asset_location(50, 1984)),
+            },
+        );
+
+        // the native token is an asset row too — otherwise a treasury's DOT
+        // holding is an integer with no unit beside a USDT holding that has one
+        assets.insert(
+            "polkadot-asset-hub",
+            AssetRow {
+                asset_key: "native".into(),
+                representation_kind: "native".into(),
+                symbol: Some("DOT".into()),
+                name: Some("DOT".into()),
+                decimals: Some(10),
+                supply: None,
+                status: None,
+                location_key: Some(r#"{"interior":[],"parents":0}"#.into()),
+                xcm_location: Some(serde_json::json!({"parents": 0, "interior": []})),
+            },
+        );
+
+        let holder = adapter_substrate::accounts::pallet_account(b"py/trsry");
+        treasury.insert_account(
+            "polkadot",
+            TreasuryAccountRow {
+                chain_id: "polkadot-asset-hub".into(),
+                account_id: holder.to_vec(),
+                role: "pot".into(),
+                instance: Some("treasury".into()),
+                label: "Treasury pot (py/trsry)".into(),
+                derivation: Some("modl:py/trsry".into()),
+                source: "derived".into(),
+                ss58: Some("13UVJyLnbVp9RBZYFwFGyDvVd1y27Tt8tkntv6Q7JVPhFsTB".into()),
+            },
+        );
+        // an anchored USDT position, plus one transfer out after the anchor…
+        balances.insert_anchor(
+            "polkadot-asset-hub",
+            &holder,
+            "assets:1984",
+            BalanceAnchorRow {
+                height: 19_400_000,
+                free: "20895000000".into(),
+                reserved: "0".into(),
+                total: "20895000000".into(),
+                spec_version: Some(2003002),
+                source: "treasury-holdings".into(),
+                note: None,
+                status: Some("liquid".into()),
+            },
+        );
+        balances.insert_change(
+            "polkadot-asset-hub",
+            &holder,
+            "assets:1984",
+            BalanceChangeRow {
+                height: 19_400_100,
+                timestamp: Some(ts("2026-08-01T00:00:00Z")),
+                event_index: 3,
+                delta: "-895000000".into(),
+                reason: "transfer_out".into(),
+                counterparty: None,
+            },
+        );
+        // …and an asset this account has only ever been seen MOVING, never
+        // anchored: it must appear with a null amount, not vanish
+        balances.insert_change(
+            "polkadot-asset-hub",
+            &holder,
+            "assets:1337",
+            BalanceChangeRow {
+                height: 19_400_050,
+                timestamp: Some(ts("2026-08-01T00:00:00Z")),
+                event_index: 1,
+                delta: "4800000000".into(),
+                reason: "transfer_in".into(),
+                counterparty: None,
             },
         );
 
@@ -3152,6 +4069,7 @@ mod tests {
             balances,
             gov,
             treasury,
+            assets,
             parse_account: Arc::new(|s| {
                 adapter_substrate::accounts::parse_account(s).map(|a| a.to_vec())
             }),
@@ -3542,6 +4460,137 @@ mod tests {
         let (_, filtered) =
             get_json(&app, "/v1/treasury/polkadot/spends?status=rejected").await;
         assert_eq!(filtered["spends"].as_array().unwrap().len(), 0);
+    }
+
+    /// THE PHASE 2 EXIT SURFACE. Three things must be true at once, and the
+    /// third is the one incumbents get wrong: the amount is right, its
+    /// provenance travels with it, and what is MISSING is stated.
+    #[tokio::test]
+    async fn treasury_holdings_itemize_positions_with_provenance_and_state_the_gaps() {
+        let app = router(test_state().await);
+        let (status, json) = get_json(&app, "/v1/treasury/polkadot/holdings").await;
+        assert_eq!(status, StatusCode::OK);
+
+        let seg = &json["segments"][0];
+        assert_eq!(seg["chain"], "polkadot-asset-hub");
+        let account = &seg["accounts"][0];
+        // the account says WHY it is treasury money, re-derivably
+        assert_eq!(account["derivation"], "modl:py/trsry");
+        assert_eq!(account["role"], "pot");
+        assert_eq!(account["instance"], "treasury");
+
+        let positions = account["positions"].as_array().unwrap();
+        let usdt = positions
+            .iter()
+            .find(|p| p["asset"] == "assets:1984")
+            .expect("the anchored USDT position");
+        // anchor 20895000000 minus a later 895000000 transfer out
+        assert_eq!(usdt["amount"], "20000000000");
+        assert_eq!(usdt["symbol"], "USDT");
+        assert_eq!(usdt["decimals"], 6);
+        // six decimals applied WITHOUT floats
+        assert_eq!(usdt["display"], "20000.000000");
+        assert_eq!(usdt["basis"], "anchor+deltas");
+        assert_eq!(usdt["provenance"]["anchor_height"], 19_400_000);
+        assert_eq!(usdt["provenance"]["anchor_spec_version"], 2003002);
+        assert_eq!(usdt["provenance"]["anchor_source"], "treasury-holdings");
+        assert_eq!(usdt["provenance"]["delta_sum_since_anchor"], "-895000000");
+        assert_eq!(usdt["provenance"]["delta_count_since_anchor"], 1);
+        assert_eq!(usdt["provenance"]["account_status"], "liquid");
+
+        // an asset seen MOVING but never anchored is reported with a null
+        // amount — present and honest, not omitted and tidy
+        let unanchored = positions
+            .iter()
+            .find(|p| p["asset"] == "assets:1337")
+            .expect("the unanchored USDC position");
+        assert!(unanchored["amount"].is_null());
+        assert!(unanchored["display"].is_null());
+        assert_eq!(unanchored["basis"], "deltas_only");
+        // …and with no registry entry, no symbol is invented for it
+        assert!(unanchored["symbol"].is_null());
+        assert!(unanchored["decimals"].is_null());
+
+        let coverage = &json["coverage"];
+        // the NATIVE position is here too, rendered in DOT's own decimals —
+        // 500 anchored + 200 moved since, at 10 decimals
+        let native = positions
+            .iter()
+            .find(|p| p["asset"] == "native")
+            .expect("the native position");
+        assert_eq!(native["amount"], "700");
+        assert_eq!((native["symbol"].as_str(), native["decimals"].as_u64()), (Some("DOT"), Some(10)));
+        assert_eq!(native["display"], "0.0000000700");
+
+        assert_eq!(coverage["positions_with_an_anchor"], 2);
+        assert_eq!(coverage["positions_without_an_anchor"], 1);
+        assert!(coverage["valuation"].as_str().unwrap().contains("quantities only"));
+        let gaps = coverage["not_covered"].as_array().unwrap();
+        assert!(gaps.iter().any(|g| g.as_str().unwrap().contains("bounty")));
+        assert!(gaps.iter().any(|g| g.as_str().unwrap().contains("Hydration")));
+    }
+
+    #[tokio::test]
+    async fn assets_endpoint_lists_representations_of_one_chain() {
+        let app = router(test_state().await);
+        let (status, json) = get_json(&app, "/v1/assets/polkadot-asset-hub").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["count"], 2);
+        // sorted by asset_key: "assets:1984" before "native"
+        let a = &json["assets"][0];
+        assert_eq!(a["asset_key"], "assets:1984");
+        assert_eq!(a["representation_kind"], "trust_backed");
+        assert_eq!(a["decimals"], 6);
+        // the location a treasury spend names it by travels with it
+        assert_eq!(a["xcm_location"]["interior"][1]["GeneralIndex"], 1984);
+        // a chain with no registered assets is empty, not an error
+        let (status, json) = get_json(&app, "/v1/assets/polkadot").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["count"], 0);
+    }
+
+    /// The slice-5 drill, done by the API instead of by hand: spend 313 is
+    /// 83760000000 of SOMETHING, and only the asset registry can say that the
+    /// something is USDT at six decimals rather than planck of DOT.
+    #[tokio::test]
+    async fn a_spend_resolves_to_the_asset_it_was_denominated_in() {
+        let app = router(test_state().await);
+        let (status, json) = get_json(&app, "/v1/treasury/polkadot/spends/313").await;
+        assert_eq!(status, StatusCode::OK);
+        let asset = &json["asset"];
+        assert_eq!(asset["resolved"], true);
+        // resolved on ASSET HUB, though the spend was approved on the relay:
+        // the location said Parachain(1000) and the registry knew which chain
+        // that is — no caller named a chain
+        assert_eq!(asset["chain"], "polkadot-asset-hub");
+        assert_eq!(asset["asset"], "assets:1984");
+        assert_eq!(asset["symbol"], "USDT");
+        assert_eq!(asset["decimals"], 6);
+        assert_eq!(asset["display"], "83760.000000");
+
+        // the fellowship spend carries no asset_location (a v1-mapper row), and
+        // the response says exactly that instead of quietly showing nothing
+        let (status, json) =
+            get_json(&app, "/v1/treasury/polkadot/spends/7?instance=fellowship_treasury").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["asset"]["resolved"], false);
+        assert!(json["asset"]["reason"].as_str().unwrap().contains("treasury-range"));
+    }
+
+    #[test]
+    fn units_are_formatted_by_string_surgery_never_by_floats() {
+        assert_eq!(format_units("20895000000", 6).unwrap(), "20895.000000");
+        // fewer digits than decimals must pad, not truncate
+        assert_eq!(format_units("5", 6).unwrap(), "0.000005");
+        assert_eq!(format_units("0", 10).unwrap(), "0.0000000000");
+        assert_eq!(format_units("-1500", 2).unwrap(), "-15.00");
+        assert_eq!(format_units("12", 0).unwrap(), "12");
+        // a value no float could hold exactly, rendered exactly
+        assert_eq!(
+            format_units("243100255393737286", 10).unwrap(),
+            "24310025.5393737286"
+        );
+        assert!(format_units("not-a-number", 6).is_none());
     }
 
     #[tokio::test]

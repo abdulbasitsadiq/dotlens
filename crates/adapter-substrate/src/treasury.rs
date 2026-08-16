@@ -83,7 +83,14 @@
 use canonical::CanonicalEvent;
 use ingest::treasury::{SpendFact, TreasuryMapper};
 
-pub const TREASURY_MAPPER_VERSION: u32 = 1;
+/// 1 → 2 (Phase 2, slice 6): `AssetSpendApproved` now also emits the
+/// NORMALIZED `asset_location` (and `asset_key` where no metadata is needed).
+/// No existing field changed meaning — but rows written at version 1 have
+/// those columns NULL, and a NULL that means "written before this rule
+/// existed" must be distinguishable from one that means "this spend names no
+/// asset". The version column is that distinction; re-run `treasury-range`
+/// over a window to fill it.
+pub const TREASURY_MAPPER_VERSION: u32 = 2;
 
 pub struct SubstrateTreasuryMapper;
 
@@ -96,7 +103,14 @@ impl TreasuryMapper for SubstrateTreasuryMapper {
     }
 }
 
-/// Treasury instance pallets (decoder-lowercased) → instance name.
+/// Pallet name (decoder-lowercased) → treasury INSTANCE. Public because the
+/// treasury-account list must use exactly this vocabulary: if the account
+/// sync and the spend mapper disagreed about what "fellowship_treasury" is,
+/// the holdings page and the spends page would be describing different money.
+pub fn instance_for_pallet(pallet: &str) -> Option<&'static str> {
+    instance_of(pallet)
+}
+
 fn instance_of(pallet: &str) -> Option<&'static str> {
     match pallet {
         "treasury" => Some("treasury"),
@@ -133,6 +147,8 @@ pub fn facts_for_event(event: &CanonicalEvent) -> Result<Vec<SpendFact>, String>
         figure_kind: None,
         slashed: None,
         asset_kind: None,
+        asset_location: None,
+        asset_key: None,
         beneficiary: None,
         beneficiary_location: None,
         payment_id: None,
@@ -185,7 +201,25 @@ pub fn facts_for_event(event: &CanonicalEvent) -> Result<Vec<SpendFact>, String>
         // ------------------------------------------------ modern spend flow
         "AssetSpendApproved" => {
             let beneficiary_raw = field(data, "beneficiary", 3).cloned();
+            let asset_kind_raw = field(data, "asset_kind", 1).cloned();
+            // NORMALIZED, not just kept: a VersionedLocatableAsset names two
+            // things (which chain holds the asset, which asset on it) in a
+            // spelling that differs by XCM version. Stripping the version here
+            // is what lets a spend join `core.assets` later and be reported in
+            // the unit it was actually denominated in. Failing to normalize is
+            // NOT fatal — `asset_kind` above already halts on absence, and a
+            // shape we cannot normalize is honestly recorded as null rather
+            // than half-parsed.
+            let asset_location = asset_kind_raw
+                .as_ref()
+                .and_then(crate::assets::locatable_asset_parts);
+            let asset_key = asset_location
+                .as_ref()
+                .and_then(|p| p.get("asset"))
+                .and_then(crate::assets::metadata_free_asset_key);
             SpendFact {
+                asset_location,
+                asset_key,
                 spend_kind: Some(KIND_ASSET_SPEND.into()),
                 spend_id: Some(field_u64(data, "index", 0).ok_or_else(|| ctx("no index"))?),
                 // MANDATORY in every version that has this event. Absent
@@ -194,11 +228,7 @@ pub fn facts_for_event(event: &CanonicalEvent) -> Result<Vec<SpendFact>, String>
                 // planck of DOT. Halt instead (reviewer catch: the two fields
                 // that cannot be wrong were guarded and the one that would be
                 // catastrophically wrong was not).
-                asset_kind: Some(
-                    field(data, "asset_kind", 1)
-                        .cloned()
-                        .ok_or_else(|| ctx("no asset_kind"))?,
-                ),
+                asset_kind: Some(asset_kind_raw.ok_or_else(|| ctx("no asset_kind"))?),
                 amount: Some(field_u128(data, "amount", 2).ok_or_else(|| ctx("no amount"))?),
                 figure_kind: Some("flow".into()),
                 // the beneficiary is a LOCATION here; extract an account only

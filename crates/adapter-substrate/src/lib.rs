@@ -31,6 +31,12 @@ pub mod accounts;
 /// Pure — no I/O.
 pub mod balances;
 
+/// Assets semantics: pallet-assets event→delta mapping (through the SAME
+/// balances tables, on an asset key), canonical XCM-location naming, and the
+/// metadata-driven storage plumbing that reads asset holdings from state.
+/// Pure — no I/O.
+pub mod assets;
+
 /// Governance semantics: referenda event→timeline mapping + track definitions
 /// decoded from runtime metadata. Pure — no I/O.
 pub mod gov;
