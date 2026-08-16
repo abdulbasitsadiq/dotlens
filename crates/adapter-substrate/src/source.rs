@@ -34,6 +34,10 @@ struct Connection {
     client: RpcClient,
 }
 
+/// The block-hash type callers hold between `block_hash` and the `*_at`
+/// probes — re-exported so dotlens-node never needs a direct subxt dep.
+pub type BlockHash = subxt::utils::H256;
+
 pub struct SubstrateSource {
     chain_id: String,
     endpoints: Vec<String>,

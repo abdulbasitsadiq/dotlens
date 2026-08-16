@@ -1,0 +1,55 @@
+# Polkadot People (1004) — on-chain identity, and the target chain for
+# Project Individuality proof-of-personhood (ECOSYSTEM.md §2, §8).
+#
+# The second half of the plug-and-play test, and a SECOND migration boundary:
+# `pallet-identity` moved off the relay chain here — the enactment landed
+# 2024-07-25 (referendum 983, "People Chain Migration and Release"), the first
+# time functionality LEFT the relay rather than being added to it. The identity
+# domain residency records that; no code knows it happened.
+#
+# No identity module is implemented yet (Phase 5) — enabling `blocks`/`balances`
+# now means the chain is indexed and labeled from today, so the history is
+# already there when the identity module lands.
+id: polkadot-people
+name: Polkadot People
+family: substrate
+relay: polkadot
+para_id: 1004
+network: polkadot
+ss58_prefix: 0
+lifecycle:
+  - status: live
+    from: "2024-07-18T19:36:24Z"   # VERIFIED 2026-08-16: block #1
+                                   # 0x925308ed2178c2dea2d5046fca2c17b2a31d63f8f3b665936c09c8a462497641
+                                   # Timestamp.Now = 1721331384000 ms.
+                                   # This PROVES the reviewer's catch rather
+                                   # than merely asserting it: the chain was
+                                   # producing blocks 6 days 16h before the
+                                   # identity domain moved here
+                                   # (2024-07-25T12:04:30Z). "Chain is live"
+                                   # and "domain moved here" are separate
+                                   # facts; the residency date stays put.
+endpoints:
+  rpc:
+    # verified 2026-08-16 against polkadot-js/apps apps-config
+    # (productionRelayPolkadot.ts, prodParasPolkadotCommon)
+    - wss://polkadot-people-rpc.polkadot.io
+    - wss://people-polkadot-rpc.n.dwellir.com
+    - wss://rpc-people-polkadot.luckyfriday.io
+    - wss://people-polkadot.api.onfinality.io/public-ws
+capabilities:
+  blocks: true
+  extrinsics: true
+  events: true
+  runtime_metadata: true
+  identity: true
+  xcm:
+    min_version: 2
+modules:
+  - blocks
+  - extrinsics
+  - events
+  - accounts
+  - balances
+  # no `identity` module yet — the domain is registered (residency below) so
+  # that resolution is already correct when Phase 5 implements it

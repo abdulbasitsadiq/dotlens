@@ -153,15 +153,34 @@ pub struct ResidencyEntry {
     pub to: Option<DateTime<Utc>>,
 }
 
+/// Which residency domain carries a referenda INSTANCE. Class names are
+/// adapter vocabulary ("referenda", "fellowship_referenda"); this table maps
+/// them to a domain so the API can stitch a class across chains without ever
+/// naming one. Adding an instance is a seed edit (Invariant 2).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReferendaClass {
+    pub class: String,
+    pub domain: String,
+}
+
+/// The public-OpenGov domain: what an unlisted class resolves to.
+pub const DEFAULT_GOV_DOMAIN: &str = "governance";
+
+/// The referenda instance every gov endpoint serves when none is requested.
+pub const DEFAULT_REFERENDA_CLASS: &str = "referenda";
+
 #[derive(Debug, Clone, Deserialize)]
 struct ResidencyFile {
     residency: Vec<ResidencyEntry>,
+    #[serde(default)]
+    referenda_classes: Vec<ReferendaClass>,
 }
 
 #[derive(Debug, Clone, Default)]
 pub struct Registry {
     chains: BTreeMap<String, ChainConfig>,
     residency: Vec<ResidencyEntry>,
+    referenda_classes: Vec<ReferendaClass>,
 }
 
 impl Registry {
@@ -202,6 +221,7 @@ impl Registry {
                         source,
                     })?;
                 reg.residency.extend(file.residency);
+                reg.referenda_classes.extend(file.referenda_classes);
             } else {
                 let chain: ChainConfig =
                     serde_yaml::from_str(&text).map_err(|source| RegistryError::Yaml {
@@ -302,6 +322,24 @@ impl Registry {
     pub fn residency(&self) -> &[ResidencyEntry] {
         &self.residency
     }
+
+    /// Every registered referenda instance. The gov API walks these when no
+    /// class is specified, so a newly registered instance appears without a
+    /// code change.
+    pub fn referenda_classes(&self) -> &[ReferendaClass] {
+        &self.referenda_classes
+    }
+
+    /// Residency domain carrying a referenda class. Unlisted classes fall back
+    /// to the public-OpenGov domain — a new instance that nobody registered
+    /// still resolves somewhere sensible instead of 404-ing.
+    pub fn domain_for_class(&self, class: &str) -> &str {
+        self.referenda_classes
+            .iter()
+            .find(|c| c.class == class)
+            .map(|c| c.domain.as_str())
+            .unwrap_or(DEFAULT_GOV_DOMAIN)
+    }
 }
 
 #[cfg(test)]
@@ -347,7 +385,65 @@ mod tests {
     fn unknown_domain_is_an_error_not_a_guess() {
         let reg = Registry::load_from_dir(&seeds_dir()).unwrap();
         let now = Utc.with_ymd_and_hms(2026, 8, 15, 0, 0, 0).unwrap();
-        assert!(reg.resolve_domain("identity", "polkadot", now).is_err());
+        assert!(reg.resolve_domain("sharding", "polkadot", now).is_err());
+        // a registered domain on an unregistered network is still an error
+        assert!(reg.resolve_domain("governance", "kusama", now).is_err());
+    }
+
+    #[test]
+    fn collectives_and_people_register_with_zero_adapter_code() {
+        let reg = Registry::load_from_dir(&seeds_dir()).unwrap();
+        let collectives = reg.chain("polkadot-collectives").expect("collectives");
+        assert_eq!(collectives.para_id, Some(1001));
+        assert_eq!(collectives.relay.as_deref(), Some("polkadot"));
+        assert!(collectives.has_module("governance"), "fellowship referenda + votes");
+        assert!(collectives.has_capability("fellowship"));
+        let people = reg.chain("polkadot-people").expect("people");
+        assert_eq!(people.para_id, Some(1004));
+        assert!(people.has_capability("identity"));
+        // no identity MODULE yet (Phase 5) — the domain resolves anyway
+        assert!(!people.has_module("identity"));
+        assert!(people.endpoints.rpc.iter().all(|e| e.starts_with("wss://")));
+    }
+
+    #[test]
+    fn fellowship_and_identity_residency_resolve() {
+        let reg = Registry::load_from_dir(&seeds_dir()).unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 8, 15, 0, 0, 0).unwrap();
+        // the Fellowship did not follow governance to Asset Hub
+        assert_eq!(
+            reg.resolve_domain("fellowship", "polkadot", now).unwrap().id,
+            "polkadot-collectives"
+        );
+        assert_eq!(
+            reg.resolve_domain("governance", "polkadot", now).unwrap().id,
+            "polkadot-asset-hub"
+        );
+        // identity: the OTHER migration, relay → People on 2024-07-25
+        let before = Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap();
+        assert_eq!(reg.resolve_domain("identity", "polkadot", before).unwrap().id, "polkadot");
+        assert_eq!(
+            reg.resolve_domain("identity", "polkadot", now).unwrap().id,
+            "polkadot-people"
+        );
+    }
+
+    #[test]
+    fn referenda_classes_map_to_domains_with_a_default() {
+        let reg = Registry::load_from_dir(&seeds_dir()).unwrap();
+        assert_eq!(reg.domain_for_class("referenda"), "governance");
+        assert_eq!(reg.domain_for_class("fellowship_referenda"), "fellowship");
+        // an instance nobody registered still resolves to public OpenGov
+        assert_eq!(reg.domain_for_class("ambassador_referenda"), DEFAULT_GOV_DOMAIN);
+        // every registered class points at a domain that actually has windows
+        for c in reg.referenda_classes() {
+            assert!(
+                reg.residency().iter().any(|r| r.domain == c.domain),
+                "class {} maps to domain {} with no residency window",
+                c.class,
+                c.domain
+            );
+        }
     }
 
     #[test]

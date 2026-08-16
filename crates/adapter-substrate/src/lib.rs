@@ -35,6 +35,15 @@ pub mod balances;
 /// decoded from runtime metadata. Pure — no I/O.
 pub mod gov;
 
+/// RuntimeCall decoding: preimage bytes → call tree (type-id-driven nesting).
+/// Pure — no I/O.
+pub mod calls;
+
+/// Voting semantics: conviction-voting / ranked-collective event→fact mapping,
+/// the ConvictionVoting.VotingFor storage key (twox64), and VotingFor (anchor)
+/// decoding. Pure — no I/O.
+pub mod votes;
+
 use canonical::{CanonicalBlock, CanonicalEvent, CanonicalTransaction, Lineage};
 use serde::{Deserialize, Serialize};
 

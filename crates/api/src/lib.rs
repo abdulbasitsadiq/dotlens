@@ -281,6 +281,87 @@ pub struct GovTrackRow {
     pub spec_version: u64,
 }
 
+/// One decoded proposal (a `gov.preimages` row) — the call tree a referendum
+/// executes, with honest coverage (`decode_status`: decoded|missing|undecodable).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct PreimageRow {
+    pub proposal_hash: String,
+    pub len: u64,
+    pub decode_status: String,
+    pub source: String,
+    pub call_summary: Option<String>,
+    pub decoded_call: Option<serde_json::Value>,
+    pub note: Option<String>,
+    pub spec_version: Option<u64>,
+    pub fetched_at_height: Option<u64>,
+}
+
+/// One account's current vote on one referendum (a `gov.vote_positions` row).
+/// Amounts are decimal strings — plancks exceed u64/f64.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct VoteRow {
+    pub class: String,
+    pub referendum_id: u64,
+    /// 0x-hex account.
+    pub voter: String,
+    /// false once the vote was removed (history is kept, not deleted).
+    pub active: bool,
+    /// standard | split | split_abstain | ranked.
+    pub vote_type: String,
+    pub aye_balance: Option<String>,
+    pub nay_balance: Option<String>,
+    pub abstain_balance: Option<String>,
+    pub conviction: Option<u8>,
+    pub conviction_label: Option<String>,
+    /// Post-conviction weights, as the pallet tallies them. DIRECT votes only:
+    /// delegated power is not in any event — see `voting_anchors`.
+    pub aye_votes: String,
+    pub nay_votes: String,
+    pub support: String,
+    /// Height of the event this position came from.
+    pub height: u64,
+}
+
+/// Total post-conviction weight of a vote, for ordering only (the backends
+/// must agree on it, or a `limit` returns different subsets).
+fn weight(v: &VoteRow) -> u128 {
+    v.aye_votes
+        .parse::<u128>()
+        .unwrap_or(0)
+        .saturating_add(v.nay_votes.parse::<u128>().unwrap_or(0))
+}
+
+/// One delegation edge (a `gov.delegations` row).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct DelegationRow {
+    pub class: String,
+    pub track_id: u32,
+    /// 0x-hex accounts.
+    pub delegator: String,
+    pub target: Option<String>,
+    pub active: bool,
+    pub height: u64,
+}
+
+/// One `ConvictionVoting.VotingFor` state observation (a `gov.voting_anchors`
+/// row) — the only honest source for delegation AMOUNTS and for delegated
+/// power RECEIVED, neither of which any event carries.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct VotingAnchorRow {
+    pub class: String,
+    pub track_id: u32,
+    pub height: u64,
+    /// casting | delegating.
+    pub mode: String,
+    pub delegating_target: Option<String>,
+    pub delegating_balance: Option<String>,
+    pub delegating_conviction_label: Option<String>,
+    pub delegations_votes: Option<String>,
+    pub delegations_capital: Option<String>,
+    pub spec_version: Option<u64>,
+    pub note: Option<String>,
+}
+
 /// Read side of the gov schema, per chain. The API stitches chains together
 /// via governance domain residency (referendum numbering is continuous across
 /// the Nov 2025 migration; one referendum may have rows on both chains).
@@ -306,6 +387,40 @@ pub trait GovIndex: Send + Sync {
         limit: u64,
     ) -> Result<Vec<ReferendumRow>, IndexError>;
     async fn tracks(&self, chain_id: &str) -> Result<Vec<GovTrackRow>, IndexError>;
+    /// Best preimage row for a proposal hash (a decoded row wins over
+    /// missing/undecodable attempts).
+    async fn preimage(
+        &self,
+        chain_id: &str,
+        proposal_hash: &str,
+    ) -> Result<Option<PreimageRow>, IndexError>;
+    /// Current votes on one referendum, heaviest first.
+    async fn referendum_votes(
+        &self,
+        chain_id: &str,
+        class: &str,
+        id: u64,
+        limit: u64,
+    ) -> Result<Vec<VoteRow>, IndexError>;
+    /// One account's current vote positions, most recent first.
+    async fn account_votes(
+        &self,
+        chain_id: &str,
+        voter: &[u8],
+        limit: u64,
+    ) -> Result<Vec<VoteRow>, IndexError>;
+    /// One account's delegation edges (as delegator).
+    async fn account_delegations(
+        &self,
+        chain_id: &str,
+        delegator: &[u8],
+    ) -> Result<Vec<DelegationRow>, IndexError>;
+    /// One account's voting-state anchors, oldest first.
+    async fn voting_anchors(
+        &self,
+        chain_id: &str,
+        account: &[u8],
+    ) -> Result<Vec<VotingAnchorRow>, IndexError>;
 }
 
 #[derive(Default)]
@@ -313,6 +428,10 @@ pub struct MemoryGovIndex {
     referenda: RwLock<HashMap<(String, String, u64), ReferendumRow>>,
     events: RwLock<HashMap<(String, String, u64), Vec<ReferendumEventRow>>>,
     tracks: RwLock<HashMap<String, Vec<GovTrackRow>>>,
+    preimages: RwLock<HashMap<(String, String), Vec<PreimageRow>>>,
+    votes: RwLock<HashMap<String, Vec<VoteRow>>>,
+    delegations: RwLock<HashMap<String, Vec<DelegationRow>>>,
+    anchors: RwLock<HashMap<(String, String), Vec<VotingAnchorRow>>>,
 }
 
 impl MemoryGovIndex {
@@ -335,6 +454,33 @@ impl MemoryGovIndex {
     }
     pub fn insert_track(&self, chain: &str, row: GovTrackRow) {
         self.tracks.write().expect("lock").entry(chain.into()).or_default().push(row);
+    }
+    pub fn insert_preimage(&self, chain: &str, row: PreimageRow) {
+        self.preimages
+            .write()
+            .expect("lock")
+            .entry((chain.into(), row.proposal_hash.clone()))
+            .or_default()
+            .push(row);
+    }
+    pub fn insert_vote(&self, chain: &str, row: VoteRow) {
+        self.votes.write().expect("lock").entry(chain.into()).or_default().push(row);
+    }
+    pub fn insert_delegation(&self, chain: &str, row: DelegationRow) {
+        self.delegations
+            .write()
+            .expect("lock")
+            .entry(chain.into())
+            .or_default()
+            .push(row);
+    }
+    pub fn insert_voting_anchor(&self, chain: &str, account: &[u8], row: VotingAnchorRow) {
+        self.anchors
+            .write()
+            .expect("lock")
+            .entry((chain.into(), format!("0x{}", hex_lower(account))))
+            .or_default()
+            .push(row);
     }
 }
 
@@ -383,6 +529,90 @@ impl GovIndex for MemoryGovIndex {
         let map = self.tracks.read().map_err(|e| IndexError(e.to_string()))?;
         let mut rows = map.get(chain_id).cloned().unwrap_or_default();
         rows.sort_by(|a, b| (&a.pallet, a.track_id).cmp(&(&b.pallet, b.track_id)));
+        Ok(rows)
+    }
+    async fn preimage(
+        &self,
+        chain_id: &str,
+        proposal_hash: &str,
+    ) -> Result<Option<PreimageRow>, IndexError> {
+        let map = self.preimages.read().map_err(|e| IndexError(e.to_string()))?;
+        let rows = map.get(&(chain_id.into(), proposal_hash.into()));
+        Ok(rows.and_then(|rows| {
+            rows.iter()
+                .find(|r| r.decode_status == "decoded")
+                .or_else(|| rows.first())
+                .cloned()
+        }))
+    }
+    async fn referendum_votes(
+        &self,
+        chain_id: &str,
+        class: &str,
+        id: u64,
+        limit: u64,
+    ) -> Result<Vec<VoteRow>, IndexError> {
+        let map = self.votes.read().map_err(|e| IndexError(e.to_string()))?;
+        let mut rows: Vec<VoteRow> = map
+            .get(chain_id)
+            .map(|rows| {
+                rows.iter()
+                    .filter(|r| r.class == class && r.referendum_id == id)
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default();
+        // same order as the Pg backend: heaviest first, then voter — otherwise
+        // a `limit` returns different subsets from the two backends
+        rows.sort_by(|a, b| {
+            weight(b).cmp(&weight(a)).then_with(|| a.voter.cmp(&b.voter))
+        });
+        rows.truncate(limit as usize);
+        Ok(rows)
+    }
+    async fn account_votes(
+        &self,
+        chain_id: &str,
+        voter: &[u8],
+        limit: u64,
+    ) -> Result<Vec<VoteRow>, IndexError> {
+        let hex = format!("0x{}", hex_lower(voter));
+        let map = self.votes.read().map_err(|e| IndexError(e.to_string()))?;
+        let mut rows: Vec<VoteRow> = map
+            .get(chain_id)
+            .map(|rows| rows.iter().filter(|r| r.voter == hex).cloned().collect())
+            .unwrap_or_default();
+        rows.sort_by(|a, b| {
+            b.height
+                .cmp(&a.height)
+                .then_with(|| b.referendum_id.cmp(&a.referendum_id))
+        });
+        rows.truncate(limit as usize);
+        Ok(rows)
+    }
+    async fn account_delegations(
+        &self,
+        chain_id: &str,
+        delegator: &[u8],
+    ) -> Result<Vec<DelegationRow>, IndexError> {
+        let hex = format!("0x{}", hex_lower(delegator));
+        let map = self.delegations.read().map_err(|e| IndexError(e.to_string()))?;
+        let mut rows: Vec<DelegationRow> = map
+            .get(chain_id)
+            .map(|rows| rows.iter().filter(|r| r.delegator == hex).cloned().collect())
+            .unwrap_or_default();
+        rows.sort_by_key(|r| (r.class.clone(), r.track_id));
+        Ok(rows)
+    }
+    async fn voting_anchors(
+        &self,
+        chain_id: &str,
+        account: &[u8],
+    ) -> Result<Vec<VotingAnchorRow>, IndexError> {
+        let hex = format!("0x{}", hex_lower(account));
+        let map = self.anchors.read().map_err(|e| IndexError(e.to_string()))?;
+        let mut rows = map.get(&(chain_id.into(), hex)).cloned().unwrap_or_default();
+        rows.sort_by_key(|r| (r.track_id, r.height));
         Ok(rows)
     }
 }
@@ -916,6 +1146,248 @@ pub mod pg {
                 })
                 .collect())
         }
+
+        async fn preimage(
+            &self,
+            chain_id: &str,
+            proposal_hash: &str,
+        ) -> Result<Option<super::PreimageRow>, IndexError> {
+            // a decoded row wins over missing/undecodable attempts
+            let row: Option<(
+                String,
+                i64,
+                String,
+                String,
+                Option<String>,
+                Option<serde_json::Value>,
+                Option<String>,
+                Option<i64>,
+                Option<i64>,
+            )> = sqlx::query_as(
+                "select proposal_hash, len, decode_status, source, call_summary, \
+                        decoded_call, note, spec_version, fetched_at_height \
+                 from gov.preimages \
+                 where chain_id = $1 and proposal_hash = $2 \
+                 order by (decode_status = 'decoded') desc, len desc limit 1",
+            )
+            .bind(chain_id)
+            .bind(proposal_hash)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| IndexError(e.to_string()))?;
+            Ok(row.map(
+                |(proposal_hash, len, decode_status, source, call_summary, decoded_call, note, spec, height)| {
+                    super::PreimageRow {
+                        proposal_hash,
+                        len: len as u64,
+                        decode_status,
+                        source,
+                        call_summary,
+                        decoded_call,
+                        note,
+                        spec_version: spec.map(|s| s as u64),
+                        fetched_at_height: height.map(|h| h as u64),
+                    }
+                },
+            ))
+        }
+
+        async fn referendum_votes(
+            &self,
+            chain_id: &str,
+            class: &str,
+            id: u64,
+            limit: u64,
+        ) -> Result<Vec<super::VoteRow>, IndexError> {
+            let rows: Vec<VoteTuple> = sqlx::query_as(&format!(
+                "select {VOTE_COLS} from gov.vote_positions \
+                 where chain_id = $1 and class = $2 and referendum_id = $3 \
+                 order by (aye_votes + nay_votes) desc, voter limit $4"
+            ))
+            .bind(chain_id)
+            .bind(class)
+            .bind(id as i64)
+            .bind(limit as i64)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| IndexError(e.to_string()))?;
+            Ok(rows.into_iter().map(vote_from_row).collect())
+        }
+
+        async fn account_votes(
+            &self,
+            chain_id: &str,
+            voter: &[u8],
+            limit: u64,
+        ) -> Result<Vec<super::VoteRow>, IndexError> {
+            let rows: Vec<VoteTuple> = sqlx::query_as(&format!(
+                "select {VOTE_COLS} from gov.vote_positions \
+                 where chain_id = $1 and voter = $2 \
+                 order by status_height desc, referendum_id desc limit $3"
+            ))
+            .bind(chain_id)
+            .bind(voter)
+            .bind(limit as i64)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| IndexError(e.to_string()))?;
+            Ok(rows.into_iter().map(vote_from_row).collect())
+        }
+
+        async fn account_delegations(
+            &self,
+            chain_id: &str,
+            delegator: &[u8],
+        ) -> Result<Vec<super::DelegationRow>, IndexError> {
+            let rows: Vec<(String, i32, Vec<u8>, Option<Vec<u8>>, bool, i64)> = sqlx::query_as(
+                "select class, track_id, delegator, target, active, status_height \
+                 from gov.delegations \
+                 where chain_id = $1 and delegator = $2 \
+                 order by class, track_id",
+            )
+            .bind(chain_id)
+            .bind(delegator)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| IndexError(e.to_string()))?;
+            Ok(rows
+                .into_iter()
+                .map(|(class, track_id, delegator, target, active, height)| {
+                    super::DelegationRow {
+                        class,
+                        track_id: track_id as u32,
+                        delegator: format!("0x{}", super::hex_lower(&delegator)),
+                        target: target.map(|t| format!("0x{}", super::hex_lower(&t))),
+                        active,
+                        height: height as u64,
+                    }
+                })
+                .collect())
+        }
+
+        async fn voting_anchors(
+            &self,
+            chain_id: &str,
+            account: &[u8],
+        ) -> Result<Vec<super::VotingAnchorRow>, IndexError> {
+            let rows: Vec<(
+                String,
+                i32,
+                i64,
+                String,
+                Option<Vec<u8>>,
+                Option<String>,
+                Option<String>,
+                Option<String>,
+                Option<String>,
+                Option<i64>,
+                Option<String>,
+            )> = sqlx::query_as(
+                "select class, track_id, block_height, mode, delegating_target, \
+                        delegating_balance::text, delegating_conviction_label, \
+                        delegations_votes::text, delegations_capital::text, \
+                        spec_version, note \
+                 from gov.voting_anchors \
+                 where chain_id = $1 and account_id = $2 \
+                 order by track_id, block_height",
+            )
+            .bind(chain_id)
+            .bind(account)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| IndexError(e.to_string()))?;
+            Ok(rows
+                .into_iter()
+                .map(
+                    |(
+                        class,
+                        track_id,
+                        height,
+                        mode,
+                        target,
+                        balance,
+                        conviction_label,
+                        votes,
+                        capital,
+                        spec,
+                        note,
+                    )| super::VotingAnchorRow {
+                        class,
+                        track_id: track_id as u32,
+                        height: height as u64,
+                        mode,
+                        delegating_target: target
+                            .map(|t| format!("0x{}", super::hex_lower(&t))),
+                        delegating_balance: balance,
+                        delegating_conviction_label: conviction_label,
+                        delegations_votes: votes,
+                        delegations_capital: capital,
+                        spec_version: spec.map(|s| s as u64),
+                        note,
+                    },
+                )
+                .collect())
+        }
+    }
+
+    /// `gov.vote_positions` columns, in the order `vote_from_row` expects.
+    /// NUMERICs come back as text (plancks exceed u64/f64, no decimal dep).
+    const VOTE_COLS: &str = "class, referendum_id, voter, active, vote_type, \
+                             aye_balance::text, nay_balance::text, abstain_balance::text, \
+                             conviction, conviction_label, aye_votes::text, nay_votes::text, \
+                             support::text, status_height";
+
+    type VoteTuple = (
+        String,
+        i64,
+        Vec<u8>,
+        bool,
+        String,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<i16>,
+        Option<String>,
+        String,
+        String,
+        String,
+        i64,
+    );
+
+    fn vote_from_row(
+        (
+            class,
+            referendum_id,
+            voter,
+            active,
+            vote_type,
+            aye_balance,
+            nay_balance,
+            abstain_balance,
+            conviction,
+            conviction_label,
+            aye_votes,
+            nay_votes,
+            support,
+            height,
+        ): VoteTuple,
+    ) -> super::VoteRow {
+        super::VoteRow {
+            class,
+            referendum_id: referendum_id as u64,
+            voter: format!("0x{}", super::hex_lower(&voter)),
+            active,
+            vote_type,
+            aye_balance,
+            nay_balance,
+            abstain_balance,
+            conviction: conviction.map(|c| c as u8),
+            conviction_label,
+            aye_votes,
+            nay_votes,
+            support,
+            height: height as u64,
+        }
     }
 }
 
@@ -938,6 +1410,8 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/balances/{network}/{account}/history", get(get_balance_history))
         .route("/v1/gov/{network}/referenda", get(list_gov_referenda))
         .route("/v1/gov/{network}/referenda/{id}", get(get_gov_referendum))
+        .route("/v1/gov/{network}/referenda/{id}/votes", get(get_gov_referendum_votes))
+        .route("/v1/gov/{network}/accounts/{account}/votes", get(get_gov_account_votes))
         .route("/v1/gov/{network}/tracks", get(get_gov_tracks))
         .route("/v1/domains/{network}/{domain}", get(resolve_domain))
         .with_state(state)
@@ -1134,15 +1608,61 @@ struct GovQuery {
     at: Option<DateTime<Utc>>,
 }
 
-/// Governance residency windows for a network, in time order. Empty = the
-/// network has no governance residency configured (404, not a guess).
-fn gov_windows<'a>(registry: &'a Registry, network: &str) -> Vec<&'a registry::ResidencyEntry> {
+/// Residency windows carrying one referenda CLASS on a network, in time order.
+/// Empty = nothing configured for it (404, not a guess).
+///
+/// The class → domain step is registry DATA (`referenda_classes` in the seeds),
+/// so the public instance stitches relay → Asset Hub across the Nov-2025
+/// migration while the fellowship instance resolves to Collectives — and no
+/// caller ever names a chain (Invariant 2).
+fn gov_windows<'a>(
+    registry: &'a Registry,
+    network: &str,
+    class: &str,
+) -> Vec<&'a registry::ResidencyEntry> {
+    let domain = registry.domain_for_class(class);
     let mut windows: Vec<&registry::ResidencyEntry> = registry
         .residency()
         .iter()
-        .filter(|r| r.domain == "governance" && r.network == network)
+        .filter(|r| r.domain == domain && r.network == network)
         .collect();
     windows.sort_by_key(|r| r.from);
+    windows
+}
+
+/// Every chain hosting ANY registered referenda instance on this network — the
+/// account surface, where a Fellow's votes live on a different chain from their
+/// token votes.
+///
+/// Starts from the DEFAULT domain, so a residency seed that predates the
+/// `referenda_classes` map (or a network whose file omits it) still serves the
+/// public instance instead of 404-ing (reviewer catch: the class-scoped paths
+/// have that fallback, this one silently did not).
+///
+/// Deduplicated by chain. That means if two classes ever share a chain, the
+/// segment carries the FIRST class's window bounds — fine while the public and
+/// fellowship instances live apart, worth revisiting if they converge.
+fn all_gov_windows<'a>(
+    registry: &'a Registry,
+    network: &str,
+) -> Vec<&'a registry::ResidencyEntry> {
+    // default instance first, then every registered one (deduped)
+    let mut classes: Vec<&str> = vec![registry::DEFAULT_REFERENDA_CLASS];
+    for c in registry.referenda_classes() {
+        if !classes.contains(&c.class.as_str()) {
+            classes.push(&c.class);
+        }
+    }
+    let mut seen: Vec<&str> = Vec::new();
+    let mut windows: Vec<&'a registry::ResidencyEntry> = Vec::new();
+    for class in classes {
+        for w in gov_windows(registry, network, class) {
+            if !seen.contains(&w.chain.as_str()) {
+                seen.push(&w.chain);
+                windows.push(w);
+            }
+        }
+    }
     windows
 }
 
@@ -1179,12 +1699,17 @@ async fn get_gov_referendum(
     Path((network, id)): Path<(String, u64)>,
     Query(q): Query<GovQuery>,
 ) -> Response {
-    let class = q.class.unwrap_or_else(|| "referenda".to_string());
-    let windows = gov_windows(&state.registry, &network);
+    let class = q
+        .class
+        .unwrap_or_else(|| registry::DEFAULT_REFERENDA_CLASS.to_string());
+    let windows = gov_windows(&state.registry, &network, &class);
     if windows.is_empty() {
         return error(
             StatusCode::NOT_FOUND,
-            format!("no 'governance' domain residency for network '{network}'"),
+            format!(
+                "no residency for referenda class '{class}' (domain '{}') on network '{network}'",
+                state.registry.domain_for_class(&class)
+            ),
         );
     }
 
@@ -1218,11 +1743,35 @@ async fn get_gov_referendum(
             format!("referendum {network}/{class}/{id} not indexed"),
         );
     };
+
+    // attach the decoded proposal (the "what does it DO" answer): first
+    // decoded row across the residency chains wins; a relay-era referendum's
+    // preimage may only exist on the relay row, a post-migration one on AH
+    let mut preimage: Option<PreimageRow> = None;
+    if let Some(hash) = &referendum.proposal_hash {
+        for w in gov_windows(&state.registry, &network, &class) {
+            match state.gov.preimage(&w.chain, hash).await {
+                Ok(Some(p)) => {
+                    let decoded = p.decode_status == "decoded";
+                    if preimage.is_none() || decoded {
+                        preimage = Some(p);
+                    }
+                    if decoded {
+                        break;
+                    }
+                }
+                Ok(None) => {}
+                Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+            }
+        }
+    }
+
     Json(serde_json::json!({
         "network": network,
         "class": class,
         "referendum_id": id,
         "referendum": referendum,
+        "preimage": preimage,
         "segments": segments,
     }))
     .into_response()
@@ -1235,13 +1784,18 @@ async fn list_gov_referenda(
     Path(network): Path<String>,
     Query(q): Query<GovQuery>,
 ) -> Response {
-    let class = q.class.unwrap_or_else(|| "referenda".to_string());
+    let class = q
+        .class
+        .unwrap_or_else(|| registry::DEFAULT_REFERENDA_CLASS.to_string());
     let limit = q.limit.unwrap_or(25).min(200);
-    let windows = gov_windows(&state.registry, &network);
+    let windows = gov_windows(&state.registry, &network, &class);
     if windows.is_empty() {
         return error(
             StatusCode::NOT_FOUND,
-            format!("no 'governance' domain residency for network '{network}'"),
+            format!(
+                "no residency for referenda class '{class}' (domain '{}') on network '{network}'",
+                state.registry.domain_for_class(&class)
+            ),
         );
     }
     let mut by_id: std::collections::BTreeMap<u64, ReferendumRow> = std::collections::BTreeMap::new();
@@ -1268,21 +1822,193 @@ async fn list_gov_referenda(
     .into_response()
 }
 
-/// Track definitions for the chain hosting governance at `at` (default now) —
-/// decoded from that runtime's own metadata, served as data.
+/// Sum a column of decimal-string plancks. Overflow-free: the sum of every
+/// vote on a referendum still fits u128 (total issuance is ~10^19 plancks).
+fn sum_decimal(values: impl Iterator<Item = String>) -> String {
+    values
+        .filter_map(|v| v.parse::<u128>().ok())
+        .fold(0u128, |a, b| a.saturating_add(b))
+        .to_string()
+}
+
+/// WHO decided this referendum: current vote positions, residency-stitched,
+/// with a direct-vote tally.
+///
+/// One voter can hold a position row on BOTH sides of the Nov-2025 migration
+/// for the same referendum (voted on the relay, changed or withdrew on Asset
+/// Hub) — the relay row then stays `active` forever, because no further relay
+/// event will ever touch it. So positions are MERGED per voter, latest
+/// residency window winning, exactly like `merge_referendum` does for the
+/// summary (reviewer catch: without this the tally double-counts and resurrects
+/// withdrawn votes).
+///
+/// COVERAGE IS EXPLICIT. `direct_tally` describes the merged rows below it and
+/// nothing else:
+///   - it does NOT match the on-chain tally when delegated power is involved —
+///     no pallet event carries a delegation's weight (see
+///     `/v1/gov/{network}/accounts/{account}/votes` for the state anchors);
+///   - `truncated` says whether `limit` cut the vote list short;
+///   - a segment with `votes_indexed: 0` on a chain that hosted governance
+///     before the poll-index era is an honest gap, not "nobody voted".
+async fn get_gov_referendum_votes(
+    State(state): State<AppState>,
+    Path((network, id)): Path<(String, u64)>,
+    Query(q): Query<GovQuery>,
+) -> Response {
+    let class = q
+        .class
+        .unwrap_or_else(|| registry::DEFAULT_REFERENDA_CLASS.to_string());
+    let limit = q.limit.unwrap_or(100).min(1000);
+    let windows = gov_windows(&state.registry, &network, &class);
+    if windows.is_empty() {
+        return error(
+            StatusCode::NOT_FOUND,
+            format!(
+                "no residency for referenda class '{class}' (domain '{}') on network '{network}'",
+                state.registry.domain_for_class(&class)
+            ),
+        );
+    }
+
+    // windows are time-ordered, so a later insert overwrites an earlier one
+    let mut merged: std::collections::BTreeMap<String, VoteRow> =
+        std::collections::BTreeMap::new();
+    let mut segments = Vec::with_capacity(windows.len());
+    let mut truncated = false;
+    for w in &windows {
+        let votes = match state.gov.referendum_votes(&w.chain, &class, id, limit).await {
+            Ok(v) => v,
+            Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+        };
+        truncated |= votes.len() as u64 >= limit;
+        segments.push(serde_json::json!({
+            "chain": w.chain,
+            "from": w.from,
+            "to": w.to,
+            "votes_indexed": votes.len(),
+        }));
+        for v in votes {
+            merged.insert(v.voter.clone(), v);
+        }
+    }
+    let votes: Vec<&VoteRow> = merged.values().collect();
+    let active: Vec<&VoteRow> = merged.values().filter(|v| v.active).collect();
+    Json(serde_json::json!({
+        "network": network,
+        "class": class,
+        "referendum_id": id,
+        "direct_tally": {
+            "voters": active.len(),
+            "ayes": sum_decimal(active.iter().map(|v| v.aye_votes.clone())),
+            "nays": sum_decimal(active.iter().map(|v| v.nay_votes.clone())),
+            "support": sum_decimal(active.iter().map(|v| v.support.clone())),
+            "truncated": truncated,
+            "note": "direct votes only — delegated power is not carried by any event",
+        },
+        "votes": votes,
+        "segments": segments,
+    }))
+    .into_response()
+}
+
+/// One account's governance participation for a NETWORK: current vote
+/// positions, delegation edges, and the VotingFor state anchors that carry the
+/// numbers events never do (how much was delegated, and how much delegated
+/// power the account received).
+///
+/// `?class=` filters to one referenda instance; omitted, every instance is
+/// returned (an account can be both a token holder and a Fellow).
+async fn get_gov_account_votes(
+    State(state): State<AppState>,
+    Path((network, account)): Path<(String, String)>,
+    Query(q): Query<GovQuery>,
+) -> Response {
+    let limit = q.limit.unwrap_or(100).min(1000);
+    let class = q.class;
+    let account_id = match (state.parse_account)(&account) {
+        Ok(bytes) => bytes,
+        Err(e) => return error(StatusCode::BAD_REQUEST, format!("bad account '{account}': {e}")),
+    };
+    // no class given → walk every registered instance's chains, because an
+    // account's Fellowship votes live on a different chain from its token
+    // votes; with ?class= we walk only that instance's residency
+    let windows = match class.as_deref() {
+        Some(c) => gov_windows(&state.registry, &network, c),
+        None => all_gov_windows(&state.registry, &network),
+    };
+    if windows.is_empty() {
+        return error(
+            StatusCode::NOT_FOUND,
+            match class.as_deref() {
+                Some(c) => format!(
+                    "no residency for referenda class '{c}' (domain '{}') on network '{network}'",
+                    state.registry.domain_for_class(c)
+                ),
+                None => format!("no governance residency for network '{network}'"),
+            },
+        );
+    }
+
+    let keep = |c: &str| class.as_deref().is_none_or(|want| want == c);
+    let mut segments = Vec::with_capacity(windows.len());
+    for w in &windows {
+        let votes: Vec<VoteRow> = match state.gov.account_votes(&w.chain, &account_id, limit).await
+        {
+            Ok(v) => v.into_iter().filter(|r| keep(&r.class)).collect(),
+            Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+        };
+        let delegations: Vec<DelegationRow> =
+            match state.gov.account_delegations(&w.chain, &account_id).await {
+                Ok(d) => d.into_iter().filter(|r| keep(&r.class)).collect(),
+                Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+            };
+        let anchors: Vec<VotingAnchorRow> =
+            match state.gov.voting_anchors(&w.chain, &account_id).await {
+                Ok(a) => a.into_iter().filter(|r| keep(&r.class)).collect(),
+                Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+            };
+        segments.push(serde_json::json!({
+            "chain": w.chain,
+            "from": w.from,
+            "to": w.to,
+            "votes": votes,
+            "delegations": delegations,
+            "voting_anchors": anchors,
+        }));
+    }
+    Json(serde_json::json!({
+        "network": network,
+        "account_id": format!("0x{}", hex_lower(&account_id)),
+        "segments": segments,
+    }))
+    .into_response()
+}
+
+/// Track definitions for the chain hosting a referenda CLASS at `at` (default:
+/// the public instance, now) — decoded from that runtime's own metadata,
+/// served as data. `?class=fellowship_referenda` returns the Fellowship's
+/// tracks from Collectives; the class → domain step is the same registry data
+/// every other gov endpoint uses (reviewer catch: this handler used to hardcode
+/// the governance domain, which made the fellowship tracks it now syncs
+/// unreachable).
 async fn get_gov_tracks(
     State(state): State<AppState>,
     Path(network): Path<String>,
     Query(q): Query<GovQuery>,
 ) -> Response {
     let at = q.at.unwrap_or_else(Utc::now);
-    let chain = match state.registry.resolve_domain("governance", &network, at) {
+    let class = q
+        .class
+        .unwrap_or_else(|| registry::DEFAULT_REFERENDA_CLASS.to_string());
+    let domain = state.registry.domain_for_class(&class);
+    let chain = match state.registry.resolve_domain(domain, &network, at) {
         Ok(c) => c,
         Err(e) => return error(StatusCode::NOT_FOUND, e.to_string()),
     };
     match state.gov.tracks(&chain.id).await {
         Ok(tracks) => Json(serde_json::json!({
             "network": network,
+            "class": class,
             "chain": chain.id,
             "at": at,
             "tracks": tracks,
@@ -1500,6 +2226,24 @@ mod tests {
                 submitted_at_height: None,
             },
         );
+        // ref 1500's proposal, decoded on AH (fetched post-migration)
+        gov.insert_preimage(
+            "polkadot-asset-hub",
+            PreimageRow {
+                proposal_hash: format!("0x{}", "ab".repeat(32)),
+                len: 142,
+                decode_status: "decoded".into(),
+                source: "state".into(),
+                call_summary: Some("utility.batch".into()),
+                decoded_call: Some(serde_json::json!({
+                    "call": "utility.batch",
+                    "args": {"calls": [{"call": "system.remark", "args": {"remark": [104, 105]}}]}
+                })),
+                note: None,
+                spec_version: Some(2_003_002),
+                fetched_at_height: Some(10_400_000),
+            },
+        );
         gov.insert_track(
             "polkadot-asset-hub",
             GovTrackRow {
@@ -1508,6 +2252,122 @@ mod tests {
                 name: "root".into(),
                 params: serde_json::json!({"max_deciding": 1}),
                 spec_version: 2_003_002,
+            },
+        );
+        gov.insert_track(
+            "polkadot-collectives",
+            GovTrackRow {
+                pallet: "fellowshipreferenda".into(),
+                track_id: 1,
+                name: "members".into(),
+                params: serde_json::json!({"max_deciding": 10}),
+                spec_version: 1_005_001,
+            },
+        );
+
+        // votes on ref 1500, also spanning the migration: A votes aye on the
+        // relay and WITHDRAWS on Asset Hub (its relay row stays 'active'
+        // forever — nothing on the relay will ever touch it again), while B
+        // votes nay on Asset Hub. The merge must let the withdrawal win.
+        let voter_a = adapter_substrate::accounts::para_sovereign(1000);
+        let voter_b = adapter_substrate::accounts::para_sovereign(2034);
+        let delegator = adapter_substrate::accounts::para_sovereign(2004);
+        let vote_row = |voter: &[u8; 32], active: bool, aye: &str, nay: &str, height: u64| VoteRow {
+            class: "referenda".into(),
+            referendum_id: 1500,
+            voter: format!("0x{}", hex_lower(voter)),
+            active,
+            vote_type: "standard".into(),
+            aye_balance: (aye != "0").then(|| "1000".to_string()),
+            nay_balance: (nay != "0").then(|| "1000".to_string()),
+            abstain_balance: None,
+            conviction: Some(if aye != "0" { 3 } else { 0 }),
+            conviction_label: Some(if aye != "0" { "locked3x" } else { "none" }.into()),
+            aye_votes: aye.into(),
+            nay_votes: nay.into(),
+            support: if aye != "0" { "1000".into() } else { "0".into() },
+            height,
+        };
+        gov.insert_vote("polkadot", vote_row(&voter_a, true, "3000", "0", 28_400_100));
+        gov.insert_vote("polkadot-asset-hub", vote_row(&voter_b, true, "0", "100", 10_290_000));
+        gov.insert_vote("polkadot-asset-hub", vote_row(&voter_a, false, "3000", "0", 10_295_000));
+        gov.insert_delegation(
+            "polkadot-asset-hub",
+            DelegationRow {
+                class: "referenda".into(),
+                track_id: 34,
+                delegator: format!("0x{}", hex_lower(&delegator)),
+                target: Some(format!("0x{}", hex_lower(&voter_b))),
+                active: true,
+                height: 10_280_000,
+            },
+        );
+        // THE PLUG-AND-PLAY FIXTURE: a fellowship referendum and a
+        // rank-weighted vote on Collectives. Nothing here is chain-specific —
+        // the class resolves to its own residency domain, which happens to
+        // point at a chain the API has never heard of.
+        gov.insert_referendum(
+            "polkadot-collectives",
+            ReferendumRow {
+                class: "fellowship_referenda".into(),
+                referendum_id: 300,
+                track_id: Some(1),
+                status: "approved".into(),
+                status_height: 5_000_000,
+                proposal: None,
+                proposal_hash: None,
+                proposal_len: None,
+                submitted_at_height: Some(4_999_000),
+            },
+        );
+        gov.insert_event(
+            "polkadot-collectives",
+            "fellowship_referenda",
+            300,
+            ReferendumEventRow {
+                height: 5_000_000,
+                timestamp: Some(ts("2026-07-01T00:00:00Z")),
+                event_index: 3,
+                kind: "approved".into(),
+                data: serde_json::json!({"index": 300}),
+            },
+        );
+        gov.insert_vote(
+            "polkadot-collectives",
+            VoteRow {
+                class: "fellowship_referenda".into(),
+                referendum_id: 300,
+                voter: format!("0x{}", hex_lower(&delegator)),
+                active: true,
+                vote_type: "ranked".into(),
+                aye_balance: None,
+                nay_balance: None,
+                abstain_balance: None,
+                conviction: None,
+                conviction_label: None,
+                aye_votes: "9".into(),
+                nay_votes: "0".into(),
+                support: "0".into(),
+                height: 4_999_500,
+            },
+        );
+
+        // the anchor carries what no event does: the delegated amount
+        gov.insert_voting_anchor(
+            "polkadot-asset-hub",
+            &delegator,
+            VotingAnchorRow {
+                class: "referenda".into(),
+                track_id: 34,
+                height: 10_290_000,
+                mode: "delegating".into(),
+                delegating_target: Some(format!("0x{}", hex_lower(&voter_b))),
+                delegating_balance: Some("5000".into()),
+                delegating_conviction_label: Some("locked6x".into()),
+                delegations_votes: Some("0".into()),
+                delegations_capital: Some("0".into()),
+                spec_version: Some(2_003_002),
+                note: None,
             },
         );
 
@@ -1668,10 +2528,19 @@ mod tests {
         assert_eq!(segments[1]["chain"], "polkadot-asset-hub");
         assert_eq!(segments[1]["events"][0]["kind"], "approved");
 
+        // the decoded call tree rides along (found on AH via the residency walk)
+        assert_eq!(json["preimage"]["decode_status"], "decoded");
+        assert_eq!(json["preimage"]["call_summary"], "utility.batch");
+        assert_eq!(
+            json["preimage"]["decoded_call"]["args"]["calls"][0]["call"],
+            "system.remark"
+        );
+
         // an 'unknown' post-migration row must not erase the relay verdict
         let (_, j1400) = get_json(&app, "/v1/gov/polkadot/referenda/1400").await;
         assert_eq!(j1400["referendum"]["status"], "rejected");
         assert_eq!(j1400["referendum"]["track_id"], 33);
+        assert!(j1400["preimage"].is_null(), "no preimage row for 1400");
 
         // unindexed referendum → 404; unknown network → 404
         let (s2, _) = get_json(&app, "/v1/gov/polkadot/referenda/999999").await;
@@ -1707,6 +2576,108 @@ mod tests {
         let (_, before) = get_json(&app, "/v1/gov/polkadot/tracks?at=2025-06-01T00:00:00Z").await;
         assert_eq!(before["chain"], "polkadot");
         assert_eq!(before["tracks"].as_array().unwrap().len(), 0);
+
+        // …and the fellowship instance resolves to ITS chain, which never
+        // migrated — same endpoint, same residency machinery, different domain
+        let (fs, fellowship) =
+            get_json(&app, "/v1/gov/polkadot/tracks?class=fellowship_referenda").await;
+        assert_eq!(fs, StatusCode::OK);
+        assert_eq!(fellowship["chain"], "polkadot-collectives");
+        assert_eq!(fellowship["class"], "fellowship_referenda");
+        assert_eq!(fellowship["tracks"][0]["pallet"], "fellowshipreferenda");
+        assert_eq!(fellowship["tracks"][0]["name"], "members");
+    }
+
+    #[tokio::test]
+    async fn referendum_votes_stitch_windows_and_tally_only_active_votes() {
+        let app = router(test_state().await);
+        let (status, json) = get_json(&app, "/v1/gov/polkadot/referenda/1500/votes").await;
+        assert_eq!(status, StatusCode::OK);
+
+        // both residency windows reported, with per-window coverage
+        let segments = json["segments"].as_array().unwrap();
+        assert_eq!(segments.len(), 2);
+        assert_eq!(segments[0]["chain"], "polkadot");
+        assert_eq!(segments[0]["votes_indexed"], 1);
+        assert_eq!(segments[1]["chain"], "polkadot-asset-hub");
+        assert_eq!(segments[1]["votes_indexed"], 2);
+
+        // THE cross-migration case: A voted aye on the relay and withdrew on
+        // Asset Hub. Positions merge per voter (latest window wins), so the
+        // relay row must NOT survive as an active aye.
+        let votes = json["votes"].as_array().unwrap();
+        assert_eq!(votes.len(), 2, "two voters, not three rows");
+        let a_addr = format!("0x{}", hex_lower(&adapter_substrate::accounts::para_sovereign(1000)));
+        let a = votes
+            .iter()
+            .find(|v| v["voter"] == a_addr)
+            .expect("voter A merged");
+        assert_eq!(a["active"], false, "the Asset Hub withdrawal wins");
+
+        // the tally counts only ACTIVE merged positions: B's 100 nay
+        assert_eq!(json["direct_tally"]["voters"], 1);
+        assert_eq!(json["direct_tally"]["ayes"], "0");
+        assert_eq!(json["direct_tally"]["nays"], "100");
+        assert_eq!(json["direct_tally"]["support"], "0");
+        assert_eq!(json["direct_tally"]["truncated"], false);
+        // coverage is stated, never implied
+        assert!(json["direct_tally"]["note"].as_str().unwrap().contains("delegated"));
+    }
+
+    #[tokio::test]
+    async fn account_votes_carry_delegations_and_state_anchors() {
+        let app = router(test_state().await);
+        let delegator = adapter_substrate::accounts::para_sovereign(2004);
+        let addr = format!("0x{}", hex_lower(&delegator));
+        let (status, json) =
+            get_json(&app, &format!("/v1/gov/polkadot/accounts/{addr}/votes")).await;
+        assert_eq!(status, StatusCode::OK);
+        let segments = json["segments"].as_array().unwrap();
+        // with no ?class=, the account surface walks EVERY registered instance:
+        // the public one (relay → Asset Hub) plus the Fellowship's Collectives
+        assert_eq!(segments.len(), 3);
+        assert_eq!(segments[2]["chain"], "polkadot-collectives");
+        assert_eq!(segments[2]["votes"][0]["vote_type"], "ranked");
+        // the delegator cast no votes; its edge + anchor live in the AH window
+        assert_eq!(segments[0]["delegations"].as_array().unwrap().len(), 0);
+        let ah = &segments[1];
+        assert_eq!(ah["delegations"][0]["track_id"], 34);
+        assert_eq!(ah["delegations"][0]["active"], true);
+        // the ONLY place the delegated amount exists
+        assert_eq!(ah["voting_anchors"][0]["delegating_balance"], "5000");
+        assert_eq!(ah["voting_anchors"][0]["delegating_conviction_label"], "locked6x");
+
+        let (bad, _) = get_json(&app, "/v1/gov/polkadot/accounts/13UVJyLnbVpXXX/votes").await;
+        assert_eq!(bad, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn fellowship_class_resolves_to_collectives_with_no_chain_named() {
+        // THE PLUG-AND-PLAY PROOF at the API surface: the fellowship instance
+        // lives on a chain that never moved to Asset Hub, and the only thing
+        // that knows it is registry data (referenda_classes → domain → chain).
+        let app = router(test_state().await);
+        let (status, json) =
+            get_json(&app, "/v1/gov/polkadot/referenda/300?class=fellowship_referenda").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["referendum"]["status"], "approved");
+        assert_eq!(json["referendum"]["class"], "fellowship_referenda");
+        let segments = json["segments"].as_array().unwrap();
+        assert_eq!(segments.len(), 1, "the fellowship has one residency window");
+        assert_eq!(segments[0]["chain"], "polkadot-collectives");
+        assert_eq!(segments[0]["events"][0]["kind"], "approved");
+
+        // ranked votes come back through the same class-scoped residency
+        let (vs, votes) =
+            get_json(&app, "/v1/gov/polkadot/referenda/300/votes?class=fellowship_referenda").await;
+        assert_eq!(vs, StatusCode::OK);
+        assert_eq!(votes["votes"][0]["vote_type"], "ranked");
+        assert_eq!(votes["direct_tally"]["ayes"], "9");
+
+        // and it is NOT visible under the public class (different domain,
+        // different chains) — instances stay separate without any filtering code
+        let (s404, _) = get_json(&app, "/v1/gov/polkadot/referenda/300").await;
+        assert_eq!(s404, StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]

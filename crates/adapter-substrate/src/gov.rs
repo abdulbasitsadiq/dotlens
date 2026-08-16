@@ -58,6 +58,16 @@ impl GovMapper for SubstrateGovMapper {
 
 /// Referenda instance pallets (decoder-lowercased) → class. Instances are
 /// adapter vocabulary, like "balances.Transfer" is for the balances mapper.
+///
+/// KNOWN-UNMAPPED instances, stated rather than implied (these became
+/// REACHABLE the moment Collectives was registered, and they map to ∅ here
+/// rather than halting the worker):
+///   ambassadorreferenda.* — pallet-referenda Instance2 on Collectives
+///   secretarycollective.* / ambassadorcollective.* — further ranked-collective
+///                           instances there
+///   democracy.*           — the pre-OpenGov relay model
+/// Each needs a registry `referenda_classes` entry alongside its class here, so
+/// adding one stays a two-line change in two files.
 fn class_of(pallet: &str) -> Option<&'static str> {
     match pallet {
         "referenda" => Some("referenda"),
@@ -203,6 +213,29 @@ fn json_h256_hex(v: &serde_json::Value) -> Option<String> {
     } else {
         None
     }
+}
+
+// ------------------------------------------------------- preimage storage key
+
+/// twox128("Preimage") ++ twox128("PreimageFor"). Verified in-sandbox against
+/// reference xxhash with the same derivation that reproduces
+/// accounts::SYSTEM_ACCOUNT_PREFIX byte-for-byte.
+pub const PREIMAGE_FOR_PREFIX: [u8; 32] = [
+    0xd8, 0xf3, 0x14, 0xb7, 0xf4, 0xe6, 0xb0, 0x95, 0xf0, 0xf8, 0xee, 0x46, 0x56, 0xa4, 0x48,
+    0x25, 0x7c, 0x7d, 0xda, 0x85, 0xc9, 0xc2, 0x97, 0x99, 0x9f, 0xd0, 0x22, 0x15, 0xe8, 0xc8,
+    0xf9, 0xde,
+];
+
+/// Full preimage.preimageFor storage key for one (hash, len). The map's
+/// hasher is Identity, so the key is prefix ++ SCALE((H256, u32)) =
+/// prefix ++ hash ++ len_le. The stored VALUE is a BoundedVec<u8> (compact
+/// length prefix + call bytes) — callers strip the prefix before decoding.
+pub fn preimage_for_key(hash: &[u8; 32], len: u32) -> Vec<u8> {
+    let mut key = Vec::with_capacity(32 + 32 + 4);
+    key.extend_from_slice(&PREIMAGE_FOR_PREFIX);
+    key.extend_from_slice(hash);
+    key.extend_from_slice(&len.to_le_bytes());
+    key
 }
 
 // ------------------------------------------------------------- tracks decode

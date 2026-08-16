@@ -1,6 +1,18 @@
 # Which chain hosts which functional domain, over time. THE anti-migration table.
 # Facts verified Aug 2026 — see ../../ECOSYSTEM.md §1. Times are UTC.
 # Kusama entries will be added when Kusama chains are registered.
+
+# Where each referenda INSTANCE lives, as data. The class names are adapter
+# vocabulary (adapter_substrate::gov maps pallet → class); this table says which
+# residency domain carries each one, so the gov API can stitch a class across
+# chains without knowing any chain id. Unlisted classes fall back to
+# 'governance' — the public OpenGov default.
+referenda_classes:
+  - class: referenda
+    domain: governance
+  - class: fellowship_referenda
+    domain: fellowship
+
 residency:
   - domain: governance
     network: polkadot
@@ -52,4 +64,36 @@ residency:
     network: polkadot
     chain: polkadot
     from: "2020-05-26T00:00:00Z"
+    to: null
+
+  # The Fellowship did NOT move to Asset Hub in Nov 2025 — its referenda and
+  # its rank-weighted votes stay on Collectives (verified: the AH runtime at
+  # spec 2003002 carries no ranked-collective pallet).
+  - domain: fellowship
+    network: polkadot
+    chain: polkadot-collectives
+    from: "2022-11-21T11:36:30Z"   # VERIFIED 2026-08-16 = the chain's own
+                                   # block #1 timestamp. Unlike identity below,
+                                   # this domain has no separate arrival date:
+                                   # the Fellowship pallets shipped in the
+                                   # genesis runtime of a chain built for them,
+                                   # so residency starts with the chain.
+    to: null
+
+  # The OTHER migration: pallet-identity LEFT the relay for the People chain —
+  # the first time functionality left rather than joined it. Boundary = ref 983
+  # ("People Chain Migration and Release") Executed at relay block 21800000,
+  # 2024-07-25T12:04:30Z. The real handover was a WINDOW, not an instant: that
+  # enactment enabled `reap_identity` on the relay, and the People chain
+  # unblocked public calls 43,200 blocks (~3 days) later. We model the
+  # enactment instant and say so.
+  - domain: identity
+    network: polkadot
+    chain: polkadot
+    from: "2020-05-26T00:00:00Z"
+    to: "2024-07-25T12:04:30Z"
+  - domain: identity
+    network: polkadot
+    chain: polkadot-people
+    from: "2024-07-25T12:04:30Z"
     to: null

@@ -17,7 +17,14 @@
 //!   dotlens-node balances-range <chain> <a> <b>       # map deltas over a range, exit
 //!   dotlens-node anchor-balance <chain> <acct> <h>    # record absolute balance anchor
 //!   dotlens-node gov-range <chain> <a> <b>    # map referendum timelines over a range
+//!   dotlens-node votes-range <chain> <a> <b>  # map votes + delegations over a range
+//!   dotlens-node anchor-voting <chain> <acct> <track> [height]  # VotingFor state anchor
 //!   dotlens-node sync-tracks                  # decode gov tracks from metadata, exit
+//!   dotlens-node fetch-preimage <chain> <hash> <len> [height]  # fetch+decode one preimage
+//!   dotlens-node decode-preimages <chain> [height]   # decode all pending proposals
+//!
+//! Per-module followers are opt-in flags: LIVE_INGEST, DECODE_FOLLOW,
+//! BALANCES_FOLLOW, GOV_FOLLOW, VOTES_FOLLOW, TIP_FOLLOW (all `=1`).
 //!
 //! backfill accepts an optional worker count (`backfill <chain> <a> <b> 8`) —
 //! deterministic chunks, per-chunk checkpoints, re-run the same command to
@@ -90,7 +97,11 @@ enum Command {
     BalancesRange { chain: String, from: u64, to: u64 },
     AnchorBalance { chain: String, account: String, height: u64 },
     GovRange { chain: String, from: u64, to: u64 },
+    VotesRange { chain: String, from: u64, to: u64 },
+    AnchorVoting { chain: String, account: String, track: u32, height: Option<u64> },
     SyncTracks,
+    FetchPreimage { chain: String, hash: String, len: u64, height: Option<u64> },
+    DecodePreimages { chain: String, height: Option<u64> },
 }
 
 fn parse_args() -> Result<Command> {
@@ -142,7 +153,43 @@ fn parse_args() -> Result<Command> {
             let (chain, from, to) = range("usage: dotlens-node gov-range <chain> <from> <to>")?;
             Ok(Command::GovRange { chain, from, to })
         }
+        Some("votes-range") => {
+            let (chain, from, to) = range("usage: dotlens-node votes-range <chain> <from> <to>")?;
+            Ok(Command::VotesRange { chain, from, to })
+        }
+        Some("anchor-voting") => {
+            let usage = "usage: dotlens-node anchor-voting <chain> <account> <track> [height]";
+            let chain = args.get(1).context(usage)?.clone();
+            let account = args.get(2).context(usage)?.clone();
+            let track: u32 = args.get(3).context(usage)?.parse().context(usage)?;
+            anyhow::ensure!(track <= u16::MAX as u32, "track id must fit in u16");
+            let height = match args.get(4) {
+                Some(h) => Some(h.parse::<u64>().context(usage)?),
+                None => None,
+            };
+            Ok(Command::AnchorVoting { chain, account, track, height })
+        }
         Some("sync-tracks") => Ok(Command::SyncTracks),
+        Some("fetch-preimage") => {
+            let usage = "usage: dotlens-node fetch-preimage <chain> <hash> <len> [height]";
+            let chain = args.get(1).context(usage)?.clone();
+            let hash = args.get(2).context(usage)?.clone();
+            let len: u64 = args.get(3).context(usage)?.parse().context(usage)?;
+            let height = match args.get(4) {
+                Some(h) => Some(h.parse::<u64>().context(usage)?),
+                None => None,
+            };
+            Ok(Command::FetchPreimage { chain, hash, len, height })
+        }
+        Some("decode-preimages") => {
+            let usage = "usage: dotlens-node decode-preimages <chain> [height]";
+            let chain = args.get(1).context(usage)?.clone();
+            let height = match args.get(2) {
+                Some(h) => Some(h.parse::<u64>().context(usage)?),
+                None => None,
+            };
+            Ok(Command::DecodePreimages { chain, height })
+        }
         Some("anchor-balance") => {
             let usage = "usage: dotlens-node anchor-balance <chain> <account> <height>";
             let chain = args.get(1).context(usage)?.clone();
@@ -285,6 +332,19 @@ async fn main() -> Result<()> {
         );
         return run_gov_range(&registry, &backends, chain, *from, *to).await;
     }
+    if let Command::VotesRange { chain, from, to } = &command {
+        anyhow::ensure!(
+            backends.persistent,
+            "votes-range requires DATABASE_URL (canonical events + vote facts must persist)"
+        );
+        return run_votes_range(&registry, &backends, chain, *from, *to).await;
+    }
+    if let Command::AnchorVoting { chain, account, track, height } = &command {
+        return run_anchor_voting(
+            &registry, &backends, raw.as_ref(), chain, account, *track, *height,
+        )
+        .await;
+    }
     if matches!(command, Command::SyncTracks) {
         #[cfg(feature = "pg")]
         if let Some(pool) = &backends.pool {
@@ -294,6 +354,13 @@ async fn main() -> Result<()> {
             return Ok(());
         }
         anyhow::bail!("sync-tracks requires the `pg` feature and DATABASE_URL");
+    }
+    if let Command::FetchPreimage { chain, hash, len, height } = &command {
+        return run_fetch_preimage(&registry, &backends, raw.as_ref(), chain, hash, *len, *height)
+            .await;
+    }
+    if let Command::DecodePreimages { chain, height } = &command {
+        return run_decode_preimages(&registry, &backends, raw.as_ref(), chain, *height).await;
     }
 
     // -- account labels: derive + project on every start (idempotent) ---------
@@ -340,6 +407,7 @@ async fn main() -> Result<()> {
     spawn_decode_followers(&registry, &backends, &raw);
     spawn_balances_followers(&registry, &backends);
     spawn_gov_followers(&registry, &backends);
+    spawn_votes_followers(&registry, &backends);
     spawn_tip_followers(&registry, &backends, &raw);
 
     // -- API ------------------------------------------------------------------
@@ -871,6 +939,524 @@ async fn run_gov_range(
 #[cfg(not(feature = "pg"))]
 async fn run_gov_range(_: &Registry, _: &Backends, _: &str, _: u64, _: u64) -> Result<()> {
     anyhow::bail!("gov-range requires the `pg` feature")
+}
+
+/// Votes followers: chase each chain's decode checkpoint, mapping canonical
+/// conviction-voting / ranked-collective events into vote + delegation facts.
+/// Pure mapping over Pg — no network, `pg` only. Eligibility is registry data:
+/// the chain must enable the `governance` module.
+fn spawn_votes_followers(registry: &Arc<Registry>, backends: &Arc<Backends>) {
+    if !env_flag("VOTES_FOLLOW") {
+        tracing::info!("votes follower disabled (set VOTES_FOLLOW=1 to enable)");
+        return;
+    }
+    if !backends.persistent {
+        tracing::warn!("VOTES_FOLLOW=1 but no DATABASE_URL — refusing to map into memory");
+        return;
+    }
+    #[cfg(feature = "pg")]
+    {
+        use adapter_substrate::votes::SubstrateVoteMapper;
+
+        let poll = std::time::Duration::from_secs(
+            env_or("POLL_INTERVAL_SECS", "6").parse().unwrap_or(6),
+        );
+        for chain in registry.chains() {
+            if !chain.has_module("governance") {
+                continue;
+            }
+            if chain.family != registry::ChainFamily::Substrate {
+                tracing::debug!(chain = %chain.id, "no votes mapper for this family — skipped");
+                continue;
+            }
+            let Some(pool) = backends.pool.clone() else { continue };
+            let chain_id = chain.id.clone();
+            let backends = backends.clone();
+            tokio::spawn(async move {
+                tracing::info!(chain = %chain_id, "votes follower started");
+                let source = dotlens_node::balances_pg::PgEventSource::new(pool.clone());
+                let sink = dotlens_node::votes_pg::PgVoteSink::new(pool);
+                let deps = ingest::votes::VotesDeps {
+                    checkpoints: backends.checkpoints.as_ref(),
+                    source: &source,
+                    sink: &sink,
+                };
+                ingest::votes::votes_follow(&chain_id, &SubstrateVoteMapper, &deps, poll).await;
+            });
+        }
+    }
+}
+
+#[cfg(feature = "pg")]
+async fn run_votes_range(
+    registry: &Registry,
+    backends: &Backends,
+    chain: &str,
+    from: u64,
+    to: u64,
+) -> Result<()> {
+    use adapter_substrate::votes::SubstrateVoteMapper;
+
+    let cfg = registry
+        .chain(chain)
+        .with_context(|| format!("unknown chain: {chain}"))?;
+    anyhow::ensure!(
+        cfg.family == registry::ChainFamily::Substrate,
+        "no votes mapper for family {:?}",
+        cfg.family
+    );
+    let pool = backends.pool.as_ref().context("votes-range requires DATABASE_URL")?;
+    let source = dotlens_node::balances_pg::PgEventSource::new(pool.clone());
+    let sink = dotlens_node::votes_pg::PgVoteSink::new(pool.clone());
+    let deps = ingest::votes::VotesDeps {
+        checkpoints: backends.checkpoints.as_ref(),
+        source: &source,
+        sink: &sink,
+    };
+    let n = ingest::votes::votes_range(&cfg.id, &SubstrateVoteMapper, &deps, from, to)
+        .await
+        .with_context(|| format!("votes-range {chain} {from}..={to}"))?;
+    tracing::info!(chain, from, to, mapped = n, "votes-range complete");
+    println!("votes-range {chain} {from}..={to}: mapped {n} blocks");
+    Ok(())
+}
+
+#[cfg(not(feature = "pg"))]
+async fn run_votes_range(_: &Registry, _: &Backends, _: &str, _: u64, _: u64) -> Result<()> {
+    anyhow::bail!("votes-range requires the `pg` feature")
+}
+
+/// anchor-voting <chain> <account> <track> [height]: read
+/// ConvictionVoting.VotingFor(account, track) from state, decode against
+/// block-correct metadata, record an immutable anchor. This is the ONLY source
+/// for delegation AMOUNTS and for delegated power RECEIVED — no event carries
+/// either (see adapter_substrate::votes docs).
+#[cfg(all(feature = "pg", feature = "live"))]
+#[allow(clippy::too_many_arguments)]
+async fn run_anchor_voting(
+    registry: &Registry,
+    backends: &Backends,
+    raw: &dyn RawStore,
+    chain: &str,
+    account: &str,
+    track: u32,
+    height: Option<u64>,
+) -> Result<()> {
+    use adapter_substrate::{accounts, source::SubstrateSource, votes as av};
+    use ingest::live::ChainSource;
+
+    let pool = backends
+        .pool
+        .as_ref()
+        .context("anchor-voting requires DATABASE_URL")?;
+    let cfg = registry
+        .chain(chain)
+        .with_context(|| format!("unknown chain: {chain}"))?;
+    let account_id = accounts::parse_account(account)
+        .map_err(|e| anyhow::anyhow!("bad account '{account}': {e}"))?;
+    let track_u16 = u16::try_from(track).context("track id must fit in u16")?;
+    let source = SubstrateSource::new(&cfg.id, cfg.endpoints.rpc.clone())
+        .map_err(|e| anyhow::anyhow!(e))?;
+
+    let height = match height {
+        Some(h) => h,
+        None => source.finalized_height().await.map_err(|e| anyhow::anyhow!(e))?,
+    };
+    let hash = source.block_hash(height).await.map_err(|e| anyhow::anyhow!(e))?;
+    let spec = source
+        .runtime_version_at(hash)
+        .await
+        .map_err(|e| anyhow::anyhow!(e))?;
+
+    // metadata: archived blob if we have it, else fetch AND archive (so the
+    // anchor's lineage is reproducible from the raw store forever)
+    let meta_key = raw_store::keys::metadata(&cfg.id, spec);
+    let metadata = match raw.get(&meta_key) {
+        Ok(blob) => blob,
+        Err(raw_store::RawStoreError::NotFound(_)) => {
+            let blob = source.metadata_at(height).await.map_err(|e| anyhow::anyhow!(e))?;
+            raw.put(&meta_key, &blob, "anchor-voting")?;
+            tracing::info!(chain = %cfg.id, spec, "metadata archived while anchoring votes");
+            blob
+        }
+        Err(e) => return Err(e.into()),
+    };
+
+    let key = av::voting_for_key(&account_id, track_u16);
+    let (position, note) = match source
+        .storage_at(&key, hash)
+        .await
+        .map_err(|e| anyhow::anyhow!(e))?
+    {
+        Some(bytes) => (
+            av::decode_voting_for(&metadata, &bytes).map_err(|e| anyhow::anyhow!(e))?,
+            None,
+        ),
+        // ValueQuery: no entry means the storage DEFAULT (casting nothing),
+        // recorded honestly as such rather than skipped
+        None => (av::VotingPosition::empty(), Some("absent")),
+    };
+    dotlens_node::votes_pg::insert_voting_anchor(
+        pool,
+        &cfg.id,
+        &account_id,
+        // the ConvictionVoting instance is the public OpenGov class
+        "referenda",
+        track,
+        height,
+        &position,
+        Some(spec),
+        "anchor-voting",
+        note,
+    )
+    .await?;
+    println!(
+        "voting anchor {chain}/{account} track {track} at #{height} (spec {spec}): mode={} \
+         delegating={:?} conviction={:?} received_votes={:?}{}",
+        position.mode,
+        position.delegating_balance,
+        position.delegating_conviction_label,
+        position.delegations_votes,
+        note.map(|n| format!(" [{n}]")).unwrap_or_default()
+    );
+    Ok(())
+}
+
+#[cfg(not(all(feature = "pg", feature = "live")))]
+#[allow(clippy::too_many_arguments)]
+async fn run_anchor_voting(
+    _: &Registry,
+    _: &Backends,
+    _: &dyn RawStore,
+    _: &str,
+    _: &str,
+    _: u32,
+    _: Option<u64>,
+) -> Result<()> {
+    anyhow::bail!("anchor-voting requires the `pg` and `live` features")
+}
+
+/// Everything one preimage decode needs from a block context: the archived
+/// (or fetched-and-archived) metadata plus lineage.
+#[cfg(all(feature = "pg", feature = "live"))]
+struct PreimageCtx {
+    metadata: Vec<u8>,
+    spec: u32,
+    block_hash: adapter_substrate::source::BlockHash,
+    height: u64,
+}
+
+#[cfg(all(feature = "pg", feature = "live"))]
+async fn preimage_ctx(
+    source: &adapter_substrate::source::SubstrateSource,
+    raw: &dyn RawStore,
+    chain_id: &str,
+    height: Option<u64>,
+) -> Result<PreimageCtx> {
+    use ingest::live::ChainSource;
+
+    let height = match height {
+        Some(h) => h,
+        None => source.finalized_height().await.map_err(|e| anyhow::anyhow!(e))?,
+    };
+    let block_hash = source.block_hash(height).await.map_err(|e| anyhow::anyhow!(e))?;
+    let spec = source
+        .runtime_version_at(block_hash)
+        .await
+        .map_err(|e| anyhow::anyhow!(e))?;
+    // archived blob if we have it, else fetch AND archive (lineage stays
+    // reproducible from the raw store — same discipline as anchor-balance)
+    let meta_key = raw_store::keys::metadata(chain_id, spec);
+    let metadata = match raw.get(&meta_key) {
+        Ok(blob) => blob,
+        Err(raw_store::RawStoreError::NotFound(_)) => {
+            let blob = source.metadata_at(height).await.map_err(|e| anyhow::anyhow!(e))?;
+            raw.put(&meta_key, &blob, "preimage-decode")?;
+            tracing::info!(chain = %chain_id, spec, "metadata archived while decoding preimages");
+            blob
+        }
+        Err(e) => return Err(e.into()),
+    };
+    Ok(PreimageCtx { metadata, spec, block_hash, height })
+}
+
+/// Fetch one preimage from state, archive the raw value, verify the hash,
+/// decode the call tree, record the row. Returns the decode_status recorded.
+#[cfg(all(feature = "pg", feature = "live"))]
+async fn fetch_and_record_preimage(
+    pool: &sqlx::PgPool,
+    receipts: &dyn ingest::ReceiptSink,
+    source: &adapter_substrate::source::SubstrateSource,
+    raw: &dyn RawStore,
+    chain_id: &str,
+    ctx: &PreimageCtx,
+    hash32: &[u8; 32],
+    len: u64,
+) -> Result<String> {
+    use adapter_substrate::{calls, gov as agov};
+    use dotlens_node::gov_pg::{upsert_preimage, PreimageRecord};
+
+    let hash_hex = format!("0x{}", hex::encode(hash32));
+    let record = |status: &str,
+                  bytes_location: Option<String>,
+                  decoded: Option<calls::DecodedCall>,
+                  note: Option<String>| PreimageRecord {
+        proposal_hash: hash_hex.clone(),
+        len,
+        bytes_location,
+        call_summary: decoded.as_ref().map(|d| d.summary.clone()),
+        decoded_call: decoded.map(|d| d.tree),
+        decode_status: status.to_string(),
+        source: "state".to_string(),
+        note,
+        spec_version: Some(ctx.spec),
+        decoder_version: calls::CALL_DECODER_VERSION,
+        fetched_at_height: Some(ctx.height),
+    };
+
+    let key = agov::preimage_for_key(hash32, u32::try_from(len).context("len exceeds u32")?);
+    let Some(value) = source
+        .storage_at(&key, ctx.block_hash)
+        .await
+        .map_err(|e| anyhow::anyhow!(e))?
+    else {
+        // cleared after enactment, or never noted — honest coverage, not an error
+        upsert_preimage(pool, chain_id, &record("missing", None, None, None)).await?;
+        return Ok("missing".into());
+    };
+
+    // the stored value is BoundedVec<u8>: compact length prefix + call bytes
+    let call_bytes = <Vec<u8> as parity_scale_codec::Decode>::decode(&mut &value[..])
+        .map_err(|e| anyhow::anyhow!("preimage value is not a BoundedVec<u8>: {e}"))?;
+    // verify BEFORE archiving (review catch): the raw store is write-once, so
+    // a garbage endpoint response archived under this key would poison it
+    // forever — a value failing these checks is by definition NOT the
+    // preimage for this key, so raw-first loses nothing by rejecting it.
+    // Deliberate (documented): a mismatch aborts the whole batch loudly
+    // rather than recording 'undecodable' — never file corrupt bytes as data.
+    anyhow::ensure!(
+        call_bytes.len() as u64 == len,
+        "preimage length mismatch: state has {} bytes, key says {len}",
+        call_bytes.len()
+    );
+    let computed = calls::blake2_256(&call_bytes);
+    anyhow::ensure!(
+        &computed == hash32,
+        "preimage hash mismatch: blake2(bytes) = 0x{} ≠ {hash_hex} — refusing to record",
+        hex::encode(computed)
+    );
+    let raw_key = raw_store::keys::preimage(chain_id, &hex::encode(hash32), len);
+    let receipt = raw.put(&raw_key, &value, "fetch-preimage")?;
+    if let Err(e) = receipts.record(&receipt).await {
+        tracing::warn!(error = %e, "preimage receipt not recorded — continuing");
+    }
+
+    match calls::decode_call(&ctx.metadata, &call_bytes) {
+        Ok(d) => {
+            upsert_preimage(pool, chain_id, &record("decoded", Some(raw_key), Some(d), None))
+                .await?;
+            Ok("decoded".into())
+        }
+        Err(e) => {
+            // bytes are archived; a future decoder version rebuilds from raw
+            upsert_preimage(
+                pool,
+                chain_id,
+                &record("undecodable", Some(raw_key), None, Some(e)),
+            )
+            .await?;
+            Ok("undecodable".into())
+        }
+    }
+}
+
+#[cfg(all(feature = "pg", feature = "live"))]
+async fn run_fetch_preimage(
+    registry: &Registry,
+    backends: &Backends,
+    raw: &dyn RawStore,
+    chain: &str,
+    hash: &str,
+    len: u64,
+    height: Option<u64>,
+) -> Result<()> {
+    use adapter_substrate::source::SubstrateSource;
+
+    let pool = backends.pool.as_ref().context("fetch-preimage requires DATABASE_URL")?;
+    let cfg = registry
+        .chain(chain)
+        .with_context(|| format!("unknown chain: {chain}"))?;
+    let hash32 = parse_h256(hash)?;
+    let source = SubstrateSource::new(&cfg.id, cfg.endpoints.rpc.clone())
+        .map_err(|e| anyhow::anyhow!(e))?;
+    let ctx = preimage_ctx(&source, raw, &cfg.id, height).await?;
+    let status = fetch_and_record_preimage(
+        pool, backends.receipts.as_ref(), &source, raw, &cfg.id, &ctx, &hash32, len,
+    )
+    .await?;
+    println!(
+        "preimage {chain}/{hash} len {len} at #{} (spec {}): {status}",
+        ctx.height, ctx.spec
+    );
+    Ok(())
+}
+
+/// decode-preimages <chain> [height]: work through every referendum proposal
+/// on the chain that has no decoded preimage yet — Inline bytes decode
+/// directly, Lookup hashes fetch from state, Legacy (democracy-era, length
+/// unknown) records an honest 'missing'.
+#[cfg(all(feature = "pg", feature = "live"))]
+async fn run_decode_preimages(
+    registry: &Registry,
+    backends: &Backends,
+    raw: &dyn RawStore,
+    chain: &str,
+    height: Option<u64>,
+) -> Result<()> {
+    use adapter_substrate::{calls, source::SubstrateSource};
+    use dotlens_node::gov_pg::{
+        fill_inline_proposal_hash, referenda_needing_preimages, upsert_preimage, PreimageRecord,
+    };
+
+    let pool = backends.pool.as_ref().context("decode-preimages requires DATABASE_URL")?;
+    let cfg = registry
+        .chain(chain)
+        .with_context(|| format!("unknown chain: {chain}"))?;
+    let source = SubstrateSource::new(&cfg.id, cfg.endpoints.rpc.clone())
+        .map_err(|e| anyhow::anyhow!(e))?;
+    let ctx = preimage_ctx(&source, raw, &cfg.id, height).await?;
+
+    let rows = referenda_needing_preimages(pool, &cfg.id).await?;
+    let (mut decoded, mut missing, mut undecodable, mut inline, mut legacy) =
+        (0u32, 0u32, 0u32, 0u32, 0u32);
+    for (class, referendum_id, proposal, proposal_hash, proposal_len, submitted_at) in &rows {
+        if let Some(inline_body) = proposal.get("Inline") {
+            // bytes travel in the referendum itself — no state fetch needed
+            let Some(bytes) = calls::json_bytes(inline_body) else {
+                anyhow::bail!(
+                    "{}/{class}/{referendum_id}: Inline proposal bytes unreadable — \
+                     mapper output corrupt?",
+                    cfg.id
+                );
+            };
+            // decode against SUBMISSION-era metadata when we know the height:
+            // call indices reshuffle across upgrades, and tip metadata could
+            // decode old inline bytes successfully-but-WRONG (review catch).
+            // Pruned endpoints may refuse old-state queries → loud warn +
+            // tip fallback (spec_version lineage keeps it auditable).
+            let ref_ctx_owned: Option<PreimageCtx> = match submitted_at {
+                Some(h) => match preimage_ctx(&source, raw, &cfg.id, Some(*h as u64)).await {
+                    Ok(c) => Some(c),
+                    Err(e) => {
+                        tracing::warn!(chain = %cfg.id, class, referendum_id, height = h,
+                            error = %e,
+                            "submission-era metadata unavailable — decoding against tip");
+                        None
+                    }
+                },
+                None => None,
+            };
+            let ref_ctx = ref_ctx_owned.as_ref().unwrap_or(&ctx);
+            let hash_hex = format!("0x{}", hex::encode(calls::blake2_256(&bytes)));
+            let len = bytes.len() as u64;
+            let (status, d, note) = match calls::decode_call(&ref_ctx.metadata, &bytes) {
+                Ok(d) => {
+                    inline += 1;
+                    ("decoded", Some(d), None)
+                }
+                Err(e) => {
+                    undecodable += 1;
+                    ("undecodable", None, Some(e))
+                }
+            };
+            upsert_preimage(pool, &cfg.id, &PreimageRecord {
+                proposal_hash: hash_hex.clone(),
+                len,
+                bytes_location: None, // bytes live in gov.referenda.proposal (canonical)
+                call_summary: d.as_ref().map(|d| d.summary.clone()),
+                decoded_call: d.map(|d| d.tree),
+                decode_status: status.to_string(),
+                source: "inline".to_string(),
+                note,
+                spec_version: Some(ref_ctx.spec),
+                decoder_version: calls::CALL_DECODER_VERSION,
+                fetched_at_height: None,
+            })
+            .await?;
+            fill_inline_proposal_hash(pool, &cfg.id, class, *referendum_id, &hash_hex, len)
+                .await?;
+        } else if proposal.get("Legacy").is_some() {
+            // democracy-era: preimageFor is keyed (hash, len) and Legacy carries
+            // no length — record honest 'missing' (len 0 sentinel; excluded from
+            // future pending lists), covered by a later slice if ever needed
+            let Some(hash_hex) = proposal_hash else {
+                tracing::warn!(chain = %cfg.id, class, referendum_id,
+                    "Legacy proposal without hash — skipped");
+                continue;
+            };
+            upsert_preimage(pool, &cfg.id, &PreimageRecord {
+                proposal_hash: hash_hex.clone(),
+                len: 0,
+                bytes_location: None,
+                call_summary: None,
+                decoded_call: None,
+                decode_status: "missing".to_string(),
+                source: "state".to_string(),
+                note: Some("legacy proposal: length unknown, democracy-era preimage".into()),
+                spec_version: Some(ctx.spec),
+                decoder_version: calls::CALL_DECODER_VERSION,
+                fetched_at_height: Some(ctx.height),
+            })
+            .await?;
+            legacy += 1;
+        } else {
+            let (Some(hash_hex), Some(plen)) = (proposal_hash, proposal_len) else {
+                tracing::warn!(chain = %cfg.id, class, referendum_id,
+                    "Lookup proposal without hash/len — skipped");
+                continue;
+            };
+            let hash32 = parse_h256(hash_hex)?;
+            let status = fetch_and_record_preimage(
+                pool, backends.receipts.as_ref(), &source, raw, &cfg.id, &ctx,
+                &hash32, *plen as u64,
+            )
+            .await?;
+            match status.as_str() {
+                "decoded" => decoded += 1,
+                "missing" => missing += 1,
+                _ => undecodable += 1,
+            }
+        }
+    }
+    println!(
+        "decode-preimages {chain} at #{} (spec {}): {} pending → \
+         {decoded} fetched+decoded, {inline} inline decoded, {missing} missing, \
+         {undecodable} undecodable, {legacy} legacy skipped",
+        ctx.height, ctx.spec, rows.len()
+    );
+    Ok(())
+}
+
+#[cfg(all(feature = "pg", feature = "live"))]
+fn parse_h256(s: &str) -> Result<[u8; 32]> {
+    let hexpart = s.strip_prefix("0x").unwrap_or(s);
+    let bytes = hex::decode(hexpart).context("hash is not hex")?;
+    <[u8; 32]>::try_from(bytes.as_slice())
+        .map_err(|_| anyhow::anyhow!("hash must be 32 bytes, got {}", bytes.len()))
+}
+
+#[cfg(not(all(feature = "pg", feature = "live")))]
+async fn run_fetch_preimage(
+    _: &Registry, _: &Backends, _: &dyn RawStore, _: &str, _: &str, _: u64, _: Option<u64>,
+) -> Result<()> {
+    anyhow::bail!("fetch-preimage requires the `pg` and `live` features")
+}
+
+#[cfg(not(all(feature = "pg", feature = "live")))]
+async fn run_decode_preimages(
+    _: &Registry, _: &Backends, _: &dyn RawStore, _: &str, _: Option<u64>,
+) -> Result<()> {
+    anyhow::bail!("decode-preimages requires the `pg` and `live` features")
 }
 
 #[cfg(feature = "pg")]

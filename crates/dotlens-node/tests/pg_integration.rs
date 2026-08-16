@@ -134,17 +134,32 @@ async fn registry_sync_is_idempotent_and_creates_partitions() {
             .unwrap();
     assert_eq!(relay.as_deref(), Some("polkadot"));
 
-    // per-chain partitions exist for every registered chain, on all three tables
-    for table in ["blocks", "transactions", "events"] {
+    // per-chain partitions exist for every registered chain, on every
+    // partitioned table — registering a chain is the ONLY step (adding
+    // Collectives/People in the registration slice needed no code here)
+    for (schema, table) in [
+        ("core", "blocks"),
+        ("core", "transactions"),
+        ("core", "events"),
+        ("balances", "balance_changes"),
+        ("gov", "referendum_events"),
+        ("gov", "votes"),
+        ("gov", "delegation_events"),
+    ] {
         let (parts,): (i64,) = sqlx::query_as(
             "select count(*) from pg_tables \
-             where schemaname = 'core' and tablename like $1 || '\\_p\\_%'",
+             where schemaname = $1 and tablename like $2 || '\\_p\\_%'",
         )
+        .bind(schema)
         .bind(table)
         .fetch_one(&db.pool)
         .await
         .unwrap();
-        assert_eq!(parts as usize, reg.chains().count(), "partitions for core.{table}");
+        assert_eq!(
+            parts as usize,
+            reg.chains().count(),
+            "partitions for {schema}.{table}"
+        );
     }
 
     db.drop_db().await;
@@ -742,6 +757,14 @@ async fn sibling_sovereign_labels_appear_when_a_chain_registers() {
     // and AH's sibling sovereign appears on test-para — both directions
     assert!(exists("sibl_sovereign", "test-para", "sibl:1000").await);
 
+    // the same mechanism, for the two chains the registration slice added:
+    // no code anywhere knows 1001/1004 exist
+    assert!(exists("para_sovereign", "polkadot", "para:1001").await);
+    assert!(exists("para_sovereign", "polkadot", "para:1004").await);
+    assert!(exists("sibl_sovereign", "polkadot-asset-hub", "sibl:1001").await);
+    assert!(exists("sibl_sovereign", "polkadot-collectives", "sibl:1004").await);
+    assert!(exists("sibl_sovereign", "polkadot-people", "sibl:1000").await);
+
     // ss58 agrees with the adapter's own derivation (self-consistency)
     let expected = adapter_substrate::frame_decoder::ss58_encode(
         0,
@@ -1150,6 +1173,354 @@ async fn gov_worker_builds_timelines_projection_converges_and_tracks_sync() {
     }
 
     let _ = std::fs::remove_dir_all(&raw_dir);
+    db.drop_db().await;
+}
+
+#[tokio::test]
+async fn preimage_rows_upsert_join_and_never_downgrade() {
+    use api::GovIndex as _;
+    use dotlens_node::gov_pg::{
+        fill_inline_proposal_hash, referenda_needing_preimages, upsert_preimage, PreimageRecord,
+    };
+
+    let Some(db) = TestDb::create().await else { return };
+    let reg = seeds();
+    sync_registry(&db.pool, &reg).await.expect("registry sync");
+
+    let hash = format!("0x{}", "cd".repeat(32));
+    // two referenda on AH: one Lookup (hash known), one Inline (hash NULL
+    // until decode-preimages hashes the bytes)
+    sqlx::query(
+        "insert into gov.referenda (chain_id, class, referendum_id, proposal, proposal_hash, \
+             proposal_len, status, status_height, status_event_index, runtime_version, mapper_version) \
+         values ('polkadot-asset-hub', 'referenda', 2000, $1, $2, 142, 'deciding', 100, 0, 100, 1), \
+                ('polkadot-asset-hub', 'referenda', 2001, $3, null, null, 'submitted', 90, 0, 100, 1)",
+    )
+    .bind(serde_json::json!({"Lookup": {"hash": [vec![0xcdu8; 32]], "len": 142}}))
+    .bind(&hash)
+    .bind(serde_json::json!({"Inline": [0u8, 1]}))
+    .execute(&db.pool)
+    .await
+    .expect("seed referenda");
+
+    // both pending (the Inline row has no hash yet, the Lookup no preimage)
+    let pending = referenda_needing_preimages(&db.pool, "polkadot-asset-hub")
+        .await
+        .expect("pending list");
+    assert_eq!(pending.len(), 2);
+
+    let rec = |status: &str, tree: Option<serde_json::Value>| PreimageRecord {
+        proposal_hash: hash.clone(),
+        len: 142,
+        bytes_location: tree.is_some().then(|| "raw/test/preimage".to_string()),
+        call_summary: tree.as_ref().map(|_| "utility.batch".to_string()),
+        decoded_call: tree,
+        decode_status: status.to_string(),
+        source: "state".to_string(),
+        note: None,
+        spec_version: Some(2_003_002),
+        decoder_version: 1,
+        fetched_at_height: Some(500),
+    };
+
+    // missing → decoded upgrades; a later missing must NOT downgrade
+    upsert_preimage(&db.pool, "polkadot-asset-hub", &rec("missing", None)).await.unwrap();
+    upsert_preimage(
+        &db.pool,
+        "polkadot-asset-hub",
+        &rec("decoded", Some(serde_json::json!({"call": "utility.batch", "args": {}}))),
+    )
+    .await
+    .unwrap();
+    upsert_preimage(&db.pool, "polkadot-asset-hub", &rec("missing", None)).await.unwrap();
+
+    let idx = api::pg::PgGovIndex::new(db.pool.clone());
+    let p = idx
+        .preimage("polkadot-asset-hub", &hash)
+        .await
+        .unwrap()
+        .expect("preimage row");
+    assert_eq!(p.decode_status, "decoded", "decoded rows are never downgraded");
+    assert_eq!(p.call_summary.as_deref(), Some("utility.batch"));
+    assert_eq!(p.len, 142);
+
+    // the decoded Lookup ref drops out of the pending list; Inline remains
+    let pending = referenda_needing_preimages(&db.pool, "polkadot-asset-hub")
+        .await
+        .expect("pending after decode");
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].1, 2001);
+
+    // inline fill: hash lands, coalesce-only (a second fill can't overwrite)
+    let inline_hash = format!("0x{}", "ee".repeat(32));
+    fill_inline_proposal_hash(&db.pool, "polkadot-asset-hub", "referenda", 2001, &inline_hash, 2)
+        .await
+        .unwrap();
+    fill_inline_proposal_hash(
+        &db.pool, "polkadot-asset-hub", "referenda", 2001, "0xdeadbeef", 999,
+    )
+    .await
+    .unwrap();
+    let (got_hash, got_len): (Option<String>, Option<i64>) = sqlx::query_as(
+        "select proposal_hash, proposal_len from gov.referenda \
+         where chain_id = 'polkadot-asset-hub' and class = 'referenda' and referendum_id = 2001",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!((got_hash.as_deref(), got_len), (Some(inline_hash.as_str()), Some(2)));
+
+    db.drop_db().await;
+}
+
+#[tokio::test]
+async fn vote_facts_land_projections_converge_and_voting_anchors_roundtrip() {
+    use adapter_substrate::votes::{SubstrateVoteMapper, VotingPosition};
+    use api::GovIndex as _;
+    use canonical::{CanonicalBlock, CanonicalEvent, Lineage};
+
+    let Some(db) = TestDb::create().await else { return };
+    let reg = seeds();
+    sync_registry(&db.pool, &reg).await.expect("registry sync");
+
+    let block = |chain: &str, height: u64, ts: &str, events: Vec<CanonicalEvent>| CanonicalBlock {
+        chain_id: chain.into(),
+        height,
+        hash: format!("0x{height:064x}"),
+        parent_hash: format!("0x{:064x}", height - 1),
+        timestamp: Some(ts.parse().unwrap()),
+        finalized: true,
+        lineage: Lineage {
+            runtime_version: 2_003_002,
+            decoder_version: 2,
+            raw_location: format!("raw/{chain}/test/{height}"),
+        },
+        transactions: vec![],
+        events,
+    };
+    let ev = |index: u32, name: &str, data: serde_json::Value| CanonicalEvent {
+        index,
+        transaction_index: Some(0),
+        name: name.into(),
+        data,
+    };
+    // `[vec![b; 32]]` — NOT `[[b; 32]]`: serde_json::json! rejects array-repeat
+    // expressions in array position (the trap that bit slice 1)
+    let acct = |b: u8| serde_json::json!([vec![b; 32]]);
+    let voter_a = vec![0xa1u8; 32];
+    let voter_b = vec![0xb2u8; 32];
+    let delegator = vec![0xc3u8; 32];
+
+    let index = PgBlockIndex::new(db.pool.clone());
+    // relay, pre-migration: A votes aye with 1x conviction on ref 1500…
+    index
+        .insert(block("polkadot", 100, "2025-10-20T00:00:00Z", vec![
+            ev(0, "convictionvoting.Voted", serde_json::json!({
+                "who": acct(0xa1),
+                // 2^64 plancks: exercises the NUMERIC path end to end
+                "vote": {"Standard": {"vote": [0x81], "balance": "18446744073709551616"}},
+                "poll_index": 1500,
+            })),
+            ev(1, "system.ExtrinsicSuccess", serde_json::json!({})),
+        ]))
+        .await
+        .expect("relay 100");
+    // …and a legacy-shape vote (no poll_index) that we can NOT attribute
+    index
+        .insert(block("polkadot", 105, "2025-10-21T00:00:00Z", vec![ev(
+            0,
+            "convictionvoting.Voted",
+            serde_json::json!({
+                "who": acct(0xb2),
+                "vote": {"Standard": {"vote": [0x00], "balance": 1005}},
+            }),
+        )]))
+        .await
+        .expect("relay 105");
+    // Asset Hub, post-migration: B votes nay, C delegates to B, a lock expires
+    index
+        .insert(block("polkadot-asset-hub", 200, "2025-11-10T00:00:00Z", vec![
+            ev(0, "convictionvoting.Voted", serde_json::json!({
+                "who": acct(0xb2),
+                "vote": {"Standard": {"vote": [0x00], "balance": 1005}},
+                "poll_index": 1500,
+            })),
+            ev(1, "convictionvoting.Delegated", serde_json::json!([acct(0xc3), acct(0xb2), 34])),
+            ev(2, "convictionvoting.VoteUnlocked", serde_json::json!({"who": acct(0xa1), "class": 34})),
+        ]))
+        .await
+        .expect("ah 200");
+    // …then B withdraws its vote
+    index
+        .insert(block("polkadot-asset-hub", 210, "2025-11-12T00:00:00Z", vec![ev(
+            0,
+            "convictionvoting.VoteRemoved",
+            serde_json::json!({
+                "who": acct(0xb2),
+                "vote": {"Standard": {"vote": [0x00], "balance": 1005}},
+                "poll_index": 1500,
+            }),
+        )]))
+        .await
+        .expect("ah 210");
+
+    let checkpoints = PgCheckpointStore::new(db.pool.clone());
+    let source = dotlens_node::balances_pg::PgEventSource::new(db.pool.clone());
+    let sink = dotlens_node::votes_pg::PgVoteSink::new(db.pool.clone());
+    let deps = ingest::votes::VotesDeps {
+        checkpoints: &checkpoints,
+        source: &source,
+        sink: &sink,
+    };
+
+    // OUT OF ORDER on purpose: the withdrawal first, then the vote it removed —
+    // the ordering guard must keep the position inactive
+    ingest::votes::votes_range("polkadot-asset-hub", &SubstrateVoteMapper, &deps, 210, 210)
+        .await
+        .expect("ah withdrawal first");
+    ingest::votes::votes_range("polkadot-asset-hub", &SubstrateVoteMapper, &deps, 200, 200)
+        .await
+        .expect("ah vote + delegation");
+    ingest::votes::votes_range("polkadot", &SubstrateVoteMapper, &deps, 100, 105)
+        .await
+        .expect("relay range");
+
+    let idx = api::pg::PgGovIndex::new(db.pool.clone());
+
+    // relay: A's aye position, weights exactly as the pallet tallies them
+    let relay_votes = idx.referendum_votes("polkadot", "referenda", 1500, 50).await.unwrap();
+    assert_eq!(relay_votes.len(), 1);
+    let a = &relay_votes[0];
+    assert!(a.active);
+    assert_eq!(a.voter, format!("0x{}", "a1".repeat(32)));
+    assert_eq!(a.conviction, Some(1));
+    assert_eq!(a.aye_votes, "18446744073709551616", "1x conviction: votes = capital");
+    assert_eq!(a.support, "18446744073709551616");
+    assert_eq!(a.nay_votes, "0");
+
+    // AH: B's position survives the out-of-order replay as INACTIVE
+    let ah_votes = idx
+        .referendum_votes("polkadot-asset-hub", "referenda", 1500, 50)
+        .await
+        .unwrap();
+    assert_eq!(ah_votes.len(), 1);
+    assert!(!ah_votes[0].active, "the later withdrawal wins over the earlier vote");
+    assert_eq!(ah_votes[0].nay_votes, "100", "no conviction → capital/10");
+
+    // the legacy unattributed vote: recorded, but never projected
+    let (unattributed, ref_null): (i64, i64) = sqlx::query_as(
+        "select count(*) filter (where attribution = 'unattributed'), \
+                count(*) filter (where referendum_id is null) from gov.votes",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!((unattributed, ref_null), (1, 1));
+    let (positions,): (i64,) = sqlx::query_as("select count(*) from gov.vote_positions")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(positions, 2, "A on the relay + B on AH; the legacy vote has no subject");
+
+    // VoteUnlocked is lock bookkeeping: it must produce no fact at all
+    let (vote_rows,): (i64,) = sqlx::query_as("select count(*) from gov.votes")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(vote_rows, 4, "2 relay + 1 AH vote + 1 AH withdrawal, no unlock row");
+
+    // delegation edge + projection
+    let delegations = idx.account_delegations("polkadot-asset-hub", &delegator).await.unwrap();
+    assert_eq!(delegations.len(), 1);
+    assert_eq!(delegations[0].track_id, 34);
+    assert!(delegations[0].active);
+    assert_eq!(delegations[0].target, Some(format!("0x{}", "b2".repeat(32))));
+
+    // partition routing: nothing in the default partitions
+    for table in ["gov.votes_default", "gov.delegation_events_default"] {
+        let (n,): (i64,) = sqlx::query_as(&format!("select count(*) from {table}"))
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(n, 0, "{table} must stay empty (per-chain partitions)");
+    }
+
+    // CONVERGENCE: replay everything behind the frontier — counts stable,
+    // the withdrawal still wins
+    ingest::votes::votes_range("polkadot-asset-hub", &SubstrateVoteMapper, &deps, 200, 210)
+        .await
+        .expect("ah replay");
+    ingest::votes::votes_range("polkadot", &SubstrateVoteMapper, &deps, 100, 105)
+        .await
+        .expect("relay replay");
+    let (vote_rows_again,): (i64,) = sqlx::query_as("select count(*) from gov.votes")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(vote_rows_again, 4, "insert-ignore: replay adds nothing");
+    let ah_again = idx
+        .referendum_votes("polkadot-asset-hub", "referenda", 1500, 50)
+        .await
+        .unwrap();
+    assert!(!ah_again[0].active, "replaying the older vote must not reactivate it");
+
+    // account surface: A's vote is findable by voter
+    let a_votes = idx.account_votes("polkadot", &voter_a, 10).await.unwrap();
+    assert_eq!(a_votes.len(), 1);
+    assert_eq!(a_votes[0].referendum_id, 1500);
+    assert!(idx.account_votes("polkadot", &voter_b, 10).await.unwrap().is_empty());
+
+    // ---- voting anchors: the numbers no event carries ----------------------
+    let position = VotingPosition {
+        mode: "delegating".into(),
+        delegating_target: Some(voter_b.clone()),
+        delegating_balance: Some(5_000_000_000_000),
+        delegating_conviction: Some(6),
+        delegating_conviction_label: Some("locked6x".into()),
+        casting_vote_count: None,
+        delegations_votes: Some(0),
+        delegations_capital: Some(0),
+        prior_until: Some(0),
+        prior_balance: Some(0),
+        raw: serde_json::json!({"Delegating": {"balance": 5_000_000_000_000u64}}),
+    };
+    dotlens_node::votes_pg::insert_voting_anchor(
+        &db.pool,
+        "polkadot-asset-hub",
+        &delegator,
+        "referenda",
+        34,
+        200,
+        &position,
+        Some(2_003_002),
+        "test",
+        None,
+    )
+    .await
+    .expect("anchor insert");
+    // anchors are immutable observations: re-inserting is a no-op
+    dotlens_node::votes_pg::insert_voting_anchor(
+        &db.pool,
+        "polkadot-asset-hub",
+        &delegator,
+        "referenda",
+        34,
+        200,
+        &VotingPosition::empty(),
+        Some(2_003_002),
+        "test",
+        Some("absent"),
+    )
+    .await
+    .expect("anchor re-insert");
+
+    let anchors = idx.voting_anchors("polkadot-asset-hub", &delegator).await.unwrap();
+    assert_eq!(anchors.len(), 1, "same (account, class, track, height) → one row");
+    assert_eq!(anchors[0].mode, "delegating", "the first observation is not overwritten");
+    assert_eq!(anchors[0].delegating_balance.as_deref(), Some("5000000000000"));
+    assert_eq!(anchors[0].delegating_conviction_label.as_deref(), Some("locked6x"));
+    assert_eq!(anchors[0].delegating_target, Some(format!("0x{}", "b2".repeat(32))));
+
     db.drop_db().await;
 }
 

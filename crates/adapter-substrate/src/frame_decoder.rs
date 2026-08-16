@@ -403,7 +403,7 @@ fn composite_to_json(c: &Composite<()>) -> serde_json::Value {
     }
 }
 
-fn primitive_to_json(p: &scale_value::Primitive) -> serde_json::Value {
+pub(crate) fn primitive_to_json(p: &scale_value::Primitive) -> serde_json::Value {
     use scale_value::Primitive;
     match p {
         Primitive::Bool(b) => serde_json::Value::Bool(*b),

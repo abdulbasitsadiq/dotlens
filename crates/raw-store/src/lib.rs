@@ -58,6 +58,12 @@ pub mod keys {
     pub fn metadata(chain: &str, runtime_version: u32) -> String {
         format!("raw/{chain}/meta/{runtime_version}/metadata.scale")
     }
+    /// Preimage bytes as read from state (the RAW storage value, compact
+    /// length prefix included). `hash_hex` without 0x; keyed by (hash, len)
+    /// exactly like pallet-preimage's own storage.
+    pub fn preimage(chain: &str, hash_hex: &str, len: u64) -> String {
+        format!("raw/{chain}/preimage/{hash_hex}/{len}.scale")
+    }
     /// Unfinalized blocks are HASH-KEYED: forks at one height coexist under
     /// write-once immutability, and superseded blocks stay archived.
     /// `short_hash` = hex hash without 0x, truncated by the caller.

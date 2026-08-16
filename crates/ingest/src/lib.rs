@@ -10,6 +10,7 @@ pub mod decode;
 pub mod gov;
 pub mod live;
 pub mod tip;
+pub mod votes;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};

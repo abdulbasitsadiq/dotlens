@@ -1,0 +1,56 @@
+# Polkadot Collectives (1001) — home of the Technical Fellowship.
+#
+# THE PLUG-AND-PLAY TEST (Phase 2 exit criterion): registering this chain must
+# require ZERO adapter code. The pieces were already in place before it existed
+# here: the gov mapper maps pallet `fellowshipreferenda` → class
+# "fellowship_referenda", and the votes mapper maps `fellowshipcollective`
+# (pallet-ranked-collective) → the same class. This file plus the residency
+# entry are the whole change.
+#
+# The Nov-2025 Asset Hub migration did NOT move the Fellowship: the committed
+# AH metadata fixture (spec 2003002) contains no FellowshipCollective /
+# RankedCollective pallet, while governance/staking/balances all moved. Should
+# that change, it is a residency edit — data, not code.
+id: polkadot-collectives
+name: Polkadot Collectives
+family: substrate
+relay: polkadot
+para_id: 1001
+network: polkadot
+ss58_prefix: 0
+lifecycle:
+  - status: live
+    from: "2022-11-21T11:36:30Z"   # VERIFIED 2026-08-16: block #1
+                                   # 0xb74eb81feb260bee0d4900fb45d6aefd2f5b06e4806e077a1108ae142a3eef42
+                                   # Timestamp.Now = 1669030590414 ms
+                                   # (2022-11-21T11:36:30.414Z, truncated to
+                                   # the second here). Genesis block 0 carries
+                                   # no timestamp, so block #1 is the earliest
+                                   # on-chain instant the chain can attest.
+endpoints:
+  rpc:
+    # verified 2026-08-16 against polkadot-js/apps apps-config
+    # (productionRelayPolkadot.ts, prodParasPolkadotCommon)
+    - wss://polkadot-collectives-rpc.polkadot.io
+    - wss://collectives-polkadot-rpc.n.dwellir.com
+    - wss://rpc-collectives-polkadot.luckyfriday.io
+    - wss://collectives.api.onfinality.io/public-ws
+capabilities:
+  blocks: true
+  extrinsics: true
+  events: true
+  runtime_metadata: true
+  # fellowship referenda + ranked-collective voting live here, so the chain
+  # IS governance-capable — for the fellowship class, not the public one
+  governance: true
+  fellowship: true
+  xcm:
+    min_version: 2
+modules:
+  - blocks
+  - extrinsics
+  - events
+  - accounts
+  - balances
+  - governance             # fellowship referenda (class fellowship_referenda)
+                           # + ranked-collective votes, both already mapped
