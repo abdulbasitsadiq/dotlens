@@ -7,6 +7,7 @@
 
 pub mod balances;
 pub mod decode;
+pub mod gov;
 pub mod live;
 pub mod tip;
 

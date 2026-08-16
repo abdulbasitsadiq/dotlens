@@ -27,3 +27,6 @@ modules:
   - events
   - accounts
   - balances               # historical only — balances domain resided here pre-2025-11-04
+  - governance             # historical only — governance resided here pre-2025-11-04;
+                           # the post-migration relay runtime has no referenda pallet,
+                           # so live mapping is a no-op and tracks sync yields zero rows

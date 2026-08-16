@@ -917,6 +917,242 @@ async fn balances_worker_maps_deltas_and_survives_the_boundary_filter() {
     db.drop_db().await;
 }
 
+// ------------------------------------------------------------- governance
+
+#[tokio::test]
+async fn gov_worker_builds_timelines_projection_converges_and_tracks_sync() {
+    use adapter_substrate::gov::SubstrateGovMapper;
+    use api::GovIndex as _;
+    use canonical::{CanonicalBlock, CanonicalEvent, Lineage};
+
+    let Some(db) = TestDb::create().await else { return };
+    let reg = seeds();
+    sync_registry(&db.pool, &reg).await.expect("registry sync");
+
+    let block = |chain: &str, height: u64, ts: &str, events: Vec<CanonicalEvent>| CanonicalBlock {
+        chain_id: chain.into(),
+        height,
+        hash: format!("0x{height:064x}"),
+        parent_hash: format!("0x{:064x}", height - 1),
+        timestamp: Some(ts.parse().unwrap()),
+        finalized: true,
+        lineage: Lineage {
+            runtime_version: 100,
+            decoder_version: 2,
+            raw_location: format!("raw/{chain}/test/{height}"),
+        },
+        transactions: vec![],
+        events,
+    };
+    let ev = |index: u32, name: &str, data: serde_json::Value| CanonicalEvent {
+        index,
+        transaction_index: Some(0),
+        name: name.into(),
+        data,
+    };
+    let h256 = serde_json::json!([vec![0xabu8; 32]]);
+
+    // THE migration story: ref 1500 submitted + deciding on the relay
+    // (Oct 2025), confirmed + approved on Asset Hub (Nov 2025). Plus a
+    // fellowship-instance event to prove class separation.
+    let index = PgBlockIndex::new(db.pool.clone());
+    index
+        .insert(block("polkadot", 100, "2025-10-20T00:00:00Z", vec![
+            ev(0, "referenda.Submitted", serde_json::json!({
+                "index": 1500, "track": 34,
+                "proposal": {"Lookup": {"hash": h256, "len": 142}},
+            })),
+            ev(1, "system.ExtrinsicSuccess", serde_json::json!({})),
+        ]))
+        .await
+        .expect("relay 100");
+    index
+        .insert(block("polkadot", 110, "2025-10-25T00:00:00Z", vec![ev(
+            0,
+            "referenda.DecisionStarted",
+            serde_json::json!({
+                "index": 1500, "track": 34,
+                "proposal": {"Lookup": {"hash": h256, "len": 142}},
+                "tally": {"ayes": 0, "nays": 0, "support": 0},
+            }),
+        )]))
+        .await
+        .expect("relay 110");
+    index
+        .insert(block("polkadot-asset-hub", 200, "2025-11-10T00:00:00Z", vec![
+            ev(0, "referenda.ConfirmStarted", serde_json::json!({"index": 1500})),
+            ev(1, "referenda.Confirmed", serde_json::json!({
+                "index": 1500, "tally": {"ayes": 9, "nays": 1, "support": 5},
+            })),
+            ev(2, "referenda.Approved", serde_json::json!({"index": 1500})),
+            ev(3, "fellowshipreferenda.Approved", serde_json::json!({"index": 300})),
+        ]))
+        .await
+        .expect("ah 200");
+    index
+        .insert(block("polkadot-asset-hub", 210, "2025-11-12T00:00:00Z", vec![ev(
+            0,
+            "referenda.SubmissionDepositRefunded",
+            serde_json::json!({"index": 1500, "who": [vec![7u8; 32]], "amount": 10000000000u64}),
+        )]))
+        .await
+        .expect("ah 210");
+
+    let checkpoints = PgCheckpointStore::new(db.pool.clone());
+    let source = dotlens_node::balances_pg::PgEventSource::new(db.pool.clone());
+    let sink = dotlens_node::gov_pg::PgTimelineSink::new(db.pool.clone());
+    let deps = ingest::gov::GovDeps {
+        checkpoints: &checkpoints,
+        source: &source,
+        sink: &sink,
+    };
+
+    // OUT OF ORDER on purpose: the info-only refund block first — the
+    // projection must hold an 'unknown' placeholder that any real status beats
+    ingest::gov::gov_range("polkadot-asset-hub", &SubstrateGovMapper, &deps, 210, 210)
+        .await
+        .expect("ah refund-first range");
+    let idx = api::pg::PgGovIndex::new(db.pool.clone());
+    let placeholder = idx
+        .referendum("polkadot-asset-hub", "referenda", 1500)
+        .await
+        .unwrap()
+        .expect("placeholder row");
+    assert_eq!(placeholder.status, "unknown");
+
+    // now the status events (and the relay side)
+    ingest::gov::gov_range("polkadot-asset-hub", &SubstrateGovMapper, &deps, 200, 200)
+        .await
+        .expect("ah status range");
+    ingest::gov::gov_range("polkadot", &SubstrateGovMapper, &deps, 100, 110)
+        .await
+        .expect("relay range");
+
+    // relay projection: deciding at (110, 0), submission facts captured
+    let relay = idx
+        .referendum("polkadot", "referenda", 1500)
+        .await
+        .unwrap()
+        .expect("relay row");
+    assert_eq!(relay.status, "deciding");
+    assert_eq!(relay.status_height, 110);
+    assert_eq!(relay.track_id, Some(34));
+    assert_eq!(relay.proposal_hash.as_deref(), Some(&format!("0x{}", "ab".repeat(32))[..]));
+    assert_eq!(relay.proposal_len, Some(142));
+    assert_eq!(relay.submitted_at_height, Some(100));
+
+    // AH projection: approved at (200, 2); the later refund never moved status
+    let ah = idx
+        .referendum("polkadot-asset-hub", "referenda", 1500)
+        .await
+        .unwrap()
+        .expect("ah row");
+    assert_eq!(ah.status, "approved");
+    assert_eq!((ah.status_height, ah.track_id), (200, None));
+
+    // fellowship instance is its own class
+    let fellowship = idx
+        .referendum("polkadot-asset-hub", "fellowship_referenda", 300)
+        .await
+        .unwrap()
+        .expect("fellowship row");
+    assert_eq!(fellowship.status, "approved");
+    assert!(idx
+        .referendum("polkadot-asset-hub", "referenda", 300)
+        .await
+        .unwrap()
+        .is_none());
+
+    // timeline reads join block timestamps, ordered
+    let events = idx
+        .referendum_events("polkadot-asset-hub", "referenda", 1500)
+        .await
+        .unwrap();
+    assert_eq!(events.len(), 4);
+    assert_eq!(events[0].kind, "confirm_started");
+    assert_eq!(events[3].kind, "submission_deposit_refunded");
+    assert!(events[0].timestamp.is_some());
+
+    // partition routing: nothing in the default partition
+    let (in_default,): (i64,) =
+        sqlx::query_as("select count(*) from gov.referendum_events_default")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!(in_default, 0, "timeline rows must route to per-chain partitions");
+
+    // CONVERGENCE: replay everything (behind the frontier, mixed order) —
+    // counts stable, statuses unchanged (older status events don't regress)
+    ingest::gov::gov_range("polkadot", &SubstrateGovMapper, &deps, 100, 100)
+        .await
+        .expect("relay replay of submitted only");
+    ingest::gov::gov_range("polkadot-asset-hub", &SubstrateGovMapper, &deps, 200, 210)
+        .await
+        .expect("ah replay");
+    let (total_events,): (i64,) = sqlx::query_as("select count(*) from gov.referendum_events")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(total_events, 7, "insert-ignore: 2 relay + 4 ah + 1 fellowship");
+    let relay2 = idx.referendum("polkadot", "referenda", 1500).await.unwrap().unwrap();
+    assert_eq!(
+        (relay2.status.as_str(), relay2.status_height),
+        ("deciding", 110),
+        "replaying an older status event must not regress the projection"
+    );
+
+    // list surface: newest first
+    let listed = idx.list_referenda("polkadot-asset-hub", "referenda", 10).await.unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].referendum_id, 1500);
+
+    // ---- tracks: decoded from the runtime's own archived metadata ----------
+    let raw_dir = tmp_raw("gov-tracks");
+    let raw = FsRawStore::new(&raw_dir);
+    let meta_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../fixtures/real/polkadot-asset-hub-19498783/metadata.scale");
+    match std::fs::read(&meta_path) {
+        Ok(blob) => {
+            let key = raw_store::keys::metadata("polkadot-asset-hub", 2_003_002);
+            raw.put(&key, &blob, "test").expect("stage metadata blob");
+            sqlx::query(
+                "insert into substrate.runtime_versions \
+                     (chain_id, spec_version, metadata_version, metadata_blob_location) \
+                 values ($1, $2, 14, $3) on conflict do nothing",
+            )
+            .bind("polkadot-asset-hub")
+            .bind(2_003_002i64)
+            .bind(&key)
+            .execute(&db.pool)
+            .await
+            .expect("runtime_versions row");
+
+            let r1 = dotlens_node::gov_pg::sync_tracks(&db.pool, &reg, &raw)
+                .await
+                .expect("first track sync");
+            assert_eq!(r1.tracks, 16, "OpenGov's 16 tracks from AH metadata");
+            // the relay has the governance module but no archived metadata here
+            assert!(r1.chains_skipped.contains(&"polkadot".to_string()));
+
+            // idempotent
+            let r2 = dotlens_node::gov_pg::sync_tracks(&db.pool, &reg, &raw)
+                .await
+                .expect("second track sync");
+            assert_eq!(r2.tracks, 16);
+            let tracks = idx.tracks("polkadot-asset-hub").await.unwrap();
+            assert_eq!(tracks.len(), 16);
+            let root = tracks.iter().find(|t| t.track_id == 0).expect("track 0");
+            assert_eq!((root.name.as_str(), root.pallet.as_str()), ("root", "referenda"));
+            assert_eq!(root.spec_version, 2_003_002);
+            assert!(root.params.get("decision_period").is_some());
+        }
+        Err(_) => eprintln!("NOTE: real fixture metadata absent — track-sync assertions skipped"),
+    }
+
+    let _ = std::fs::remove_dir_all(&raw_dir);
+    db.drop_db().await;
+}
+
 // ------------------------------------------------------------ reorg safety
 
 #[tokio::test]

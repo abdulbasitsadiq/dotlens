@@ -17,6 +17,9 @@ pub mod labels;
 pub mod balances_pg;
 
 #[cfg(feature = "pg")]
+pub mod gov_pg;
+
+#[cfg(feature = "pg")]
 pub mod tip_pg;
 
 /// Deterministic contiguous chunking for concurrent backfill: same inputs →

@@ -31,6 +31,10 @@ pub mod accounts;
 /// Pure — no I/O.
 pub mod balances;
 
+/// Governance semantics: referenda event→timeline mapping + track definitions
+/// decoded from runtime metadata. Pure — no I/O.
+pub mod gov;
+
 use canonical::{CanonicalBlock, CanonicalEvent, CanonicalTransaction, Lineage};
 use serde::{Deserialize, Serialize};
 

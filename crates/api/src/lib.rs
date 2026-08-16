@@ -243,6 +243,150 @@ impl BalanceIndex for MemoryBalanceIndex {
     }
 }
 
+// ---------------------------------------------------------------------- gov
+
+/// The `gov.referenda` projection, query-shaped.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ReferendumRow {
+    pub class: String,
+    pub referendum_id: u64,
+    pub track_id: Option<u32>,
+    /// submitted|deciding|confirming|confirmed|approved|rejected|timed_out|
+    /// cancelled|killed|unknown ('unknown' = only info events seen so far).
+    pub status: String,
+    pub status_height: u64,
+    pub proposal: Option<serde_json::Value>,
+    pub proposal_hash: Option<String>,
+    pub proposal_len: Option<u64>,
+    pub submitted_at_height: Option<u64>,
+}
+
+/// One referendum timeline entry (a `gov.referendum_events` row).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ReferendumEventRow {
+    pub height: u64,
+    pub timestamp: Option<DateTime<Utc>>,
+    pub event_index: u32,
+    pub kind: String,
+    pub data: serde_json::Value,
+}
+
+/// One track definition (a `gov.tracks` row — decoded from runtime metadata).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct GovTrackRow {
+    pub pallet: String,
+    pub track_id: u32,
+    pub name: String,
+    pub params: serde_json::Value,
+    pub spec_version: u64,
+}
+
+/// Read side of the gov schema, per chain. The API stitches chains together
+/// via governance domain residency (referendum numbering is continuous across
+/// the Nov 2025 migration; one referendum may have rows on both chains).
+#[async_trait]
+pub trait GovIndex: Send + Sync {
+    async fn referendum(
+        &self,
+        chain_id: &str,
+        class: &str,
+        id: u64,
+    ) -> Result<Option<ReferendumRow>, IndexError>;
+    async fn referendum_events(
+        &self,
+        chain_id: &str,
+        class: &str,
+        id: u64,
+    ) -> Result<Vec<ReferendumEventRow>, IndexError>;
+    /// Latest referenda by id, descending.
+    async fn list_referenda(
+        &self,
+        chain_id: &str,
+        class: &str,
+        limit: u64,
+    ) -> Result<Vec<ReferendumRow>, IndexError>;
+    async fn tracks(&self, chain_id: &str) -> Result<Vec<GovTrackRow>, IndexError>;
+}
+
+#[derive(Default)]
+pub struct MemoryGovIndex {
+    referenda: RwLock<HashMap<(String, String, u64), ReferendumRow>>,
+    events: RwLock<HashMap<(String, String, u64), Vec<ReferendumEventRow>>>,
+    tracks: RwLock<HashMap<String, Vec<GovTrackRow>>>,
+}
+
+impl MemoryGovIndex {
+    pub fn new() -> Self {
+        Self::default()
+    }
+    pub fn insert_referendum(&self, chain: &str, row: ReferendumRow) {
+        self.referenda
+            .write()
+            .expect("lock")
+            .insert((chain.into(), row.class.clone(), row.referendum_id), row);
+    }
+    pub fn insert_event(&self, chain: &str, class: &str, id: u64, row: ReferendumEventRow) {
+        self.events
+            .write()
+            .expect("lock")
+            .entry((chain.into(), class.into(), id))
+            .or_default()
+            .push(row);
+    }
+    pub fn insert_track(&self, chain: &str, row: GovTrackRow) {
+        self.tracks.write().expect("lock").entry(chain.into()).or_default().push(row);
+    }
+}
+
+#[async_trait]
+impl GovIndex for MemoryGovIndex {
+    async fn referendum(
+        &self,
+        chain_id: &str,
+        class: &str,
+        id: u64,
+    ) -> Result<Option<ReferendumRow>, IndexError> {
+        let map = self.referenda.read().map_err(|e| IndexError(e.to_string()))?;
+        Ok(map.get(&(chain_id.into(), class.into(), id)).cloned())
+    }
+    async fn referendum_events(
+        &self,
+        chain_id: &str,
+        class: &str,
+        id: u64,
+    ) -> Result<Vec<ReferendumEventRow>, IndexError> {
+        let map = self.events.read().map_err(|e| IndexError(e.to_string()))?;
+        let mut rows = map
+            .get(&(chain_id.into(), class.into(), id))
+            .cloned()
+            .unwrap_or_default();
+        rows.sort_by_key(|r| (r.height, r.event_index));
+        Ok(rows)
+    }
+    async fn list_referenda(
+        &self,
+        chain_id: &str,
+        class: &str,
+        limit: u64,
+    ) -> Result<Vec<ReferendumRow>, IndexError> {
+        let map = self.referenda.read().map_err(|e| IndexError(e.to_string()))?;
+        let mut rows: Vec<ReferendumRow> = map
+            .iter()
+            .filter(|((c, cl, _), _)| c == chain_id && cl == class)
+            .map(|(_, r)| r.clone())
+            .collect();
+        rows.sort_by(|a, b| b.referendum_id.cmp(&a.referendum_id));
+        rows.truncate(limit as usize);
+        Ok(rows)
+    }
+    async fn tracks(&self, chain_id: &str) -> Result<Vec<GovTrackRow>, IndexError> {
+        let map = self.tracks.read().map_err(|e| IndexError(e.to_string()))?;
+        let mut rows = map.get(chain_id).cloned().unwrap_or_default();
+        rows.sort_by(|a, b| (&a.pallet, a.track_id).cmp(&(&b.pallet, b.track_id)));
+        Ok(rows)
+    }
+}
+
 // -------------------------------------------------------------------- pg impl
 
 #[cfg(feature = "pg")]
@@ -636,6 +780,143 @@ pub mod pg {
                 .collect())
         }
     }
+
+    /// Postgres-backed gov reads over `gov.*`.
+    pub struct PgGovIndex {
+        pool: PgPool,
+    }
+
+    impl PgGovIndex {
+        pub fn new(pool: PgPool) -> Self {
+            Self { pool }
+        }
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn referendum_from_row(
+        (class, referendum_id, track_id, status, status_height, proposal, proposal_hash, proposal_len, submitted_at): (
+            String,
+            i64,
+            Option<i32>,
+            String,
+            i64,
+            Option<serde_json::Value>,
+            Option<String>,
+            Option<i64>,
+            Option<i64>,
+        ),
+    ) -> super::ReferendumRow {
+        super::ReferendumRow {
+            class,
+            referendum_id: referendum_id as u64,
+            track_id: track_id.map(|t| t as u32),
+            status,
+            status_height: status_height as u64,
+            proposal,
+            proposal_hash,
+            proposal_len: proposal_len.map(|l| l as u64),
+            submitted_at_height: submitted_at.map(|h| h as u64),
+        }
+    }
+
+    const REFERENDUM_COLS: &str = "class, referendum_id, track_id, status, status_height, \
+                                   proposal, proposal_hash, proposal_len, submitted_at_height";
+
+    #[async_trait]
+    impl super::GovIndex for PgGovIndex {
+        async fn referendum(
+            &self,
+            chain_id: &str,
+            class: &str,
+            id: u64,
+        ) -> Result<Option<super::ReferendumRow>, IndexError> {
+            let row = sqlx::query_as(&format!(
+                "select {REFERENDUM_COLS} from gov.referenda \
+                 where chain_id = $1 and class = $2 and referendum_id = $3"
+            ))
+            .bind(chain_id)
+            .bind(class)
+            .bind(id as i64)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| IndexError(e.to_string()))?;
+            Ok(row.map(referendum_from_row))
+        }
+
+        async fn referendum_events(
+            &self,
+            chain_id: &str,
+            class: &str,
+            id: u64,
+        ) -> Result<Vec<super::ReferendumEventRow>, IndexError> {
+            let rows: Vec<(i64, Option<DateTime<Utc>>, i32, String, serde_json::Value)> =
+                sqlx::query_as(
+                    "select e.block_height, b.timestamp, e.event_index, e.kind, e.data \
+                     from gov.referendum_events e \
+                     left join core.blocks b \
+                       on b.chain_id = e.chain_id and b.height = e.block_height \
+                     where e.chain_id = $1 and e.class = $2 and e.referendum_id = $3 \
+                     order by e.block_height, e.event_index",
+                )
+                .bind(chain_id)
+                .bind(class)
+                .bind(id as i64)
+                .fetch_all(&self.pool)
+                .await
+                .map_err(|e| IndexError(e.to_string()))?;
+            Ok(rows
+                .into_iter()
+                .map(|(height, timestamp, event_index, kind, data)| super::ReferendumEventRow {
+                    height: height as u64,
+                    timestamp,
+                    event_index: event_index as u32,
+                    kind,
+                    data,
+                })
+                .collect())
+        }
+
+        async fn list_referenda(
+            &self,
+            chain_id: &str,
+            class: &str,
+            limit: u64,
+        ) -> Result<Vec<super::ReferendumRow>, IndexError> {
+            let rows: Vec<_> = sqlx::query_as(&format!(
+                "select {REFERENDUM_COLS} from gov.referenda \
+                 where chain_id = $1 and class = $2 \
+                 order by referendum_id desc limit $3"
+            ))
+            .bind(chain_id)
+            .bind(class)
+            .bind(limit as i64)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| IndexError(e.to_string()))?;
+            Ok(rows.into_iter().map(referendum_from_row).collect())
+        }
+
+        async fn tracks(&self, chain_id: &str) -> Result<Vec<super::GovTrackRow>, IndexError> {
+            let rows: Vec<(String, i32, String, serde_json::Value, i64)> = sqlx::query_as(
+                "select pallet, track_id, name, params, spec_version from gov.tracks \
+                 where chain_id = $1 order by pallet, track_id",
+            )
+            .bind(chain_id)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| IndexError(e.to_string()))?;
+            Ok(rows
+                .into_iter()
+                .map(|(pallet, track_id, name, params, spec_version)| super::GovTrackRow {
+                    pallet,
+                    track_id: track_id as u32,
+                    name,
+                    params,
+                    spec_version: spec_version as u64,
+                })
+                .collect())
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -644,6 +925,7 @@ pub struct AppState {
     pub blocks: Arc<dyn BlockIndex>,
     pub labels: Arc<dyn LabelIndex>,
     pub balances: Arc<dyn BalanceIndex>,
+    pub gov: Arc<dyn GovIndex>,
     pub parse_account: AccountParser,
 }
 
@@ -654,6 +936,9 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/blocks/{chain}/{height}", get(get_block))
         .route("/v1/accounts/{chain}/{account}/labels", get(get_labels))
         .route("/v1/balances/{network}/{account}/history", get(get_balance_history))
+        .route("/v1/gov/{network}/referenda", get(list_gov_referenda))
+        .route("/v1/gov/{network}/referenda/{id}", get(get_gov_referendum))
+        .route("/v1/gov/{network}/tracks", get(get_gov_tracks))
         .route("/v1/domains/{network}/{domain}", get(resolve_domain))
         .with_state(state)
 }
@@ -838,6 +1123,175 @@ fn changes_with_running_totals(
         .collect()
 }
 
+// ---------------------------------------------------------------- gov routes
+
+#[derive(Deserialize)]
+struct GovQuery {
+    /// Referenda instance; defaults to public OpenGov.
+    class: Option<String>,
+    limit: Option<u64>,
+    /// RFC3339; tracks endpoint only — the migration-aware knob.
+    at: Option<DateTime<Utc>>,
+}
+
+/// Governance residency windows for a network, in time order. Empty = the
+/// network has no governance residency configured (404, not a guess).
+fn gov_windows<'a>(registry: &'a Registry, network: &str) -> Vec<&'a registry::ResidencyEntry> {
+    let mut windows: Vec<&registry::ResidencyEntry> = registry
+        .residency()
+        .iter()
+        .filter(|r| r.domain == "governance" && r.network == network)
+        .collect();
+    windows.sort_by_key(|r| r.from);
+    windows
+}
+
+/// Merge a later residency window's projection over an earlier one:
+/// status comes from the later window UNLESS it only saw info events
+/// ('unknown' — e.g. a post-migration deposit refund for a relay-decided
+/// referendum must not erase the relay's terminal status); info fields
+/// coalesce; submission is the earliest observation.
+fn merge_referendum(prev: ReferendumRow, later: ReferendumRow) -> ReferendumRow {
+    let (status, status_height) = if later.status == "unknown" {
+        (prev.status, prev.status_height)
+    } else {
+        (later.status, later.status_height)
+    };
+    ReferendumRow {
+        class: later.class,
+        referendum_id: later.referendum_id,
+        track_id: later.track_id.or(prev.track_id),
+        status,
+        status_height,
+        proposal: later.proposal.or(prev.proposal),
+        proposal_hash: later.proposal_hash.or(prev.proposal_hash),
+        proposal_len: later.proposal_len.or(prev.proposal_len),
+        submitted_at_height: prev.submitted_at_height.or(later.submitted_at_height),
+    }
+}
+
+/// THE Phase 2 governance surface: one referendum's full story for a NETWORK,
+/// stitched across chains by governance domain residency. A referendum
+/// submitted on the relay and concluded on Asset Hub renders as ONE timeline —
+/// the caller never has to know the migration happened (ARCHITECTURE §4).
+async fn get_gov_referendum(
+    State(state): State<AppState>,
+    Path((network, id)): Path<(String, u64)>,
+    Query(q): Query<GovQuery>,
+) -> Response {
+    let class = q.class.unwrap_or_else(|| "referenda".to_string());
+    let windows = gov_windows(&state.registry, &network);
+    if windows.is_empty() {
+        return error(
+            StatusCode::NOT_FOUND,
+            format!("no 'governance' domain residency for network '{network}'"),
+        );
+    }
+
+    let mut merged: Option<ReferendumRow> = None;
+    let mut segments = Vec::with_capacity(windows.len());
+    for w in windows {
+        let summary = match state.gov.referendum(&w.chain, &class, id).await {
+            Ok(s) => s,
+            Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+        };
+        let events = match state.gov.referendum_events(&w.chain, &class, id).await {
+            Ok(ev) => ev,
+            Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+        };
+        if let Some(s) = summary {
+            merged = Some(match merged.take() {
+                None => s,
+                Some(prev) => merge_referendum(prev, s),
+            });
+        }
+        segments.push(serde_json::json!({
+            "chain": w.chain,
+            "from": w.from,
+            "to": w.to,
+            "events": events,
+        }));
+    }
+    let Some(referendum) = merged else {
+        return error(
+            StatusCode::NOT_FOUND,
+            format!("referendum {network}/{class}/{id} not indexed"),
+        );
+    };
+    Json(serde_json::json!({
+        "network": network,
+        "class": class,
+        "referendum_id": id,
+        "referendum": referendum,
+        "segments": segments,
+    }))
+    .into_response()
+}
+
+/// Latest referenda for a network, residency-merged (a referendum with rows on
+/// both sides of the migration appears once, with its stitched summary).
+async fn list_gov_referenda(
+    State(state): State<AppState>,
+    Path(network): Path<String>,
+    Query(q): Query<GovQuery>,
+) -> Response {
+    let class = q.class.unwrap_or_else(|| "referenda".to_string());
+    let limit = q.limit.unwrap_or(25).min(200);
+    let windows = gov_windows(&state.registry, &network);
+    if windows.is_empty() {
+        return error(
+            StatusCode::NOT_FOUND,
+            format!("no 'governance' domain residency for network '{network}'"),
+        );
+    }
+    let mut by_id: std::collections::BTreeMap<u64, ReferendumRow> = std::collections::BTreeMap::new();
+    for w in &windows {
+        let rows = match state.gov.list_referenda(&w.chain, &class, limit).await {
+            Ok(r) => r,
+            Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+        };
+        for row in rows {
+            let id = row.referendum_id;
+            let merged = match by_id.remove(&id) {
+                None => row,
+                Some(prev) => merge_referendum(prev, row),
+            };
+            by_id.insert(id, merged);
+        }
+    }
+    let referenda: Vec<&ReferendumRow> = by_id.values().rev().take(limit as usize).collect();
+    Json(serde_json::json!({
+        "network": network,
+        "class": class,
+        "referenda": referenda,
+    }))
+    .into_response()
+}
+
+/// Track definitions for the chain hosting governance at `at` (default now) —
+/// decoded from that runtime's own metadata, served as data.
+async fn get_gov_tracks(
+    State(state): State<AppState>,
+    Path(network): Path<String>,
+    Query(q): Query<GovQuery>,
+) -> Response {
+    let at = q.at.unwrap_or_else(Utc::now);
+    let chain = match state.registry.resolve_domain("governance", &network, at) {
+        Ok(c) => c,
+        Err(e) => return error(StatusCode::NOT_FOUND, e.to_string()),
+    };
+    match state.gov.tracks(&chain.id).await {
+        Ok(tracks) => Json(serde_json::json!({
+            "network": network,
+            "chain": chain.id,
+            "at": at,
+            "tracks": tracks,
+        }))
+        .into_response(),
+        Err(e) => error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    }
+}
+
 #[derive(Deserialize)]
 struct AtQuery {
     /// RFC3339; defaults to now. The migration-aware knob.
@@ -949,11 +1403,120 @@ mod tests {
             },
         );
 
+        // governance stitched across the migration: ref 1500 submitted +
+        // deciding on the relay, concluded on Asset Hub; ref 1400 decided on
+        // the relay with only an info-event row ('unknown') on AH
+        let gov = Arc::new(MemoryGovIndex::new());
+        gov.insert_referendum(
+            "polkadot",
+            ReferendumRow {
+                class: "referenda".into(),
+                referendum_id: 1500,
+                track_id: Some(34),
+                status: "deciding".into(),
+                status_height: 28_400_000,
+                proposal: Some(serde_json::json!({"Lookup": {"hash": [vec![171u8; 32]], "len": 142}})),
+                proposal_hash: Some(format!("0x{}", "ab".repeat(32))),
+                proposal_len: Some(142),
+                submitted_at_height: Some(28_399_000),
+            },
+        );
+        gov.insert_event(
+            "polkadot",
+            "referenda",
+            1500,
+            ReferendumEventRow {
+                height: 28_399_000,
+                timestamp: Some(ts("2025-10-20T00:00:00Z")),
+                event_index: 5,
+                kind: "submitted".into(),
+                data: serde_json::json!({"index": 1500, "track": 34}),
+            },
+        );
+        gov.insert_event(
+            "polkadot",
+            "referenda",
+            1500,
+            ReferendumEventRow {
+                height: 28_400_000,
+                timestamp: Some(ts("2025-10-25T00:00:00Z")),
+                event_index: 2,
+                kind: "decision_started".into(),
+                data: serde_json::json!({"index": 1500, "track": 34}),
+            },
+        );
+        gov.insert_referendum(
+            "polkadot-asset-hub",
+            ReferendumRow {
+                class: "referenda".into(),
+                referendum_id: 1500,
+                track_id: None,
+                status: "approved".into(),
+                status_height: 10_300_000,
+                proposal: None,
+                proposal_hash: None,
+                proposal_len: None,
+                submitted_at_height: None,
+            },
+        );
+        gov.insert_event(
+            "polkadot-asset-hub",
+            "referenda",
+            1500,
+            ReferendumEventRow {
+                height: 10_300_000,
+                timestamp: Some(ts("2025-11-10T00:00:00Z")),
+                event_index: 7,
+                kind: "approved".into(),
+                data: serde_json::json!({"index": 1500}),
+            },
+        );
+        gov.insert_referendum(
+            "polkadot",
+            ReferendumRow {
+                class: "referenda".into(),
+                referendum_id: 1400,
+                track_id: Some(33),
+                status: "rejected".into(),
+                status_height: 27_000_000,
+                proposal: None,
+                proposal_hash: None,
+                proposal_len: None,
+                submitted_at_height: None,
+            },
+        );
+        // post-migration deposit refund only — must NOT erase the relay verdict
+        gov.insert_referendum(
+            "polkadot-asset-hub",
+            ReferendumRow {
+                class: "referenda".into(),
+                referendum_id: 1400,
+                track_id: None,
+                status: "unknown".into(),
+                status_height: 0,
+                proposal: None,
+                proposal_hash: None,
+                proposal_len: None,
+                submitted_at_height: None,
+            },
+        );
+        gov.insert_track(
+            "polkadot-asset-hub",
+            GovTrackRow {
+                pallet: "referenda".into(),
+                track_id: 0,
+                name: "root".into(),
+                params: serde_json::json!({"max_deciding": 1}),
+                spec_version: 2_003_002,
+            },
+        );
+
         AppState {
             registry,
             blocks,
             labels,
             balances,
+            gov,
             parse_account: Arc::new(|s| {
                 adapter_substrate::accounts::parse_account(s).map(|a| a.to_vec())
             }),
@@ -1081,6 +1644,69 @@ mod tests {
         )
         .await;
         assert_eq!(s2, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn referendum_timeline_stitches_across_the_migration_boundary() {
+        let app = router(test_state().await);
+        let (status, json) = get_json(&app, "/v1/gov/polkadot/referenda/1500").await;
+        assert_eq!(status, StatusCode::OK);
+
+        // merged summary: AH verdict wins, relay-era submission facts coalesce
+        let r = &json["referendum"];
+        assert_eq!(r["status"], "approved");
+        assert_eq!(r["track_id"], 34);
+        assert_eq!(r["submitted_at_height"], 28_399_000);
+        assert_eq!(r["proposal_hash"], format!("0x{}", "ab".repeat(32)));
+
+        // segments in residency order: relay window then AH window
+        let segments = json["segments"].as_array().unwrap();
+        assert_eq!(segments.len(), 2);
+        assert_eq!(segments[0]["chain"], "polkadot");
+        assert_eq!(segments[0]["events"].as_array().unwrap().len(), 2);
+        assert_eq!(segments[0]["events"][0]["kind"], "submitted");
+        assert_eq!(segments[1]["chain"], "polkadot-asset-hub");
+        assert_eq!(segments[1]["events"][0]["kind"], "approved");
+
+        // an 'unknown' post-migration row must not erase the relay verdict
+        let (_, j1400) = get_json(&app, "/v1/gov/polkadot/referenda/1400").await;
+        assert_eq!(j1400["referendum"]["status"], "rejected");
+        assert_eq!(j1400["referendum"]["track_id"], 33);
+
+        // unindexed referendum → 404; unknown network → 404
+        let (s2, _) = get_json(&app, "/v1/gov/polkadot/referenda/999999").await;
+        assert_eq!(s2, StatusCode::NOT_FOUND);
+        let (s3, _) = get_json(&app, "/v1/gov/nowhere/referenda/1500").await;
+        assert_eq!(s3, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn referenda_list_merges_windows_and_orders_desc() {
+        let app = router(test_state().await);
+        let (status, json) = get_json(&app, "/v1/gov/polkadot/referenda?limit=10").await;
+        assert_eq!(status, StatusCode::OK);
+        let rows = json["referenda"].as_array().unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0]["referendum_id"], 1500);
+        assert_eq!(rows[0]["status"], "approved");
+        assert_eq!(rows[1]["referendum_id"], 1400);
+        assert_eq!(rows[1]["status"], "rejected", "unknown must not clobber");
+    }
+
+    #[tokio::test]
+    async fn tracks_resolve_via_governance_residency() {
+        let app = router(test_state().await);
+        // now (2026): governance lives on Asset Hub
+        let (status, json) = get_json(&app, "/v1/gov/polkadot/tracks").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["chain"], "polkadot-asset-hub");
+        assert_eq!(json["tracks"][0]["track_id"], 0);
+        assert_eq!(json["tracks"][0]["name"], "root");
+
+        // pre-migration: resolves to the relay (which has no synced tracks here)
+        let (_, before) = get_json(&app, "/v1/gov/polkadot/tracks?at=2025-06-01T00:00:00Z").await;
+        assert_eq!(before["chain"], "polkadot");
+        assert_eq!(before["tracks"].as_array().unwrap().len(), 0);
     }
 
     #[tokio::test]

@@ -16,6 +16,8 @@
 //!   dotlens-node verify-labels <chain>        # probe labels on-chain, record, exit
 //!   dotlens-node balances-range <chain> <a> <b>       # map deltas over a range, exit
 //!   dotlens-node anchor-balance <chain> <acct> <h>    # record absolute balance anchor
+//!   dotlens-node gov-range <chain> <a> <b>    # map referendum timelines over a range
+//!   dotlens-node sync-tracks                  # decode gov tracks from metadata, exit
 //!
 //! backfill accepts an optional worker count (`backfill <chain> <a> <b> 8`) —
 //! deterministic chunks, per-chunk checkpoints, re-run the same command to
@@ -43,6 +45,7 @@ struct Backends {
     blocks: Arc<dyn BlockIndex>,
     labels: Arc<dyn api::LabelIndex>,
     balances: Arc<dyn api::BalanceIndex>,
+    gov: Arc<dyn api::GovIndex>,
     runtime_versions: Arc<dyn RuntimeVersionSink>,
     /// Kept for label sync/verify (they need direct SQL, not a trait).
     #[cfg(feature = "pg")]
@@ -57,6 +60,7 @@ fn memory_backends() -> Backends {
         blocks: Arc::new(MemoryBlockIndex::new()),
         labels: Arc::new(api::MemoryLabelIndex::new()),
         balances: Arc::new(api::MemoryBalanceIndex::new()),
+        gov: Arc::new(api::MemoryGovIndex::new()),
         runtime_versions: Arc::new(NoopRuntimeVersionSink),
         #[cfg(feature = "pg")]
         pool: None,
@@ -85,6 +89,8 @@ enum Command {
     VerifyLabels { chain: String },
     BalancesRange { chain: String, from: u64, to: u64 },
     AnchorBalance { chain: String, account: String, height: u64 },
+    GovRange { chain: String, from: u64, to: u64 },
+    SyncTracks,
 }
 
 fn parse_args() -> Result<Command> {
@@ -132,6 +138,11 @@ fn parse_args() -> Result<Command> {
             let (chain, from, to) = range("usage: dotlens-node balances-range <chain> <from> <to>")?;
             Ok(Command::BalancesRange { chain, from, to })
         }
+        Some("gov-range") => {
+            let (chain, from, to) = range("usage: dotlens-node gov-range <chain> <from> <to>")?;
+            Ok(Command::GovRange { chain, from, to })
+        }
+        Some("sync-tracks") => Ok(Command::SyncTracks),
         Some("anchor-balance") => {
             let usage = "usage: dotlens-node anchor-balance <chain> <account> <height>";
             let chain = args.get(1).context(usage)?.clone();
@@ -203,6 +214,7 @@ async fn main() -> Result<()> {
             blocks: Arc::new(PgBlockIndex::new(pool.clone())),
             labels: Arc::new(api::pg::PgLabelIndex::new(pool.clone())),
             balances: Arc::new(api::pg::PgBalanceIndex::new(pool.clone())),
+            gov: Arc::new(api::pg::PgGovIndex::new(pool.clone())),
             runtime_versions: Arc::new(PgRuntimeVersionSink::new(pool.clone())),
             pool: Some(pool),
             persistent: true,
@@ -266,6 +278,23 @@ async fn main() -> Result<()> {
         return run_anchor_balance(&registry, &backends, raw.as_ref(), chain, account, *height)
             .await;
     }
+    if let Command::GovRange { chain, from, to } = &command {
+        anyhow::ensure!(
+            backends.persistent,
+            "gov-range requires DATABASE_URL (canonical events + timelines must persist)"
+        );
+        return run_gov_range(&registry, &backends, chain, *from, *to).await;
+    }
+    if matches!(command, Command::SyncTracks) {
+        #[cfg(feature = "pg")]
+        if let Some(pool) = &backends.pool {
+            let report =
+                dotlens_node::gov_pg::sync_tracks(pool, registry.as_ref(), raw.as_ref()).await?;
+            println!("track sync: {report:?}");
+            return Ok(());
+        }
+        anyhow::bail!("sync-tracks requires the `pg` feature and DATABASE_URL");
+    }
 
     // -- account labels: derive + project on every start (idempotent) ---------
     #[cfg(feature = "pg")]
@@ -278,6 +307,13 @@ async fn main() -> Result<()> {
             seeded = report.seeded_labels,
             missing_metadata = ?report.chains_missing_metadata,
             "account labels synced"
+        );
+        let tracks =
+            dotlens_node::gov_pg::sync_tracks(pool, registry.as_ref(), raw.as_ref()).await?;
+        tracing::info!(
+            tracks = tracks.tracks,
+            skipped = ?tracks.chains_skipped,
+            "governance tracks synced"
         );
     }
 
@@ -303,6 +339,7 @@ async fn main() -> Result<()> {
     spawn_live_followers(&registry, &backends, &raw);
     spawn_decode_followers(&registry, &backends, &raw);
     spawn_balances_followers(&registry, &backends);
+    spawn_gov_followers(&registry, &backends);
     spawn_tip_followers(&registry, &backends, &raw);
 
     // -- API ------------------------------------------------------------------
@@ -312,6 +349,7 @@ async fn main() -> Result<()> {
         blocks: backends.blocks.clone(),
         labels: backends.labels.clone(),
         balances: backends.balances.clone(),
+        gov: backends.gov.clone(),
         // family-encoded address parsing is adapter-owned (Invariant 4); with
         // more families this becomes registry-driven dispatch
         parse_account: Arc::new(|s| {
@@ -748,6 +786,91 @@ fn spawn_balances_followers(registry: &Arc<Registry>, backends: &Arc<Backends>) 
             });
         }
     }
+}
+
+/// Gov followers: chase each chain's decode checkpoint, mapping canonical
+/// referenda events into referendum timelines. Pure mapping over Pg — no
+/// network, `pg` only. Eligibility is registry data: the chain must enable
+/// the `governance` module.
+fn spawn_gov_followers(registry: &Arc<Registry>, backends: &Arc<Backends>) {
+    if !env_flag("GOV_FOLLOW") {
+        tracing::info!("gov follower disabled (set GOV_FOLLOW=1 to enable)");
+        return;
+    }
+    if !backends.persistent {
+        tracing::warn!("GOV_FOLLOW=1 but no DATABASE_URL — refusing to map into memory");
+        return;
+    }
+    #[cfg(feature = "pg")]
+    {
+        use adapter_substrate::gov::SubstrateGovMapper;
+
+        let poll = std::time::Duration::from_secs(
+            env_or("POLL_INTERVAL_SECS", "6").parse().unwrap_or(6),
+        );
+        for chain in registry.chains() {
+            if !chain.has_module("governance") {
+                continue;
+            }
+            if chain.family != registry::ChainFamily::Substrate {
+                tracing::debug!(chain = %chain.id, "no gov mapper for this family — skipped");
+                continue;
+            }
+            let Some(pool) = backends.pool.clone() else { continue };
+            let chain_id = chain.id.clone();
+            let backends = backends.clone();
+            tokio::spawn(async move {
+                tracing::info!(chain = %chain_id, "gov follower started");
+                let source = dotlens_node::balances_pg::PgEventSource::new(pool.clone());
+                let sink = dotlens_node::gov_pg::PgTimelineSink::new(pool);
+                let deps = ingest::gov::GovDeps {
+                    checkpoints: backends.checkpoints.as_ref(),
+                    source: &source,
+                    sink: &sink,
+                };
+                ingest::gov::gov_follow(&chain_id, &SubstrateGovMapper, &deps, poll).await;
+            });
+        }
+    }
+}
+
+#[cfg(feature = "pg")]
+async fn run_gov_range(
+    registry: &Registry,
+    backends: &Backends,
+    chain: &str,
+    from: u64,
+    to: u64,
+) -> Result<()> {
+    use adapter_substrate::gov::SubstrateGovMapper;
+
+    let cfg = registry
+        .chain(chain)
+        .with_context(|| format!("unknown chain: {chain}"))?;
+    anyhow::ensure!(
+        cfg.family == registry::ChainFamily::Substrate,
+        "no gov mapper for family {:?}",
+        cfg.family
+    );
+    let pool = backends.pool.as_ref().context("gov-range requires DATABASE_URL")?;
+    let source = dotlens_node::balances_pg::PgEventSource::new(pool.clone());
+    let sink = dotlens_node::gov_pg::PgTimelineSink::new(pool.clone());
+    let deps = ingest::gov::GovDeps {
+        checkpoints: backends.checkpoints.as_ref(),
+        source: &source,
+        sink: &sink,
+    };
+    let n = ingest::gov::gov_range(&cfg.id, &SubstrateGovMapper, &deps, from, to)
+        .await
+        .with_context(|| format!("gov-range {chain} {from}..={to}"))?;
+    tracing::info!(chain, from, to, mapped = n, "gov-range complete");
+    println!("gov-range {chain} {from}..={to}: mapped {n} blocks");
+    Ok(())
+}
+
+#[cfg(not(feature = "pg"))]
+async fn run_gov_range(_: &Registry, _: &Backends, _: &str, _: u64, _: u64) -> Result<()> {
+    anyhow::bail!("gov-range requires the `pg` feature")
 }
 
 #[cfg(feature = "pg")]

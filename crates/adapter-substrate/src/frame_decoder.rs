@@ -378,7 +378,7 @@ fn event_name_and_fields(event: &Value) -> Option<(String, serde_json::Value)> {
 // — and real balances exceed u64::MAX plancks. Big numbers become decimal
 // strings; the schema-on-read consumers already parse both (see json_as_u64).
 
-fn value_to_json(v: &Value) -> serde_json::Value {
+pub(crate) fn value_to_json(v: &Value) -> serde_json::Value {
     match &v.value {
         ValueDef::Composite(c) => composite_to_json(c),
         ValueDef::Variant(var) => {
