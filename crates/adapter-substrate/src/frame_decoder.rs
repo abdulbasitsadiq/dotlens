@@ -45,6 +45,10 @@ pub enum FrameDecodeError {
     Events(String),
 }
 
+fn default_true() -> bool {
+    true
+}
+
 /// The live envelope written by SubstrateSource (slice 2).
 #[derive(Debug, Deserialize)]
 struct LiveEnvelope {
@@ -52,7 +56,9 @@ struct LiveEnvelope {
     hash: String,
     parent_hash: String,
     spec_version: u32,
-    #[serde(default)]
+    // default TRUE: `finalized: false` now means "replaceable + invisible to
+    // balances", so an absent field must fail SAFE (immutable), never open
+    #[serde(default = "default_true")]
     finalized: bool,
     extrinsics: Vec<String>,
 }

@@ -58,6 +58,12 @@ pub mod keys {
     pub fn metadata(chain: &str, runtime_version: u32) -> String {
         format!("raw/{chain}/meta/{runtime_version}/metadata.scale")
     }
+    /// Unfinalized blocks are HASH-KEYED: forks at one height coexist under
+    /// write-once immutability, and superseded blocks stay archived.
+    /// `short_hash` = hex hash without 0x, truncated by the caller.
+    pub fn unfinalized_block(chain: &str, height: u64, short_hash: &str, item: &str) -> String {
+        format!("raw/{chain}/unfinalized/{height}/{short_hash}/{item}")
+    }
 }
 
 pub struct FsRawStore {

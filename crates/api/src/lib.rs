@@ -53,6 +53,13 @@ impl BlockIndex for MemoryBlockIndex {
     }
     async fn insert(&self, block: CanonicalBlock) -> Result<(), IndexError> {
         let mut map = self.inner.write().map_err(|e| IndexError(e.to_string()))?;
+        // THE replacement rule (reorg safety): finalized rows are immutable;
+        // unfinalized rows are always replaceable (tip worker fork swaps).
+        if let Some(existing) = map.get(&(block.chain_id.clone(), block.height)) {
+            if existing.finalized {
+                return Ok(());
+            }
+        }
         map.insert((block.chain_id.clone(), block.height), block);
         Ok(())
     }
@@ -346,6 +353,61 @@ pub mod pg {
         async fn insert(&self, block: CanonicalBlock) -> Result<(), IndexError> {
             let err = |e: sqlx::Error| IndexError(e.to_string());
             let mut tx = self.pool.begin().await.map_err(err)?;
+
+            // THE replacement rule (reorg safety, ARCHITECTURE §15): finalized
+            // rows are immutable (insert is a no-op); unfinalized rows are
+            // always replaceable — fork swaps and the finalized pipeline
+            // superseding the tip both land here. Row + children replaced
+            // atomically in this transaction.
+            //
+            // Advisory lock = the serialization point for (chain, height).
+            // `select for update` alone cannot serialize the missing-row race
+            // (tip inserting unfinalized vs decode inserting finalized at the
+            // same height: both see None, children interleave) nor survive the
+            // delete-reinsert pattern (EvalPlanQual returns zero rows to the
+            // waiter). Review catch — without this, a finalized block could
+            // permanently carry a losing fork's events.
+            sqlx::query("select pg_advisory_xact_lock(hashtextextended($1, $2))")
+                .bind(&block.chain_id)
+                .bind(block.height as i64)
+                .execute(&mut *tx)
+                .await
+                .map_err(err)?;
+            let existing: Option<(bool,)> = sqlx::query_as(
+                "select finalized from core.blocks where chain_id = $1 and height = $2 \
+                 for update",
+            )
+            .bind(&block.chain_id)
+            .bind(block.height as i64)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(err)?;
+            match existing {
+                Some((true,)) => {
+                    // immutable — nothing to do (identical re-ingest or a
+                    // late tip fetch racing finalization)
+                    return tx.commit().await.map_err(err);
+                }
+                Some((false,)) => {
+                    for table in ["events", "transactions"] {
+                        sqlx::query(&format!(
+                            "delete from core.{table} where chain_id = $1 and block_height = $2"
+                        ))
+                        .bind(&block.chain_id)
+                        .bind(block.height as i64)
+                        .execute(&mut *tx)
+                        .await
+                        .map_err(err)?;
+                    }
+                    sqlx::query("delete from core.blocks where chain_id = $1 and height = $2")
+                        .bind(&block.chain_id)
+                        .bind(block.height as i64)
+                        .execute(&mut *tx)
+                        .await
+                        .map_err(err)?;
+                }
+                None => {}
+            }
 
             sqlx::query(
                 "insert into core.blocks (chain_id, height, hash, parent_hash, timestamp, \

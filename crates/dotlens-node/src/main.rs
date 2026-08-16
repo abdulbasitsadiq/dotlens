@@ -17,6 +17,11 @@
 //!   dotlens-node balances-range <chain> <a> <b>       # map deltas over a range, exit
 //!   dotlens-node anchor-balance <chain> <acct> <h>    # record absolute balance anchor
 //!
+//! backfill accepts an optional worker count (`backfill <chain> <a> <b> 8`) —
+//! deterministic chunks, per-chunk checkpoints, re-run the same command to
+//! resume. TIP_FOLLOW=1 follows the unfinalized head with reorg handling
+//! (finalized rows immutable; unfinalized replaced/pruned).
+//!
 //! Live ingestion (`live` feature + LIVE_INGEST=1 + DATABASE_URL): every
 //! registered chain with rpc endpoints and the `blocks` module gets a follower
 //! task ingesting finalized heads raw-first (no decode yet — that's the
@@ -73,7 +78,7 @@ fn env_flag(key: &str) -> bool {
 enum Command {
     Run,
     Migrate,
-    Backfill { chain: String, from: u64, to: u64 },
+    Backfill { chain: String, from: u64, to: u64, workers: u64 },
     DecodeRange { chain: String, from: u64, to: u64 },
     CaptureFixture { chain: String, height: u64 },
     SyncLabels,
@@ -95,8 +100,17 @@ fn parse_args() -> Result<Command> {
         None => Ok(Command::Run),
         Some("migrate") => Ok(Command::Migrate),
         Some("backfill") => {
-            let (chain, from, to) = range("usage: dotlens-node backfill <chain> <from> <to>")?;
-            Ok(Command::Backfill { chain, from, to })
+            let usage = "usage: dotlens-node backfill <chain> <from> <to> [workers]";
+            let (chain, from, to) = range(usage)?;
+            let workers: u64 = match args.get(4) {
+                Some(w) => {
+                    let w: u64 = w.parse().context(usage)?;
+                    anyhow::ensure!((1..=64).contains(&w), "workers must be 1..=64");
+                    w
+                }
+                None => 1,
+            };
+            Ok(Command::Backfill { chain, from, to, workers })
         }
         Some("decode-range") => {
             let (chain, from, to) = range("usage: dotlens-node decode-range <chain> <from> <to>")?;
@@ -211,12 +225,12 @@ async fn main() -> Result<()> {
     let raw: Arc<dyn RawStore> = Arc::new(FsRawStore::new(&raw_root));
 
     // -- one-shot subcommands: run, report, exit ------------------------------
-    if let Command::Backfill { chain, from, to } = &command {
+    if let Command::Backfill { chain, from, to, workers } = &command {
         anyhow::ensure!(
             backends.persistent,
             "backfill requires DATABASE_URL (raw receipts + checkpoints must persist)"
         );
-        return run_backfill(&registry, &backends, raw.as_ref(), chain, *from, *to).await;
+        return run_backfill(&registry, &backends, &raw, chain, *from, *to, *workers).await;
     }
     if let Command::DecodeRange { chain, from, to } = &command {
         anyhow::ensure!(
@@ -289,6 +303,7 @@ async fn main() -> Result<()> {
     spawn_live_followers(&registry, &backends, &raw);
     spawn_decode_followers(&registry, &backends, &raw);
     spawn_balances_followers(&registry, &backends);
+    spawn_tip_followers(&registry, &backends, &raw);
 
     // -- API ------------------------------------------------------------------
     let bind = env_or("API_BIND", "127.0.0.1:8080");
@@ -367,36 +382,79 @@ fn spawn_live_followers(_: &Arc<Registry>, _: &Arc<Backends>, _: &Arc<dyn RawSto
     }
 }
 
+/// Backfill a height range, optionally across N concurrent workers.
+/// Chunking is DETERMINISTIC (dotlens_node::backfill_chunks): each chunk owns
+/// checkpoint module `raw_backfill:{a}-{b}`, so any crash/kill resumes
+/// per-chunk by re-running the exact same command — the restart-safety story
+/// for the ≥1M-block drill. workers=1 keeps the historical single-range
+/// module name (existing checkpoints stay valid).
 #[cfg(feature = "live")]
 async fn run_backfill(
     registry: &Registry,
     backends: &Backends,
-    raw: &dyn RawStore,
+    raw: &Arc<dyn RawStore>,
     chain: &str,
     from: u64,
     to: u64,
+    workers: u64,
 ) -> Result<()> {
     use adapter_substrate::source::SubstrateSource;
 
     let cfg = registry
         .chain(chain)
         .with_context(|| format!("unknown chain: {chain}"))?;
-    let source = SubstrateSource::new(&cfg.id, cfg.endpoints.rpc.clone())
-        .map_err(|e| anyhow::anyhow!(e))?;
-    let deps = ingest::live::IngestDeps {
-        raw,
-        checkpoints: backends.checkpoints.as_ref(),
-        receipts: backends.receipts.as_ref(),
-        runtime_versions: backends.runtime_versions.as_ref(),
-    };
-    // per-range checkpoint module: disjoint ranges never fight each other,
-    // and re-running the same range resumes exactly where it stopped
-    let module = format!("{}:{from}-{to}", ingest::live::MODULE_BACKFILL);
-    let n = ingest::live::ingest_range(&cfg.id, &source, &deps, &module, from, to, &mut None)
-        .await
-        .with_context(|| format!("backfill {chain} {from}..={to}"))?;
-    tracing::info!(chain, from, to, processed = n, "backfill complete");
-    println!("backfill {chain} {from}..={to}: processed {n} blocks");
+    let chunks = dotlens_node::backfill_chunks(from, to, workers);
+    tracing::info!(chain, from, to, chunks = chunks.len(), "backfill starting");
+
+    let mut handles = Vec::with_capacity(chunks.len());
+    for (a, b) in chunks {
+        let chain_id = cfg.id.clone();
+        let endpoints = cfg.endpoints.rpc.clone();
+        let raw = raw.clone();
+        let checkpoints = backends.checkpoints.clone();
+        let receipts = backends.receipts.clone();
+        let runtime_versions = backends.runtime_versions.clone();
+        handles.push(tokio::spawn(async move {
+            // each worker owns its connection + failover rotation
+            let source =
+                SubstrateSource::new(&chain_id, endpoints).map_err(|e| anyhow::anyhow!(e))?;
+            let deps = ingest::live::IngestDeps {
+                raw: raw.as_ref(),
+                checkpoints: checkpoints.as_ref(),
+                receipts: receipts.as_ref(),
+                runtime_versions: runtime_versions.as_ref(),
+            };
+            let module = format!("{}:{a}-{b}", ingest::live::MODULE_BACKFILL);
+            let n = ingest::live::ingest_range(&chain_id, &source, &deps, &module, a, b, &mut None)
+                .await
+                .with_context(|| format!("chunk {a}..={b}"))?;
+            Ok::<(u64, u64, u64), anyhow::Error>((a, b, n))
+        }));
+    }
+
+    let (mut total, mut failed) = (0u64, 0u32);
+    for handle in handles {
+        match handle.await {
+            Ok(Ok((a, b, n))) => {
+                total += n;
+                tracing::info!(from = a, to = b, processed = n, "chunk complete");
+            }
+            Ok(Err(e)) => {
+                failed += 1;
+                tracing::error!(error = %e, "chunk FAILED");
+            }
+            Err(e) => {
+                failed += 1;
+                tracing::error!(error = %e, "chunk task panicked");
+            }
+        }
+    }
+    anyhow::ensure!(
+        failed == 0,
+        "{failed} chunk(s) failed — re-run the SAME command to resume from per-chunk checkpoints"
+    );
+    tracing::info!(chain, from, to, processed = total, "backfill complete");
+    println!("backfill {chain} {from}..={to}: processed {total} blocks");
     Ok(())
 }
 
@@ -404,8 +462,9 @@ async fn run_backfill(
 async fn run_backfill(
     _: &Registry,
     _: &Backends,
-    _: &dyn RawStore,
+    _: &Arc<dyn RawStore>,
     _: &str,
+    _: u64,
     _: u64,
     _: u64,
 ) -> Result<()> {
@@ -581,6 +640,68 @@ async fn run_verify_labels(registry: &Registry, backends: &Backends, chain: &str
 #[cfg(not(all(feature = "pg", feature = "live")))]
 async fn run_verify_labels(_: &Registry, _: &Backends, _: &str) -> Result<()> {
     anyhow::bail!("verify-labels requires the `pg` and `live` features")
+}
+
+/// Tip followers: keep the finalized+1..=best window fresh with reorg
+/// handling. Needs `live` (best-head RPC) + `pg` (unfinalized bookkeeping).
+#[cfg(all(feature = "pg", feature = "live"))]
+fn spawn_tip_followers(
+    registry: &Arc<Registry>,
+    backends: &Arc<Backends>,
+    raw: &Arc<dyn RawStore>,
+) {
+    use adapter_substrate::frame_decoder::SubstrateFrameDecoder;
+    use adapter_substrate::source::SubstrateSource;
+
+    if !env_flag("TIP_FOLLOW") {
+        tracing::info!("tip follower disabled (set TIP_FOLLOW=1 to enable)");
+        return;
+    }
+    if !backends.persistent {
+        tracing::warn!("TIP_FOLLOW=1 but no DATABASE_URL — refusing to track tips in memory");
+        return;
+    }
+    let poll = std::time::Duration::from_secs(
+        env_or("TIP_POLL_INTERVAL_SECS", "3").parse().unwrap_or(3),
+    );
+    let now = chrono::Utc::now();
+    for chain in registry.chains() {
+        let live = chain.status_at(now) == Some(registry::LifecycleStatus::Live);
+        if !live || !chain.has_module("blocks") || chain.endpoints.rpc.is_empty() {
+            continue;
+        }
+        let source = match SubstrateSource::new(&chain.id, chain.endpoints.rpc.clone()) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(chain = %chain.id, error = %e, "tip follower not started");
+                continue;
+            }
+        };
+        let decoder = SubstrateFrameDecoder::new(chain.ss58_prefix.unwrap_or(42));
+        let Some(pool) = backends.pool.clone() else { continue };
+        let chain_id = chain.id.clone();
+        let backends = backends.clone();
+        let raw = raw.clone();
+        tokio::spawn(async move {
+            tracing::info!(chain = %chain_id, "tip follower started");
+            let store = dotlens_node::tip_pg::PgUnfinalizedStore::new(pool);
+            let sink = dotlens_node::pipeline::BlockIndexSink(backends.blocks.clone());
+            let deps = ingest::tip::TipDeps {
+                raw: raw.as_ref(),
+                receipts: backends.receipts.as_ref(),
+                store: &store,
+                sink: &sink,
+            };
+            ingest::tip::tip_follow(&chain_id, &source, &decoder, &deps, poll).await;
+        });
+    }
+}
+
+#[cfg(not(all(feature = "pg", feature = "live")))]
+fn spawn_tip_followers(_: &Arc<Registry>, _: &Arc<Backends>, _: &Arc<dyn RawStore>) {
+    if env_flag("TIP_FOLLOW") {
+        tracing::warn!("built without `pg`+`live` — TIP_FOLLOW is IGNORED");
+    }
 }
 
 /// Balances followers: chase each chain's decode checkpoint, mapping canonical

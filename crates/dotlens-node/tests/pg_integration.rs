@@ -916,3 +916,126 @@ async fn balances_worker_maps_deltas_and_survives_the_boundary_filter() {
 
     db.drop_db().await;
 }
+
+// ------------------------------------------------------------ reorg safety
+
+#[tokio::test]
+async fn unfinalized_rows_are_replaceable_finalized_rows_are_immutable() {
+    use canonical::{CanonicalBlock, CanonicalEvent, CanonicalTransaction, Lineage};
+    use ingest::tip::UnfinalizedStore as _;
+
+    let Some(db) = TestDb::create().await else { return };
+    let reg = seeds();
+    sync_registry(&db.pool, &reg).await.expect("registry sync");
+
+    let block = |height: u64, hash: &str, finalized: bool, n_events: u32| CanonicalBlock {
+        chain_id: "polkadot".into(),
+        height,
+        hash: hash.into(),
+        parent_hash: "0x00".into(),
+        timestamp: None,
+        finalized,
+        lineage: Lineage {
+            runtime_version: 100,
+            decoder_version: 2,
+            raw_location: format!("raw/polkadot/unfinalized/{height}/{hash}"),
+        },
+        transactions: vec![CanonicalTransaction {
+            index: 0,
+            hash: Some(format!("{hash}-tx0")),
+            signer: None,
+            call: "timestamp.set".into(),
+            args: serde_json::json!({}),
+            success: true,
+        }],
+        events: (0..n_events)
+            .map(|i| CanonicalEvent {
+                index: i,
+                transaction_index: Some(0),
+                name: "system.ExtrinsicSuccess".into(),
+                data: serde_json::json!({}),
+            })
+            .collect(),
+    };
+    let index = PgBlockIndex::new(db.pool.clone());
+    let store = dotlens_node::tip_pg::PgUnfinalizedStore::new(db.pool.clone());
+
+    // 1. unfinalized fork A lands at height 50 (2 events)
+    index.insert(block(50, "0xforkA", false, 2)).await.unwrap();
+    assert_eq!(
+        store.unfinalized_hash("polkadot", 50).await.unwrap().as_deref(),
+        Some("0xforkA")
+    );
+
+    // 2. reorg: fork B replaces it entirely — block, transactions, AND events
+    index.insert(block(50, "0xforkB", false, 3)).await.unwrap();
+    let (hash, tx_hash): (String, String) = sqlx::query_as(
+        "select b.hash, t.hash from core.blocks b \
+         join core.transactions t on t.chain_id = b.chain_id and t.block_height = b.height \
+         where b.chain_id = 'polkadot' and b.height = 50",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!((hash.as_str(), tx_hash.as_str()), ("0xforkB", "0xforkB-tx0"));
+    let (ev_count,): (i64,) = sqlx::query_as(
+        "select count(*) from core.events where chain_id = 'polkadot' and block_height = 50",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(ev_count, 3, "fork A's events fully replaced, never merged");
+
+    // 3. finalization arrives with fork B → row becomes finalized
+    index.insert(block(50, "0xforkB", true, 3)).await.unwrap();
+    assert!(store.unfinalized_hash("polkadot", 50).await.unwrap().is_none());
+    let (finalized,): (bool,) = sqlx::query_as(
+        "select finalized from core.blocks where chain_id = 'polkadot' and height = 50",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert!(finalized);
+
+    // 4. finalized rows are IMMUTABLE: neither a late tip fetch nor a
+    // different-hash insert changes anything
+    index.insert(block(50, "0xevil", false, 9)).await.unwrap();
+    index.insert(block(50, "0xevil", true, 9)).await.unwrap();
+    let (hash, ev_count): ((String,), (i64,)) = (
+        sqlx::query_as("select hash from core.blocks where chain_id='polkadot' and height=50")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap(),
+        sqlx::query_as(
+            "select count(*) from core.events where chain_id='polkadot' and block_height=50",
+        )
+        .fetch_one(&db.pool)
+        .await
+        .unwrap(),
+    );
+    assert_eq!(hash.0, "0xforkB");
+    assert_eq!(ev_count.0, 3);
+
+    // 5. prune: unfinalized 51..53 vanish (children too), finalized 50 survives
+    for h in 51..=53 {
+        index.insert(block(h, &format!("0xtip{h}"), false, 1)).await.unwrap();
+    }
+    let pruned = store.prune_unfinalized_above("polkadot", 50).await.unwrap();
+    assert_eq!(pruned, 3);
+    let (blocks_left, orphan_events): ((i64,), (i64,)) = (
+        sqlx::query_as("select count(*) from core.blocks where chain_id='polkadot'")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap(),
+        sqlx::query_as(
+            "select count(*) from core.events where chain_id='polkadot' and block_height > 50",
+        )
+        .fetch_one(&db.pool)
+        .await
+        .unwrap(),
+    );
+    assert_eq!(blocks_left.0, 1, "only the finalized block remains");
+    assert_eq!(orphan_events.0, 0, "no orphaned children after prune");
+
+    db.drop_db().await;
+}

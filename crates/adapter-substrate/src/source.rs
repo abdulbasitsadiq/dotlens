@@ -11,6 +11,7 @@
 
 use async_trait::async_trait;
 use ingest::live::{ChainSource, FetchedBlock, RawArtifact, SourceError};
+use ingest::tip::TipSource;
 use subxt::config::RpcConfigFor;
 use subxt::rpcs::{LegacyRpcMethods, RpcClient};
 use subxt::PolkadotConfig;
@@ -175,24 +176,15 @@ fn hex32(h: &subxt::utils::H256) -> String {
     format!("0x{}", hex::encode(h.as_ref()))
 }
 
-#[async_trait]
-impl ChainSource for SubstrateSource {
-    async fn finalized_height(&self) -> Result<u64, SourceError> {
-        let hash = self
-            .with_failover("chain_getFinalizedHead", |m| async move {
-                m.chain_get_finalized_head().await
-            })
-            .await?;
-        let header = self
-            .with_failover("chain_getHeader", |m| async move {
-                m.chain_get_header(Some(hash)).await
-            })
-            .await?
-            .ok_or_else(|| SourceError::Rpc("finalized head has no header".into()))?;
-        Ok(header.number as u64)
-    }
-
-    async fn fetch_block(&self, height: u64) -> Result<FetchedBlock, SourceError> {
+impl SubstrateSource {
+    /// Shared fetch: the envelope's `finalized` flag is the ONLY difference
+    /// between the finalized pipeline's fetches and the tip worker's — the
+    /// decoder propagates it into the canonical row.
+    async fn fetch_block_impl(
+        &self,
+        height: u64,
+        finalized: bool,
+    ) -> Result<FetchedBlock, SourceError> {
         let hash = self.hash_at(height).await?;
 
         let block = self
@@ -226,7 +218,7 @@ impl ChainSource for SubstrateSource {
             "state_root": hex32(&header.state_root),
             "extrinsics_root": hex32(&header.extrinsics_root),
             "spec_version": runtime.spec_version,
-            "finalized": true,
+            "finalized": finalized,
             "extrinsics": block
                 .block
                 .extrinsics
@@ -254,6 +246,50 @@ impl ChainSource for SubstrateSource {
             transaction_version: Some(runtime.transaction_version),
             artifacts,
         })
+    }
+}
+
+#[async_trait]
+impl TipSource for SubstrateSource {
+    /// Best (unfinalized) head: chain_getHeader with no hash = current best.
+    async fn best_height(&self) -> Result<u64, SourceError> {
+        let header = self
+            .with_failover("chain_getHeader(best)", |m| async move {
+                m.chain_get_header(None).await
+            })
+            .await?
+            .ok_or_else(|| SourceError::Rpc("no best header".into()))?;
+        Ok(header.number as u64)
+    }
+
+    async fn canonical_hash_at(&self, height: u64) -> Result<String, SourceError> {
+        Ok(hex32(&self.hash_at(height).await?))
+    }
+
+    async fn fetch_unfinalized(&self, height: u64) -> Result<FetchedBlock, SourceError> {
+        self.fetch_block_impl(height, false).await
+    }
+}
+
+#[async_trait]
+impl ChainSource for SubstrateSource {
+    async fn finalized_height(&self) -> Result<u64, SourceError> {
+        let hash = self
+            .with_failover("chain_getFinalizedHead", |m| async move {
+                m.chain_get_finalized_head().await
+            })
+            .await?;
+        let header = self
+            .with_failover("chain_getHeader", |m| async move {
+                m.chain_get_header(Some(hash)).await
+            })
+            .await?
+            .ok_or_else(|| SourceError::Rpc("finalized head has no header".into()))?;
+        Ok(header.number as u64)
+    }
+
+    async fn fetch_block(&self, height: u64) -> Result<FetchedBlock, SourceError> {
+        self.fetch_block_impl(height, true).await
     }
 
     async fn metadata_at(&self, height: u64) -> Result<Vec<u8>, SourceError> {

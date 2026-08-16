@@ -8,6 +8,7 @@
 pub mod balances;
 pub mod decode;
 pub mod live;
+pub mod tip;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};

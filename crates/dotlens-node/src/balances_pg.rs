@@ -28,8 +28,12 @@ impl EventSource for PgEventSource {
         chain_id: &str,
         height: u64,
     ) -> Result<Option<BlockEvents>, String> {
+        // `finalized` guard: the balances worker chases the finalized decode
+        // checkpoint, but defense-in-depth — unfinalized (tip) rows must NEVER
+        // become money deltas; they read as "not decoded yet"
         let head: Option<(i64,)> = sqlx::query_as(
-            "select runtime_version from core.blocks where chain_id = $1 and height = $2",
+            "select runtime_version from core.blocks \
+             where chain_id = $1 and height = $2 and finalized",
         )
         .bind(chain_id)
         .bind(height as i64)
