@@ -39,6 +39,10 @@ pub mod gov;
 /// Pure — no I/O.
 pub mod calls;
 
+/// Treasury semantics: spend/payout/pot event→fact mapping across pallet
+/// instances. Pure — no I/O.
+pub mod treasury;
+
 /// Voting semantics: conviction-voting / ranked-collective event→fact mapping,
 /// the ConvictionVoting.VotingFor storage key (twox64), and VotingFor (anchor)
 /// decoding. Pure — no I/O.

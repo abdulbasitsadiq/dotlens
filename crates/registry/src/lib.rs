@@ -161,6 +161,15 @@ pub struct ResidencyEntry {
 pub struct ReferendaClass {
     pub class: String,
     pub domain: String,
+    /// Decoder-lowercased instance pallet ("referenda", "fellowshipreferenda"),
+    /// matching `gov.tracks.pallet`. Required to disambiguate a chain that runs
+    /// SEVERAL referenda instances with COLLIDING track ids — Collectives runs
+    /// three, where track 1 is "members" (Fellowship) and "ambassador"
+    /// (Ambassador) at once. Optional so a pre-existing seed still loads;
+    /// absent = no pallet filter, i.e. the old ambiguous behaviour, and the
+    /// tracks response says which it did.
+    #[serde(default)]
+    pub pallet: Option<String>,
 }
 
 /// The public-OpenGov domain: what an unlisted class resolves to.
@@ -169,11 +178,28 @@ pub const DEFAULT_GOV_DOMAIN: &str = "governance";
 /// The referenda instance every gov endpoint serves when none is requested.
 pub const DEFAULT_REFERENDA_CLASS: &str = "referenda";
 
+/// Which residency domain carries a treasury pallet INSTANCE. Same shape and
+/// purpose as [`ReferendaClass`]: instance names are adapter vocabulary
+/// ("treasury", "fellowship_treasury"), the registry says where each lives, so
+/// no query code names a chain.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TreasuryInstance {
+    pub instance: String,
+    pub domain: String,
+}
+
+/// The treasury instance every treasury endpoint serves when none is requested,
+/// and the domain an unregistered instance falls back to.
+pub const DEFAULT_TREASURY_INSTANCE: &str = "treasury";
+pub const DEFAULT_TREASURY_DOMAIN: &str = "treasury";
+
 #[derive(Debug, Clone, Deserialize)]
 struct ResidencyFile {
     residency: Vec<ResidencyEntry>,
     #[serde(default)]
     referenda_classes: Vec<ReferendaClass>,
+    #[serde(default)]
+    treasury_instances: Vec<TreasuryInstance>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -181,6 +207,7 @@ pub struct Registry {
     chains: BTreeMap<String, ChainConfig>,
     residency: Vec<ResidencyEntry>,
     referenda_classes: Vec<ReferendaClass>,
+    treasury_instances: Vec<TreasuryInstance>,
 }
 
 impl Registry {
@@ -222,6 +249,7 @@ impl Registry {
                     })?;
                 reg.residency.extend(file.residency);
                 reg.referenda_classes.extend(file.referenda_classes);
+                reg.treasury_instances.extend(file.treasury_instances);
             } else {
                 let chain: ChainConfig =
                     serde_yaml::from_str(&text).map_err(|source| RegistryError::Yaml {
@@ -340,6 +368,32 @@ impl Registry {
             .map(|c| c.domain.as_str())
             .unwrap_or(DEFAULT_GOV_DOMAIN)
     }
+
+    /// Every registered treasury instance. The API walks these when no
+    /// instance is specified, so a newly registered one appears with no code.
+    pub fn treasury_instances(&self) -> &[TreasuryInstance] {
+        &self.treasury_instances
+    }
+
+    /// Residency domain carrying a treasury instance; unregistered instances
+    /// fall back to the main treasury domain.
+    pub fn domain_for_treasury_instance(&self, instance: &str) -> &str {
+        self.treasury_instances
+            .iter()
+            .find(|t| t.instance == instance)
+            .map(|t| t.domain.as_str())
+            .unwrap_or(DEFAULT_TREASURY_DOMAIN)
+    }
+
+    /// The instance pallet a class's tracks live under, when registered.
+    /// `None` = unfiltered (and callers must say so rather than imply a
+    /// single-instance chain).
+    pub fn pallet_for_class(&self, class: &str) -> Option<&str> {
+        self.referenda_classes
+            .iter()
+            .find(|c| c.class == class)
+            .and_then(|c| c.pallet.as_deref())
+    }
 }
 
 #[cfg(test)]
@@ -435,6 +489,15 @@ mod tests {
         assert_eq!(reg.domain_for_class("fellowship_referenda"), "fellowship");
         // an instance nobody registered still resolves to public OpenGov
         assert_eq!(reg.domain_for_class("ambassador_referenda"), DEFAULT_GOV_DOMAIN);
+
+        // the pallet each class's tracks live under — the disambiguator for a
+        // chain running several instances with colliding track ids
+        assert_eq!(reg.pallet_for_class("referenda"), Some("referenda"));
+        assert_eq!(
+            reg.pallet_for_class("fellowship_referenda"),
+            Some("fellowshipreferenda")
+        );
+        assert_eq!(reg.pallet_for_class("ambassador_referenda"), None);
         // every registered class points at a domain that actually has windows
         for c in reg.referenda_classes() {
             assert!(
@@ -442,6 +505,52 @@ mod tests {
                 "class {} maps to domain {} with no residency window",
                 c.class,
                 c.domain
+            );
+        }
+    }
+
+    #[test]
+    fn treasury_instances_map_to_domains_with_a_default() {
+        let reg = Registry::load_from_dir(&seeds_dir()).unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 8, 15, 0, 0, 0).unwrap();
+        assert_eq!(reg.domain_for_treasury_instance("treasury"), "treasury");
+        assert_eq!(
+            reg.domain_for_treasury_instance("fellowship_treasury"),
+            "fellowship_treasury"
+        );
+        // unregistered instance falls back to the main treasury domain
+        assert_eq!(
+            reg.domain_for_treasury_instance("some_future_treasury"),
+            DEFAULT_TREASURY_DOMAIN
+        );
+
+        // the main treasury followed governance to Asset Hub; the Collectives
+        // sub-treasuries did not move, because their chain did not
+        assert_eq!(
+            reg.resolve_domain("treasury", "polkadot", now).unwrap().id,
+            "polkadot-asset-hub"
+        );
+        for domain in ["fellowship_treasury", "ambassador_treasury"] {
+            assert_eq!(
+                reg.resolve_domain(domain, "polkadot", now).unwrap().id,
+                "polkadot-collectives",
+                "{domain}"
+            );
+        }
+        for t in reg.treasury_instances() {
+            assert!(
+                reg.residency().iter().any(|r| r.domain == t.domain),
+                "treasury instance {} maps to domain {} with no residency window",
+                t.instance,
+                t.domain
+            );
+        }
+        // every chain that hosts an instance must enable the module, or the
+        // follower silently never starts for it
+        for chain in ["polkadot", "polkadot-asset-hub", "polkadot-collectives"] {
+            assert!(
+                reg.chain(chain).unwrap().has_module("treasury"),
+                "{chain} hosts a treasury instance but has no treasury module"
             );
         }
     }

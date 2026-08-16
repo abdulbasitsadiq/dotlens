@@ -1524,6 +1524,193 @@ async fn vote_facts_land_projections_converge_and_voting_anchors_roundtrip() {
     db.drop_db().await;
 }
 
+#[tokio::test]
+async fn treasury_spends_converge_and_pot_flows_stay_unprojected() {
+    use adapter_substrate::treasury::SubstrateTreasuryMapper;
+    use api::TreasuryIndex as _;
+    use canonical::{CanonicalBlock, CanonicalEvent, Lineage};
+
+    let Some(db) = TestDb::create().await else { return };
+    let reg = seeds();
+    sync_registry(&db.pool, &reg).await.expect("registry sync");
+
+    let block = |chain: &str, height: u64, ts: &str, events: Vec<CanonicalEvent>| CanonicalBlock {
+        chain_id: chain.into(),
+        height,
+        hash: format!("0x{height:064x}"),
+        parent_hash: format!("0x{:064x}", height - 1),
+        timestamp: Some(ts.parse().unwrap()),
+        finalized: true,
+        lineage: Lineage {
+            runtime_version: 2_003_002,
+            decoder_version: 2,
+            raw_location: format!("raw/{chain}/test/{height}"),
+        },
+        transactions: vec![],
+        events,
+    };
+    let ev = |index: u32, name: &str, data: serde_json::Value| CanonicalEvent {
+        index,
+        transaction_index: Some(0),
+        name: name.into(),
+        data,
+    };
+    let payee = vec![0xd4u8; 32];
+    // `[vec![b; 32]]`, never `[[b; 32]]` — the json! array-repeat trap
+    let beneficiary = serde_json::json!({"V4": {"parents": 0, "interior": {"X1": [
+        {"AccountId32": {"network": null, "id": payee.clone()}}
+    ]}}});
+
+    let index = PgBlockIndex::new(db.pool.clone());
+    // approval, then a FAILED payment, then a successful retry, then processed
+    index
+        .insert(block("polkadot-asset-hub", 300, "2026-01-01T00:00:00Z", vec![
+            ev(0, "treasury.AssetSpendApproved", serde_json::json!({
+                "index": 313,
+                "asset_kind": {"V4": {"asset_id": {"parents": 0, "interior": {"X2": [
+                    {"PalletInstance": 50}, {"GeneralIndex": 1984}
+                ]}}}},
+                // > u64: exercises the NUMERIC path
+                "amount": "18446744073709551616",
+                "beneficiary": beneficiary,
+                "valid_from": 300,
+                "expire_at": 900,
+            })),
+            ev(1, "treasury.Deposit", serde_json::json!({"value": 1204000000000u64})),
+        ]))
+        .await
+        .expect("ah 300");
+    index
+        .insert(block("polkadot-asset-hub", 310, "2026-01-02T00:00:00Z", vec![ev(
+            0,
+            "treasury.PaymentFailed",
+            serde_json::json!({"index": 313, "payment_id": 42}),
+        )]))
+        .await
+        .expect("ah 310");
+    index
+        .insert(block("polkadot-asset-hub", 320, "2026-01-03T00:00:00Z", vec![
+            ev(0, "treasury.Paid", serde_json::json!({"index": 313, "payment_id": 43})),
+            // a legacy-shape proposal in the SAME block: different id space,
+            // same number — must not collide with asset spend 313
+            ev(1, "treasury.Awarded", serde_json::json!({
+                "proposal_index": 313, "award": 500, "account": [payee.clone()]
+            })),
+        ]))
+        .await
+        .expect("ah 320");
+    // `check_status` runs in a LATER block than `payout` — keeping them apart
+    // is what makes the payment_id ordering testable at all (in one block the
+    // sink's own sort hides the bug)
+    index
+        .insert(block("polkadot-asset-hub", 325, "2026-01-04T00:00:00Z", vec![ev(
+            0,
+            "treasury.SpendProcessed",
+            serde_json::json!({"index": 313}),
+        )]))
+        .await
+        .expect("ah 325");
+
+    let checkpoints = PgCheckpointStore::new(db.pool.clone());
+    let source = dotlens_node::balances_pg::PgEventSource::new(db.pool.clone());
+    let sink = dotlens_node::treasury_pg::PgSpendSink::new(db.pool.clone());
+    let deps = ingest::treasury::TreasuryDeps {
+        checkpoints: &checkpoints,
+        source: &source,
+        sink: &sink,
+    };
+
+    // OUT OF ORDER, and deliberately the WORST order: the terminal block
+    // first (so a status-newer, payment-less event owns the status triplet),
+    // then the failed payment, then the approval, then the successful retry.
+    // Every column must still converge.
+    for (from, to) in [(325, 325), (310, 310), (300, 300), (320, 320)] {
+        ingest::treasury::treasury_range(
+            "polkadot-asset-hub", &SubstrateTreasuryMapper, &deps, from, to,
+        )
+        .await
+        .expect("out-of-order range");
+    }
+
+    let idx = api::pg::PgTreasuryIndex::new(db.pool.clone());
+    let spend = idx
+        .spend("polkadot-asset-hub", "treasury", "asset_spend", 313)
+        .await
+        .unwrap()
+        .expect("asset spend 313");
+    // (325,0) SpendProcessed is the newest status, and it does NOT claim success
+    assert_eq!(spend.status, "processed");
+    // …while the value columns survived the later, valueless events
+    assert_eq!(spend.amount.as_deref(), Some("18446744073709551616"));
+    assert_eq!(spend.beneficiary.as_deref(), Some(&format!("0x{}", "d4".repeat(32))[..]));
+    assert!(spend.asset_kind.is_some(), "asset kind kept from the approval");
+    // THE ordering trap: the failed attempt (310) was applied AFTER the
+    // successful retry (320) in this run, and the terminal event (325) owns the
+    // status. Only the payment's own coordinate gets this right.
+    assert_eq!(spend.payment_id.as_deref(), Some("43"), "the successful retry's id");
+    assert_eq!(spend.first_seen_height, 300, "least() keeps the earliest sighting");
+
+    // the legacy proposal with the SAME number is a different row entirely
+    let proposal = idx
+        .spend("polkadot-asset-hub", "treasury", "proposal", 313)
+        .await
+        .unwrap()
+        .expect("proposal 313");
+    assert_eq!((proposal.status.as_str(), proposal.amount.as_deref()), ("awarded", Some("500")));
+
+    // pot flows: recorded as facts, never projected
+    let pot = idx.pot_events("polkadot-asset-hub", "treasury", 10).await.unwrap();
+    assert_eq!(pot.len(), 1);
+    assert_eq!((pot[0].kind.as_str(), pot[0].amount.as_deref()), ("pot_deposit", Some("1204000000000")));
+    assert!(pot[0].timestamp.is_some(), "joined to the block timestamp");
+    let (projected,): (i64,) = sqlx::query_as("select count(*) from treasury.spends")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(projected, 2, "one asset spend + one proposal; the deposit is not a spend");
+
+    // full timeline for the spend, in order
+    let events = idx
+        .spend_events("polkadot-asset-hub", "treasury", "asset_spend", 313)
+        .await
+        .unwrap();
+    let kinds: Vec<&str> = events.iter().map(|e| e.kind.as_str()).collect();
+    assert_eq!(kinds, vec!["approved", "payment_failed", "paid", "processed"]);
+    // pot figures say what they MEAN, so nobody sums a balance as a flow
+    let (flows, snapshots): (i64, i64) = sqlx::query_as(
+        "select count(*) filter (where figure_kind = 'flow'), \
+                count(*) filter (where figure_kind = 'snapshot') \
+         from treasury.spend_events where attribution = 'pot'",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!((flows, snapshots), (1, 0), "the Deposit is a flow");
+
+    // partition routing + convergence on replay
+    let (in_default,): (i64,) = sqlx::query_as("select count(*) from treasury.spend_events_default")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(in_default, 0, "facts must route to per-chain partitions");
+    ingest::treasury::treasury_range("polkadot-asset-hub", &SubstrateTreasuryMapper, &deps, 300, 325)
+        .await
+        .expect("replay");
+    let (facts,): (i64,) = sqlx::query_as("select count(*) from treasury.spend_events")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(facts, 6, "insert-ignore: replay adds nothing");
+    let after = idx
+        .spend("polkadot-asset-hub", "treasury", "asset_spend", 313)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(after.status, "processed", "replaying older events must not regress");
+
+    db.drop_db().await;
+}
+
 // ------------------------------------------------------------ reorg safety
 
 #[tokio::test]

@@ -54,3 +54,6 @@ modules:
   - balances
   - governance             # fellowship referenda (class fellowship_referenda)
                            # + ranked-collective votes, both already mapped
+  - treasury               # the Fellowship and Ambassador SUB-treasuries are
+                           # pallet-treasury instances here — separate money
+                           # from the main treasury on Asset Hub

@@ -123,6 +123,7 @@ pub async fn sync_registry(pool: &PgPool, registry: &Registry) -> Result<()> {
             ("gov", "referendum_events"),
             ("gov", "votes"),
             ("gov", "delegation_events"),
+            ("treasury", "spend_events"),
         ] {
             let part = format!("{schema}.{table}_p_{}", c.id.replace('-', "_"));
             let ddl = format!(

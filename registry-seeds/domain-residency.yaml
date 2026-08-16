@@ -7,11 +7,33 @@
 # residency domain carries each one, so the gov API can stitch a class across
 # chains without knowing any chain id. Unlisted classes fall back to
 # 'governance' — the public OpenGov default.
+# `pallet` is the decoder-lowercased instance pallet name, and it is load-
+# bearing: Collectives runs THREE referenda instances, and their track ids
+# COLLIDE (id 1 is "members" for the Fellowship and "ambassador" for the
+# Ambassador programme). Without filtering tracks by pallet, one chain's track
+# list is ambiguous. Verified 2026-08-16: /v1/gov/polkadot/tracks?class=
+# fellowship_referenda returned 27 rows across two instances.
 referenda_classes:
   - class: referenda
     domain: governance
+    pallet: referenda
   - class: fellowship_referenda
     domain: fellowship
+    pallet: fellowshipreferenda
+
+# Where each treasury pallet INSTANCE lives, same doctrine as the referenda
+# classes above. Instance names are adapter vocabulary (mapped from the pallet
+# name); this table says which residency domain carries each, so the treasury
+# API stitches the main treasury across the Nov-2025 migration while the
+# Collectives sub-treasuries resolve to their own chain. Unlisted instances
+# fall back to the 'treasury' domain.
+treasury_instances:
+  - instance: treasury
+    domain: treasury
+  - instance: fellowship_treasury
+    domain: fellowship_treasury
+  - instance: ambassador_treasury
+    domain: ambassador_treasury
 
 residency:
   - domain: governance
@@ -78,6 +100,23 @@ residency:
                                    # the Fellowship pallets shipped in the
                                    # genesis runtime of a chain built for them,
                                    # so residency starts with the chain.
+    to: null
+
+  # The Collectives sub-treasuries. Both are pallet instances on the same
+  # chain as the Fellowship, and both are separate money from the main
+  # treasury — verified 2026-08-16: the AH runtime carries no FellowshipTreasury
+  # or AmbassadorTreasury pallet. Windows open at the chain's genesis (block #1
+  # timestamp); the Ambassador programme itself started later, which matters
+  # only if you query its residency before it existed.
+  - domain: fellowship_treasury
+    network: polkadot
+    chain: polkadot-collectives
+    from: "2022-11-21T11:36:30Z"
+    to: null
+  - domain: ambassador_treasury
+    network: polkadot
+    chain: polkadot-collectives
+    from: "2022-11-21T11:36:30Z"
     to: null
 
   # The OTHER migration: pallet-identity LEFT the relay for the People chain —

@@ -23,6 +23,9 @@ pub mod gov_pg;
 pub mod votes_pg;
 
 #[cfg(feature = "pg")]
+pub mod treasury_pg;
+
+#[cfg(feature = "pg")]
 pub mod tip_pg;
 
 /// Deterministic contiguous chunking for concurrent backfill: same inputs →

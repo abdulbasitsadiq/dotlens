@@ -362,6 +362,207 @@ pub struct VotingAnchorRow {
     pub note: Option<String>,
 }
 
+// ----------------------------------------------------------------- treasury
+
+/// One treasury spend (a `treasury.spends` row), query-shaped. Amounts are
+/// decimal strings — plancks exceed u64/f64.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct SpendRow {
+    pub instance: String,
+    /// proposal (legacy id space) | asset_spend (modern id space).
+    pub spend_kind: String,
+    pub spend_id: u64,
+    /// proposed|approved|awarded|rejected|paid|processed|payment_failed|voided.
+    /// `processed` does NOT assert success — the pallet emits it for expiry too.
+    pub status: String,
+    pub amount: Option<String>,
+    /// The proposer's slashed bond on a rejection. NEVER treasury spending.
+    pub slashed: Option<String>,
+    /// VersionedLocatableAsset; null = the native token (legacy flow).
+    pub asset_kind: Option<serde_json::Value>,
+    /// 0x-hex, when the beneficiary is (or names) a plain account.
+    pub beneficiary: Option<String>,
+    pub beneficiary_location: Option<serde_json::Value>,
+    pub payment_id: Option<String>,
+    pub valid_from: Option<u64>,
+    pub expire_at: Option<u64>,
+    pub first_seen_height: u64,
+    pub status_height: u64,
+}
+
+/// One treasury event (a `treasury.spend_events` row) — a step in a spend's
+/// life, or a pot flow that names no spend.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct SpendEventRow {
+    pub height: u64,
+    pub timestamp: Option<DateTime<Utc>>,
+    pub event_index: u32,
+    pub kind: String,
+    pub amount: Option<String>,
+    pub data: serde_json::Value,
+}
+
+/// Read side of the treasury schema, per chain. Instances are stitched across
+/// chains by their own residency domain, exactly like referenda classes.
+#[async_trait]
+pub trait TreasuryIndex: Send + Sync {
+    /// Latest spends for an instance, newest first. `status` and `spend_kind`
+    /// filter; `spend_kind` matters because the legacy and modern id spaces
+    /// are different number lines that both start at 0.
+    async fn spends(
+        &self,
+        chain_id: &str,
+        instance: &str,
+        status: Option<&str>,
+        spend_kind: Option<&str>,
+        limit: u64,
+    ) -> Result<Vec<SpendRow>, IndexError>;
+    async fn spend(
+        &self,
+        chain_id: &str,
+        instance: &str,
+        spend_kind: &str,
+        spend_id: u64,
+    ) -> Result<Option<SpendRow>, IndexError>;
+    async fn spend_events(
+        &self,
+        chain_id: &str,
+        instance: &str,
+        spend_kind: &str,
+        spend_id: u64,
+    ) -> Result<Vec<SpendEventRow>, IndexError>;
+    /// Pot flows (deposits, burns, rollovers) — money that names no spend.
+    async fn pot_events(
+        &self,
+        chain_id: &str,
+        instance: &str,
+        limit: u64,
+    ) -> Result<Vec<SpendEventRow>, IndexError>;
+}
+
+#[derive(Default)]
+pub struct MemoryTreasuryIndex {
+    spends: RwLock<HashMap<(String, String, String, u64), SpendRow>>,
+    events: RwLock<HashMap<(String, String), Vec<(Option<(String, u64)>, SpendEventRow)>>>,
+}
+
+impl MemoryTreasuryIndex {
+    pub fn new() -> Self {
+        Self::default()
+    }
+    pub fn insert_spend(&self, chain: &str, row: SpendRow) {
+        self.spends.write().expect("lock").insert(
+            (
+                chain.into(),
+                row.instance.clone(),
+                row.spend_kind.clone(),
+                row.spend_id,
+            ),
+            row,
+        );
+    }
+    /// `subject` = (spend_kind, spend_id); None for a pot flow.
+    pub fn insert_event(
+        &self,
+        chain: &str,
+        instance: &str,
+        subject: Option<(String, u64)>,
+        row: SpendEventRow,
+    ) {
+        self.events
+            .write()
+            .expect("lock")
+            .entry((chain.into(), instance.into()))
+            .or_default()
+            .push((subject, row));
+    }
+}
+
+#[async_trait]
+impl TreasuryIndex for MemoryTreasuryIndex {
+    async fn spends(
+        &self,
+        chain_id: &str,
+        instance: &str,
+        status: Option<&str>,
+        spend_kind: Option<&str>,
+        limit: u64,
+    ) -> Result<Vec<SpendRow>, IndexError> {
+        let map = self.spends.read().map_err(|e| IndexError(e.to_string()))?;
+        let mut rows: Vec<SpendRow> = map
+            .iter()
+            .filter(|((c, i, k, _), r)| {
+                c == chain_id
+                    && i == instance
+                    && status.is_none_or(|s| r.status == s)
+                    && spend_kind.is_none_or(|want| k == want)
+            })
+            .map(|(_, r)| r.clone())
+            .collect();
+        rows.sort_by(|a, b| {
+            b.first_seen_height
+                .cmp(&a.first_seen_height)
+                .then_with(|| b.spend_id.cmp(&a.spend_id))
+        });
+        rows.truncate(limit as usize);
+        Ok(rows)
+    }
+    async fn spend(
+        &self,
+        chain_id: &str,
+        instance: &str,
+        spend_kind: &str,
+        spend_id: u64,
+    ) -> Result<Option<SpendRow>, IndexError> {
+        let map = self.spends.read().map_err(|e| IndexError(e.to_string()))?;
+        Ok(map
+            .get(&(chain_id.into(), instance.into(), spend_kind.into(), spend_id))
+            .cloned())
+    }
+    async fn spend_events(
+        &self,
+        chain_id: &str,
+        instance: &str,
+        spend_kind: &str,
+        spend_id: u64,
+    ) -> Result<Vec<SpendEventRow>, IndexError> {
+        let map = self.events.read().map_err(|e| IndexError(e.to_string()))?;
+        let mut rows: Vec<SpendEventRow> = map
+            .get(&(chain_id.into(), instance.into()))
+            .map(|rows| {
+                rows.iter()
+                    .filter(|(subject, _)| {
+                        subject.as_ref().is_some_and(|(k, i)| k == spend_kind && *i == spend_id)
+                    })
+                    .map(|(_, r)| r.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
+        rows.sort_by_key(|r| (r.height, r.event_index));
+        Ok(rows)
+    }
+    async fn pot_events(
+        &self,
+        chain_id: &str,
+        instance: &str,
+        limit: u64,
+    ) -> Result<Vec<SpendEventRow>, IndexError> {
+        let map = self.events.read().map_err(|e| IndexError(e.to_string()))?;
+        let mut rows: Vec<SpendEventRow> = map
+            .get(&(chain_id.into(), instance.into()))
+            .map(|rows| {
+                rows.iter()
+                    .filter(|(subject, _)| subject.is_none())
+                    .map(|(_, r)| r.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
+        rows.sort_by(|a, b| (b.height, b.event_index).cmp(&(a.height, a.event_index)));
+        rows.truncate(limit as usize);
+        Ok(rows)
+    }
+}
+
 /// Read side of the gov schema, per chain. The API stitches chains together
 /// via governance domain residency (referendum numbering is continuous across
 /// the Nov 2025 migration; one referendum may have rows on both chains).
@@ -1330,6 +1531,195 @@ pub mod pg {
         }
     }
 
+    /// Postgres-backed treasury reads over `treasury.*`.
+    pub struct PgTreasuryIndex {
+        pool: PgPool,
+    }
+
+    impl PgTreasuryIndex {
+        pub fn new(pool: PgPool) -> Self {
+            Self { pool }
+        }
+    }
+
+    const SPEND_COLS: &str = "instance, spend_kind, spend_id, status, amount::text, \
+                              slashed::text, asset_kind, beneficiary, beneficiary_location, \
+                              payment_id, valid_from, expire_at, first_seen_height, status_height";
+
+    type SpendTuple = (
+        String,
+        String,
+        i64,
+        String,
+        Option<String>,
+        Option<String>,
+        Option<serde_json::Value>,
+        Option<Vec<u8>>,
+        Option<serde_json::Value>,
+        Option<String>,
+        Option<i64>,
+        Option<i64>,
+        i64,
+        i64,
+    );
+
+    fn spend_from_row(
+        (
+            instance,
+            spend_kind,
+            spend_id,
+            status,
+            amount,
+            slashed,
+            asset_kind,
+            beneficiary,
+            beneficiary_location,
+            payment_id,
+            valid_from,
+            expire_at,
+            first_seen_height,
+            status_height,
+        ): SpendTuple,
+    ) -> super::SpendRow {
+        super::SpendRow {
+            instance,
+            spend_kind,
+            spend_id: spend_id as u64,
+            status,
+            amount,
+            slashed,
+            asset_kind,
+            beneficiary: beneficiary.map(|b| format!("0x{}", super::hex_lower(&b))),
+            beneficiary_location,
+            payment_id,
+            valid_from: valid_from.map(|v| v as u64),
+            expire_at: expire_at.map(|v| v as u64),
+            first_seen_height: first_seen_height as u64,
+            status_height: status_height as u64,
+        }
+    }
+
+    type SpendEventTuple = (
+        i64,
+        Option<DateTime<Utc>>,
+        i32,
+        String,
+        Option<String>,
+        serde_json::Value,
+    );
+
+    fn spend_event_from_row(
+        (height, timestamp, event_index, kind, amount, data): SpendEventTuple,
+    ) -> super::SpendEventRow {
+        super::SpendEventRow {
+            height: height as u64,
+            timestamp,
+            event_index: event_index as u32,
+            kind,
+            amount,
+            data,
+        }
+    }
+
+    #[async_trait]
+    impl super::TreasuryIndex for PgTreasuryIndex {
+        async fn spends(
+            &self,
+            chain_id: &str,
+            instance: &str,
+            status: Option<&str>,
+            spend_kind: Option<&str>,
+            limit: u64,
+        ) -> Result<Vec<super::SpendRow>, IndexError> {
+            let rows: Vec<SpendTuple> = sqlx::query_as(&format!(
+                "select {SPEND_COLS} from treasury.spends \
+                 where chain_id = $1 and instance = $2 \
+                   and ($3::text is null or status = $3) \
+                   and ($4::text is null or spend_kind = $4) \
+                 order by spend_kind, spend_id desc limit $5"
+            ))
+            .bind(chain_id)
+            .bind(instance)
+            .bind(status)
+            .bind(spend_kind)
+            .bind(limit as i64)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| IndexError(e.to_string()))?;
+            Ok(rows.into_iter().map(spend_from_row).collect())
+        }
+
+        async fn spend(
+            &self,
+            chain_id: &str,
+            instance: &str,
+            spend_kind: &str,
+            spend_id: u64,
+        ) -> Result<Option<super::SpendRow>, IndexError> {
+            let row: Option<SpendTuple> = sqlx::query_as(&format!(
+                "select {SPEND_COLS} from treasury.spends \
+                 where chain_id = $1 and instance = $2 and spend_kind = $3 and spend_id = $4"
+            ))
+            .bind(chain_id)
+            .bind(instance)
+            .bind(spend_kind)
+            .bind(spend_id as i64)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| IndexError(e.to_string()))?;
+            Ok(row.map(spend_from_row))
+        }
+
+        async fn spend_events(
+            &self,
+            chain_id: &str,
+            instance: &str,
+            spend_kind: &str,
+            spend_id: u64,
+        ) -> Result<Vec<super::SpendEventRow>, IndexError> {
+            let rows: Vec<SpendEventTuple> = sqlx::query_as(
+                "select e.block_height, b.timestamp, e.event_index, e.kind, e.amount::text, e.data \
+                 from treasury.spend_events e \
+                 left join core.blocks b \
+                   on b.chain_id = e.chain_id and b.height = e.block_height \
+                 where e.chain_id = $1 and e.instance = $2 \
+                   and e.spend_kind = $3 and e.spend_id = $4 \
+                 order by e.block_height, e.event_index",
+            )
+            .bind(chain_id)
+            .bind(instance)
+            .bind(spend_kind)
+            .bind(spend_id as i64)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| IndexError(e.to_string()))?;
+            Ok(rows.into_iter().map(spend_event_from_row).collect())
+        }
+
+        async fn pot_events(
+            &self,
+            chain_id: &str,
+            instance: &str,
+            limit: u64,
+        ) -> Result<Vec<super::SpendEventRow>, IndexError> {
+            let rows: Vec<SpendEventTuple> = sqlx::query_as(
+                "select e.block_height, b.timestamp, e.event_index, e.kind, e.amount::text, e.data \
+                 from treasury.spend_events e \
+                 left join core.blocks b \
+                   on b.chain_id = e.chain_id and b.height = e.block_height \
+                 where e.chain_id = $1 and e.instance = $2 and e.spend_id is null \
+                 order by e.block_height desc, e.event_index desc limit $3",
+            )
+            .bind(chain_id)
+            .bind(instance)
+            .bind(limit as i64)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| IndexError(e.to_string()))?;
+            Ok(rows.into_iter().map(spend_event_from_row).collect())
+        }
+    }
+
     /// `gov.vote_positions` columns, in the order `vote_from_row` expects.
     /// NUMERICs come back as text (plancks exceed u64/f64, no decimal dep).
     const VOTE_COLS: &str = "class, referendum_id, voter, active, vote_type, \
@@ -1398,6 +1788,7 @@ pub struct AppState {
     pub labels: Arc<dyn LabelIndex>,
     pub balances: Arc<dyn BalanceIndex>,
     pub gov: Arc<dyn GovIndex>,
+    pub treasury: Arc<dyn TreasuryIndex>,
     pub parse_account: AccountParser,
 }
 
@@ -1413,6 +1804,9 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/gov/{network}/referenda/{id}/votes", get(get_gov_referendum_votes))
         .route("/v1/gov/{network}/accounts/{account}/votes", get(get_gov_account_votes))
         .route("/v1/gov/{network}/tracks", get(get_gov_tracks))
+        .route("/v1/treasury/{network}/spends", get(list_treasury_spends))
+        .route("/v1/treasury/{network}/spends/{id}", get(get_treasury_spend))
+        .route("/v1/treasury/{network}/pot", get(get_treasury_pot))
         .route("/v1/domains/{network}/{domain}", get(resolve_domain))
         .with_state(state)
 }
@@ -2005,17 +2399,276 @@ async fn get_gov_tracks(
         Ok(c) => c,
         Err(e) => return error(StatusCode::NOT_FOUND, e.to_string()),
     };
+    // Resolving the CHAIN is not enough: Collectives runs three referenda
+    // instances whose track ids collide (id 1 = "members" for the Fellowship,
+    // "ambassador" for the Ambassador programme), so a chain-only answer is
+    // ambiguous to join against a referendum's track_id. Filter by the class's
+    // own pallet — registry data, so a new instance needs no code here.
+    let pallet = state.registry.pallet_for_class(&class);
     match state.gov.tracks(&chain.id).await {
-        Ok(tracks) => Json(serde_json::json!({
-            "network": network,
-            "class": class,
-            "chain": chain.id,
-            "at": at,
-            "tracks": tracks,
-        }))
-        .into_response(),
+        Ok(tracks) => {
+            let tracks: Vec<GovTrackRow> = match pallet {
+                Some(p) => tracks.into_iter().filter(|t| t.pallet == p).collect(),
+                None => tracks,
+            };
+            Json(serde_json::json!({
+                "network": network,
+                "class": class,
+                "chain": chain.id,
+                "at": at,
+                // null = this class registered no pallet, so every instance on
+                // the chain is listed and track ids may collide. Stated, not implied.
+                "pallet": pallet,
+                "tracks": tracks,
+            }))
+            .into_response()
+        }
         Err(e) => error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     }
+}
+
+// ----------------------------------------------------------- treasury routes
+
+#[derive(Deserialize)]
+struct TreasuryQuery {
+    /// Pallet instance; defaults to the main treasury.
+    instance: Option<String>,
+    /// Spend id space for the detail route: proposal | asset_spend.
+    kind: Option<String>,
+    status: Option<String>,
+    limit: Option<u64>,
+}
+
+/// Residency windows carrying one treasury INSTANCE, in time order. Same
+/// registry-driven step as the referenda classes: the main treasury stitches
+/// relay → Asset Hub across Nov-2025, the Collectives sub-treasuries resolve to
+/// their own chain, and no caller names either.
+fn treasury_windows<'a>(
+    registry: &'a Registry,
+    network: &str,
+    instance: &str,
+) -> Vec<&'a registry::ResidencyEntry> {
+    let domain = registry.domain_for_treasury_instance(instance);
+    let mut windows: Vec<&registry::ResidencyEntry> = registry
+        .residency()
+        .iter()
+        .filter(|r| r.domain == domain && r.network == network)
+        .collect();
+    windows.sort_by_key(|r| r.from);
+    windows
+}
+
+fn treasury_instance(q: &TreasuryQuery) -> String {
+    q.instance
+        .clone()
+        .unwrap_or_else(|| registry::DEFAULT_TREASURY_INSTANCE.to_string())
+}
+
+fn no_treasury_residency(instance: &str, network: &str, domain: &str) -> Response {
+    error(
+        StatusCode::NOT_FOUND,
+        format!("no residency for treasury instance '{instance}' (domain '{domain}') on network '{network}'"),
+    )
+}
+
+/// Merge one spend's rows from two residency windows.
+///
+/// This is NOT the vote-position rule (later window replaces): a vote row is
+/// self-contained, a spend row is not. Only `AssetSpendApproved` carries the
+/// amount, asset kind and beneficiary, so for a spend approved on the relay and
+/// paid on Asset Hub the later row's value columns are all NULL. Replacing
+/// wholesale would drop the amount from the answer to "what was promised"
+/// (reviewer catch). Status and payment come from the later window; the value
+/// columns fall back to the earlier one; the first sighting is the earliest.
+fn merge_spend(prev: SpendRow, later: SpendRow) -> SpendRow {
+    SpendRow {
+        instance: later.instance,
+        spend_kind: later.spend_kind,
+        spend_id: later.spend_id,
+        status: later.status,
+        status_height: later.status_height,
+        amount: later.amount.or(prev.amount),
+        slashed: later.slashed.or(prev.slashed),
+        asset_kind: later.asset_kind.or(prev.asset_kind),
+        beneficiary: later.beneficiary.or(prev.beneficiary),
+        beneficiary_location: later.beneficiary_location.or(prev.beneficiary_location),
+        payment_id: later.payment_id.or(prev.payment_id),
+        valid_from: later.valid_from.or(prev.valid_from),
+        expire_at: later.expire_at.or(prev.expire_at),
+        first_seen_height: prev.first_seen_height.min(later.first_seen_height),
+    }
+}
+
+/// WHAT THE TREASURY PROMISED: spends for one instance, residency-stitched.
+///
+/// A spend's id is unique only within (instance, id space), and the same id can
+/// carry events on both sides of the Nov-2025 migration (the pallet's state
+/// moved with it), so rows are MERGED per (kind, id) with the later window
+/// winning — the same rule the vote positions use.
+async fn list_treasury_spends(
+    State(state): State<AppState>,
+    Path(network): Path<String>,
+    Query(q): Query<TreasuryQuery>,
+) -> Response {
+    let instance = treasury_instance(&q);
+    let limit = q.limit.unwrap_or(50).min(500);
+    let windows = treasury_windows(&state.registry, &network, &instance);
+    if windows.is_empty() {
+        return no_treasury_residency(
+            &instance,
+            &network,
+            state.registry.domain_for_treasury_instance(&instance),
+        );
+    }
+
+    let mut merged: std::collections::BTreeMap<(String, u64), SpendRow> =
+        std::collections::BTreeMap::new();
+    let mut segments = Vec::with_capacity(windows.len());
+    for w in &windows {
+        let rows = match state
+            .treasury
+            .spends(&w.chain, &instance, q.status.as_deref(), q.kind.as_deref(), limit)
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+        };
+        segments.push(serde_json::json!({
+            "chain": w.chain,
+            "from": w.from,
+            "to": w.to,
+            "spends_indexed": rows.len(),
+        }));
+        for r in rows {
+            let key = (r.spend_kind.clone(), r.spend_id);
+            let merged_row = match merged.remove(&key) {
+                None => r,
+                Some(prev) => merge_spend(prev, r),
+            };
+            merged.insert(key, merged_row);
+        }
+    }
+    // sort by the id space, NOT by height: relay heights (~32M) and Asset Hub
+    // heights (~19M) are different number lines, so sorting merged rows by
+    // height would float every relay-era proposal above every recent spend
+    let mut spends: Vec<&SpendRow> = merged.values().collect();
+    spends.sort_by(|a, b| {
+        a.spend_kind
+            .cmp(&b.spend_kind)
+            .then_with(|| b.spend_id.cmp(&a.spend_id))
+    });
+    spends.truncate(limit as usize);
+    Json(serde_json::json!({
+        "network": network,
+        "instance": instance,
+        "status": q.status,
+        "spend_kind": q.kind,
+        "spends": spends,
+        "segments": segments,
+    }))
+    .into_response()
+}
+
+/// One spend's full story: the merged row plus its per-chain event timeline.
+/// `?kind=` picks the id space (the legacy proposal counter and the modern
+/// SpendIndex are different numbers that both start at 0), defaulting to the
+/// modern one.
+async fn get_treasury_spend(
+    State(state): State<AppState>,
+    Path((network, id)): Path<(String, u64)>,
+    Query(q): Query<TreasuryQuery>,
+) -> Response {
+    let instance = treasury_instance(&q);
+    let kind = q.kind.clone().unwrap_or_else(|| "asset_spend".to_string());
+    let windows = treasury_windows(&state.registry, &network, &instance);
+    if windows.is_empty() {
+        return no_treasury_residency(
+            &instance,
+            &network,
+            state.registry.domain_for_treasury_instance(&instance),
+        );
+    }
+
+    let mut spend: Option<SpendRow> = None;
+    let mut segments = Vec::with_capacity(windows.len());
+    for w in &windows {
+        match state.treasury.spend(&w.chain, &instance, &kind, id).await {
+            // merge, never replace: the approval's value columns live in the
+            // earlier window when a spend straddles the migration
+            Ok(Some(s)) => {
+                spend = Some(match spend.take() {
+                    None => s,
+                    Some(prev) => merge_spend(prev, s),
+                })
+            }
+            Ok(None) => {}
+            Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+        }
+        let events = match state.treasury.spend_events(&w.chain, &instance, &kind, id).await {
+            Ok(e) => e,
+            Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+        };
+        segments.push(serde_json::json!({
+            "chain": w.chain,
+            "from": w.from,
+            "to": w.to,
+            "events": events,
+        }));
+    }
+    let Some(spend) = spend else {
+        return error(
+            StatusCode::NOT_FOUND,
+            format!("treasury spend {network}/{instance}/{kind}/{id} not indexed"),
+        );
+    };
+    Json(serde_json::json!({
+        "network": network,
+        "instance": instance,
+        "spend_kind": kind,
+        "spend_id": id,
+        "spend": spend,
+        "segments": segments,
+    }))
+    .into_response()
+}
+
+/// Pot flows: money into and out of the treasury account that names no spend
+/// (deposits, burns, rollovers, the spend-period bookkeeping). Newest first.
+async fn get_treasury_pot(
+    State(state): State<AppState>,
+    Path(network): Path<String>,
+    Query(q): Query<TreasuryQuery>,
+) -> Response {
+    let instance = treasury_instance(&q);
+    let limit = q.limit.unwrap_or(50).min(500);
+    let windows = treasury_windows(&state.registry, &network, &instance);
+    if windows.is_empty() {
+        return no_treasury_residency(
+            &instance,
+            &network,
+            state.registry.domain_for_treasury_instance(&instance),
+        );
+    }
+    let mut segments = Vec::with_capacity(windows.len());
+    for w in &windows {
+        let events = match state.treasury.pot_events(&w.chain, &instance, limit).await {
+            Ok(e) => e,
+            Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+        };
+        segments.push(serde_json::json!({
+            "chain": w.chain,
+            "from": w.from,
+            "to": w.to,
+            "events": events,
+        }));
+    }
+    Json(serde_json::json!({
+        "network": network,
+        "instance": instance,
+        "note": "pot flows only — these name no spend; see /spends for what was promised",
+        "segments": segments,
+    }))
+    .into_response()
 }
 
 #[derive(Deserialize)]
@@ -2264,6 +2917,18 @@ mod tests {
                 spec_version: 1_005_001,
             },
         );
+        // the collision that made the chain-only answer ambiguous: a SECOND
+        // instance on the same chain, same track id, different meaning
+        gov.insert_track(
+            "polkadot-collectives",
+            GovTrackRow {
+                pallet: "ambassadorreferenda".into(),
+                track_id: 1,
+                name: "ambassador".into(),
+                params: serde_json::json!({"max_deciding": 10}),
+                spec_version: 1_005_001,
+            },
+        );
 
         // votes on ref 1500, also spanning the migration: A votes aye on the
         // relay and WITHDRAWS on Asset Hub (its relay row stays 'active'
@@ -2371,12 +3036,122 @@ mod tests {
             },
         );
 
+        // treasury: one modern asset spend that STRADDLES the migration —
+        // approved on the relay, paid on Asset Hub — plus a pot deposit that
+        // names no spend, and a Fellowship sub-treasury spend on Collectives.
+        let treasury = Arc::new(MemoryTreasuryIndex::new());
+        let usdt = serde_json::json!({"V4": {"asset_id": {"parents": 0, "interior":
+            {"X2": [{"PalletInstance": 50}, {"GeneralIndex": 1984}]}}}});
+        let payee = adapter_substrate::accounts::para_sovereign(2034);
+        let payee_hex = format!("0x{}", hex_lower(&payee));
+        treasury.insert_spend(
+            "polkadot",
+            SpendRow {
+                instance: "treasury".into(),
+                spend_kind: "asset_spend".into(),
+                spend_id: 313,
+                status: "approved".into(),
+                amount: Some("83760000000".into()),
+                slashed: None,
+                asset_kind: Some(usdt.clone()),
+                beneficiary: Some(payee_hex.clone()),
+                beneficiary_location: Some(serde_json::json!({"V4": {"parents": 0}})),
+                payment_id: None,
+                valid_from: Some(28_000_000),
+                expire_at: Some(28_900_000),
+                first_seen_height: 28_000_000,
+                status_height: 28_000_000,
+            },
+        );
+        treasury.insert_event(
+            "polkadot",
+            "treasury",
+            Some(("asset_spend".into(), 313)),
+            SpendEventRow {
+                height: 28_000_000,
+                timestamp: Some(ts("2025-10-01T00:00:00Z")),
+                event_index: 4,
+                kind: "approved".into(),
+                amount: Some("83760000000".into()),
+                data: serde_json::json!({"index": 313}),
+            },
+        );
+        // …and the Asset Hub row is what the INDEXER really produces for the
+        // second half of a straddling spend: status and payment only. The
+        // amount, asset kind and beneficiary exist solely on the relay row,
+        // because only `AssetSpendApproved` carries them.
+        treasury.insert_spend(
+            "polkadot-asset-hub",
+            SpendRow {
+                instance: "treasury".into(),
+                spend_kind: "asset_spend".into(),
+                spend_id: 313,
+                status: "paid".into(),
+                amount: None,
+                slashed: None,
+                asset_kind: None,
+                beneficiary: None,
+                beneficiary_location: None,
+                payment_id: Some("5551".into()),
+                valid_from: None,
+                expire_at: None,
+                first_seen_height: 10_400_000,
+                status_height: 10_400_000,
+            },
+        );
+        treasury.insert_event(
+            "polkadot-asset-hub",
+            "treasury",
+            Some(("asset_spend".into(), 313)),
+            SpendEventRow {
+                height: 10_400_000,
+                timestamp: Some(ts("2026-01-05T00:00:00Z")),
+                event_index: 2,
+                kind: "paid".into(),
+                amount: None,
+                data: serde_json::json!({"index": 313, "payment_id": 5551}),
+            },
+        );
+        treasury.insert_event(
+            "polkadot-asset-hub",
+            "treasury",
+            None,
+            SpendEventRow {
+                height: 10_400_100,
+                timestamp: Some(ts("2026-01-05T01:00:00Z")),
+                event_index: 0,
+                kind: "pot_deposit".into(),
+                amount: Some("1204000000000".into()),
+                data: serde_json::json!({"value": 1204000000000u64}),
+            },
+        );
+        treasury.insert_spend(
+            "polkadot-collectives",
+            SpendRow {
+                instance: "fellowship_treasury".into(),
+                spend_kind: "asset_spend".into(),
+                spend_id: 7,
+                status: "processed".into(),
+                amount: Some("1000000000".into()),
+                slashed: None,
+                asset_kind: None,
+                beneficiary: None,
+                beneficiary_location: None,
+                payment_id: None,
+                valid_from: None,
+                expire_at: None,
+                first_seen_height: 5_100_000,
+                status_height: 5_100_500,
+            },
+        );
+
         AppState {
             registry,
             blocks,
             labels,
             balances,
             gov,
+            treasury,
             parse_account: Arc::new(|s| {
                 adapter_substrate::accounts::parse_account(s).map(|a| a.to_vec())
             }),
@@ -2584,8 +3359,13 @@ mod tests {
         assert_eq!(fs, StatusCode::OK);
         assert_eq!(fellowship["chain"], "polkadot-collectives");
         assert_eq!(fellowship["class"], "fellowship_referenda");
-        assert_eq!(fellowship["tracks"][0]["pallet"], "fellowshipreferenda");
-        assert_eq!(fellowship["tracks"][0]["name"], "members");
+        // Collectives hosts a SECOND instance whose track 1 is a different
+        // thing entirely; the class's own pallet is what disambiguates
+        assert_eq!(fellowship["pallet"], "fellowshipreferenda");
+        let rows = fellowship["tracks"].as_array().unwrap();
+        assert_eq!(rows.len(), 1, "the ambassador instance must not leak in");
+        assert_eq!(rows[0]["pallet"], "fellowshipreferenda");
+        assert_eq!(rows[0]["name"], "members");
     }
 
     #[tokio::test]
@@ -2678,6 +3458,90 @@ mod tests {
         // different chains) — instances stay separate without any filtering code
         let (s404, _) = get_json(&app, "/v1/gov/polkadot/referenda/300").await;
         assert_eq!(s404, StatusCode::NOT_FOUND);
+    }
+
+    fn payee_hex_expected() -> String {
+        format!("0x{}", hex_lower(&adapter_substrate::accounts::para_sovereign(2034)))
+    }
+
+    #[tokio::test]
+    async fn treasury_spend_stitches_the_migration_and_pot_flows_stay_separate() {
+        let app = router(test_state().await);
+
+        // spend 313 was approved on the relay and PAID on Asset Hub: one spend,
+        // merged, with the later window's status winning
+        let (status, json) = get_json(&app, "/v1/treasury/polkadot/spends/313").await;
+        assert_eq!(status, StatusCode::OK);
+        // status + payment from the LATER window…
+        assert_eq!(json["spend"]["status"], "paid");
+        assert_eq!(json["spend"]["payment_id"], "5551");
+        // …and the value columns from the EARLIER one, where the approval was.
+        // Replacing wholesale would answer "what was promised" with null.
+        assert_eq!(json["spend"]["amount"], "83760000000");
+        assert_eq!(json["spend"]["beneficiary"], payee_hex_expected());
+        assert_eq!(json["spend"]["valid_from"], 28_000_000);
+        assert_eq!(json["spend"]["first_seen_height"], 10_400_000);
+        // the asset is NOT DOT — the spend carries its own asset kind
+        assert_eq!(
+            json["spend"]["asset_kind"]["V4"]["asset_id"]["interior"]["X2"][1]["GeneralIndex"],
+            1984
+        );
+        let segments = json["segments"].as_array().unwrap();
+        assert_eq!(segments.len(), 2);
+        assert_eq!(segments[0]["events"][0]["kind"], "approved");
+        assert_eq!(segments[1]["events"][0]["kind"], "paid");
+
+        // the list surface merges the same spend to ONE row
+        let (_, list) = get_json(&app, "/v1/treasury/polkadot/spends").await;
+        let spends = list["spends"].as_array().unwrap();
+        assert_eq!(spends.len(), 1, "one spend, not one per chain");
+        assert_eq!(spends[0]["spend_id"], 313);
+        assert_eq!(spends[0]["status"], "paid");
+        assert_eq!(spends[0]["amount"], "83760000000", "merged, not replaced");
+
+        // ?kind= filters the id space instead of being silently ignored
+        let (_, legacy) = get_json(&app, "/v1/treasury/polkadot/spends?kind=proposal").await;
+        assert_eq!(legacy["spends"].as_array().unwrap().len(), 0);
+        assert_eq!(legacy["spend_kind"], "proposal");
+
+        // pot flows are money that names no spend, and never leak into spends
+        let (_, pot) = get_json(&app, "/v1/treasury/polkadot/pot").await;
+        let ah = &pot["segments"][1];
+        assert_eq!(ah["events"][0]["kind"], "pot_deposit");
+        assert_eq!(ah["events"][0]["amount"], "1204000000000");
+
+        // the legacy id space is a DIFFERENT number line: proposal 313 is not
+        // asset spend 313
+        let (s404, _) = get_json(&app, "/v1/treasury/polkadot/spends/313?kind=proposal").await;
+        assert_eq!(s404, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn sub_treasuries_resolve_to_their_own_chain() {
+        let app = router(test_state().await);
+        let (status, json) =
+            get_json(&app, "/v1/treasury/polkadot/spends?instance=fellowship_treasury").await;
+        assert_eq!(status, StatusCode::OK);
+        let segments = json["segments"].as_array().unwrap();
+        assert_eq!(segments.len(), 1, "the sub-treasury has one residency window");
+        assert_eq!(segments[0]["chain"], "polkadot-collectives");
+        assert_eq!(json["spends"][0]["spend_id"], 7);
+        assert_eq!(json["spends"][0]["status"], "processed");
+
+        // and the main treasury does not see it (separate money, separate chain)
+        let (_, main) = get_json(&app, "/v1/treasury/polkadot/spends").await;
+        let ids: Vec<u64> = main["spends"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| s["spend_id"].as_u64().unwrap())
+            .collect();
+        assert!(!ids.contains(&7));
+
+        // status filter reaches the index, not just the response
+        let (_, filtered) =
+            get_json(&app, "/v1/treasury/polkadot/spends?status=rejected").await;
+        assert_eq!(filtered["spends"].as_array().unwrap().len(), 0);
     }
 
     #[tokio::test]

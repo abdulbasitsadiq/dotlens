@@ -18,13 +18,14 @@
 //!   dotlens-node anchor-balance <chain> <acct> <h>    # record absolute balance anchor
 //!   dotlens-node gov-range <chain> <a> <b>    # map referendum timelines over a range
 //!   dotlens-node votes-range <chain> <a> <b>  # map votes + delegations over a range
+//!   dotlens-node treasury-range <chain> <a> <b>  # map treasury spends + pot flows
 //!   dotlens-node anchor-voting <chain> <acct> <track> [height]  # VotingFor state anchor
 //!   dotlens-node sync-tracks                  # decode gov tracks from metadata, exit
 //!   dotlens-node fetch-preimage <chain> <hash> <len> [height]  # fetch+decode one preimage
 //!   dotlens-node decode-preimages <chain> [height]   # decode all pending proposals
 //!
 //! Per-module followers are opt-in flags: LIVE_INGEST, DECODE_FOLLOW,
-//! BALANCES_FOLLOW, GOV_FOLLOW, VOTES_FOLLOW, TIP_FOLLOW (all `=1`).
+//! BALANCES_FOLLOW, GOV_FOLLOW, VOTES_FOLLOW, TREASURY_FOLLOW, TIP_FOLLOW (all `=1`).
 //!
 //! backfill accepts an optional worker count (`backfill <chain> <a> <b> 8`) —
 //! deterministic chunks, per-chunk checkpoints, re-run the same command to
@@ -53,6 +54,7 @@ struct Backends {
     labels: Arc<dyn api::LabelIndex>,
     balances: Arc<dyn api::BalanceIndex>,
     gov: Arc<dyn api::GovIndex>,
+    treasury: Arc<dyn api::TreasuryIndex>,
     runtime_versions: Arc<dyn RuntimeVersionSink>,
     /// Kept for label sync/verify (they need direct SQL, not a trait).
     #[cfg(feature = "pg")]
@@ -68,6 +70,7 @@ fn memory_backends() -> Backends {
         labels: Arc::new(api::MemoryLabelIndex::new()),
         balances: Arc::new(api::MemoryBalanceIndex::new()),
         gov: Arc::new(api::MemoryGovIndex::new()),
+        treasury: Arc::new(api::MemoryTreasuryIndex::new()),
         runtime_versions: Arc::new(NoopRuntimeVersionSink),
         #[cfg(feature = "pg")]
         pool: None,
@@ -98,6 +101,7 @@ enum Command {
     AnchorBalance { chain: String, account: String, height: u64 },
     GovRange { chain: String, from: u64, to: u64 },
     VotesRange { chain: String, from: u64, to: u64 },
+    TreasuryRange { chain: String, from: u64, to: u64 },
     AnchorVoting { chain: String, account: String, track: u32, height: Option<u64> },
     SyncTracks,
     FetchPreimage { chain: String, hash: String, len: u64, height: Option<u64> },
@@ -156,6 +160,11 @@ fn parse_args() -> Result<Command> {
         Some("votes-range") => {
             let (chain, from, to) = range("usage: dotlens-node votes-range <chain> <from> <to>")?;
             Ok(Command::VotesRange { chain, from, to })
+        }
+        Some("treasury-range") => {
+            let (chain, from, to) =
+                range("usage: dotlens-node treasury-range <chain> <from> <to>")?;
+            Ok(Command::TreasuryRange { chain, from, to })
         }
         Some("anchor-voting") => {
             let usage = "usage: dotlens-node anchor-voting <chain> <account> <track> [height]";
@@ -262,6 +271,7 @@ async fn main() -> Result<()> {
             labels: Arc::new(api::pg::PgLabelIndex::new(pool.clone())),
             balances: Arc::new(api::pg::PgBalanceIndex::new(pool.clone())),
             gov: Arc::new(api::pg::PgGovIndex::new(pool.clone())),
+            treasury: Arc::new(api::pg::PgTreasuryIndex::new(pool.clone())),
             runtime_versions: Arc::new(PgRuntimeVersionSink::new(pool.clone())),
             pool: Some(pool),
             persistent: true,
@@ -339,6 +349,13 @@ async fn main() -> Result<()> {
         );
         return run_votes_range(&registry, &backends, chain, *from, *to).await;
     }
+    if let Command::TreasuryRange { chain, from, to } = &command {
+        anyhow::ensure!(
+            backends.persistent,
+            "treasury-range requires DATABASE_URL (canonical events + spend facts must persist)"
+        );
+        return run_treasury_range(&registry, &backends, chain, *from, *to).await;
+    }
     if let Command::AnchorVoting { chain, account, track, height } = &command {
         return run_anchor_voting(
             &registry, &backends, raw.as_ref(), chain, account, *track, *height,
@@ -408,6 +425,7 @@ async fn main() -> Result<()> {
     spawn_balances_followers(&registry, &backends);
     spawn_gov_followers(&registry, &backends);
     spawn_votes_followers(&registry, &backends);
+    spawn_treasury_followers(&registry, &backends);
     spawn_tip_followers(&registry, &backends, &raw);
 
     // -- API ------------------------------------------------------------------
@@ -418,6 +436,7 @@ async fn main() -> Result<()> {
         labels: backends.labels.clone(),
         balances: backends.balances.clone(),
         gov: backends.gov.clone(),
+        treasury: backends.treasury.clone(),
         // family-encoded address parsing is adapter-owned (Invariant 4); with
         // more families this becomes registry-driven dispatch
         parse_account: Arc::new(|s| {
@@ -1134,6 +1153,95 @@ async fn run_anchor_voting(
     _: Option<u64>,
 ) -> Result<()> {
     anyhow::bail!("anchor-voting requires the `pg` and `live` features")
+}
+
+/// Treasury followers: chase each chain's decode checkpoint, mapping canonical
+/// treasury-pallet events into spend facts and pot flows. Pure mapping over Pg
+/// — no network, `pg` only. Eligibility is registry data: the chain must enable
+/// the `treasury` module.
+fn spawn_treasury_followers(registry: &Arc<Registry>, backends: &Arc<Backends>) {
+    if !env_flag("TREASURY_FOLLOW") {
+        tracing::info!("treasury follower disabled (set TREASURY_FOLLOW=1 to enable)");
+        return;
+    }
+    if !backends.persistent {
+        tracing::warn!("TREASURY_FOLLOW=1 but no DATABASE_URL — refusing to map into memory");
+        return;
+    }
+    #[cfg(feature = "pg")]
+    {
+        use adapter_substrate::treasury::SubstrateTreasuryMapper;
+
+        let poll = std::time::Duration::from_secs(
+            env_or("POLL_INTERVAL_SECS", "6").parse().unwrap_or(6),
+        );
+        for chain in registry.chains() {
+            if !chain.has_module("treasury") {
+                continue;
+            }
+            if chain.family != registry::ChainFamily::Substrate {
+                tracing::debug!(chain = %chain.id, "no treasury mapper for this family — skipped");
+                continue;
+            }
+            let Some(pool) = backends.pool.clone() else { continue };
+            let chain_id = chain.id.clone();
+            let backends = backends.clone();
+            tokio::spawn(async move {
+                tracing::info!(chain = %chain_id, "treasury follower started");
+                let source = dotlens_node::balances_pg::PgEventSource::new(pool.clone());
+                let sink = dotlens_node::treasury_pg::PgSpendSink::new(pool);
+                let deps = ingest::treasury::TreasuryDeps {
+                    checkpoints: backends.checkpoints.as_ref(),
+                    source: &source,
+                    sink: &sink,
+                };
+                ingest::treasury::treasury_follow(&chain_id, &SubstrateTreasuryMapper, &deps, poll)
+                    .await;
+            });
+        }
+    }
+}
+
+#[cfg(feature = "pg")]
+async fn run_treasury_range(
+    registry: &Registry,
+    backends: &Backends,
+    chain: &str,
+    from: u64,
+    to: u64,
+) -> Result<()> {
+    use adapter_substrate::treasury::SubstrateTreasuryMapper;
+
+    let cfg = registry
+        .chain(chain)
+        .with_context(|| format!("unknown chain: {chain}"))?;
+    anyhow::ensure!(
+        cfg.family == registry::ChainFamily::Substrate,
+        "no treasury mapper for family {:?}",
+        cfg.family
+    );
+    let pool = backends
+        .pool
+        .as_ref()
+        .context("treasury-range requires DATABASE_URL")?;
+    let source = dotlens_node::balances_pg::PgEventSource::new(pool.clone());
+    let sink = dotlens_node::treasury_pg::PgSpendSink::new(pool.clone());
+    let deps = ingest::treasury::TreasuryDeps {
+        checkpoints: backends.checkpoints.as_ref(),
+        source: &source,
+        sink: &sink,
+    };
+    let n = ingest::treasury::treasury_range(&cfg.id, &SubstrateTreasuryMapper, &deps, from, to)
+        .await
+        .with_context(|| format!("treasury-range {chain} {from}..={to}"))?;
+    tracing::info!(chain, from, to, mapped = n, "treasury-range complete");
+    println!("treasury-range {chain} {from}..={to}: mapped {n} blocks");
+    Ok(())
+}
+
+#[cfg(not(feature = "pg"))]
+async fn run_treasury_range(_: &Registry, _: &Backends, _: &str, _: u64, _: u64) -> Result<()> {
+    anyhow::bail!("treasury-range requires the `pg` feature")
 }
 
 /// Everything one preimage decode needs from a block context: the archived
