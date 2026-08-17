@@ -174,7 +174,7 @@ fn bounded_call_hash_len(proposal: &serde_json::Value) -> (Option<String>, Optio
 // as objects, positional as arrays; H256 as (nested) byte arrays; small
 // numbers as JSON numbers, >u64 as decimal strings.
 
-fn field<'a>(data: &'a serde_json::Value, name: &str, index: usize) -> Option<&'a serde_json::Value> {
+pub(crate) fn field<'a>(data: &'a serde_json::Value, name: &str, index: usize) -> Option<&'a serde_json::Value> {
     match data {
         serde_json::Value::Object(map) => map.get(name),
         serde_json::Value::Array(items) => items.get(index),
@@ -192,7 +192,7 @@ fn field_u64(data: &serde_json::Value, name: &str, index: usize) -> Option<u64> 
 
 /// Collect exactly 32 bytes out of arbitrarily nested arrays/objects (H256
 /// renders as a newtype over the byte array) → 0x-hex.
-fn json_h256_hex(v: &serde_json::Value) -> Option<String> {
+pub(crate) fn json_h256_hex(v: &serde_json::Value) -> Option<String> {
     fn walk(v: &serde_json::Value, out: &mut Vec<u8>) -> bool {
         match v {
             serde_json::Value::Number(n) => match n.as_u64() {

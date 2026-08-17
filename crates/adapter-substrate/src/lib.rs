@@ -59,6 +59,11 @@ pub mod treasury;
 /// decoding. Pure — no I/O.
 pub mod votes;
 
+/// pallet-whitelist: the Fellowship's fast path. Three events, unchanged in
+/// every published version of the pallet — and the one rule that matters is
+/// that `WhitelistedCallDispatched` fires for a FAILED call too.
+pub mod whitelist;
+
 use canonical::{CanonicalBlock, CanonicalEvent, CanonicalTransaction, Lineage};
 use serde::{Deserialize, Serialize};
 

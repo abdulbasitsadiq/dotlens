@@ -123,6 +123,7 @@ pub async fn sync_registry(pool: &PgPool, registry: &Registry) -> Result<()> {
             ("gov", "referendum_events"),
             ("gov", "votes"),
             ("gov", "delegation_events"),
+            ("gov", "whitelist_events"),
             ("treasury", "spend_events"),
             ("treasury", "bounty_events"),
         ] {

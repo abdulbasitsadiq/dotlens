@@ -508,6 +508,44 @@ pub struct PreimageRow {
     pub fetched_at_height: Option<u64>,
 }
 
+/// One whitelisted call — a `gov.whitelisted_calls` projection row.
+///
+/// `status` and `dispatch_ok` answer two DIFFERENT questions and must be read
+/// as such: `status = "dispatched"` says the whitelisted call was handed to
+/// `dispatch`, its whitelist entry consumed and its preimage unrequested;
+/// `dispatch_ok` says whether the call then SUCCEEDED. pallet-whitelist emits
+/// the same event either way and swallows the error, so a false here is an
+/// enactment that silently did not happen.
+///
+/// `status = "whitelisted"` with no dispatch is a legitimate TERMINAL state,
+/// not a pending one — see migration 0012 on the three ways a dispatch fails
+/// with no event at all.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct WhitelistedCallRow {
+    pub call_hash: String,
+    pub status: String,
+    pub dispatch_ok: Option<bool>,
+    pub dispatch_error: Option<serde_json::Value>,
+    pub dispatch_height: Option<u64>,
+    pub first_seen_height: u64,
+    pub whitelisted_height: Option<u64>,
+    pub status_height: u64,
+    pub runtime_version: u64,
+    pub mapper_version: u32,
+}
+
+/// One `gov.whitelist_events` row — the append-only history of a call hash.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct WhitelistEventRow {
+    pub block_height: u64,
+    pub event_index: u32,
+    pub kind: String,
+    pub dispatch_ok: Option<bool>,
+    pub dispatch_error: Option<serde_json::Value>,
+    pub data: serde_json::Value,
+    pub runtime_version: u64,
+}
+
 /// One account's current vote on one referendum (a `gov.vote_positions` row).
 /// Amounts are decimal strings — plancks exceed u64/f64.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
@@ -1027,6 +1065,24 @@ pub trait GovIndex: Send + Sync {
         limit: u64,
     ) -> Result<Vec<ReferendumRow>, IndexError>;
     async fn tracks(&self, chain_id: &str) -> Result<Vec<GovTrackRow>, IndexError>;
+    /// One whitelisted call by its hash.
+    async fn whitelisted_call(
+        &self,
+        chain_id: &str,
+        call_hash: &str,
+    ) -> Result<Option<WhitelistedCallRow>, IndexError>;
+    /// Everything that ever happened to one call hash, oldest first.
+    async fn whitelist_events(
+        &self,
+        chain_id: &str,
+        call_hash: &str,
+    ) -> Result<Vec<WhitelistEventRow>, IndexError>;
+    /// Latest whitelisted calls, most recently moved first.
+    async fn list_whitelisted_calls(
+        &self,
+        chain_id: &str,
+        limit: u64,
+    ) -> Result<Vec<WhitelistedCallRow>, IndexError>;
     /// Best preimage row for a proposal hash (a decoded row wins over
     /// missing/undecodable attempts).
     async fn preimage(
@@ -1069,6 +1125,8 @@ pub struct MemoryGovIndex {
     events: RwLock<HashMap<(String, String, u64), Vec<ReferendumEventRow>>>,
     tracks: RwLock<HashMap<String, Vec<GovTrackRow>>>,
     preimages: RwLock<HashMap<(String, String), Vec<PreimageRow>>>,
+    whitelisted: RwLock<HashMap<(String, String), WhitelistedCallRow>>,
+    whitelist_events: RwLock<HashMap<(String, String), Vec<WhitelistEventRow>>>,
     votes: RwLock<HashMap<String, Vec<VoteRow>>>,
     delegations: RwLock<HashMap<String, Vec<DelegationRow>>>,
     anchors: RwLock<HashMap<(String, String), Vec<VotingAnchorRow>>>,
@@ -1077,6 +1135,20 @@ pub struct MemoryGovIndex {
 impl MemoryGovIndex {
     pub fn new() -> Self {
         Self::default()
+    }
+    pub fn insert_whitelisted_call(&self, chain: &str, row: WhitelistedCallRow) {
+        self.whitelisted
+            .write()
+            .unwrap()
+            .insert((chain.to_string(), row.call_hash.clone()), row);
+    }
+    pub fn insert_whitelist_event(&self, chain: &str, call_hash: &str, row: WhitelistEventRow) {
+        self.whitelist_events
+            .write()
+            .unwrap()
+            .entry((chain.to_string(), call_hash.to_string()))
+            .or_default()
+            .push(row);
     }
     pub fn insert_referendum(&self, chain: &str, row: ReferendumRow) {
         self.referenda
@@ -1184,6 +1256,51 @@ impl GovIndex for MemoryGovIndex {
                 .or_else(|| rows.first())
                 .cloned()
         }))
+    }
+    async fn whitelisted_call(
+        &self,
+        chain_id: &str,
+        call_hash: &str,
+    ) -> Result<Option<WhitelistedCallRow>, IndexError> {
+        let map = self.whitelisted.read().map_err(|e| IndexError(e.to_string()))?;
+        Ok(map.get(&(chain_id.into(), call_hash.into())).cloned())
+    }
+    async fn whitelist_events(
+        &self,
+        chain_id: &str,
+        call_hash: &str,
+    ) -> Result<Vec<WhitelistEventRow>, IndexError> {
+        let map = self
+            .whitelist_events
+            .read()
+            .map_err(|e| IndexError(e.to_string()))?;
+        let mut rows = map
+            .get(&(chain_id.into(), call_hash.into()))
+            .cloned()
+            .unwrap_or_default();
+        rows.sort_by_key(|r| (r.block_height, r.event_index));
+        Ok(rows)
+    }
+    async fn list_whitelisted_calls(
+        &self,
+        chain_id: &str,
+        limit: u64,
+    ) -> Result<Vec<WhitelistedCallRow>, IndexError> {
+        let map = self.whitelisted.read().map_err(|e| IndexError(e.to_string()))?;
+        let mut rows: Vec<WhitelistedCallRow> = map
+            .iter()
+            .filter(|((c, _), _)| c == chain_id)
+            .map(|(_, r)| r.clone())
+            .collect();
+        // identical ordering to the Pg backend, so `limit` returns the same
+        // subset from either — the rule slice 3 set for paired backends. The
+        // hash is the tiebreak because two rows can share a status coordinate
+        // only across different hashes.
+        rows.sort_by(|a, b| {
+            (b.status_height, &b.call_hash).cmp(&(a.status_height, &a.call_hash))
+        });
+        rows.truncate(limit as usize);
+        Ok(rows)
     }
     async fn referendum_votes(
         &self,
@@ -1845,6 +1962,49 @@ pub mod pg {
         }
     }
 
+    /// Shared by the point lookup and the list so the two cannot disagree
+    /// about column order — the projection has ten columns and two of them are
+    /// nullable i64 heights, which is exactly where a transposition hides.
+    #[allow(clippy::type_complexity)]
+    fn whitelisted_row(
+        (
+            call_hash,
+            status,
+            dispatch_ok,
+            dispatch_error,
+            dispatch_height,
+            first_seen_height,
+            whitelisted_height,
+            status_height,
+            runtime_version,
+            mapper_version,
+        ): (
+            String,
+            String,
+            Option<bool>,
+            Option<serde_json::Value>,
+            Option<i64>,
+            i64,
+            Option<i64>,
+            i64,
+            i64,
+            i32,
+        ),
+    ) -> super::WhitelistedCallRow {
+        super::WhitelistedCallRow {
+            call_hash,
+            status,
+            dispatch_ok,
+            dispatch_error,
+            dispatch_height: dispatch_height.map(|h| h as u64),
+            first_seen_height: first_seen_height as u64,
+            whitelisted_height: whitelisted_height.map(|h| h as u64),
+            status_height: status_height as u64,
+            runtime_version: runtime_version as u64,
+            mapper_version: mapper_version as u32,
+        }
+    }
+
     #[allow(clippy::type_complexity)]
     fn referendum_from_row(
         (class, referendum_id, track_id, status, status_height, proposal, proposal_hash, proposal_len, submitted_at): (
@@ -1968,6 +2128,105 @@ pub mod pg {
                     spec_version: spec_version as u64,
                 })
                 .collect())
+        }
+
+        async fn whitelisted_call(
+            &self,
+            chain_id: &str,
+            call_hash: &str,
+        ) -> Result<Option<super::WhitelistedCallRow>, IndexError> {
+            let row: Option<(
+                String,
+                String,
+                Option<bool>,
+                Option<serde_json::Value>,
+                Option<i64>,
+                i64,
+                Option<i64>,
+                i64,
+                i64,
+                i32,
+            )> = sqlx::query_as(
+                "select call_hash, status, dispatch_ok, dispatch_error, dispatch_height, \
+                        first_seen_height, whitelisted_height, status_height, \
+                        runtime_version, mapper_version \
+                 from gov.whitelisted_calls \
+                 where chain_id = $1 and call_hash = $2",
+            )
+            .bind(chain_id)
+            .bind(call_hash)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| IndexError(e.to_string()))?;
+            Ok(row.map(whitelisted_row))
+        }
+
+        async fn whitelist_events(
+            &self,
+            chain_id: &str,
+            call_hash: &str,
+        ) -> Result<Vec<super::WhitelistEventRow>, IndexError> {
+            let rows: Vec<(i64, i32, String, Option<bool>, Option<serde_json::Value>, serde_json::Value, i64)> =
+                sqlx::query_as(
+                    "select block_height, event_index, kind, dispatch_ok, dispatch_error, \
+                            data, runtime_version \
+                     from gov.whitelist_events \
+                     where chain_id = $1 and call_hash = $2 \
+                     order by block_height, event_index",
+                )
+                .bind(chain_id)
+                .bind(call_hash)
+                .fetch_all(&self.pool)
+                .await
+                .map_err(|e| IndexError(e.to_string()))?;
+            Ok(rows
+                .into_iter()
+                .map(|(h, i, kind, ok, err, data, rv)| super::WhitelistEventRow {
+                    block_height: h as u64,
+                    event_index: i as u32,
+                    kind,
+                    dispatch_ok: ok,
+                    dispatch_error: err,
+                    data,
+                    runtime_version: rv as u64,
+                })
+                .collect())
+        }
+
+        async fn list_whitelisted_calls(
+            &self,
+            chain_id: &str,
+            limit: u64,
+        ) -> Result<Vec<super::WhitelistedCallRow>, IndexError> {
+            // ordering identical to MemoryGovIndex so `limit` returns the same
+            // subset from either backend; `collate "C"` so the hash tiebreak
+            // sorts byte-wise in both, the fix slice 6 made for assets.
+            let rows: Vec<(
+                String,
+                String,
+                Option<bool>,
+                Option<serde_json::Value>,
+                Option<i64>,
+                i64,
+                Option<i64>,
+                i64,
+                i64,
+                i32,
+            )> = sqlx::query_as(
+                "select call_hash, status, dispatch_ok, dispatch_error, dispatch_height, \
+                        first_seen_height, whitelisted_height, status_height, \
+                        runtime_version, mapper_version \
+                 from gov.whitelisted_calls \
+                 where chain_id = $1 \
+                 order by status_height desc, call_hash collate \"C\" desc \
+                 limit $2",
+            )
+            .bind(chain_id)
+            .bind(limit as i64)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| IndexError(e.to_string()))?;
+            Ok(rows.into_iter().map(whitelisted_row).collect())
         }
 
         async fn preimage(
@@ -2678,6 +2937,8 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/gov/{network}/referenda/{id}/votes", get(get_gov_referendum_votes))
         .route("/v1/gov/{network}/accounts/{account}/votes", get(get_gov_account_votes))
         .route("/v1/gov/{network}/tracks", get(get_gov_tracks))
+        .route("/v1/gov/{network}/whitelist", get(list_gov_whitelist))
+        .route("/v1/gov/{network}/whitelist/{hash}", get(get_gov_whitelisted_call))
         .route("/v1/treasury/{network}/spends", get(list_treasury_spends))
         .route("/v1/treasury/{network}/spends/{id}", get(get_treasury_spend))
         .route("/v1/treasury/{network}/pot", get(get_treasury_pot))
@@ -2960,6 +3221,209 @@ fn merge_referendum(prev: ReferendumRow, later: ReferendumRow) -> ReferendumRow 
         proposal_len: later.proposal_len.or(prev.proposal_len),
         submitted_at_height: prev.submitted_at_height.or(later.submitted_at_height),
     }
+}
+
+/// Normalize a user-supplied call hash to the form the tables store: 0x-prefixed
+/// lowercase. A pasted hash from a UI arrives in either case and sometimes bare.
+fn normalize_call_hash(raw: &str) -> String {
+    // lower-case BEFORE stripping: `to_uppercase()` on a hash yields `0X…`,
+    // and a case-sensitive strip would leave the prefix in place and return
+    // `0x0x…`, which no lookup can ever match.
+    let lower = raw.trim().to_ascii_lowercase();
+    format!("0x{}", lower.strip_prefix("0x").unwrap_or(&lower))
+}
+
+/// What this endpoint deliberately does NOT claim, stated in the payload
+/// rather than in a doc nobody reads — the `not_covered` contract the holdings
+/// endpoint established.
+///
+/// THE STITCH TO THE TWO REFERENDA IS NOT HERE, and the reason is a decoder
+/// fact rather than an oversight. Both directions were designed for this slice
+/// and both turn out to be unresolvable by any search over `gov.preimages`:
+///
+///   * BACKWARD (which Fellowship referendum authorized this hash): the
+///     Fellowship votes on Collectives and the decision reaches Asset Hub by
+///     XCM. `whitelist.whitelist_call(hash)` therefore travels inside an XCM
+///     `Transact`, whose payload is `DoubleEncoded<Call>` — a `Vec<u8>`.
+///     `calls.rs` detects nested calls by matching a node's type id against the
+///     runtime's `RuntimeCall` type, and a byte vector is not that type, so the
+///     decoder correctly renders the inner call as opaque bytes and does not
+///     recurse. There is no `whitelist.whitelist_call` node to find.
+///
+///   * FORWARD (which public referendum dispatched it): the track-1 referendum's
+///     preimage decodes to `whitelist.dispatch_whitelisted_call_with_preimage
+///     { call }`, which carries the CALL and no hash at all — the pallet derives
+///     the hash by re-encoding and hashing it. Confirming the match therefore
+///     needs a re-encode we cannot do from decoded JSON.
+///
+/// A text search would fail on both counts anyway: `call_node` renders a
+/// `T::Hash` argument as a byte ARRAY, not as hex, so `decoded_call::text like
+/// '%<hex>%'` matches nothing. Guessing a link here would produce an endpoint
+/// that silently returns nothing and looks like an absence of whitelist
+/// activity. It gets its own slice, designed against real decoded rows.
+fn whitelist_not_covered() -> serde_json::Value {
+    serde_json::json!([
+        "the Fellowship referendum that authorized this hash is not linked: it lives on \
+         Collectives and reaches this chain inside an XCM Transact, whose payload decodes \
+         as opaque bytes rather than as a nested call",
+        "the public referendum that dispatched this hash is not linked: \
+         dispatch_whitelisted_call_with_preimage carries the call, not its hash, so the \
+         match needs a re-encode that decoded JSON cannot supply",
+        "a whitelisted call that was never dispatched may have failed with \
+         UnavailablePreImage, UndecodableCall or InvalidCallWeightWitness — all three fail \
+         the extrinsic with NO event, so this endpoint cannot distinguish them from a call \
+         still awaiting its referendum",
+        "authorized_call is null unless someone fetched that preimage by hand: \
+         decode-preimages walks gov.referenda, and a whitelisted call hash is never \
+         a referendum's proposal hash, so nothing populates it automatically yet"
+    ])
+}
+
+/// One whitelisted call: its status, whether its dispatch actually WORKED, its
+/// full event history, and — the answer that matters — what the Fellowship
+/// authorized, joined from `gov.preimages` by the same hash.
+///
+/// The join itself is exact rather than heuristic — `whitelist_call` REQUESTS
+/// the preimage of the hash it whitelists, so a whitelisted call hash IS a
+/// preimage hash and `gov.preimages` is keyed by hash. But it is NOT populated
+/// automatically, and pretending otherwise would be the slice-6 dead-join
+/// defect again: `decode-preimages` walks `gov.referenda`, so it only ever
+/// fetches hashes that are some REFERENDUM's proposal hash, and a whitelisted
+/// call hash never is. Until a later slice walks `gov.whitelisted_calls` too,
+/// this field is populated only for hashes someone fetched by hand — and
+/// `fetch-preimage` needs a `len` that `CallWhitelisted` does not carry
+/// (recoverable from `preimage.StatusFor`, which is keyed by hash alone).
+/// Stated in `not_covered` rather than left to look like an absence of data.
+async fn get_gov_whitelisted_call(
+    State(state): State<AppState>,
+    Path((network, hash)): Path<(String, String)>,
+) -> Response {
+    // EVERY governance chain, not just the default class's — the follower is
+    // gated on the `governance` module, so it indexes Collectives too, and
+    // walking only the `referenda` residency would write rows that can never
+    // be read back.
+    let windows = all_gov_windows(&state.registry, &network);
+    if windows.is_empty() {
+        return error(
+            StatusCode::NOT_FOUND,
+            format!("no governance residency for network '{network}'"),
+        );
+    }
+    let call_hash = normalize_call_hash(&hash);
+
+    let mut merged: Option<WhitelistedCallRow> = None;
+    let mut preimage: Option<PreimageRow> = None;
+    let mut segments = Vec::with_capacity(windows.len());
+    for w in windows {
+        let row = match state.gov.whitelisted_call(&w.chain, &call_hash).await {
+            Ok(r) => r,
+            Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+        };
+        let events = match state.gov.whitelist_events(&w.chain, &call_hash).await {
+            Ok(ev) => ev,
+            Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+        };
+        // A later residency window wins outright — unlike a referendum, a
+        // whitelisted call has no fields to coalesce, and the same hash
+        // whitelisted on the relay before the migration and again on Asset Hub
+        // after is two separate authorizations, not one split record. The
+        // per-chain segments below keep both visible.
+        if let Some(r) = row {
+            merged = Some(r);
+        }
+        if preimage.is_none() {
+            preimage = match state.gov.preimage(&w.chain, &call_hash).await {
+                Ok(p) => p.filter(|p| p.decode_status == "decoded"),
+                Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+            };
+        }
+        segments.push(serde_json::json!({
+            "chain": w.chain,
+            "from": w.from,
+            "to": w.to,
+            "events": events,
+        }));
+    }
+
+    let Some(call) = merged else {
+        return error(
+            StatusCode::NOT_FOUND,
+            format!("whitelisted call {network}/{call_hash} not indexed"),
+        );
+    };
+
+    // Say what the two flags mean, in the payload, because "dispatched" reads
+    // like success to anyone who has not read pallet-whitelist.
+    let enacted = match (call.status.as_str(), call.dispatch_ok) {
+        ("dispatched", Some(true)) => "the whitelisted call was dispatched and SUCCEEDED",
+        ("dispatched", Some(false)) => {
+            "the whitelisted call was dispatched and FAILED — pallet-whitelist swallows the \
+             error, so the extrinsic still succeeded, the whitelist entry was still consumed \
+             and the fee was still charged, but the call did not take effect"
+        }
+        ("dispatched", None) => {
+            "dispatched, but the result could not be read — this should be unreachable, \
+             because an unreadable result halts the mapper"
+        }
+        ("removed", None) => "the authorization was removed before it was ever dispatched",
+        ("removed", Some(_)) => {
+            "removed — but an EARLIER dispatch of this same hash is on record below; a hash \
+             can be whitelisted, dispatched and whitelisted again, and the verdict shown is \
+             that earlier attempt's"
+        }
+        _ => {
+            "whitelisted and not yet dispatched — a legitimate terminal state, not \
+             necessarily a pending one (see coverage.not_covered)"
+        }
+    };
+
+    Json(serde_json::json!({
+        "network": network,
+        "call_hash": call.call_hash,
+        "call": call,
+        "enacted": enacted,
+        "authorized_call": preimage,
+        "segments": segments,
+        "coverage": { "not_covered": whitelist_not_covered() },
+    }))
+    .into_response()
+}
+
+/// Recent whitelisted calls for a network, residency-stitched.
+async fn list_gov_whitelist(
+    State(state): State<AppState>,
+    Path(network): Path<String>,
+    Query(q): Query<GovQuery>,
+) -> Response {
+    let windows = all_gov_windows(&state.registry, &network);
+    if windows.is_empty() {
+        return error(
+            StatusCode::NOT_FOUND,
+            format!("no governance residency for network '{network}'"),
+        );
+    }
+    let limit = q.limit.unwrap_or(50).min(500);
+
+    let mut segments = Vec::with_capacity(windows.len());
+    for w in windows {
+        let calls = match state.gov.list_whitelisted_calls(&w.chain, limit).await {
+            Ok(c) => c,
+            Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+        };
+        segments.push(serde_json::json!({
+            "chain": w.chain,
+            "from": w.from,
+            "to": w.to,
+            "calls": calls,
+        }));
+    }
+    Json(serde_json::json!({
+        "network": network,
+        "limit": limit,
+        "segments": segments,
+        "coverage": { "not_covered": whitelist_not_covered() },
+    }))
+    .into_response()
 }
 
 /// THE Phase 2 governance surface: one referendum's full story for a NETWORK,
@@ -4436,6 +4900,84 @@ mod tests {
                 fetched_at_height: Some(10_400_000),
             },
         );
+        // A whitelisted call that was DISPATCHED AND FAILED, with its
+        // authorized call available under the SAME hash in gov.preimages —
+        // which is the exact join `whitelist_call`'s preimage request creates.
+        let wl_hash = format!("0x{}", "7c".repeat(32));
+        gov.insert_preimage(
+            "polkadot-asset-hub",
+            PreimageRow {
+                proposal_hash: wl_hash.clone(),
+                len: 83,
+                decode_status: "decoded".into(),
+                source: "state".into(),
+                call_summary: Some("system.set_code".into()),
+                decoded_call: Some(serde_json::json!({
+                    "call": "system.set_code", "args": {"code": [1, 2, 3]}
+                })),
+                note: None,
+                spec_version: Some(2_003_002),
+                fetched_at_height: Some(19_000_100),
+            },
+        );
+        gov.insert_whitelisted_call(
+            "polkadot-asset-hub",
+            WhitelistedCallRow {
+                call_hash: wl_hash.clone(),
+                status: "dispatched".into(),
+                dispatch_ok: Some(false),
+                dispatch_error: Some(serde_json::json!({"Module": {"index": 31, "error": "0x02000000"}})),
+                dispatch_height: Some(19_000_200),
+                first_seen_height: 19_000_100,
+                whitelisted_height: Some(19_000_100),
+                status_height: 19_000_200,
+                runtime_version: 2_003_002,
+                mapper_version: 1,
+            },
+        );
+        gov.insert_whitelist_event(
+            "polkadot-asset-hub",
+            &wl_hash,
+            WhitelistEventRow {
+                block_height: 19_000_100,
+                event_index: 4,
+                kind: "whitelisted".into(),
+                dispatch_ok: None,
+                dispatch_error: None,
+                data: serde_json::json!({}),
+                runtime_version: 2_003_002,
+            },
+        );
+        gov.insert_whitelist_event(
+            "polkadot-asset-hub",
+            &wl_hash,
+            WhitelistEventRow {
+                block_height: 19_000_200,
+                event_index: 7,
+                kind: "dispatched".into(),
+                dispatch_ok: Some(false),
+                dispatch_error: Some(serde_json::json!({"Module": {"index": 31, "error": "0x02000000"}})),
+                data: serde_json::json!({}),
+                runtime_version: 2_003_002,
+            },
+        );
+        // …and one that was whitelisted and never dispatched, which is a
+        // terminal state rather than a pending one.
+        gov.insert_whitelisted_call(
+            "polkadot-asset-hub",
+            WhitelistedCallRow {
+                call_hash: format!("0x{}", "5d".repeat(32)),
+                status: "whitelisted".into(),
+                dispatch_ok: None,
+                dispatch_error: None,
+                dispatch_height: None,
+                first_seen_height: 19_000_050,
+                whitelisted_height: Some(19_000_050),
+                status_height: 19_000_050,
+                runtime_version: 2_003_002,
+                mapper_version: 1,
+            },
+        );
         gov.insert_track(
             "polkadot-asset-hub",
             GovTrackRow {
@@ -5125,6 +5667,94 @@ mod tests {
         assert_eq!(rows[0]["status"], "approved");
         assert_eq!(rows[1]["referendum_id"], 1400);
         assert_eq!(rows[1]["status"], "rejected", "unknown must not clobber");
+    }
+
+    /// The slice's whole point, asserted rather than documented: a whitelisted
+    /// call that was dispatched and REVERTED must not read as enacted.
+    #[tokio::test]
+    async fn a_dispatched_whitelisted_call_that_failed_is_never_reported_as_enacted() {
+        let app = router(test_state().await);
+        let hash = format!("0x{}", "7c".repeat(32));
+        let (status, json) = get_json(&app, &format!("/v1/gov/polkadot/whitelist/{hash}")).await;
+        assert_eq!(status, StatusCode::OK);
+
+        // it WAS dispatched — storage was cleaned, the fee was charged
+        assert_eq!(json["call"]["status"], "dispatched");
+        // …and it did NOT work, which is a different fact
+        assert_eq!(json["call"]["dispatch_ok"], false);
+        assert!(
+            json["enacted"].as_str().unwrap().contains("FAILED"),
+            "the payload must say so in words, not leave it to a boolean nobody reads: {}",
+            json["enacted"]
+        );
+        assert_eq!(json["call"]["dispatch_error"]["Module"]["index"], 31);
+
+        // the authorized call is joined from gov.preimages BY THE SAME HASH —
+        // exact, because whitelist_call requests the preimage of what it
+        // whitelists, so a whitelisted hash IS a preimage hash
+        assert_eq!(json["authorized_call"]["call_summary"], "system.set_code");
+        assert_eq!(json["authorized_call"]["decoded_call"]["call"], "system.set_code");
+
+        // full history, oldest first, on the chain governance currently lives on
+        let seg = json["segments"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["chain"] == "polkadot-asset-hub")
+            .expect("an asset hub segment");
+        let events = seg["events"].as_array().unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0]["kind"], "whitelisted");
+        assert_eq!(events[1]["kind"], "dispatched");
+        assert_eq!(events[1]["dispatch_ok"], false);
+
+        // and the gaps are stated in the payload, not in a doc
+        let nc = json["coverage"]["not_covered"].as_array().unwrap();
+        assert_eq!(nc.len(), 4);
+        assert!(nc.iter().any(|s| s.as_str().unwrap().contains("XCM Transact")));
+    }
+
+    /// A hash that was whitelisted and never dispatched is TERMINAL, not
+    /// pending — three failure modes emit no event at all. And the request
+    /// never names a chain (Invariant 2): `polkadot` resolves through
+    /// governance residency to Asset Hub.
+    #[tokio::test]
+    async fn a_whitelisted_call_with_no_dispatch_is_terminal_and_no_chain_is_named() {
+        let app = router(test_state().await);
+        let hash = format!("0x{}", "5d".repeat(32));
+        // upper-case and bare forms must resolve identically to the stored form
+        for form in [hash.clone(), hash.to_uppercase(), hash.trim_start_matches("0x").to_string()] {
+            let (status, json) =
+                get_json(&app, &format!("/v1/gov/polkadot/whitelist/{form}")).await;
+            assert_eq!(status, StatusCode::OK, "form {form} should resolve");
+            assert_eq!(json["call"]["status"], "whitelisted");
+            assert_eq!(json["call"]["dispatch_ok"], serde_json::Value::Null);
+            assert!(json["enacted"].as_str().unwrap().contains("terminal state"));
+            assert_eq!(json["call_hash"], hash);
+        }
+
+        // the list surface, both rows, most recently moved first
+        let (status, list) = get_json(&app, "/v1/gov/polkadot/whitelist").await;
+        assert_eq!(status, StatusCode::OK);
+        let calls = list["segments"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["chain"] == "polkadot-asset-hub")
+            .expect("an asset hub segment")["calls"]
+            .as_array()
+            .unwrap();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0]["status_height"], 19_000_200);
+        assert_eq!(calls[1]["status_height"], 19_000_050);
+
+        // an unknown hash is a 404, not an empty success
+        let (status, _) = get_json(
+            &app,
+            &format!("/v1/gov/polkadot/whitelist/0x{}", "00".repeat(32)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]

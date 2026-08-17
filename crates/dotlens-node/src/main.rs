@@ -26,9 +26,11 @@
 //!   dotlens-node fetch-preimage <chain> <hash> <len> [height]  # fetch+decode one preimage
 //!   dotlens-node decode-preimages <chain> [height]   # decode all pending proposals
 //!
+//!   dotlens-node whitelist-range <chain> <from> <to>   # map whitelist events
+//!
 //! Per-module followers are opt-in flags: LIVE_INGEST, DECODE_FOLLOW,
 //! BALANCES_FOLLOW, GOV_FOLLOW, VOTES_FOLLOW, TREASURY_FOLLOW, BOUNTIES_FOLLOW,
-//! TIP_FOLLOW (all `=1`).
+//! WHITELIST_FOLLOW, TIP_FOLLOW (all `=1`).
 //!
 //! backfill accepts an optional worker count (`backfill <chain> <a> <b> 8`) —
 //! deterministic chunks, per-chunk checkpoints, re-run the same command to
@@ -110,6 +112,7 @@ enum Command {
     VotesRange { chain: String, from: u64, to: u64 },
     TreasuryRange { chain: String, from: u64, to: u64 },
     BountiesRange { chain: String, from: u64, to: u64 },
+    WhitelistRange { chain: String, from: u64, to: u64 },
     SyncBountyAccounts,
     AnchorVoting { chain: String, account: String, track: u32, height: Option<u64> },
     SyncTracks,
@@ -182,6 +185,11 @@ fn parse_args() -> Result<Command> {
             let (chain, from, to) =
                 range("usage: dotlens-node bounties-range <chain> <from> <to>")?;
             Ok(Command::BountiesRange { chain, from, to })
+        }
+        Some("whitelist-range") => {
+            let (chain, from, to) =
+                range("usage: dotlens-node whitelist-range <chain> <from> <to>")?;
+            Ok(Command::WhitelistRange { chain, from, to })
         }
         Some("sync-bounty-accounts") => Ok(Command::SyncBountyAccounts),
         Some("anchor-voting") => {
@@ -402,6 +410,13 @@ async fn main() -> Result<()> {
         );
         return run_bounties_range(&registry, &backends, raw.as_ref(), chain, *from, *to).await;
     }
+    if let Command::WhitelistRange { chain, from, to } = &command {
+        anyhow::ensure!(
+            backends.persistent,
+            "whitelist-range requires DATABASE_URL (canonical events + whitelist facts must persist)"
+        );
+        return run_whitelist_range(&registry, &backends, chain, *from, *to).await;
+    }
     if matches!(command, Command::SyncBountyAccounts) {
         #[cfg(feature = "pg")]
         if let Some(pool) = &backends.pool {
@@ -541,6 +556,7 @@ async fn main() -> Result<()> {
     spawn_votes_followers(&registry, &backends);
     spawn_treasury_followers(&registry, &backends);
     spawn_bounties_followers(&registry, &backends, &raw);
+    spawn_whitelist_followers(&registry, &backends);
     spawn_tip_followers(&registry, &backends, &raw);
 
     // -- API ------------------------------------------------------------------
@@ -1496,6 +1512,105 @@ async fn run_bounties_range(
     _: u64,
 ) -> Result<()> {
     anyhow::bail!("bounties-range requires the `pg` feature")
+}
+
+/// Whitelist followers: chase each chain's decode checkpoint, mapping
+/// pallet-whitelist events into whitelisted-call facts. Pure mapping over Pg —
+/// no network, `pg` only. Eligibility is registry data: the chain must enable
+/// the `governance` module, which is why this needed no registry change.
+///
+/// It runs on Collectives too, where the pallet does not exist — a follower
+/// that maps nothing. That is correct rather than wasteful: whether a chain
+/// carries the pallet is a fact about its runtime, not a fact for a seed file
+/// to assert, and the day Collectives gains one it is already covered.
+fn spawn_whitelist_followers(registry: &Arc<Registry>, backends: &Arc<Backends>) {
+    if !env_flag("WHITELIST_FOLLOW") {
+        tracing::info!("whitelist follower disabled (set WHITELIST_FOLLOW=1 to enable)");
+        return;
+    }
+    if !backends.persistent {
+        tracing::warn!("WHITELIST_FOLLOW=1 but no DATABASE_URL — refusing to map into memory");
+        return;
+    }
+    #[cfg(feature = "pg")]
+    {
+        use adapter_substrate::whitelist::SubstrateWhitelistMapper;
+
+        let poll = std::time::Duration::from_secs(
+            env_or("POLL_INTERVAL_SECS", "6").parse().unwrap_or(6),
+        );
+        for chain in registry.chains() {
+            if !chain.has_module("governance") {
+                continue;
+            }
+            if chain.family != registry::ChainFamily::Substrate {
+                tracing::debug!(chain = %chain.id, "no whitelist mapper for this family — skipped");
+                continue;
+            }
+            let Some(pool) = backends.pool.clone() else { continue };
+            let chain_id = chain.id.clone();
+            let backends = backends.clone();
+            tokio::spawn(async move {
+                tracing::info!(chain = %chain_id, "whitelist follower started");
+                let source = dotlens_node::balances_pg::PgEventSource::new(pool.clone());
+                let sink = dotlens_node::whitelist_pg::PgWhitelistSink::new(pool);
+                let deps = ingest::whitelist::WhitelistDeps {
+                    checkpoints: backends.checkpoints.as_ref(),
+                    source: &source,
+                    sink: &sink,
+                };
+                ingest::whitelist::whitelist_follow(
+                    &chain_id,
+                    &SubstrateWhitelistMapper,
+                    &deps,
+                    poll,
+                )
+                .await;
+            });
+        }
+    }
+}
+
+#[cfg(feature = "pg")]
+async fn run_whitelist_range(
+    registry: &Registry,
+    backends: &Backends,
+    chain: &str,
+    from: u64,
+    to: u64,
+) -> Result<()> {
+    use adapter_substrate::whitelist::SubstrateWhitelistMapper;
+
+    let cfg = registry
+        .chain(chain)
+        .with_context(|| format!("unknown chain: {chain}"))?;
+    anyhow::ensure!(
+        cfg.family == registry::ChainFamily::Substrate,
+        "no whitelist mapper for family {:?}",
+        cfg.family
+    );
+    let pool = backends
+        .pool
+        .as_ref()
+        .context("whitelist-range requires DATABASE_URL")?;
+    let source = dotlens_node::balances_pg::PgEventSource::new(pool.clone());
+    let sink = dotlens_node::whitelist_pg::PgWhitelistSink::new(pool.clone());
+    let deps = ingest::whitelist::WhitelistDeps {
+        checkpoints: backends.checkpoints.as_ref(),
+        source: &source,
+        sink: &sink,
+    };
+    let n = ingest::whitelist::whitelist_range(&cfg.id, &SubstrateWhitelistMapper, &deps, from, to)
+        .await
+        .with_context(|| format!("whitelist-range {chain} {from}..={to}"))?;
+    tracing::info!(chain, from, to, mapped = n, "whitelist-range complete");
+    println!("whitelist-range {chain} {from}..={to}: mapped {n} blocks");
+    Ok(())
+}
+
+#[cfg(not(feature = "pg"))]
+async fn run_whitelist_range(_: &Registry, _: &Backends, _: &str, _: u64, _: u64) -> Result<()> {
+    anyhow::bail!("whitelist-range requires the `pg` feature")
 }
 
 /// Everything one preimage decode needs from a block context: the archived

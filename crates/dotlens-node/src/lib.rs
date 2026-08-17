@@ -31,6 +31,10 @@ pub mod bounties_pg;
 #[cfg(feature = "pg")]
 pub mod assets_pg;
 
+/// Whitelist facts + the whitelisted-call projection (Phase 2, slice 9).
+#[cfg(feature = "pg")]
+pub mod whitelist_pg;
+
 #[cfg(feature = "pg")]
 pub mod tip_pg;
 
