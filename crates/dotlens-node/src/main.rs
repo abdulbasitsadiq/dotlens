@@ -40,10 +40,14 @@
 //!
 //!   dotlens-node whitelist-range <chain> <from> <to>   # map whitelist events
 //!   dotlens-node xcm-range <chain> <from> <to>         # map XCM message facts
+//!   dotlens-node xcm-correlate <chain> <from> <to>     # pair the two ids of one message
 //!
 //! Per-module followers are opt-in flags: LIVE_INGEST, DECODE_FOLLOW,
 //! BALANCES_FOLLOW, GOV_FOLLOW, VOTES_FOLLOW, TREASURY_FOLLOW, BOUNTIES_FOLLOW,
-//! WHITELIST_FOLLOW, TIP_FOLLOW (all `=1`).
+//! WHITELIST_FOLLOW, XCM_FOLLOW, XCM_CORRELATE_FOLLOW, TIP_FOLLOW (all `=1`).
+//! XCM_FOLLOW and XCM_CORRELATE_FOLLOW are separate on purpose: they write
+//! different tables under different versions, and re-deriving links after a
+//! correlation-rule change must not touch a single observation row.
 //!
 //! backfill accepts an optional worker count (`backfill <chain> <a> <b> 8`) —
 //! deterministic chunks, per-chunk checkpoints, re-run the same command to
@@ -131,6 +135,7 @@ enum Command {
     BountiesRange { chain: String, from: u64, to: u64 },
     WhitelistRange { chain: String, from: u64, to: u64 },
     XcmRange { chain: String, from: u64, to: u64 },
+    XcmCorrelate { chain: String, from: u64, to: u64 },
     SyncBountyAccounts,
     AnchorVoting { chain: String, account: String, track: u32, height: Option<u64> },
     SyncTracks,
@@ -225,6 +230,11 @@ fn parse_args() -> Result<Command> {
         Some("xcm-range") => {
             let (chain, from, to) = range("usage: dotlens-node xcm-range <chain> <from> <to>")?;
             Ok(Command::XcmRange { chain, from, to })
+        }
+        Some("xcm-correlate") => {
+            let (chain, from, to) =
+                range("usage: dotlens-node xcm-correlate <chain> <from> <to>")?;
+            Ok(Command::XcmCorrelate { chain, from, to })
         }
         Some("sync-bounty-accounts") => Ok(Command::SyncBountyAccounts),
         Some("anchor-voting") => {
@@ -488,6 +498,13 @@ async fn main() -> Result<()> {
         );
         return run_xcm_range(&registry, &backends, chain, *from, *to).await;
     }
+    if let Command::XcmCorrelate { chain, from, to } = &command {
+        anyhow::ensure!(
+            backends.persistent,
+            "xcm-correlate requires DATABASE_URL (canonical events + xcm links must persist)"
+        );
+        return run_xcm_correlate(&registry, &backends, chain, *from, *to).await;
+    }
     if matches!(command, Command::SyncBountyAccounts) {
         #[cfg(feature = "pg")]
         if let Some(pool) = &backends.pool {
@@ -642,6 +659,7 @@ async fn main() -> Result<()> {
     spawn_bounties_followers(&registry, &backends, &raw);
     spawn_whitelist_followers(&registry, &backends);
     spawn_xcm_followers(&registry, &backends);
+    spawn_xcm_correlate_followers(&registry, &backends);
     spawn_tip_followers(&registry, &backends, &raw);
 
     // -- API ------------------------------------------------------------------
@@ -1700,6 +1718,109 @@ fn spawn_xcm_followers(registry: &Arc<Registry>, backends: &Arc<Backends>) {
             });
         }
     }
+}
+
+/// XCM correlation followers. Same gate as the `xcm` module — a chain whose
+/// messages we do not record has nothing to correlate — and its own env flag,
+/// because the two workers write different tables under different versions and
+/// running one without the other is a legitimate thing to want (re-deriving
+/// links after a rule change, without touching a single observation row).
+fn spawn_xcm_correlate_followers(registry: &Arc<Registry>, backends: &Arc<Backends>) {
+    if !env_flag("XCM_CORRELATE_FOLLOW") {
+        tracing::info!(
+            "xcm correlate follower disabled (set XCM_CORRELATE_FOLLOW=1 to enable)"
+        );
+        return;
+    }
+    if !backends.persistent {
+        tracing::warn!("XCM_CORRELATE_FOLLOW=1 but no DATABASE_URL — refusing to map into memory");
+        return;
+    }
+    #[cfg(feature = "pg")]
+    {
+        use adapter_substrate::xcm_correlate::SubstrateXcmCorrelator;
+
+        let poll = std::time::Duration::from_secs(
+            env_or("POLL_INTERVAL_SECS", "6").parse().unwrap_or(6),
+        );
+        for chain in registry.chains() {
+            if !chain.has_module("xcm") {
+                continue;
+            }
+            if chain.family != registry::ChainFamily::Substrate {
+                tracing::debug!(chain = %chain.id, "no xcm correlator for this family — skipped");
+                continue;
+            }
+            let Some(pool) = backends.pool.clone() else { continue };
+            let chain_id = chain.id.clone();
+            let backends = backends.clone();
+            tokio::spawn(async move {
+                tracing::info!(chain = %chain_id, "xcm correlate follower started");
+                let source = dotlens_node::balances_pg::PgEventSource::new(pool.clone());
+                let sink = dotlens_node::xcm_links_pg::PgXcmLinkSink::new(pool);
+                let deps = ingest::xcm_correlate::XcmCorrelateDeps {
+                    checkpoints: backends.checkpoints.as_ref(),
+                    source: &source,
+                    sink: &sink,
+                };
+                ingest::xcm_correlate::xcm_correlate_follow(
+                    &chain_id,
+                    &SubstrateXcmCorrelator,
+                    &deps,
+                    poll,
+                )
+                .await;
+            });
+        }
+    }
+}
+
+#[cfg(feature = "pg")]
+async fn run_xcm_correlate(
+    registry: &Registry,
+    backends: &Backends,
+    chain: &str,
+    from: u64,
+    to: u64,
+) -> Result<()> {
+    use adapter_substrate::xcm_correlate::SubstrateXcmCorrelator;
+
+    let cfg = registry
+        .chain(chain)
+        .with_context(|| format!("unknown chain: {chain}"))?;
+    anyhow::ensure!(
+        cfg.family == registry::ChainFamily::Substrate,
+        "no xcm correlator for family {:?}",
+        cfg.family
+    );
+    let pool = backends
+        .pool
+        .as_ref()
+        .context("xcm-correlate requires DATABASE_URL")?;
+    let source = dotlens_node::balances_pg::PgEventSource::new(pool.clone());
+    let sink = dotlens_node::xcm_links_pg::PgXcmLinkSink::new(pool.clone());
+    let deps = ingest::xcm_correlate::XcmCorrelateDeps {
+        checkpoints: backends.checkpoints.as_ref(),
+        source: &source,
+        sink: &sink,
+    };
+    let n = ingest::xcm_correlate::xcm_correlate_range(
+        &cfg.id,
+        &SubstrateXcmCorrelator,
+        &deps,
+        from,
+        to,
+    )
+    .await
+    .with_context(|| format!("xcm-correlate {chain} {from}..={to}"))?;
+    tracing::info!(chain, from, to, correlated = n, "xcm-correlate complete");
+    println!("xcm-correlate {chain} {from}..={to}: correlated {n} blocks");
+    Ok(())
+}
+
+#[cfg(not(feature = "pg"))]
+async fn run_xcm_correlate(_: &Registry, _: &Backends, _: &str, _: u64, _: u64) -> Result<()> {
+    anyhow::bail!("xcm-correlate requires the `pg` feature")
 }
 
 #[cfg(feature = "pg")]

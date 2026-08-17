@@ -15,7 +15,7 @@
 //! and the two id kinds — is tested where it lives, in
 //! `adapter_substrate::xcm`.
 
-use crate::module::{self, impl_module_error, EventSource, FactWriter, ModuleRun};
+use crate::module::{self, impl_module_error, EventSource, FactWriter, Mapping, ModuleRun};
 use crate::{CheckpointError, CheckpointStore};
 use async_trait::async_trait;
 use canonical::CanonicalEvent;
@@ -133,7 +133,7 @@ fn run<'a>(mapper: &'a dyn XcmMapper, deps: &'a XcmDeps<'a>) -> ModuleRun<'a, Xc
         module: MODULE_XCM,
         checkpoints: deps.checkpoints,
         source: deps.source,
-        map: Box::new(move |ev: &CanonicalEvent| mapper.facts(ev)),
+        map: Mapping::PerEvent(Box::new(move |ev: &CanonicalEvent| mapper.facts(ev))),
         mapper_version: mapper.mapper_version(),
         sink: Box::new(SinkBridge(deps.sink)),
     }

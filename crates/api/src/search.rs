@@ -7,11 +7,13 @@
 //!
 //! THREE RULES SHAPE EVERY DECISION BELOW.
 //!
-//! 1. **Ambiguity is DATA, never a guess.** A 32-byte hash is four honest
-//!    candidates; a bare number is three. The response lists them with the
-//!    reason each was offered. Guessing looks decisive and is occasionally
-//!    catastrophic — the whole point of an explorer is that you can trust what
-//!    it tells you.
+//! 1. **Ambiguity is DATA, never a guess.** A 32-byte hash is up to six honest
+//!    candidates (block, extrinsic, preimage, whitelisted call, account, and —
+//!    since Phase 3 slice 3 — XCM message); a bare number is three. Each new
+//!    module makes the paste MORE ambiguous, not less, and that is the design
+//!    working. The response lists them with the reason each was offered.
+//!    Guessing looks decisive and is occasionally catastrophic — the whole
+//!    point of an explorer is that you can trust what it tells you.
 //!
 //! 2. **Designed for the machine; the UI renders a subset.** Every candidate
 //!    carries `kind`, the `chain` it was found on, `why` it was offered, and
@@ -24,8 +26,8 @@
 //!    is the one thing here that genuinely does not scale. Full identifier or
 //!    nothing. (ROADMAP §Phase 2.)
 //!
-//! WHAT v1 DELIBERATELY DOES NOT DO. Codewords ship in the phase of the module
-//! that can answer them, so `xcm`, `sel` and `contract` are NOT accepted —
+//! WHAT THIS DELIBERATELY DOES NOT DO. Codewords ship in the phase of the
+//! module that can answer them, so `sale`, `sel` and `contract` are NOT accepted —
 //! typing one gets a parse error naming the valid set, not a promise. But a
 //! bare NAME is a SHAPE, not vocabulary: people paste display names without
 //! being taught to, so `TEXT` resolves from day one to an honest "no name index
@@ -58,6 +60,7 @@ pub enum Codeword {
     Vote,
     Para,
     Asset,
+    Xcm,
 }
 
 impl Codeword {
@@ -78,6 +81,7 @@ impl Codeword {
             "vote" | "votes" => Self::Vote,
             "para" | "chain" | "parachain" => Self::Para,
             "asset" | "token" => Self::Asset,
+            "xcm" | "message" => Self::Xcm,
             _ => return None,
         })
     }
@@ -96,12 +100,13 @@ impl Codeword {
             Self::Vote => "vote",
             Self::Para => "para",
             Self::Asset => "asset",
+            Self::Xcm => "xcm",
         }
     }
 
     /// Every codeword v1 serves, for the grammar reference and for the error
     /// message an unknown one produces.
-    pub const ALL: [Codeword; 12] = [
+    pub const ALL: [Codeword; 13] = [
         Self::Ref,
         Self::Acc,
         Self::Block,
@@ -114,6 +119,7 @@ impl Codeword {
         Self::Vote,
         Self::Para,
         Self::Asset,
+        Self::Xcm,
     ];
 
     /// Codewords reserved for modules that do not exist yet. Named explicitly
@@ -121,7 +127,6 @@ impl Codeword {
     /// difference between a roadmap and a typo.
     pub fn planned(word: &str) -> Option<&'static str> {
         Some(match word {
-            "xcm" => "XCM journeys land in Phase 3",
             "sale" | "core" => "coretime lands in Phase 3",
             "contract" | "sel" | "selector" => "contracts land in Phase 5",
             _ => return None,
@@ -446,7 +451,7 @@ fn readout(network: &str, chain: Option<&str>, term: &Term) -> String {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct Candidate {
     /// referendum | block | extrinsic | account | preimage | whitelisted_call |
-    /// asset | track | spend | bounty | para
+    /// asset | track | spend | bounty | para | xcm_message
     pub kind: &'static str,
     /// The chain it was FOUND on — never one the caller had to name.
     pub chain: Option<String>,
@@ -578,13 +583,11 @@ async fn resolve_shape(
             // 0x-hex accounts. Omitting it would have made the single most
             // likely paste return nothing.
             push_account(state, q, h, out, &mut Vec::new()).await;
-            // Named so the caller knows the candidate set is bounded by what we
-            // index, not by what a hash can be.
-            gaps.push(
-                "an XCM message topic is also a 32-byte hash; XCM lands in Phase 3, so a topic \
-                 that matches nothing above is not distinguishable from an unknown hash yet"
-                    .into(),
-            );
+            // An XCM id is also a 32-byte hash, and since Phase 3 slice 3 it is
+            // a candidate rather than a gap line. ONE probe, no alias expansion:
+            // a bare paste asks "what is this", and the journey endpoint each
+            // candidate points at does the expanding.
+            push_xcm(state, h, false, out).await;
         }
 
         // A bare number is ambiguous across id spaces — UNLESS a chain was
@@ -715,6 +718,19 @@ async fn resolve_codeword(
             push_symbol(state, arg, out).await;
         }
         Codeword::Extrinsic => resolve_shape(&infer_shape(arg), q, state, out, gaps).await,
+        // The codeword refused since Phase 2 slice 10 with "XCM journeys land in
+        // Phase 3". They have landed, so it answers — and unlike the bare-hash
+        // shape it expands ALIASES first, because someone who types `xcm` has
+        // asked about the message rather than about the id, and a wire hash and
+        // its topic are the same message.
+        Codeword::Xcm => match infer_shape(arg) {
+            Shape::Hash32(h) => push_xcm(state, &h, true, out).await,
+            _ => gaps.push(format!(
+                "'xcm {arg}' — an XCM id is a 32-byte 0x hash: a topic (pallet_xcm's \
+                 message_id), a wire hash (blake2_256 of the queued bytes), or the \
+                 messageQueue id, which is either"
+            )),
+        },
         Codeword::Para => {
             if let Some(c) = state
                 .registry
@@ -763,6 +779,72 @@ async fn resolve_codeword(
 }
 
 // ------------------------------------------------------------------ probes
+
+/// XCM observations of one id → one candidate each.
+///
+/// ONE CANDIDATE PER OBSERVATION, not one per journey, and that is the file's
+/// first rule rather than laziness: a journey spans chains and therefore has no
+/// single `chain` and no single `lineage`, and a candidate that carried neither
+/// would be the one row in the response with nothing to verify it by. Each
+/// observation has both; they all point at the same journey.
+///
+/// `expand` follows recorded wire_hash<->topic links first. One extra probe, and
+/// it is what makes `xcm <wire hash>` find the journey the receiving chain
+/// reported under the TOPIC — the exact dead end slice 2 measured.
+async fn push_xcm(state: &crate::AppState, id: &str, expand: bool, out: &mut Vec<Candidate>) {
+    let mut ids = vec![id.to_string()];
+    if expand {
+        if let Ok(links) = state.xcm.aliases(id).await {
+            for l in links {
+                for other in [l.wire_hash, l.topic] {
+                    if !ids.contains(&other) {
+                        ids.push(other);
+                    }
+                }
+            }
+        }
+    }
+    let Ok(rows) = state.xcm.by_message_ids(&ids).await else {
+        return;
+    };
+    for r in rows {
+        let direct = r.message_id.as_deref() == Some(id);
+        let where_to = match (r.side.as_str(), &r.counterparty) {
+            ("sent", Some(c)) => format!("XCM sent to {c}"),
+            ("received", Some(c)) => format!("XCM processed from {c}"),
+            ("local", _) => "XCM executed locally".to_string(),
+            // Any other side, with or without a counterparty. A side we do not
+            // recognise has no known direction, so naming the counterparty here
+            // would have to guess a preposition ("to" or "from") — the one thing
+            // this file must not do. Report the side and let the journey say the
+            // rest.
+            (side, _) => format!("XCM {side}"),
+        };
+        out.push(Candidate {
+            kind: "xcm_message",
+            chain: Some(r.chain_id.clone()),
+            title: format!("{where_to} ({}, {})", r.transport, r.status),
+            href: format!("/v1/xcm/journeys/{id}"),
+            why: if direct {
+                "this id was observed as an XCM message on this chain"
+            } else {
+                "a recorded wire_hash<->topic link ties the id you typed to this observation — \
+                 see the journey's `aliases` for the rule and evidence it rests on"
+            },
+            id: serde_json::json!({
+                "message_id": r.message_id,
+                "id_kind": r.id_kind,
+                "side": r.side,
+                "block_height": r.block_height,
+                "event_index": r.event_index,
+            }),
+            lineage: Some(serde_json::json!({
+                "runtime_version": r.runtime_version,
+                "mapper_version": r.mapper_version,
+            })),
+        });
+    }
+}
 
 fn gov_chains(state: &crate::AppState, network: &str) -> Vec<String> {
     state
@@ -1014,7 +1096,10 @@ mod tests {
     #[test]
     fn planned_codewords_are_refused_with_their_phase() {
         let r = reg();
-        for (word, when) in [("xcm 0xabc", "Phase 3"), ("sel 0xa9059cbb", "Phase 5")] {
+        // `xcm` used to live here. It moved into the grammar with the
+        // correlation slice, which is the rule working rather than an exception
+        // to it: the codeword shipped in the phase of the module that answers it.
+        for (word, when) in [("sale 42", "Phase 3"), ("sel 0xa9059cbb", "Phase 5")] {
             let err = parse(word, &r).unwrap_err();
             assert!(err.message.contains(when), "{}: {}", word, err.message);
             assert!(err.expected.iter().any(|e| e == "ref"));
@@ -1126,8 +1211,15 @@ mod tests {
         );
         // every candidate carries why + chain + lineage, for the machine
         assert!(r.candidates.iter().all(|c| !c.why.is_empty()));
-        // and the bounded candidate set states what it cannot yet distinguish
-        assert!(r.not_covered.iter().any(|g| g.contains("XCM")));
+        // The XCM gap line that used to be asserted here is GONE, replaced by a
+        // probe: "an XCM topic is also a 32-byte hash and we cannot tell yet"
+        // was true until the correlation slice, and leaving it in would be the
+        // same one-line honesty regression the `xcm` codeword was.
+        assert!(
+            !r.not_covered.iter().any(|g| g.contains("XCM")),
+            "XCM is probed now, not deferred: {:?}",
+            r.not_covered
+        );
     }
 
     /// A well-formed input that matches nothing indexed is a 200, never an
@@ -1161,6 +1253,54 @@ mod tests {
         assert!(r.candidates.is_empty());
         assert_eq!(r.not_covered.len(), 1);
         assert!(r.not_covered[0].contains("no name index yet"));
+    }
+
+    /// The `xcm` codeword was refused from Phase 2 slice 10 to Phase 3 slice 2
+    /// with "XCM journeys land in Phase 3" — a refusal that stayed accurate
+    /// until journeys shipped and then became a one-line honesty regression.
+    /// This is that line being paid off, and the codeword doing more than the
+    /// bare paste: it expands aliases, so a WIRE hash reaches the half the
+    /// receiving chain reported under the TOPIC.
+    #[tokio::test]
+    async fn the_xcm_codeword_answers_and_a_wire_hash_reaches_the_other_chain() {
+        let state = crate::tests::test_state().await;
+        let wire = format!("0x{}", "77".repeat(32));
+
+        let q = parse(&format!("xcm {wire}"), &state.registry).expect("no longer refused");
+        assert_eq!(q.term, Term::Codeword { word: Codeword::Xcm, arg: wire.clone() });
+        let r = resolve(&q, &state, &wire).await;
+        let xcm: Vec<&Candidate> = r.candidates.iter().filter(|c| c.kind == "xcm_message").collect();
+        assert_eq!(xcm.len(), 3, "both sending ids and the receiving half: {:?}", r.candidates);
+        let other_chain = xcm
+            .iter()
+            .find(|c| c.chain.as_deref() == Some("hydration"))
+            .expect("the alias expansion is the whole point");
+        assert!(other_chain.why.contains("link"), "{}", other_chain.why);
+        // Every candidate carries the lineage of the row it came from — a
+        // journey has no single lineage, which is why this is one candidate per
+        // OBSERVATION rather than one per journey.
+        assert!(xcm.iter().all(|c| c.lineage.is_some() && c.chain.is_some()));
+        assert!(xcm.iter().all(|c| c.href == format!("/v1/xcm/journeys/{wire}")));
+
+        // A bare paste is ONE probe and no expansion: it asks "what is this",
+        // and the journey endpoint it points at does the expanding.
+        let topic = format!("0x{}", "ee".repeat(32));
+        let q = parse(&topic, &state.registry).unwrap();
+        let r = resolve(&q, &state, &topic).await;
+        let kinds: Vec<&str> = r.candidates.iter().map(|c| c.kind).collect();
+        assert_eq!(
+            kinds.iter().filter(|k| **k == "xcm_message").count(),
+            2,
+            "the two observations of THIS id, not of its alias: {kinds:?}"
+        );
+        // …and the account reading still survives, because any 32 bytes is one
+        assert!(kinds.contains(&"account"));
+
+        // A codeword with the wrong shape of argument is a gap, not a candidate.
+        let q = parse("xcm 1930", &state.registry).unwrap();
+        let r = resolve(&q, &state, "xcm 1930").await;
+        assert!(r.candidates.iter().all(|c| c.kind != "xcm_message"));
+        assert!(r.not_covered.iter().any(|g| g.contains("32-byte 0x hash")));
     }
 
     #[test]

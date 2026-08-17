@@ -15,7 +15,7 @@
 //! skipped and advanced past (decode gap-fill + a later `gov-range` re-run
 //! covers them).
 
-use crate::module::{self, impl_module_error, EventSource, FactWriter, ModuleRun};
+use crate::module::{self, impl_module_error, EventSource, FactWriter, Mapping, ModuleRun};
 use crate::{CheckpointError, CheckpointStore};
 use async_trait::async_trait;
 use canonical::CanonicalEvent;
@@ -123,7 +123,7 @@ fn run<'a>(mapper: &'a dyn GovMapper, deps: &'a GovDeps<'a>) -> ModuleRun<'a, Re
         module: MODULE_GOV,
         checkpoints: deps.checkpoints,
         source: deps.source,
-        map: Box::new(move |ev: &CanonicalEvent| mapper.timeline(ev)),
+        map: Mapping::PerEvent(Box::new(move |ev: &CanonicalEvent| mapper.timeline(ev))),
         mapper_version: mapper.mapper_version(),
         sink: Box::new(SinkBridge(deps.sink)),
     }

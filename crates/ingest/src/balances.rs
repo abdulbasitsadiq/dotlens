@@ -18,7 +18,7 @@
 //! The loop that enforces all of the above now lives once, in `crate::module`;
 //! this file is the balances vocabulary plus the wiring that hands it over.
 
-use crate::module::{self, impl_module_error, FactWriter, ModuleRun};
+use crate::module::{self, impl_module_error, FactWriter, Mapping, ModuleRun};
 use crate::{CheckpointError, CheckpointStore};
 use async_trait::async_trait;
 use canonical::CanonicalEvent;
@@ -122,7 +122,7 @@ fn run<'a>(mapper: &'a dyn DeltaMapper, deps: &'a BalancesDeps<'a>) -> ModuleRun
         module: MODULE_BALANCES,
         checkpoints: deps.checkpoints,
         source: deps.source,
-        map: Box::new(move |ev: &CanonicalEvent| mapper.deltas(ev)),
+        map: Mapping::PerEvent(Box::new(move |ev: &CanonicalEvent| mapper.deltas(ev))),
         mapper_version: mapper.mapper_version(),
         sink: Box::new(SinkBridge(deps.sink)),
     }

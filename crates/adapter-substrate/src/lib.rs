@@ -68,6 +68,11 @@ pub mod whitelist;
 /// message, recorded separately and never joined here. Pure — no I/O.
 pub mod xcm;
 
+/// The XCM correlation rule: the two ids one message carries, paired inside the
+/// block that emitted both. Pure — no I/O, no chain, no neighbouring block. The
+/// cross-chain half of a journey is plain id equality and needs no rule at all.
+pub mod xcm_correlate;
+
 /// Tier 1 simulation: build a `DryRunApi::dry_run_call` request out of the
 /// runtime's own metadata and read the answer back. Pure — no I/O; the RPC is
 /// `source::SubstrateSource::state_call` and the wiring is in dotlens-node.

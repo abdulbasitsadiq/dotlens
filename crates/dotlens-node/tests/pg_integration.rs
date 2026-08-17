@@ -2667,6 +2667,204 @@ async fn xcm_facts_partition_by_chain_and_the_two_id_shapes_join() {
     db.drop_db().await;
 }
 
+/// The correlation layer end to end (Phase 3, slice 3): the two ids one message
+/// carries are paired inside the block that emitted both, and the journey then
+/// reads across two chains from either of them.
+#[tokio::test]
+async fn xcm_links_pair_the_two_sender_ids_and_a_journey_reads_from_either() {
+    use adapter_substrate::xcm::SubstrateXcmMapper;
+    use adapter_substrate::xcm_correlate::SubstrateXcmCorrelator;
+    use api::XcmIndex as _;
+    use canonical::{CanonicalBlock, CanonicalEvent, Lineage};
+
+    let Some(db) = TestDb::create().await else { return };
+    let reg = seeds();
+    sync_registry(&db.pool, &reg).await.expect("registry sync");
+
+    let topic = format!("0x{}", "ee".repeat(32));
+    let wire = format!("0x{}", "77".repeat(32));
+    let ev = |index: u32, name: &str, data: serde_json::Value| CanonicalEvent {
+        index,
+        transaction_index: None,
+        name: name.into(),
+        data,
+    };
+    let block = |chain: &str, height: u64, ts: &str, events: Vec<CanonicalEvent>| CanonicalBlock {
+        chain_id: chain.into(),
+        height,
+        hash: format!("0x{height:064x}"),
+        parent_hash: format!("0x{:064x}", height - 1),
+        timestamp: Some(ts.parse().unwrap()),
+        finalized: true,
+        lineage: Lineage {
+            runtime_version: 2_003_002,
+            decoder_version: 2,
+            raw_location: format!("raw/{chain}/test/{height}"),
+        },
+        transactions: vec![],
+        events,
+    };
+
+    let blocks = api::pg::PgBlockIndex::new(db.pool.clone());
+    // THE EVENT ORDER IS THE EVIDENCE, and it is the order live Asset Hub
+    // #19581756 produced: the inner router deposits its hash FIRST, then
+    // `WithUniqueTopic::deliver` throws that hash away and pallet-xcm deposits
+    // the topic. Reverse these two and the correlator refuses to pair them.
+    api::BlockIndex::insert(
+        &blocks,
+        block(
+            "polkadot-asset-hub",
+            900,
+            "2026-08-17T09:00:00Z",
+            vec![
+                ev(0, "xcmpqueue.XcmpMessageSent", serde_json::json!({
+                    "message_hash": vec![0x77u8; 32],
+                })),
+                ev(1, "polkadotxcm.Sent", serde_json::json!({
+                    "origin": {"parents": 0, "interior": {"Here": []}},
+                    "destination": {"parents": 1, "interior": {"X1": [[{"Parachain": [2034]}]]}},
+                    "message": [[{"WithdrawAsset": []}]],
+                    "message_id": vec![0xeeu8; 32],
+                })),
+            ],
+        ),
+    )
+    .await
+    .expect("insert AH block");
+    api::BlockIndex::insert(
+        &blocks,
+        block(
+            "hydration",
+            100,
+            "2026-08-17T09:00:24Z",
+            vec![ev(0, "messagequeue.Processed", serde_json::json!({
+                // H256 — one array layer deeper than the sender's [u8;32]
+                "id": [vec![0xeeu8; 32]],
+                "origin": {"Sibling": [1000]},
+                "weight_used": {"ref_time": 1_000},
+                "success": true,
+            }))],
+        ),
+    )
+    .await
+    .expect("insert Hydration block");
+
+    let source = dotlens_node::balances_pg::PgEventSource::new(db.pool.clone());
+    let checkpoints = ingest::pg::PgCheckpointStore::new(db.pool.clone());
+    let facts = dotlens_node::xcm_pg::PgXcmSink::new(db.pool.clone());
+    let fact_deps =
+        ingest::xcm::XcmDeps { checkpoints: &checkpoints, source: &source, sink: &facts };
+    let links = dotlens_node::xcm_links_pg::PgXcmLinkSink::new(db.pool.clone());
+    let link_deps = ingest::xcm_correlate::XcmCorrelateDeps {
+        checkpoints: &checkpoints,
+        source: &source,
+        sink: &links,
+    };
+    for (chain, h) in [("polkadot-asset-hub", 900u64), ("hydration", 100)] {
+        ingest::xcm::xcm_range(chain, &SubstrateXcmMapper, &fact_deps, h, h)
+            .await
+            .expect("map facts");
+        ingest::xcm_correlate::xcm_correlate_range(
+            chain,
+            &SubstrateXcmCorrelator,
+            &link_deps,
+            h,
+            h,
+        )
+        .await
+        .expect("correlate");
+    }
+
+    // ONE link, on the sending chain only — Hydration saw one id and has
+    // nothing to pair.
+    for (part, want) in [
+        ("xcm.message_links_p_polkadot_asset_hub", 1),
+        ("xcm.message_links_p_hydration", 0),
+        ("xcm.message_links_default", 0),
+    ] {
+        let (n,): (i64,) = sqlx::query_as(&format!("select count(*) from {part}"))
+            .fetch_one(&db.pool)
+            .await
+            .unwrap_or_else(|e| panic!("counting {part}: {e}"));
+        assert_eq!(n, want, "{part} — links partition by chain like every fact table");
+    }
+
+    let index = api::pg::PgXcmIndex::new(db.pool.clone());
+    // The alias is findable from BOTH ends: that bidirectionality is what the
+    // two indexes in 0016 exist for.
+    for from in [&topic, &wire] {
+        let found = index.aliases(from).await.expect("aliases");
+        assert_eq!(found.len(), 1, "one link, reachable from either id");
+        assert_eq!(found[0].wire_hash, wire);
+        assert_eq!(found[0].topic, topic);
+        assert_eq!(found[0].transport, "hrmp");
+        assert_eq!(found[0].rule, "unique_in_block");
+        assert_eq!(found[0].confidence, "high");
+        assert_eq!(found[0].evidence["event_gap"], 1);
+        assert_eq!(found[0].correlator_version, 1);
+        assert_eq!(found[0].runtime_version, 2_003_002, "lineage: which runtime, which rule");
+        assert_eq!(found[0].evidence["block_sends"]["wire"], 1);
+        assert_eq!((found[0].wire_event_index, found[0].topic_event_index), (0, 1));
+    }
+
+    // The journey read: three observations across two chains, ordered by the
+    // only clock they share — which the `core.blocks` join is what supplies.
+    let rows = index
+        .by_message_ids(&[topic.clone(), wire.clone()])
+        .await
+        .expect("by ids");
+    assert_eq!(rows.len(), 3);
+    assert!(
+        rows.iter().all(|r| r.timestamp.is_some()),
+        "the core.blocks join is what makes a cross-chain ordering possible"
+    );
+    let hydration = rows.iter().find(|r| r.chain_id == "hydration").unwrap();
+    let ah_topic = rows
+        .iter()
+        .find(|r| r.chain_id == "polkadot-asset-hub" && r.id_kind == "topic")
+        .unwrap();
+    assert!(
+        hydration.timestamp > ah_topic.timestamp,
+        "the receive is after the send — the journey's time_order check in one line"
+    );
+
+    // Its own checkpoint key. Sharing `xcm`'s would make each worker's progress
+    // silently skip the other's work, and nothing else in the suite pins it.
+    let cp = ingest::CheckpointStore::get(
+        &checkpoints,
+        "polkadot-asset-hub",
+        ingest::xcm_correlate::MODULE_XCM_CORRELATE,
+    )
+    .await
+    .expect("checkpoint read")
+    .expect("the correlator advanced its own checkpoint");
+    assert_eq!(cp.last_height, 900);
+    assert_ne!(
+        ingest::xcm_correlate::MODULE_XCM_CORRELATE,
+        ingest::xcm::MODULE_XCM
+    );
+
+    // Re-running converges rather than accumulating: this sink is
+    // delete-then-insert, not insert-ignore, because a link is a conclusion the
+    // current rule reached and a re-run must be able to replace it.
+    ingest::xcm_correlate::xcm_correlate_range(
+        "polkadot-asset-hub",
+        &SubstrateXcmCorrelator,
+        &link_deps,
+        900,
+        900,
+    )
+    .await
+    .expect("replay");
+    let (again,): (i64,) = sqlx::query_as("select count(*) from xcm.message_links")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(again, 1, "re-correlating a block must replace, never duplicate");
+
+    db.drop_db().await;
+}
+
 /// Tier 1 results are immutable observations keyed by STATE + INPUT (Phase 3,
 /// slice 1). The three properties that matter, and each has bitten a projection
 /// elsewhere in this project: a recorded answer is never rewritten, two states

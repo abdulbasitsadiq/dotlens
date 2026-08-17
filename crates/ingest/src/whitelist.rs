@@ -17,7 +17,7 @@
 //! and returns `Ok` to the extrinsic. "Was dispatched" and "worked" are
 //! different facts. See migration 0012's header for the pallet source.
 
-use crate::module::{self, impl_module_error, EventSource, FactWriter, ModuleRun};
+use crate::module::{self, impl_module_error, EventSource, FactWriter, Mapping, ModuleRun};
 use crate::{CheckpointError, CheckpointStore};
 use async_trait::async_trait;
 use canonical::CanonicalEvent;
@@ -136,7 +136,7 @@ fn run<'a>(
         module: MODULE_WHITELIST,
         checkpoints: deps.checkpoints,
         source: deps.source,
-        map: Box::new(move |ev: &CanonicalEvent| mapper.facts(ev)),
+        map: Mapping::PerEvent(Box::new(move |ev: &CanonicalEvent| mapper.facts(ev))),
         mapper_version: mapper.mapper_version(),
         sink: Box::new(SinkBridge(deps.sink)),
     }

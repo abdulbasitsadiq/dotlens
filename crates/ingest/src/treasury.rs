@@ -8,7 +8,7 @@
 //!
 //! Checkpoint module: `treasury`.
 
-use crate::module::{self, impl_module_error, EventSource, FactWriter, ModuleRun};
+use crate::module::{self, impl_module_error, EventSource, FactWriter, Mapping, ModuleRun};
 use crate::{CheckpointError, CheckpointStore};
 use async_trait::async_trait;
 use canonical::CanonicalEvent;
@@ -157,7 +157,7 @@ fn run<'a>(
         module: MODULE_TREASURY,
         checkpoints: deps.checkpoints,
         source: deps.source,
-        map: Box::new(move |ev: &CanonicalEvent| mapper.facts(ev)),
+        map: Mapping::PerEvent(Box::new(move |ev: &CanonicalEvent| mapper.facts(ev))),
         mapper_version: mapper.mapper_version(),
         sink: Box::new(SinkBridge(deps.sink)),
     }

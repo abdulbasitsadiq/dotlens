@@ -429,25 +429,68 @@ pub struct XcmMessageRow {
     pub weight_used: Option<serde_json::Value>,
     pub runtime_version: u64,
     pub mapper_version: u32,
+    /// The containing block's timestamp, joined from `core.blocks`.
+    ///
+    /// It is on the OBSERVATION rather than left to the caller because two
+    /// chains' block heights are not comparable and a journey has to be ordered
+    /// by something. Nullable, and honestly so: `core.blocks.timestamp` is
+    /// nullable, and a step with no time is why the journey's `time_order`
+    /// check can come back `unknown` rather than `ok`.
+    pub timestamp: Option<DateTime<Utc>>,
 }
 
-/// Read side of `xcm.messages`.
+/// One recorded id alias (`xcm.message_links`) — the correlator's only stored
+/// inference.
+///
+/// Two ids that name ONE message, established inside one block on one chain:
+/// the wire hash the router computed and the topic `WithUniqueTopic::deliver`
+/// returned after discarding it. No event on any chain states this
+/// relationship, which is why `rule`, `confidence` and `evidence` travel with
+/// it everywhere it is rendered.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct XcmLinkRow {
+    pub chain_id: String,
+    pub block_height: u64,
+    pub wire_event_index: u32,
+    pub topic_event_index: u32,
+    pub wire_hash: String,
+    pub topic: String,
+    /// hrmp | ump — never dmp, which has no sender-side hash event to pair.
+    pub transport: String,
+    /// unique_in_block | interleaved
+    pub rule: String,
+    /// high | medium
+    pub confidence: String,
+    pub evidence: serde_json::Value,
+    /// Lineage, both halves of it: which runtime's events the inference was
+    /// drawn from, and which version of the rule drew it. `correlator_version`
+    /// alone would say how we concluded but not what from.
+    pub runtime_version: u64,
+    pub correlator_version: u32,
+}
+
+/// Read side of `xcm.messages` + `xcm.message_links`.
 #[async_trait]
 pub trait XcmIndex: Send + Sync {
     /// Recent observations on one chain, newest first.
     async fn messages(&self, chain_id: &str, limit: u32)
         -> Result<Vec<XcmMessageRow>, IndexError>;
-    /// Every observation carrying this id, on ANY chain — the seam the
-    /// correlation slice will read: the halves we have, never a journey we
-    /// inferred. NOTE the search grammar still REFUSES `xcm 0x…` ("XCM journeys
-    /// land in Phase 3") and that refusal stays accurate: journeys are what has
-    /// not shipped. Wiring the codeword to these observations is search v2.
+    /// Every observation carrying this id, on ANY chain.
     async fn by_message_id(&self, message_id: &str) -> Result<Vec<XcmMessageRow>, IndexError>;
+    /// Every observation carrying ANY of these ids — the journey read, once the
+    /// alias set is known. One query rather than one per id, because the point
+    /// of the endpoint is a bounded fan-out.
+    async fn by_message_ids(&self, ids: &[String]) -> Result<Vec<XcmMessageRow>, IndexError>;
+    /// Links naming this id on EITHER side. Two indexed probes; the result is
+    /// what turns a wire hash into the topic its receiver reported, and vice
+    /// versa.
+    async fn aliases(&self, message_id: &str) -> Result<Vec<XcmLinkRow>, IndexError>;
 }
 
 #[derive(Default)]
 pub struct MemoryXcmIndex {
     rows: RwLock<Vec<XcmMessageRow>>,
+    links: RwLock<Vec<XcmLinkRow>>,
 }
 
 impl MemoryXcmIndex {
@@ -456,6 +499,9 @@ impl MemoryXcmIndex {
     }
     pub fn insert(&self, row: XcmMessageRow) {
         self.rows.write().expect("lock").push(row);
+    }
+    pub fn insert_link(&self, link: XcmLinkRow) {
+        self.links.write().expect("lock").push(link);
     }
 }
 
@@ -479,17 +525,42 @@ impl XcmIndex for MemoryXcmIndex {
         Ok(out)
     }
     async fn by_message_id(&self, message_id: &str) -> Result<Vec<XcmMessageRow>, IndexError> {
+        let ids = [message_id.to_string()];
+        self.by_message_ids(&ids).await
+    }
+    async fn by_message_ids(&self, ids: &[String]) -> Result<Vec<XcmMessageRow>, IndexError> {
         let rows = self.rows.read().map_err(|e| IndexError(e.to_string()))?;
         let mut out: Vec<XcmMessageRow> = rows
             .iter()
-            .filter(|r| r.message_id.as_deref() == Some(message_id))
+            .filter(|r| {
+                r.message_id
+                    .as_ref()
+                    .is_some_and(|id| ids.iter().any(|want| want == id))
+            })
+            .cloned()
+            .collect();
+        // identical to the Pg ordering, tie-break included — a `limit` that
+        // returned different rows from the two backends is slice 1's defect
+        out.sort_by(|a, b| {
+            a.chain_id
+                .cmp(&b.chain_id)
+                .then_with(|| a.block_height.cmp(&b.block_height))
+                .then_with(|| a.event_index.cmp(&b.event_index))
+        });
+        Ok(out)
+    }
+    async fn aliases(&self, message_id: &str) -> Result<Vec<XcmLinkRow>, IndexError> {
+        let links = self.links.read().map_err(|e| IndexError(e.to_string()))?;
+        let mut out: Vec<XcmLinkRow> = links
+            .iter()
+            .filter(|l| l.wire_hash == message_id || l.topic == message_id)
             .cloned()
             .collect();
         out.sort_by(|a, b| {
             a.chain_id
                 .cmp(&b.chain_id)
                 .then_with(|| a.block_height.cmp(&b.block_height))
-                .then_with(|| a.event_index.cmp(&b.event_index))
+                .then_with(|| a.wire_event_index.cmp(&b.wire_event_index))
         });
         Ok(out)
     }
@@ -502,8 +573,9 @@ impl XcmIndex for MemoryXcmIndex {
 pub fn xcm_not_covered() -> Vec<&'static str> {
     vec![
         "these are one-sided OBSERVATIONS, not journeys: a `sent` row and a `received` row \
-         carrying the same id are strong evidence of one message, but nothing here asserts \
-         it — the correlation layer that does is a later slice",
+         carrying the same id are strong evidence of one message, and nothing on THIS \
+         endpoint asserts it. /v1/xcm/journeys/{id} is the endpoint that does, and it ships \
+         the rule, the evidence and the checks its stitch rests on rather than a verdict",
         "there are TWO ids per message and `id_kind` says which one a row holds: `topic` \
          (pallet_xcm's message_id, derived from frame_system::unique — not a hash of \
          anything and not recomputable), `wire_hash` (blake2_256 of the queued bytes), and \
@@ -534,6 +606,85 @@ pub fn xcm_not_covered() -> Vec<&'static str> {
          channel and every offboarding teardown. It needs a storage snapshot, which is its \
          own slice",
     ]
+}
+
+/// What a JOURNEY is not. Everything an observation is not (above), plus the
+/// five things the stitch itself cannot claim.
+///
+/// This list is the reason the endpoint exists in this shape: a journey here is
+/// two mechanical rules and a set of checks, all of them named in the payload,
+/// rather than a confident single answer. A consumer who wants the confident
+/// answer can have it — `shape` and `outcome` say it in one line — but they can
+/// also see exactly what it rests on.
+pub fn xcm_journey_not_covered() -> Vec<&'static str> {
+    // SKIPPING THE FIRST LINE IS THE POINT, not an oversight. `xcm_not_covered`
+    // opens with "nothing on THIS endpoint asserts it — /v1/xcm/journeys/{id} is
+    // the endpoint that does", which is written for the OBSERVATIONS endpoint and
+    // is false here twice over: this endpoint does assert the stitch (that is what
+    // `shape`, `steps` and `checks` are), and it points the reader at the endpoint
+    // they are already reading. The review caught this exact class one endpoint
+    // over — a stale line promising the correlation layer as "a later slice" — and
+    // it survived here because the two lists share a helper. The honest version of
+    // that line for THIS endpoint is the first one added below, which says what
+    // the stitch rests on instead of deferring it.
+    let mut v: Vec<&'static str> = xcm_not_covered().into_iter().skip(1).collect();
+    v.extend([
+        "a journey is assembled from exactly two things: id EQUALITY across chains, and the \
+         wire_hash<->topic aliases the correlator recorded WITHIN one block. Nothing else is \
+         inferred. Two legs whose ids differ and that share no recorded link are two journeys \
+         here, and saying so is the point",
+        "the wire_hash<->topic link is only recorded where the block makes it unambiguous — one \
+         queued send and one `Sent` of that transport, or n of each strictly alternating. A \
+         block with 2 queued sends and 1 `Sent` records NO link, so a wire hash from that block \
+         reaches only its own half. `aliases` in this response is every link found while \
+         expanding, with the rule and evidence each rests on — a superset of those used \
+         when `alias_limit_reached` is true",
+        "there is NO hop rule (an inbound message linked to a forwarded outbound send in the \
+         same block), and its window of applicability may be empty: from staging-xcm-executor \
+         20.0.0 the topic PROPAGATES across a hop so equality already stitches it, and below \
+         19.1.0 the forwarded leg emits no `Sent` to link to at all. Only [19.1.0, 20.0.0) — \
+         and a chain that re-wraps with a NEW topic — would need one",
+        "a wire hash is a hash of CONTENT: two byte-identical queued messages have the same \
+         wire hash. A unique topic normally makes the bytes differ, but where it does not, one \
+         id names two messages — and because the alias set is expanded through that id, their \
+         two distinct topics would be pulled into ONE journey. `checks.id_uniqueness` reports \
+         that shape (same chain, same side, one id, two coordinates) rather than merging them \
+         silently",
+        "the observations and the links are written by two workers with two checkpoints and \
+         two versions, on purpose — a rule change must be able to re-derive links without \
+         touching a single observation row. The cost is that a range correlated but not yet \
+         mapped yields an alias whose ends have no steps, which reads the same as a chain we \
+         do not index. `xcm-correlate` chases the same decode frontier `xcm-range` does, so \
+         in practice they run neck and neck",
+        "steps are ordered by BLOCK TIMESTAMP, which is the only ordering two chains share; \
+         `core.blocks.timestamp` is nullable, and a step without one falls back to chain and \
+         height, which are not comparable across chains. `checks.time_order` says which case \
+         this journey is in",
+    ]);
+    v
+}
+
+/// How chain `from` names chain `to` in an XCM counterparty, from REGISTRY DATA
+/// alone — para ids and relay membership, no chain ids in code (Invariant 2).
+///
+/// This is what makes `counterparty_mirror` a check rather than a decoration:
+/// the receiving chain says which QUEUE a message came from and the sending
+/// chain says where it addressed one, and the two must be mirror images of each
+/// other. `None` means the registry cannot say, which is reported as `unknown`
+/// and never as a contradiction.
+fn xcm_counterparty_name(from: &registry::ChainConfig, to: &registry::ChainConfig)
+    -> Option<String> {
+    if from.id == to.id {
+        return Some("here".into());
+    }
+    if from.relay.as_deref() == Some(to.id.as_str()) {
+        return Some("parent".into());
+    }
+    let para = to.para_id?;
+    // A sibling (same relay) or a child (this chain IS the relay).
+    let sibling = to.relay.is_some() && to.relay == from.relay;
+    let child = to.relay.as_deref() == Some(from.id.as_str());
+    (sibling || child).then(|| format!("para:{para}"))
 }
 
 /// One recorded Tier 1 simulation (`sim.simulation_results`).
@@ -2253,13 +2404,48 @@ pub mod pg {
                 weight_used: r.try_get("weight_used").map_err(err)?,
                 runtime_version: r.try_get::<i64, _>("runtime_version").map_err(err)? as u64,
                 mapper_version: r.try_get::<i32, _>("mapper_version").map_err(err)? as u32,
+                timestamp: r.try_get("block_timestamp").map_err(err)?,
+            })
+        }
+
+        fn link(r: &sqlx::postgres::PgRow) -> Result<super::XcmLinkRow, IndexError> {
+            use sqlx::Row as _;
+            let err = |e: sqlx::Error| IndexError(e.to_string());
+            Ok(super::XcmLinkRow {
+                chain_id: r.try_get("chain_id").map_err(err)?,
+                block_height: r.try_get::<i64, _>("block_height").map_err(err)? as u64,
+                wire_event_index: r.try_get::<i32, _>("wire_event_index").map_err(err)? as u32,
+                topic_event_index: r.try_get::<i32, _>("topic_event_index").map_err(err)? as u32,
+                wire_hash: r.try_get("wire_hash").map_err(err)?,
+                topic: r.try_get("topic").map_err(err)?,
+                transport: r.try_get("transport").map_err(err)?,
+                rule: r.try_get("rule").map_err(err)?,
+                confidence: r.try_get("confidence").map_err(err)?,
+                evidence: r.try_get("evidence").map_err(err)?,
+                runtime_version: r.try_get::<i64, _>("runtime_version").map_err(err)? as u64,
+                correlator_version: r.try_get::<i32, _>("correlator_version").map_err(err)? as u32,
             })
         }
     }
 
-    const XCM_COLS: &str = "chain_id, block_height, event_index, side, transport, message_id, \
-         id_kind, counterparty, origin_location, destination, message, forwarded, status, \
-         success, error, weight_used, runtime_version, mapper_version";
+    /// Every column is `m.`-qualified and the timestamp is aliased, because
+    /// `core.blocks` carries `chain_id` and `runtime_version` too — an
+    /// unqualified list here would be ambiguous at best and silently return the
+    /// BLOCK's runtime version at worst.
+    const XCM_COLS: &str = "m.chain_id, m.block_height, m.event_index, m.side, m.transport, \
+         m.message_id, m.id_kind, m.counterparty, m.origin_location, m.destination, m.message, \
+         m.forwarded, m.status, m.success, m.error, m.weight_used, m.runtime_version, \
+         m.mapper_version, b.timestamp as block_timestamp";
+
+    /// LEFT join: an observation whose block row is missing (or whose timestamp
+    /// is null, which `core.blocks` permits) must still be returned. Dropping it
+    /// would make a journey silently lose a step for want of a clock.
+    const XCM_FROM: &str = "from xcm.messages m left join core.blocks b \
+         on b.chain_id = m.chain_id and b.height = m.block_height";
+
+    const LINK_COLS: &str = "chain_id, block_height, wire_event_index, topic_event_index, \
+         wire_hash, topic, transport, rule, confidence, evidence, runtime_version, \
+         correlator_version";
 
     #[async_trait]
     impl super::XcmIndex for PgXcmIndex {
@@ -2269,8 +2455,8 @@ pub mod pg {
             limit: u32,
         ) -> Result<Vec<super::XcmMessageRow>, IndexError> {
             let rows = sqlx::query(&format!(
-                "select {XCM_COLS} from xcm.messages where chain_id = $1 \
-                 order by block_height desc, event_index limit $2"
+                "select {XCM_COLS} {XCM_FROM} where m.chain_id = $1 \
+                 order by m.block_height desc, m.event_index limit $2"
             ))
             .bind(chain_id)
             .bind(limit as i64)
@@ -2284,17 +2470,44 @@ pub mod pg {
             &self,
             message_id: &str,
         ) -> Result<Vec<super::XcmMessageRow>, IndexError> {
-            // messages_id_idx (0015) — a point probe per partition, never a scan
-            // and never a prefix match.
+            let ids = [message_id.to_string()];
+            self.by_message_ids(&ids).await
+        }
+
+        async fn by_message_ids(
+            &self,
+            ids: &[String],
+        ) -> Result<Vec<super::XcmMessageRow>, IndexError> {
+            if ids.is_empty() {
+                return Ok(vec![]);
+            }
+            // messages_id_idx (0015) — a point probe per partition per id, never
+            // a scan and never a prefix match.
             let rows = sqlx::query(&format!(
-                "select {XCM_COLS} from xcm.messages where message_id = $1 \
-                 order by chain_id collate \"C\", block_height, event_index"
+                "select {XCM_COLS} {XCM_FROM} where m.message_id = any($1) \
+                 order by m.chain_id collate \"C\", m.block_height, m.event_index"
+            ))
+            .bind(ids)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| IndexError(e.to_string()))?;
+            rows.iter().map(Self::row).collect()
+        }
+
+        async fn aliases(&self, message_id: &str) -> Result<Vec<super::XcmLinkRow>, IndexError> {
+            // message_links_wire_idx + message_links_topic_idx (0016). An `or`
+            // over two indexed columns is a BitmapOr of two index scans, which
+            // is what those two indexes exist for.
+            let rows = sqlx::query(&format!(
+                "select {LINK_COLS} from xcm.message_links \
+                 where wire_hash = $1 or topic = $1 \
+                 order by chain_id collate \"C\", block_height, wire_event_index"
             ))
             .bind(message_id)
             .fetch_all(&self.pool)
             .await
             .map_err(|e| IndexError(e.to_string()))?;
-            rows.iter().map(Self::row).collect()
+            rows.iter().map(Self::link).collect()
         }
     }
 
@@ -3567,6 +3780,7 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/sim/{chain}/calls/{call_hash}", get(get_simulations))
         .route("/v1/xcm/{chain}/messages", get(list_xcm_messages))
         .route("/v1/xcm/messages/{message_id}", get(get_xcm_message))
+        .route("/v1/xcm/journeys/{message_id}", get(get_xcm_journey))
         .route("/v1/search", get(get_search))
         .route("/v1/domains/{network}/{domain}", get(resolve_domain))
         .with_state(state)
@@ -4292,9 +4506,319 @@ async fn get_xcm_message(
         "message_id": id,
         "observations": rows,
         "reads_as": reads_as,
+        // The correlated view of the same id. Named here because this endpoint
+        // deliberately does NOT expand aliases: asked for an id, it answers
+        // about that id, and a wire hash whose journey is on record under the
+        // topic will still return one row.
+        "journey": format!("/v1/xcm/journeys/{id}"),
         "coverage": { "not_covered": xcm_not_covered() },
     }))
     .into_response()
+}
+
+/// How far an id's alias set is allowed to grow. A link is intra-block, so a
+/// legitimate multi-hop journey adds two ids per hop; sixteen is four hops of
+/// headroom and a hard bound on the fan-out, which is the same discipline
+/// `api::search` holds itself to.
+const XCM_ALIAS_LIMIT: usize = 16;
+
+/// ONE MESSAGE, EVERY CHAIN THAT SAW IT — the correlation layer's read side
+/// (Phase 3, slice 3).
+///
+/// This is the endpoint slice 2 refused to write, and what changed is not
+/// confidence but MACHINERY: the stitch is now two mechanical rules with their
+/// evidence attached, plus three checks that can come back `contradicted` in
+/// public. `/v1/xcm/messages/{id}` still answers "where was this id seen"; this
+/// answers "what happened", and shows its working.
+///
+/// THE ONE THING THAT MADE IT POSSIBLE is the alias expansion. A sender emits
+/// two ids for one message and the receiver reports whichever one it got, so a
+/// user pasting a wire hash and a user pasting a topic are asking about the same
+/// journey and slice 2 could only answer one of them. `xcm.message_links` closes
+/// that, and `aliases` in the response shows exactly which links were used and
+/// on what evidence — a stitch you cannot audit is a stitch you cannot trust.
+async fn get_xcm_journey(
+    State(state): State<AppState>,
+    Path(message_id): Path<String>,
+) -> Response {
+    let asked = normalize_call_hash(&message_id);
+
+    // Expand to a fixpoint rather than one hop: starting from a wire hash, one
+    // hop reaches its topic, and only a second reaches the NEXT chain's wire
+    // hash when that chain re-emitted the same topic. Bounded by
+    // XCM_ALIAS_LIMIT, and the bound is reported rather than hidden.
+    let mut ids: Vec<String> = vec![asked.clone()];
+    let mut links: Vec<XcmLinkRow> = Vec::new();
+    let mut probed: usize = 0;
+    let mut truncated = false;
+    while probed < ids.len() {
+        let id = ids[probed].clone();
+        probed += 1;
+        let found = match state.xcm.aliases(&id).await {
+            Ok(l) => l,
+            Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+        };
+        for l in found {
+            for candidate in [&l.wire_hash, &l.topic] {
+                if ids.iter().any(|i| i == candidate) {
+                    continue;
+                }
+                // A dropped candidate is REPORTED, not silently forgotten: a
+                // journey assembled from a truncated id set is a partial answer
+                // and the caller has to be able to tell.
+                if ids.len() >= XCM_ALIAS_LIMIT {
+                    truncated = true;
+                    continue;
+                }
+                ids.push(candidate.clone());
+            }
+            if !links.iter().any(|k| {
+                (k.chain_id.as_str(), k.block_height, k.wire_event_index)
+                    == (l.chain_id.as_str(), l.block_height, l.wire_event_index)
+            }) {
+                links.push(l);
+            }
+        }
+    }
+
+    let mut rows = match state.xcm.by_message_ids(&ids).await {
+        Ok(r) => r,
+        Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    };
+    // Block timestamp is the ONLY ordering two chains share. `is_none()` first
+    // in the key puts undated steps LAST (Option's own Ord would put them
+    // first), where they read as "we could not place this" rather than as the
+    // start of the journey.
+    rows.sort_by(|a, b| {
+        (a.timestamp.is_none(), a.timestamp, &a.chain_id, a.block_height, a.event_index).cmp(
+            &(b.timestamp.is_none(), b.timestamp, &b.chain_id, b.block_height, b.event_index),
+        )
+    });
+
+    let sends: Vec<&XcmMessageRow> = rows.iter().filter(|r| r.side == "sent").collect();
+    let receives: Vec<&XcmMessageRow> = rows.iter().filter(|r| r.side == "received").collect();
+    let locals: Vec<&XcmMessageRow> = rows.iter().filter(|r| r.side == "local").collect();
+
+    let shape = match (rows.is_empty(), sends.is_empty(), receives.is_empty()) {
+        (true, _, _) => "unseen",
+        (_, false, false) => "send_and_receive",
+        (_, false, true) => "send_only",
+        (_, true, false) => "receive_only",
+        _ if !locals.is_empty() => "local_only",
+        _ => "observations_only",
+    };
+
+    let reads_as = match shape {
+        "unseen" => "no chain we index has seen this id, on either side. That is not the same \
+                     as the message not existing: a journey through a chain we do not map \
+                     leaves no row here"
+            .to_string(),
+        "send_and_receive" => format!(
+            "one message, stitched across {} chain(s): {} sending observation(s) and {} \
+             receiving one(s) carrying the same id. The stitch is id equality plus {} recorded \
+             alias link(s) — see checks and aliases for what corroborates it",
+            distinct_chains(&rows),
+            sends.len(),
+            receives.len(),
+            links.len()
+        ),
+        "send_only" => "only the SENDING half is on record. The message may still be in flight, \
+                        the receiving chain may not be indexed here, or it may have been \
+                        dropped in transit — the three are indistinguishable from this side"
+            .to_string(),
+        "receive_only" => "only the RECEIVING half is on record. The sending chain is either \
+                           not indexed here or emits no sender event for forwarded messages, \
+                           which is what a chain with no XcmEventEmitter does"
+            .to_string(),
+        "local_only" => "this id names a LOCAL execution (pallet_xcm.execute) — an XCM this \
+                         chain ran on itself. It has no counterparty and no journey by \
+                         construction"
+            .to_string(),
+        _ => "observations recorded, but neither a send nor a receive among them".to_string(),
+    };
+
+    // ------------------------------------------------------------ the checks
+    let latest_send = sends.iter().filter_map(|r| r.timestamp).max();
+    let earliest_receive = receives.iter().filter_map(|r| r.timestamp).min();
+    let time_order = match (latest_send, earliest_receive) {
+        (Some(s), Some(r)) if r >= s => serde_json::json!({
+            "status": "ok",
+            "note": "every receiving observation is at or after the last sending one, which is \
+                     what a real journey looks like",
+            "sent_at": s, "received_at": r,
+        }),
+        (Some(s), Some(r)) => serde_json::json!({
+            "status": "contradicted",
+            "note": "a receiving observation PRECEDES the sending one. These are almost \
+                     certainly two different messages that share an id — the likeliest cause \
+                     is a wire hash colliding on identical bytes — and this journey should not \
+                     be read as one operation",
+            "sent_at": s, "received_at": r,
+        }),
+        _ => serde_json::json!({
+            "status": "unknown",
+            "note": "not both halves carry a block timestamp (core.blocks.timestamp is \
+                     nullable), so nothing here orders them",
+        }),
+    };
+
+    let mut mirror_pairs = Vec::new();
+    let mut mirror_status = "unknown";
+    for s in &sends {
+        for r in &receives {
+            if s.chain_id == r.chain_id {
+                continue;
+            }
+            let (Some(from), Some(to)) = (
+                state.registry.chain(&s.chain_id),
+                state.registry.chain(&r.chain_id),
+            ) else {
+                continue;
+            };
+            let expect_sender_says = xcm_counterparty_name(from, to);
+            let expect_receiver_says = xcm_counterparty_name(to, from);
+            let verdict = match (
+                &expect_sender_says,
+                &s.counterparty,
+                &expect_receiver_says,
+                &r.counterparty,
+            ) {
+                (Some(es), Some(gs), Some(er), Some(gr)) if es == gs && er == gr => "corroborated",
+                (Some(es), Some(gs), _, _) if es != gs => "contradicted",
+                (_, _, Some(er), Some(gr)) if er != gr => "contradicted",
+                _ => "unknown",
+            };
+            if verdict == "contradicted" || (verdict == "corroborated" && mirror_status != "contradicted")
+            {
+                mirror_status = verdict;
+            }
+            mirror_pairs.push(serde_json::json!({
+                "from": s.chain_id, "to": r.chain_id, "verdict": verdict,
+                "sender_says": s.counterparty, "sender_should_say": expect_sender_says,
+                "receiver_says": r.counterparty, "receiver_should_say": expect_receiver_says,
+            }));
+        }
+    }
+
+    // Same chain, same side, same id, two different blocks: one id naming two
+    // messages. Two different SENDING chains is NOT flagged — that is exactly
+    // what a multi-hop with a propagated topic looks like.
+    let mut contested = Vec::new();
+    for r in &rows {
+        let Some(id) = &r.message_id else { continue };
+        let twins = rows
+            .iter()
+            .filter(|o| {
+                o.message_id.as_ref() == Some(id)
+                    && o.chain_id == r.chain_id
+                    && o.side == r.side
+                    && (o.block_height, o.event_index) != (r.block_height, r.event_index)
+            })
+            .count();
+        if twins > 0 && !contested.contains(&(r.chain_id.clone(), r.side.clone(), id.clone())) {
+            contested.push((r.chain_id.clone(), r.side.clone(), id.clone()));
+        }
+    }
+
+    let steps: Vec<serde_json::Value> = rows
+        .iter()
+        .enumerate()
+        .map(|(seq, r)| {
+            serde_json::json!({
+                "seq": seq,
+                "chain": r.chain_id,
+                "block_height": r.block_height,
+                "event_index": r.event_index,
+                "timestamp": r.timestamp,
+                "side": r.side,
+                "transport": r.transport,
+                "counterparty": r.counterparty,
+                "message_id": r.message_id,
+                "id_kind": r.id_kind,
+                "status": r.status,
+                "success": r.success,
+                "error": r.error,
+                "forwarded": r.forwarded,
+                "lineage": {
+                    "runtime_version": r.runtime_version,
+                    "mapper_version": r.mapper_version,
+                },
+            })
+        })
+        .collect();
+
+    // The receiving side's verdict, said in the pallet's own terms rather than
+    // ours — `success: true` is a claim about the QUEUE, never about intent.
+    let outcome = receives
+        .iter()
+        .map(|r| r.success)
+        .reduce(|a, b| match (a, b) {
+            (Some(false), _) | (_, Some(false)) => Some(false),
+            (Some(true), Some(true)) => Some(true),
+            _ => None,
+        })
+        .flatten()
+        .map(|ok| if ok {
+            serde_json::json!({
+                "delivered": true, "receiver_success": true,
+                "note": "the receiving chain's message queue treated this as handled and \
+                         discarded it. pallet-message-queue's own doc says that is ALL it \
+                         means — it is not a claim that the XCM achieved its intent",
+            })
+        } else {
+            serde_json::json!({
+                "delivered": true, "receiver_success": false,
+                "note": "the message ARRIVED and its execution did not complete \
+                         (Outcome::Incomplete). Delivery and intent are different facts and \
+                         this journey separates them",
+            })
+        });
+
+    Json(serde_json::json!({
+        "message_id": asked,
+        "shape": shape,
+        "reads_as": reads_as,
+        // Every id this journey was assembled from, the first being the one
+        // asked for. A caller can re-derive the whole answer from these.
+        "ids": ids,
+        "alias_limit_reached": truncated,
+        "aliases": links,
+        "chains": distinct_chains(&rows),
+        "steps": steps,
+        "outcome": outcome,
+        "checks": {
+            "time_order": time_order,
+            "counterparty_mirror": {
+                "status": if mirror_pairs.is_empty() { "unknown" } else { mirror_status },
+                "note": "the receiving chain names the QUEUE a message came from and the \
+                         sending chain names where it addressed one; on a real journey the two \
+                         are mirror images, derived here from registry para ids alone",
+                "pairs": mirror_pairs,
+            },
+            "id_uniqueness": {
+                "status": if contested.is_empty() { "ok" } else { "contested" },
+                "note": "one id naming two messages on one chain and side. A topic cannot \
+                         collide (frame_system::unique mixes intrablock entropy); a wire hash \
+                         is a hash of content and can",
+                "contested": contested
+                    .iter()
+                    .map(|(c, s, i)| serde_json::json!({"chain": c, "side": s, "message_id": i}))
+                    .collect::<Vec<_>>(),
+            },
+        },
+        "coverage": { "not_covered": xcm_journey_not_covered() },
+    }))
+    .into_response()
+}
+
+fn distinct_chains(rows: &[XcmMessageRow]) -> usize {
+    let mut seen: Vec<&str> = Vec::new();
+    for r in rows {
+        if !seen.contains(&r.chain_id.as_str()) {
+            seen.push(&r.chain_id);
+        }
+    }
+    seen.len()
 }
 
 /// Recorded Tier 1 simulations of one call, on one chain.
@@ -5656,9 +6180,11 @@ pub(crate) mod tests {
             observed_at: None,
         });
 
-        // Two halves of one XCM: Asset Hub says it sent topic 0xee to para 2034,
-        // Hydration says it processed 0xee. Deliberately the AMBIGUOUS-id case
-        // on the receiving side, because that is what a real messageQueue row is.
+        // ONE JOURNEY, in the shape live data actually produced (Asset Hub
+        // #19581756 → Hydration #13663124): the sending chain emits TWO ids for
+        // one message — the router's wire hash first, then pallet-xcm's topic —
+        // and the receiving chain reports the TOPIC, under the AMBIGUOUS id kind
+        // because messageQueue never says which of the two it is holding.
         let xcm = Arc::new(MemoryXcmIndex::new());
         let xcm_row = |chain: &str, height: u64, side: &str, id_kind: &str| XcmMessageRow {
             chain_id: chain.into(),
@@ -5679,14 +6205,50 @@ pub(crate) mod tests {
             weight_used: None,
             runtime_version: 2_003_002,
             mapper_version: 1,
+            // The receive is AFTER the send in wall-clock. Two chains' heights
+            // are not comparable, so this is the only thing that orders a
+            // journey — and the only thing that can CONTRADICT one.
+            timestamp: Some(
+                if side == "sent" { "2026-08-17T09:00:00Z" } else { "2026-08-17T09:00:24Z" }
+                    .parse()
+                    .unwrap(),
+            ),
         };
         xcm.insert(xcm_row("polkadot-asset-hub", 19_000_900, "sent", "topic"));
         xcm.insert(xcm_row("hydration", 7_000_100, "received", "ambiguous"));
+        // The SAME Asset Hub message's transport-level record: a second id, one
+        // event EARLIER in the same block, which is the order
+        // `WithUniqueTopic::deliver` produces. Without the link below it is a
+        // dead end — exactly what slice 2 measured on live data.
+        xcm.insert(XcmMessageRow {
+            event_index: 3,
+            message_id: Some(format!("0x{}", "77".repeat(32))),
+            counterparty: None, // the queue event names no recipient
+            ..xcm_row("polkadot-asset-hub", 19_000_900, "sent", "wire_hash")
+        });
         // an older, unrelated observation on the same chain, to pin ordering
         xcm.insert(XcmMessageRow {
             block_height: 19_000_100,
-            message_id: Some(format!("0x{}", "11".repeat(32))),
+            message_id: Some(format!("0x{}", "22".repeat(32))),
+            timestamp: Some("2026-08-17T08:00:00Z".parse().unwrap()),
             ..xcm_row("polkadot-asset-hub", 19_000_100, "sent", "wire_hash")
+        });
+        xcm.insert_link(XcmLinkRow {
+            chain_id: "polkadot-asset-hub".into(),
+            block_height: 19_000_900,
+            wire_event_index: 3,
+            topic_event_index: 4,
+            wire_hash: format!("0x{}", "77".repeat(32)),
+            topic: format!("0x{}", "ee".repeat(32)),
+            transport: "hrmp".into(),
+            rule: "unique_in_block".into(),
+            confidence: "high".into(),
+            evidence: serde_json::json!({
+                "transport_candidates": 1, "ordinal": 0, "event_gap": 1,
+                "block_sends": {"wire": 1, "topic": 1}
+            }),
+            runtime_version: 2_003_002,
+            correlator_version: 1,
         });
 
         // governance stitched across the migration: ref 1500 submitted +
@@ -6644,8 +7206,10 @@ pub(crate) mod tests {
         // Per-chain listing: newest first, and an unknown chain 404s.
         let (_, ah) = get_json(&app, "/v1/xcm/polkadot-asset-hub/messages").await;
         let rows = ah["messages"].as_array().unwrap();
-        assert_eq!(rows.len(), 2);
+        assert_eq!(rows.len(), 3);
         assert_eq!(rows[0]["block_height"], 19_000_900);
+        assert_eq!(rows[0]["event_index"], 3, "newest block first, then event order");
+        assert_eq!(rows[2]["block_height"], 19_000_100);
         assert!(ah["coverage"]["not_covered"]
             .as_array()
             .unwrap()
@@ -6653,6 +7217,107 @@ pub(crate) mod tests {
             .any(|s| s.as_str().unwrap().contains("one-sided OBSERVATIONS")));
         let (s, _) = get_json(&app, "/v1/xcm/nowhere/messages").await;
         assert_eq!(s, StatusCode::NOT_FOUND);
+    }
+
+    /// THE SLICE'S HEADLINE, and the thing slice 2 could not do: a wire hash and
+    /// a topic are the same message, so they must resolve to the same journey —
+    /// and the journey must show what it rests on rather than asserting it.
+    #[tokio::test]
+    async fn a_wire_hash_and_a_topic_resolve_to_one_journey_that_shows_its_working() {
+        let app = router(test_state().await);
+        let topic = format!("0x{}", "ee".repeat(32));
+        let wire = format!("0x{}", "77".repeat(32));
+
+        let (status, j) = get_json(&app, &format!("/v1/xcm/journeys/{}", topic.to_uppercase()))
+            .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(j["message_id"], topic, "0X… normalises like every other hash");
+        assert_eq!(j["shape"], "send_and_receive");
+        assert_eq!(j["chains"], 2, "no request named a chain");
+
+        // Ordered by BLOCK TIMESTAMP, which is the only clock two chains share.
+        let steps = j["steps"].as_array().unwrap();
+        assert_eq!(steps.len(), 3, "both sending ids plus the receiving half");
+        assert_eq!((steps[0]["chain"].as_str(), steps[0]["event_index"].as_u64()),
+                   (Some("polkadot-asset-hub"), Some(3)));
+        assert_eq!(steps[0]["id_kind"], "wire_hash");
+        assert_eq!(steps[1]["id_kind"], "topic");
+        assert_eq!(steps[2]["chain"], "hydration");
+        assert_eq!(steps[2]["id_kind"], "ambiguous");
+        // Invariant 3: every step carries the lineage of the row it came from.
+        assert!(steps.iter().all(|s| s["lineage"]["runtime_version"] == 2_003_002));
+
+        // THE STITCH IS AUDITABLE. The wire row reached this journey through a
+        // recorded link, and the link's rule, confidence and evidence ship with
+        // the answer — a stitch you cannot check is a stitch you cannot trust.
+        let aliases = j["aliases"].as_array().unwrap();
+        assert_eq!(aliases.len(), 1);
+        assert_eq!(aliases[0]["rule"], "unique_in_block");
+        assert_eq!(aliases[0]["confidence"], "high");
+        assert_eq!(aliases[0]["evidence"]["event_gap"], 1);
+        let ids = j["ids"].as_array().unwrap();
+        assert_eq!(ids.len(), 2);
+        assert_eq!(j["alias_limit_reached"], false);
+
+        // The checks can come back CONTRADICTED in public; here they do not.
+        assert_eq!(j["checks"]["time_order"]["status"], "ok");
+        assert_eq!(
+            j["checks"]["counterparty_mirror"]["status"], "corroborated",
+            "Asset Hub says para:2034 and Hydration says para:1000 — mirror images, from \
+             registry para ids alone"
+        );
+        assert_eq!(j["checks"]["id_uniqueness"]["status"], "ok");
+
+        // Delivery and intent are different facts, and the payload keeps them so.
+        assert_eq!(j["outcome"]["delivered"], true);
+        assert_eq!(j["outcome"]["receiver_success"], true);
+        assert!(j["outcome"]["note"].as_str().unwrap().contains("not a claim"));
+
+        // THE DEAD END SLICE 2 MEASURED, now closed: asking by the WIRE hash
+        // returns the same journey, because the alias expansion runs first.
+        let (_, by_wire) = get_json(&app, &format!("/v1/xcm/journeys/{wire}")).await;
+        assert_eq!(by_wire["shape"], "send_and_receive");
+        assert_eq!(by_wire["steps"].as_array().unwrap().len(), 3);
+        assert_eq!(by_wire["message_id"], wire, "asked by the id you typed");
+        // …while the plain observation endpoint still answers only about the id
+        // it was given. Two endpoints, two questions, neither pretending.
+        let (_, obs) = get_json(&app, &format!("/v1/xcm/messages/{wire}")).await;
+        assert_eq!(obs["observations"].as_array().unwrap().len(), 1);
+        assert_eq!(obs["journey"], format!("/v1/xcm/journeys/{wire}"));
+
+        // A wire hash from a block that recorded NO link reaches only its own
+        // half — the refusal is the feature, and it renders as send_only rather
+        // than as a journey with a missing end.
+        let (_, lone) = get_json(&app, &format!("/v1/xcm/journeys/0x{}", "22".repeat(32))).await;
+        assert_eq!(lone["shape"], "send_only");
+        assert!(lone["aliases"].as_array().unwrap().is_empty());
+        assert_eq!(lone["ids"].as_array().unwrap().len(), 1);
+        assert_eq!(lone["checks"]["time_order"]["status"], "unknown");
+
+        // An id nobody saw is not "the message does not exist".
+        let (_, unseen) = get_json(&app, &format!("/v1/xcm/journeys/0x{}", "99".repeat(32))).await;
+        assert_eq!(unseen["shape"], "unseen");
+        assert!(unseen["steps"].as_array().unwrap().is_empty());
+        assert!(unseen["reads_as"].as_str().unwrap().contains("chain we do not map"));
+
+        // The honest limits ship in the payload, including the rule we did NOT
+        // write and why its window may be empty.
+        let gaps = j["coverage"]["not_covered"].as_array().unwrap();
+        assert!(gaps.iter().any(|g| g.as_str().unwrap().contains("NO hop rule")));
+        assert!(gaps.iter().any(|g| g.as_str().unwrap().contains("hash of CONTENT")));
+        // AND IT NEVER SENDS THE READER TO THE ENDPOINT THEY ARE ALREADY ON. The
+        // observations endpoint's own first line says "nothing on THIS endpoint
+        // asserts it — /v1/xcm/journeys/{id} is the endpoint that does", which is
+        // correct there and wrong here in both halves. It shipped that way because
+        // the two lists share a helper, which is precisely how the same class of
+        // stale line reached the review one endpoint over. Assert the property, not
+        // the wording, so a future edit to either list cannot reintroduce it.
+        assert!(
+            !gaps
+                .iter()
+                .any(|g| g.as_str().unwrap().contains("/v1/xcm/journeys/{id} is the endpoint")),
+            "the journey endpoint's not_covered must not defer to the journey endpoint"
+        );
     }
 
     #[tokio::test]

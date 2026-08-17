@@ -42,6 +42,12 @@ pub mod tip_pg;
 #[cfg(feature = "pg")]
 pub mod xcm_pg;
 
+/// XCM id links (Phase 3, slice 3) — the correlator's only stored inference,
+/// rewritten per block rather than appended, because a rule change must be able
+/// to replace a conclusion.
+#[cfg(feature = "pg")]
+pub mod xcm_links_pg;
+
 /// Tier 1 simulation results (Phase 3, slice 1) — immutable observations.
 #[cfg(feature = "pg")]
 pub mod sim_pg;

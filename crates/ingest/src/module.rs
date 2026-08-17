@@ -122,6 +122,44 @@ macro_rules! impl_module_error {
 }
 pub(crate) use impl_module_error;
 
+/// Why a BLOCK-level mapper refused, in the coordinates the halt message needs.
+///
+/// A per-event mapper is handed one event and returns a `String`, because the
+/// runtime already knows which event it passed in. A block-level one is handed
+/// the whole list and must SAY which event it choked on, or the halt names a
+/// block and leaves whoever reads it at 3am to find the row themselves.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlockMapError {
+    pub event_index: u32,
+    pub event: String,
+    pub reason: String,
+}
+
+/// How a module turns one decoded block into facts.
+///
+/// Seven modules map ONE EVENT AT A TIME and cannot see their neighbours, which
+/// is the right shape for "this event says money moved". The XCM correlator
+/// cannot work that way: its whole subject is a RELATIONSHIP between two events
+/// in one block (a wire-hash send and the topic send that discarded it), so a
+/// per-event closure would have to keep state between calls — and a mapper with
+/// hidden state is a mapper whose output depends on how it was invoked.
+///
+/// So the runtime learns one new shape rather than the correlator growing a
+/// seventh hand-copy of `run_range`. That is the same trade slice 8 made: the
+/// loop stays in one file, and the price is one enum here instead of ~200
+/// duplicated lines there.
+pub enum Mapping<'a, F> {
+    /// `Fn(&event) -> facts`. The row's event index is the event's own.
+    PerEvent(Box<dyn Fn(&CanonicalEvent) -> Result<Vec<F>, String> + Send + Sync + 'a>),
+    /// `Fn(&[event]) -> (event index, fact)`. The mapper CHOOSES each row's
+    /// event index, because a fact about a relationship has to be keyed to one
+    /// of its two ends and only the mapper knows which.
+    PerBlock(
+        #[allow(clippy::type_complexity)]
+        Box<dyn Fn(&[CanonicalEvent]) -> Result<Vec<(u32, F)>, BlockMapError> + Send + Sync + 'a>,
+    ),
+}
+
 /// Where one block's facts land.
 ///
 /// Every domain sink already had precisely this signature with only the fact
@@ -166,7 +204,7 @@ pub struct ModuleRun<'a, F> {
     pub module: &'static str,
     pub checkpoints: &'a dyn CheckpointStore,
     pub source: &'a dyn EventSource,
-    pub map: Box<dyn Fn(&CanonicalEvent) -> Result<Vec<F>, String> + Send + Sync + 'a>,
+    pub map: Mapping<'a, F>,
     /// REQUIREMENT, not an optimisation: this is read ONCE, when the run is
     /// built, and every row the run writes carries it. For a `*_range` that is
     /// one range; for a `*_follow` it is the lifetime of the process. The five
@@ -224,21 +262,37 @@ where
             continue;
         };
 
-        let mut rows: Vec<(u32, F)> = Vec::new();
-        for ev in &block.events {
-            let facts = (run.map)(ev).map_err(|reason| {
+        let rows: Vec<(u32, F)> = match &run.map {
+            Mapping::PerEvent(map) => {
+                let mut rows = Vec::new();
+                for ev in &block.events {
+                    let facts = map(ev).map_err(|reason| {
+                        E::mapper_failed(
+                            chain_id.to_string(),
+                            height,
+                            ev.index,
+                            ev.name.clone(),
+                            reason,
+                        )
+                    })?;
+                    for f in facts {
+                        rows.push((ev.index, f));
+                    }
+                }
+                rows
+            }
+            // Same halt, same wording, same "writes nothing and advances
+            // nothing" — the only difference is who names the offending event.
+            Mapping::PerBlock(map) => map(&block.events).map_err(|e| {
                 E::mapper_failed(
                     chain_id.to_string(),
                     height,
-                    ev.index,
-                    ev.name.clone(),
-                    reason,
+                    e.event_index,
+                    e.event,
+                    e.reason,
                 )
-            })?;
-            for f in facts {
-                rows.push((ev.index, f));
-            }
-        }
+            })?,
+        };
         if !rows.is_empty() {
             run.sink
                 .write_facts(
