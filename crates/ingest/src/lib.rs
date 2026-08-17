@@ -6,6 +6,7 @@
 //! the Postgres backend is a first-class implementation, not a bolt-on.
 
 pub mod balances;
+pub mod bounties;
 pub mod decode;
 pub mod gov;
 pub mod live;

@@ -35,6 +35,61 @@ pub fn pallet_account(pallet_id: &[u8; 8]) -> [u8; 32] {
     padded(b"modl", pallet_id)
 }
 
+/// One component of a pallet SUB-account's derivation key. The distinction
+/// between the two variants is not cosmetic: SCALE encodes a `&str` with a
+/// compact length prefix and a fixed-size `[u8; N]` without one, so `Str("bt")`
+/// and `Bytes(b"mbt")` produce different addresses even before their contents
+/// differ. Both are in use — the legacy bounty pallets pass string literals,
+/// pallet-multi-asset-bounties passes a `Get<[u8; 3]>`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubKey<'a> {
+    /// A Rust `&str` in the tuple → compact(len) ++ bytes.
+    Str(&'a str),
+    /// A fixed-size byte array in the tuple → raw bytes, no length prefix.
+    Bytes(&'a [u8]),
+    /// A `u32` index → 4 bytes little-endian.
+    Index(u32),
+}
+
+/// `b"modl" ++ pallet_id ++ SCALE(parts)`, zero-padded — a pallet SUB-account,
+/// i.e. `PalletId::into_sub_account_truncating(parts)`.
+///
+/// This is how per-object accounts are derived: bounty 17's funds live at
+/// `modl ++ py/trsry ++ SCALE(("bt", 17u32))`, because the bounty pallet holds
+/// its money in sub-accounts of the TREASURY's pallet id, not its own. Same
+/// mechanism, different prefixes, for child bounties and for the multi-asset
+/// generation.
+///
+/// Returns None if the derivation key would exceed the 28 bytes available
+/// after the `modl` tag — the real `into_sub_account_truncating` truncates
+/// silently, which would collide two different objects onto one address. We
+/// refuse instead: an address we cannot derive unambiguously is not an address
+/// we should label.
+pub fn sub_account(pallet_id: &[u8; 8], parts: &[SubKey<'_>]) -> Option<[u8; 32]> {
+    let mut body: Vec<u8> = pallet_id.to_vec();
+    for part in parts {
+        match part {
+            SubKey::Str(s) => {
+                // SCALE compact length. Every prefix in use is 2-3 bytes, so
+                // the single-byte compact form is the only reachable one; a
+                // longer one would be a caller error, not an encoding case.
+                let bytes = s.as_bytes();
+                if bytes.len() >= 64 {
+                    return None;
+                }
+                body.push((bytes.len() as u8) << 2);
+                body.extend_from_slice(bytes);
+            }
+            SubKey::Bytes(b) => body.extend_from_slice(b),
+            SubKey::Index(i) => body.extend_from_slice(&i.to_le_bytes()),
+        }
+    }
+    if body.len() > 28 {
+        return None;
+    }
+    Some(padded(b"modl", &body))
+}
+
 /// `b"para" ++ u32_le(para_id)`, zero-padded — the parachain's sovereign
 /// account ON THE RELAY chain.
 pub fn para_sovereign(para_id: u32) -> [u8; 32] {
@@ -228,6 +283,57 @@ mod tests {
 
     // ---- golden vectors from ECOSYSTEM.md §6, independently re-derived at
     // authoring time (python blake2/base58) — these pin the derivation forever.
+
+    /// Sub-account derivation, pinned to vectors computed independently at
+    /// authoring time — and note WHY there are two encodings: `("bt", 17u32)`
+    /// puts a SCALE compact length byte (0x08) before "bt", while the
+    /// multi-asset pallet's `Get<[u8; 3]>` prefix is raw. Getting that wrong
+    /// yields a plausible-looking address that holds nothing, which is why
+    /// `verify-labels` probes these on chain rather than trusting the maths.
+    #[test]
+    fn bounty_sub_accounts_derive_with_the_right_scale_encoding() {
+        let t = b"py/trsry";
+        let hexed = |a: [u8; 32]| format!("0x{}", hex::encode(a));
+
+        let bounty17 = sub_account(t, &[SubKey::Str("bt"), SubKey::Index(17)]).unwrap();
+        assert_eq!(
+            hexed(bounty17),
+            "0x6d6f646c70792f74727372790862741100000000000000000000000000000000"
+        );
+        // 'modl' 'py/trsry' then 0x08 = compact(2), then "bt", then 17u32 LE
+        assert_eq!(&bounty17[..4], b"modl");
+        assert_eq!(&bounty17[4..12], t);
+        assert_eq!(bounty17[12], 0x08, "compact length prefix for a &str");
+        assert_eq!(&bounty17[13..15], b"bt");
+        assert_eq!(&bounty17[15..19], &17u32.to_le_bytes());
+
+        let child = sub_account(t, &[SubKey::Str("cb"), SubKey::Index(17), SubKey::Index(2)])
+            .unwrap();
+        assert_eq!(
+            hexed(child),
+            "0x6d6f646c70792f74727372790863621100000002000000000000000000000000"
+        );
+        // the parent and its child must NOT collide — the whole reason the
+        // pallet changed the prefix
+        assert_ne!(child, bounty17);
+
+        // the modern pallet's prefix is a fixed-size array: NO length byte
+        let mab = sub_account(t, &[SubKey::Bytes(b"mbt"), SubKey::Index(1)]).unwrap();
+        assert_eq!(
+            hexed(mab),
+            "0x6d6f646c70792f74727372796d62740100000000000000000000000000000000"
+        );
+        assert_eq!(&mab[12..15], b"mbt", "no compact prefix before a [u8; 3]");
+        let mab_child =
+            sub_account(t, &[SubKey::Bytes(b"mcb"), SubKey::Index(1), SubKey::Index(0)]).unwrap();
+        assert_ne!(mab_child, mab);
+        // and the two GENERATIONS must not collide at the same index either
+        assert_ne!(mab, bounty17);
+
+        // a key that would not fit is REFUSED, never truncated into a
+        // collision with a different object
+        assert!(sub_account(t, &[SubKey::Bytes(&[0u8; 24])]).is_none());
+    }
 
     #[test]
     fn treasury_pallet_account_matches_ecosystem_golden_vector() {

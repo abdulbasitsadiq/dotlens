@@ -2175,3 +2175,332 @@ async fn asset_balances_share_the_balances_tables_and_holdings_join_their_assets
 
     db.drop_db().await;
 }
+
+// ------------------------------------------------------------------ bounties
+
+/// THE OUTFLOW NEITHER 0009 NOR 0010 COULD SEE, end to end: three pallets into
+/// one table, a parent and a child told apart by the sentinel, a projection
+/// that converges when the claim is ingested before the proposal — and the one
+/// column in this project that is NOT a pure function of the facts, proved to
+/// accumulate exactly once under a replay of the same event.
+#[tokio::test]
+async fn bounty_facts_converge_and_derived_accounts_join_the_treasury_list() {
+    use adapter_substrate::accounts::{para_sovereign, sub_account, SubKey};
+    use adapter_substrate::bounties::SubstrateBountyMapper;
+    use api::BountyIndex as _;
+    use canonical::{CanonicalBlock, CanonicalEvent, Lineage};
+
+    let Some(db) = TestDb::create().await else { return };
+    let reg = seeds();
+    sync_registry(&db.pool, &reg).await.expect("registry sync");
+
+    let payee = para_sovereign(2034);
+    // `[vec![b; 32]]`, never `[[b; 32]]` — the json! array-repeat trap
+    let acct = |a: &[u8; 32]| serde_json::json!([a.to_vec()]);
+    let ev = |index: u32, name: &str, data: serde_json::Value| CanonicalEvent {
+        index,
+        transaction_index: Some(0),
+        name: name.into(),
+        data,
+    };
+    let block = |height: u64, ts: &str, events: Vec<CanonicalEvent>| CanonicalBlock {
+        chain_id: "polkadot-asset-hub".into(),
+        height,
+        hash: format!("0x{height:064x}"),
+        parent_hash: format!("0x{:064x}", height - 1),
+        timestamp: Some(ts.parse().unwrap()),
+        finalized: true,
+        lineage: Lineage {
+            runtime_version: 2_003_002,
+            decoder_version: 2,
+            raw_location: format!("raw/polkadot-asset-hub/test/{height}"),
+        },
+        transactions: vec![],
+        events,
+    };
+    // 2^65 planck: a payout that has no business fitting in a u64
+    let big = "36893488147419103232";
+    let index = PgBlockIndex::new(db.pool.clone());
+    index
+        .insert(block(600, "2026-01-01T00:00:00Z", vec![ev(
+            0,
+            "bounties.BountyProposed",
+            serde_json::json!({"index": 22}),
+        )]))
+        .await
+        .expect("ah 600");
+    // an INFO-ONLY event: it names bounty 1 and carries its value, but moves
+    // no status. The treasury sink would drop a fact like this; a bounty page
+    // that dropped it would never know what any bounty is worth.
+    index
+        .insert(block(605, "2026-01-02T00:00:00Z", vec![ev(
+            0,
+            "multiassetbounties.BountyValueIncreased",
+            serde_json::json!({"index": 1, "old_value": 100u64, "new_value": "83760000000"}),
+        )]))
+        .await
+        .expect("ah 605");
+    index
+        .insert(block(610, "2026-01-03T00:00:00Z", vec![ev(
+            0,
+            "multiassetbounties.BountyPayoutProcessed",
+            serde_json::json!({
+                "index": 1,
+                "child_index": {"None": []},
+                "asset_kind": {"V4": [{
+                    "location": {"parents": 0, "interior": {"Here": []}},
+                    "asset_id": [{"parents": 0, "interior": {"X2": [[
+                        {"PalletInstance": [50]}, {"GeneralIndex": [1984]}
+                    ]]}}]
+                }]},
+                "value": "83760000000",
+                "beneficiary": acct(&payee),
+            }),
+        )]))
+        .await
+        .expect("ah 610");
+    index
+        .insert(block(620, "2026-01-04T00:00:00Z", vec![
+            ev(0, "bounties.BountyClaimed", serde_json::json!({
+                "index": 22, "payout": big, "beneficiary": acct(&payee),
+            })),
+            // the SAME parent id in a different pallet: a child bounty, which
+            // the sentinel is what distinguishes
+            ev(1, "childbounties.Claimed", serde_json::json!({
+                "index": 22, "child_index": 3, "payout": 500u64,
+                "beneficiary": acct(&payee),
+            })),
+        ]))
+        .await
+        .expect("ah 620");
+
+    let checkpoints = PgCheckpointStore::new(db.pool.clone());
+    let source = dotlens_node::balances_pg::PgEventSource::new(db.pool.clone());
+    // DELIBERATELY with no PalletId: this is a `bounties-range` run before any
+    // metadata was archived, so `account_id` lands NULL and
+    // `sync_bounty_accounts` has to converge it later
+    let sink = dotlens_node::bounties_pg::PgBountySink::new(db.pool.clone(), None);
+    let deps = ingest::bounties::BountyDeps {
+        checkpoints: &checkpoints,
+        source: &source,
+        sink: &sink,
+    };
+    let idx = api::pg::PgBountyIndex::new(db.pool.clone());
+
+    // OUT OF ORDER, worst first: the claim before the proposal, and the
+    // value raise before the payout that gives the bounty a status at all.
+    ingest::bounties::bounties_range("polkadot-asset-hub", &SubstrateBountyMapper, &deps, 620, 620)
+        .await
+        .expect("terminal first");
+    ingest::bounties::bounties_range("polkadot-asset-hub", &SubstrateBountyMapper, &deps, 605, 605)
+        .await
+        .expect("info only");
+
+    // ---- 1. the placeholder: a bounty known ONLY by an info event ---------
+    let placeholder = idx
+        .bounty("polkadot-asset-hub", "multi_asset_bounties", 1, None)
+        .await
+        .unwrap()
+        .expect("the raise created a row");
+    assert_eq!(
+        placeholder.status, "unknown",
+        "an info-only event records the bounty without claiming to know its state"
+    );
+    assert_eq!(placeholder.value.as_deref(), Some("83760000000"));
+    assert!(placeholder.paid_out.is_none(), "a raise is not a payment");
+
+    ingest::bounties::bounties_range("polkadot-asset-hub", &SubstrateBountyMapper, &deps, 600, 600)
+        .await
+        .expect("proposal, older than the claim");
+    ingest::bounties::bounties_range("polkadot-asset-hub", &SubstrateBountyMapper, &deps, 610, 610)
+        .await
+        .expect("payout, newer than the raise");
+
+    // ---- 2. three instances, one table; parent and child told apart -------
+    let parent = idx
+        .bounty("polkadot-asset-hub", "bounties", 22, None)
+        .await
+        .unwrap()
+        .expect("legacy bounty 22");
+    assert!(parent.child_id.is_none(), "the -1 sentinel never reaches a reader");
+    assert_eq!(parent.status, "claimed", "the older proposal must not regress it");
+    assert_eq!(parent.first_seen_height, 600, "least() keeps the earliest sighting");
+    assert_eq!(parent.paid_out.as_deref(), Some(big), "2^65 survived as NUMERIC");
+
+    let child = idx
+        .bounty("polkadot-asset-hub", "child_bounties", 22, Some(3))
+        .await
+        .unwrap()
+        .expect("child bounty 22-3");
+    assert_eq!(child.child_id, Some(3));
+    assert_eq!(child.paid_out.as_deref(), Some("500"));
+    // …and the same numbers in the legacy instance are a DIFFERENT bounty
+    assert!(idx
+        .bounty("polkadot-asset-hub", "bounties", 22, Some(3))
+        .await
+        .unwrap()
+        .is_none());
+
+    let modern = idx
+        .bounty("polkadot-asset-hub", "multi_asset_bounties", 1, None)
+        .await
+        .unwrap()
+        .expect("multi-asset bounty 1");
+    assert_eq!(modern.status, "claimed", "the payout moved it off the placeholder");
+    assert_eq!(modern.value.as_deref(), Some("83760000000"));
+    assert_eq!(modern.paid_out.as_deref(), Some("83760000000"));
+    // the payout names its asset exactly as a treasury spend does, and
+    // normalizes to the SAME canonical string core.assets holds for USDT
+    let usdt_key = adapter_substrate::assets::canonical_location(
+        &adapter_substrate::assets::local_asset_location(50, 1984),
+    )
+    .expect("canonical");
+    assert_eq!(
+        modern
+            .asset_ref
+            .as_ref()
+            .and_then(|r| r.pointer("/location/asset"))
+            .map(|a| a.to_string()),
+        Some(usdt_key),
+        "a bounty payout joins core.assets through the same key a spend does"
+    );
+
+    let (instances,): (i64,) =
+        sqlx::query_as("select count(distinct instance) from treasury.bounties")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!(instances, 3, "three pallets, one table");
+
+    // ---- 3. partition routing --------------------------------------------
+    let (in_default,): (i64,) =
+        sqlx::query_as("select count(*) from treasury.bounty_events_default")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!(in_default, 0, "facts must route to per-chain partitions");
+
+    // ---- 4. THE NON-IDEMPOTENT COLUMN, replayed --------------------------
+    // Every other projection here is a pure function of the facts, so a replay
+    // is free. `paid_out` is a running total, and it is safe ONLY because the
+    // sink adds a payout when the FACT ROW was really inserted. Replay the
+    // whole span and the totals must not move.
+    ingest::bounties::bounties_range("polkadot-asset-hub", &SubstrateBountyMapper, &deps, 600, 620)
+        .await
+        .expect("replay");
+    let (facts,): (i64,) = sqlx::query_as("select count(*) from treasury.bounty_events")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(facts, 5, "insert-ignore: replay adds no facts");
+    let replayed = idx
+        .bounty("polkadot-asset-hub", "bounties", 22, None)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        replayed.paid_out.as_deref(),
+        Some(big),
+        "a payout counted twice is the whole reason this sink reads `returning`"
+    );
+    let modern_replayed = idx
+        .bounty("polkadot-asset-hub", "multi_asset_bounties", 1, None)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(modern_replayed.paid_out.as_deref(), Some("83760000000"));
+    assert_eq!(modern_replayed.status, "claimed", "replay must not regress it");
+
+    // the timeline reads in order, and the child's events are its own
+    let timeline = idx
+        .bounty_events("polkadot-asset-hub", "bounties", 22, None)
+        .await
+        .unwrap();
+    let kinds: Vec<&str> = timeline.iter().map(|e| e.kind.as_str()).collect();
+    assert_eq!(kinds, vec!["proposed", "claimed"]);
+    assert!(timeline[0].timestamp.is_some(), "joined to the block timestamp");
+
+    // ---- 5. the accounts, which is what closes the holdings gap ----------
+    let raw_dir = tmp_raw("bounties");
+    let raw = FsRawStore::new(&raw_dir);
+    let meta_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../fixtures/real/polkadot-asset-hub-19498783/metadata.scale");
+    let Ok(blob) = std::fs::read(&meta_path) else {
+        eprintln!("NOTE: real fixture metadata absent — account derivation assertions skipped");
+        db.drop_db().await;
+        return;
+    };
+    let key = raw_store::keys::metadata("polkadot-asset-hub", 2_003_002);
+    raw.put(&key, &blob, "test").expect("stage metadata");
+    sqlx::query(
+        "insert into substrate.runtime_versions \
+             (chain_id, spec_version, metadata_version, metadata_blob_location) \
+         values ($1, $2, 14, $3) on conflict do nothing",
+    )
+    .bind("polkadot-asset-hub")
+    .bind(2_003_002i64)
+    .bind(&key)
+    .execute(&db.pool)
+    .await
+    .expect("runtime_versions row");
+
+    let report = dotlens_node::bounties_pg::sync_bounty_accounts(&db.pool, &reg, &raw)
+        .await
+        .expect("bounty account sync");
+    // every bounty in this fixture is CLAIMED, i.e. terminal, so every account
+    // that could be derived is registered INACTIVE: its funds are gone and the
+    // holdings sweep (accounts × assets, zeros included) must not keep paying
+    // for it. The rows still exist — being retired is not being deleted.
+    assert_eq!(report.accounts, 0, "a claimed bounty is not swept");
+    assert_eq!(report.deactivated, 2);
+    // …and the legacy CHILD bounty is refused outright: its address depends on
+    // whether it predates pallet-child-bounties 38.0.0's renumbering, which
+    // this table does not record
+    assert_eq!(report.underivable, 1, "a legacy child bounty is not derivable");
+    assert_eq!(report.linked, 2, "every derivable row's null account_id converged");
+
+    // the address is DERIVED, not curated: bounty 22's money lives at
+    // modl ++ py/trsry ++ SCALE(("bt", 22u32))
+    let expected = sub_account(b"py/trsry", &[SubKey::Str("bt"), SubKey::Index(22)])
+        .expect("derives");
+    let (label, derivation, network, active): (String, Option<String>, String, bool) =
+        sqlx::query_as(
+            "select label, derivation, network, active from treasury.treasury_accounts \
+             where chain_id = 'polkadot-asset-hub' and account_id = $1 and role = 'bounty'",
+        )
+        .bind(&expected[..])
+        .fetch_one(&db.pool)
+        .await
+        .expect("the bounty account row");
+    assert_eq!(label, "Bounty 22");
+    assert_eq!(derivation.as_deref(), Some("modl:py/trsry/bt/22"));
+    assert!(!active, "bounty 22 is claimed, so its account is retired");
+    // …and it is registered on the NETWORK the holdings endpoint queries by
+    assert_eq!(network, "polkadot");
+    // the projection's join column now points at the same address
+    let linked = idx
+        .bounty("polkadot-asset-hub", "bounties", 22, None)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        linked.account_id,
+        Some(format!("0x{}", hex::encode(expected))),
+        "the projection and the account list must name one address"
+    );
+
+    // idempotent, and `linked` drops to zero once nothing is null
+    let again = dotlens_node::bounties_pg::sync_bounty_accounts(&db.pool, &reg, &raw)
+        .await
+        .expect("second sync");
+    assert_eq!(again.linked, 0, "nothing left to converge");
+    let (accounts,): (i64,) = sqlx::query_as(
+        "select count(*) from treasury.treasury_accounts where role = 'bounty'",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(accounts, 2, "bounty account sync must be idempotent");
+
+    db.drop_db().await;
+}

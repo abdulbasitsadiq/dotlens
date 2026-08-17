@@ -801,6 +801,207 @@ impl TreasuryIndex for MemoryTreasuryIndex {
     }
 }
 
+// ----------------------------------------------------------------- bounties
+
+/// The instance a bounty request means when it does not say. The legacy pallet
+/// holds nearly every bounty Polkadot has ever funded; the modern one is where
+/// new ones land. Echoed in every response, so the default is stated rather
+/// than assumed.
+pub const DEFAULT_BOUNTY_INSTANCE: &str = "bounties";
+
+/// The `child_id` migration 0011 stores for "the parent bounty itself". Stated
+/// here because this crate depends on no adapter (Invariant 4); a test pins it
+/// against `adapter_substrate::bounties::PARENT_SENTINEL`.
+pub const PARENT_SENTINEL: i64 = -1;
+
+/// One bounty or child bounty (a `treasury.bounties` row), query-shaped.
+///
+/// `child_id` is `Option<u64>` and NEVER the -1 the table stores: the sentinel
+/// exists so the projection can have a primary key, and migration 0011 makes
+/// rendering it back to null a contract. `None` means "the parent bounty".
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct BountyRow {
+    /// bounties | child_bounties | multi_asset_bounties.
+    pub instance: String,
+    pub bounty_id: u64,
+    pub child_id: Option<u64>,
+    /// proposed|approved|funded|curator_proposed|active|awarded|claimed|
+    /// canceled|rejected|payment_failed|unknown ('unknown' = only information
+    /// events seen so far, e.g. a value raise before the creation block was
+    /// indexed).
+    pub status: String,
+    /// What the bounty is WORTH. NOT what it has left — a bounty's remaining
+    /// balance is its ACCOUNT balance, which is why `account_id` is here.
+    pub value: Option<String>,
+    /// Sum of concluded payouts, as the pallets announce them: the
+    /// BENEFICIARY'S SHARE, NET OF THE CURATOR FEE, which no event carries. A
+    /// bounty spent more than this. Null means no payout has been seen, which
+    /// is not the same as zero.
+    pub paid_out: Option<String>,
+    /// The PROPOSER'S slashed bond on a rejection. Never bounty spending.
+    pub bond: Option<String>,
+    pub curator: Option<String>,
+    pub beneficiary: Option<String>,
+    pub beneficiary_location: Option<serde_json::Value>,
+    pub payment_id: Option<String>,
+    /// The bounty's own derived account, 0x-hex — the join to holdings, and
+    /// the only place the answer to "how much is left" can come from. Null
+    /// until `sync-bounty-accounts` has run against archived metadata.
+    pub account_id: Option<String>,
+    pub first_seen_height: u64,
+    pub status_height: u64,
+    /// `{"location": {"chain": …, "asset": …}, "key": …, "kind": …}` — what a
+    /// multi-asset payout was DENOMINATED in, in the same shape a treasury
+    /// spend carries, resolving through the same `core.assets` join. Null on
+    /// the two legacy pallets, which are native-token-only by construction.
+    pub asset_ref: Option<serde_json::Value>,
+}
+
+/// One bounty event (a `treasury.bounty_events` row) — a step in a bounty's
+/// life. Shaped like a spend event and deliberately not the same type: these
+/// are different tables with different vocabularies, and one struct serving
+/// both would make the next column added to either a lie about the other.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct BountyEventRow {
+    pub height: u64,
+    pub timestamp: Option<DateTime<Utc>>,
+    pub event_index: u32,
+    pub kind: String,
+    pub amount: Option<String>,
+    pub data: serde_json::Value,
+}
+
+/// Read side of the bounty schema, per chain. Stitched across chains through
+/// the TREASURY residency domain, because bounty funds are sub-accounts of the
+/// treasury's pallet id and move where the treasury moves.
+#[async_trait]
+pub trait BountyIndex: Send + Sync {
+    /// Bounties of one instance, newest id first. `child_id` is left as stored
+    /// per row, so a listing shows parents and children together — which is
+    /// how the money is actually held.
+    async fn bounties(
+        &self,
+        chain_id: &str,
+        instance: &str,
+        status: Option<&str>,
+        limit: u64,
+    ) -> Result<Vec<BountyRow>, IndexError>;
+    /// `child_id = None` addresses the parent bounty itself.
+    async fn bounty(
+        &self,
+        chain_id: &str,
+        instance: &str,
+        bounty_id: u64,
+        child_id: Option<u64>,
+    ) -> Result<Option<BountyRow>, IndexError>;
+    async fn bounty_events(
+        &self,
+        chain_id: &str,
+        instance: &str,
+        bounty_id: u64,
+        child_id: Option<u64>,
+    ) -> Result<Vec<BountyEventRow>, IndexError>;
+}
+
+#[derive(Default)]
+pub struct MemoryBountyIndex {
+    bounties: RwLock<HashMap<(String, String, u64, Option<u64>), BountyRow>>,
+    events: RwLock<HashMap<(String, String), Vec<((u64, Option<u64>), BountyEventRow)>>>,
+}
+
+impl MemoryBountyIndex {
+    pub fn new() -> Self {
+        Self::default()
+    }
+    pub fn insert_bounty(&self, chain: &str, row: BountyRow) {
+        self.bounties.write().expect("lock").insert(
+            (
+                chain.into(),
+                row.instance.clone(),
+                row.bounty_id,
+                row.child_id,
+            ),
+            row,
+        );
+    }
+    pub fn insert_event(
+        &self,
+        chain: &str,
+        instance: &str,
+        subject: (u64, Option<u64>),
+        row: BountyEventRow,
+    ) {
+        self.events
+            .write()
+            .expect("lock")
+            .entry((chain.into(), instance.into()))
+            .or_default()
+            .push((subject, row));
+    }
+}
+
+#[async_trait]
+impl BountyIndex for MemoryBountyIndex {
+    async fn bounties(
+        &self,
+        chain_id: &str,
+        instance: &str,
+        status: Option<&str>,
+        limit: u64,
+    ) -> Result<Vec<BountyRow>, IndexError> {
+        let map = self.bounties.read().map_err(|e| IndexError(e.to_string()))?;
+        let mut rows: Vec<BountyRow> = map
+            .iter()
+            .filter(|((c, i, _, _), r)| {
+                c == chain_id && i == instance && status.is_none_or(|s| r.status == s)
+            })
+            .map(|(_, r)| r.clone())
+            .collect();
+        // by ID, never by height: two residency windows are two block-number
+        // lines, and sorting merged rows by height floats every relay-era
+        // bounty above every recent one (the rule the spend list learned)
+        rows.sort_by(|a, b| {
+            b.bounty_id
+                .cmp(&a.bounty_id)
+                .then_with(|| b.child_id.cmp(&a.child_id))
+        });
+        rows.truncate(limit as usize);
+        Ok(rows)
+    }
+    async fn bounty(
+        &self,
+        chain_id: &str,
+        instance: &str,
+        bounty_id: u64,
+        child_id: Option<u64>,
+    ) -> Result<Option<BountyRow>, IndexError> {
+        let map = self.bounties.read().map_err(|e| IndexError(e.to_string()))?;
+        Ok(map
+            .get(&(chain_id.into(), instance.into(), bounty_id, child_id))
+            .cloned())
+    }
+    async fn bounty_events(
+        &self,
+        chain_id: &str,
+        instance: &str,
+        bounty_id: u64,
+        child_id: Option<u64>,
+    ) -> Result<Vec<BountyEventRow>, IndexError> {
+        let map = self.events.read().map_err(|e| IndexError(e.to_string()))?;
+        let mut rows: Vec<BountyEventRow> = map
+            .get(&(chain_id.into(), instance.into()))
+            .map(|rows| {
+                rows.iter()
+                    .filter(|(subject, _)| *subject == (bounty_id, child_id))
+                    .map(|(_, r)| r.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
+        rows.sort_by_key(|r| (r.height, r.event_index));
+        Ok(rows)
+    }
+}
+
 /// Read side of the gov schema, per chain. The API stitches chains together
 /// via governance domain residency (referendum numbering is continuous across
 /// the Nov 2025 migration; one referendum may have rows on both chains).
@@ -2198,6 +2399,199 @@ pub mod pg {
         }
     }
 
+    /// Postgres-backed bounty reads over `treasury.bounties` /
+    /// `treasury.bounty_events`.
+    pub struct PgBountyIndex {
+        pool: PgPool,
+    }
+
+    impl PgBountyIndex {
+        pub fn new(pool: PgPool) -> Self {
+            Self { pool }
+        }
+    }
+
+    /// Fifteen columns, and the asset triple folded into ONE jsonb value —
+    /// sqlx's tuple `FromRow` stops at 16, and a bounty row that cannot grow
+    /// another column is a schema with a cliff in it (the lesson SPEND_COLS
+    /// learned at 15).
+    const BOUNTY_COLS: &str = "instance, bounty_id, child_id, status, value::text, \
+                               paid_out::text, bond::text, curator, beneficiary, \
+                               beneficiary_location, payment_id, account_id, \
+                               first_seen_height, status_height, \
+                               case when asset_location is null and asset_key is null \
+                                     and asset_kind is null then null \
+                                    else jsonb_build_object('location', asset_location, \
+                                                            'key', asset_key, \
+                                                            'kind', asset_kind) end";
+
+    type BountyTuple = (
+        String,
+        i64,
+        i64,
+        String,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<Vec<u8>>,
+        Option<Vec<u8>>,
+        Option<serde_json::Value>,
+        Option<String>,
+        Option<Vec<u8>>,
+        i64,
+        i64,
+        Option<serde_json::Value>,
+    );
+
+    fn bounty_from_row(
+        (
+            instance,
+            bounty_id,
+            child_id,
+            status,
+            value,
+            paid_out,
+            bond,
+            curator,
+            beneficiary,
+            beneficiary_location,
+            payment_id,
+            account_id,
+            first_seen_height,
+            status_height,
+            asset_ref,
+        ): BountyTuple,
+    ) -> super::BountyRow {
+        super::BountyRow {
+            instance,
+            bounty_id: bounty_id as u64,
+            // THE SENTINEL STOPS HERE. Every read path renders -1 back to null
+            // (migration 0011); child 0 is a real child and must survive.
+            child_id: (child_id >= 0).then_some(child_id as u64),
+            status,
+            value,
+            paid_out,
+            bond,
+            curator: curator.map(|c| format!("0x{}", super::hex_lower(&c))),
+            beneficiary: beneficiary.map(|b| format!("0x{}", super::hex_lower(&b))),
+            beneficiary_location,
+            payment_id,
+            account_id: account_id.map(|a| format!("0x{}", super::hex_lower(&a))),
+            first_seen_height: first_seen_height as u64,
+            status_height: status_height as u64,
+            asset_ref,
+        }
+    }
+
+    /// `None` → the parent's sentinel. Bound as a plain i64 so the query can
+    /// use `=` and hit the primary key, which an `is not distinct from` on a
+    /// nullable column could not.
+    ///
+    /// Spelled here rather than imported: the api crate does not depend on any
+    /// adapter (Invariant 4 — even the address parser is injected). A test
+    /// asserts this equals `adapter_substrate::bounties::PARENT_SENTINEL`, so
+    /// the two copies cannot drift apart in silence.
+    fn child_key(child_id: Option<u64>) -> i64 {
+        child_id.map_or(super::PARENT_SENTINEL, |c| c as i64)
+    }
+
+    #[async_trait]
+    impl super::BountyIndex for PgBountyIndex {
+        async fn bounties(
+            &self,
+            chain_id: &str,
+            instance: &str,
+            status: Option<&str>,
+            limit: u64,
+        ) -> Result<Vec<super::BountyRow>, IndexError> {
+            // ordered exactly as MemoryBountyIndex orders, so `limit` returns
+            // the same subset from either backend (the slice-6 defect)
+            let rows: Vec<BountyTuple> = sqlx::query_as(&format!(
+                "select {BOUNTY_COLS} from treasury.bounties \
+                 where chain_id = $1 and instance = $2 \
+                   and ($3::text is null or status = $3) \
+                 order by bounty_id desc, child_id desc limit $4"
+            ))
+            .bind(chain_id)
+            .bind(instance)
+            .bind(status)
+            .bind(limit as i64)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| IndexError(e.to_string()))?;
+            Ok(rows.into_iter().map(bounty_from_row).collect())
+        }
+
+        async fn bounty(
+            &self,
+            chain_id: &str,
+            instance: &str,
+            bounty_id: u64,
+            child_id: Option<u64>,
+        ) -> Result<Option<super::BountyRow>, IndexError> {
+            let row: Option<BountyTuple> = sqlx::query_as(&format!(
+                "select {BOUNTY_COLS} from treasury.bounties \
+                 where chain_id = $1 and instance = $2 and bounty_id = $3 and child_id = $4"
+            ))
+            .bind(chain_id)
+            .bind(instance)
+            .bind(bounty_id as i64)
+            .bind(child_key(child_id))
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| IndexError(e.to_string()))?;
+            Ok(row.map(bounty_from_row))
+        }
+
+        async fn bounty_events(
+            &self,
+            chain_id: &str,
+            instance: &str,
+            bounty_id: u64,
+            child_id: Option<u64>,
+        ) -> Result<Vec<super::BountyEventRow>, IndexError> {
+            type Row = (
+                i64,
+                Option<DateTime<Utc>>,
+                i32,
+                String,
+                Option<String>,
+                serde_json::Value,
+            );
+            let rows: Vec<Row> = sqlx::query_as(
+                "select e.block_height, b.timestamp, e.event_index, e.kind, e.amount::text, e.data \
+                 from treasury.bounty_events e \
+                 left join core.blocks b \
+                   on b.chain_id = e.chain_id and b.height = e.block_height \
+                 where e.chain_id = $1 and e.instance = $2 \
+                   and e.bounty_id = $3 and e.child_id = $4 \
+                 order by e.block_height, e.event_index",
+            )
+            .bind(chain_id)
+            .bind(instance)
+            .bind(bounty_id as i64)
+            .bind(child_key(child_id))
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| IndexError(e.to_string()))?;
+            Ok(rows
+                .into_iter()
+                .map(
+                    |(height, timestamp, event_index, kind, amount, data)| {
+                        super::BountyEventRow {
+                            height: height as u64,
+                            timestamp,
+                            event_index: event_index as u32,
+                            kind,
+                            amount,
+                            data,
+                        }
+                    },
+                )
+                .collect())
+        }
+    }
+
     /// `gov.vote_positions` columns, in the order `vote_from_row` expects.
     /// NUMERICs come back as text (plancks exceed u64/f64, no decimal dep).
     const VOTE_COLS: &str = "class, referendum_id, voter, active, vote_type, \
@@ -2267,6 +2661,7 @@ pub struct AppState {
     pub balances: Arc<dyn BalanceIndex>,
     pub gov: Arc<dyn GovIndex>,
     pub treasury: Arc<dyn TreasuryIndex>,
+    pub bounties: Arc<dyn BountyIndex>,
     pub assets: Arc<dyn AssetIndex>,
     pub parse_account: AccountParser,
 }
@@ -2287,6 +2682,8 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/treasury/{network}/spends/{id}", get(get_treasury_spend))
         .route("/v1/treasury/{network}/pot", get(get_treasury_pot))
         .route("/v1/treasury/{network}/holdings", get(get_treasury_holdings))
+        .route("/v1/bounties/{network}", get(list_bounties))
+        .route("/v1/bounties/{network}/{id}", get(get_bounty))
         .route("/v1/assets/{chain}", get(list_assets))
         .route("/v1/domains/{network}/{domain}", get(resolve_domain))
         .with_state(state)
@@ -2960,7 +3357,13 @@ fn no_treasury_residency(instance: &str, network: &str, domain: &str) -> Respons
 /// paid on Asset Hub the later row's value columns are all NULL. Replacing
 /// wholesale would drop the amount from the answer to "what was promised"
 /// (reviewer catch). Status and payment come from the later window; the value
-/// columns fall back to the earlier one; the first sighting is the earliest.
+/// columns fall back to the earlier one; the first sighting is the earlier
+/// WINDOW's, taken structurally rather than by comparing the two heights —
+/// relay (~32M) and Asset Hub (~19M) block numbers are different number lines,
+/// so `min()` would answer "which chain numbers its blocks lower", exactly the
+/// mistake the list-ordering comment below warns about. Windows are sorted by
+/// `from`, so `prev` is the earlier one by construction. `merge_bounty` states
+/// the same rule; there is one shape here, not two.
 fn merge_spend(prev: SpendRow, later: SpendRow) -> SpendRow {
     SpendRow {
         instance: later.instance,
@@ -2977,7 +3380,7 @@ fn merge_spend(prev: SpendRow, later: SpendRow) -> SpendRow {
         valid_from: later.valid_from.or(prev.valid_from),
         expire_at: later.expire_at.or(prev.expire_at),
         asset_ref: later.asset_ref.or(prev.asset_ref),
-        first_seen_height: prev.first_seen_height.min(later.first_seen_height),
+        first_seen_height: prev.first_seen_height,
     }
 }
 
@@ -3125,31 +3528,63 @@ async fn get_treasury_spend(
     .into_response()
 }
 
-/// Resolve a spend's `asset_ref` against the asset registry of whichever chain
-/// the spend's own location names. Returns a resolution OBJECT even on
-/// failure, carrying the reason — a treasury page must be able to say "we do
-/// not know what unit this is in" out loud.
+/// Resolve a spend's `asset_ref`. A thin wrapper: a bounty payout and a
+/// treasury spend are denominated the same way, carry the identical
+/// `{chain, asset}` shape, and must therefore resolve through ONE piece of
+/// code — two copies would eventually disagree about what 83,760 means.
 async fn resolve_spend_asset(
     state: &AppState,
     network: &str,
     windows: &[&registry::ResidencyEntry],
     spend: &SpendRow,
 ) -> serde_json::Value {
+    resolve_asset_ref(
+        state,
+        network,
+        windows,
+        spend.asset_ref.as_ref(),
+        spend.amount.as_deref(),
+        // the legacy flow had no asset concept at all — native by
+        // construction, not by assumption
+        (spend.spend_kind == "proposal")
+            .then_some("legacy proposal flow: always the chain's native token"),
+        "no asset_location on this row — re-run treasury-range \
+         (mapper_version 1 predates it)",
+    )
+    .await
+}
+
+/// Resolve an `asset_ref` against the asset registry of whichever chain its own
+/// location names. Returns a resolution OBJECT even on failure, carrying the
+/// reason — a treasury page must be able to say "we do not know what unit this
+/// is in" out loud.
+///
+/// `native_by_construction` carries the REASON a missing asset_ref means native
+/// rather than unknown; `rerun_hint` is what to say when it means neither.
+async fn resolve_asset_ref(
+    state: &AppState,
+    network: &str,
+    windows: &[&registry::ResidencyEntry],
+    asset_ref: Option<&serde_json::Value>,
+    amount: Option<&str>,
+    native_by_construction: Option<&str>,
+    rerun_hint: &str,
+) -> serde_json::Value {
     let unresolved = |reason: &str| serde_json::json!({"resolved": false, "reason": reason});
-    let Some(asset_ref) = spend.asset_ref.as_ref() else {
-        return if spend.spend_kind == "proposal" {
-            // the legacy flow had no asset concept at all — native by
-            // construction, not by assumption
-            serde_json::json!({
+    let Some(asset_ref) = asset_ref else {
+        return match native_by_construction {
+            Some(note) => serde_json::json!({
                 "resolved": true, "asset": "native", "symbol": null, "decimals": null,
-                "note": "legacy proposal flow: always the chain's native token",
-            })
-        } else {
-            unresolved("no asset_location on this row — re-run treasury-range \
-                        (mapper_version 1 predates it)")
+                "note": note,
+            }),
+            None => unresolved(rerun_hint),
         };
     };
-    let Some(asset_loc) = asset_ref.pointer("/location/asset") else {
+    // `.filter(!is_null)` because a jsonb-built object HAS the key even when
+    // the value is null — a normalization that half-failed must read as "names
+    // no asset", not as a search for the literal string "null" (slice 6's
+    // twice-repeated defect, said out loud here).
+    let Some(asset_loc) = asset_ref.pointer("/location/asset").filter(|v| !v.is_null()) else {
         return unresolved("asset_location names no asset");
     };
     // An EMPTY interior names the holding chain's own currency. The mapper
@@ -3165,7 +3600,7 @@ async fn resolve_spend_asset(
     // matches `core.assets.location_key` exactly, whatever order Postgres's
     // jsonb chose to store it in.
     let wanted = asset_loc.to_string();
-    // WHICH CHAIN holds it: the spend says `Parachain(N)` or `Here`. `Here`
+    // WHICH CHAIN holds it: the row says `Parachain(N)` or `Here`. `Here`
     // means the chain that emitted the event, so we look through this
     // instance's own residency windows rather than assuming one.
     let para = asset_ref
@@ -3207,9 +3642,7 @@ async fn resolve_spend_asset(
                      whatever its `parents` — true for a relay and its system \
                      parachains, and registry data the day it is not"
                 ),
-                "display": spend
-                    .amount
-                    .as_deref()
+                "display": amount
                     .zip(a.decimals)
                     .and_then(|(amount, d)| format_units(amount, d)),
             });
@@ -3258,6 +3691,286 @@ async fn get_treasury_pot(
         "network": network,
         "instance": instance,
         "note": "pot flows only — these name no spend; see /spends for what was promised",
+        "segments": segments,
+    }))
+    .into_response()
+}
+
+// ----------------------------------------------------------- bounty routes
+
+#[derive(Deserialize)]
+struct BountyQuery {
+    /// bounties | child_bounties | multi_asset_bounties.
+    instance: Option<String>,
+    /// Child index. ABSENT means the parent bounty itself — the API's spelling
+    /// of the -1 the table stores.
+    child: Option<u64>,
+    status: Option<String>,
+    limit: Option<u64>,
+}
+
+fn bounty_instance(q: &BountyQuery) -> String {
+    q.instance
+        .clone()
+        .unwrap_or_else(|| DEFAULT_BOUNTY_INSTANCE.to_string())
+}
+
+/// Residency windows for bounties: the TREASURY domain, explicitly.
+///
+/// Bounty funds live at sub-accounts of the treasury's pallet id and moved to
+/// Asset Hub with it, so a bounty proposed on the relay and paid on Asset Hub
+/// is one bounty with rows on two chains — exactly a spend's shape. Named
+/// explicitly rather than by passing a bounty instance into
+/// `domain_for_treasury_instance` (whose fallback would answer the same thing
+/// by accident, which is not the same as answering it on purpose).
+///
+/// DEDUPLICATED BY CHAIN, and here that is correctness rather than economy.
+/// The per-chain queries are not window-bounded, so a chain appearing in two
+/// residency windows (a domain that left and came back) returns the same rows
+/// twice — and `merge_bounty` ADDS `paid_out`, so the bounty would report
+/// double what it paid. Every other merge in this file is idempotent under a
+/// repeated chain; this one cannot be, so the repetition is removed here. The
+/// FIRST window wins, so a deduped segment carries the earlier bounds; the
+/// same trade `all_gov_windows` makes, and it also halves the queries.
+fn bounty_windows<'a>(registry: &'a Registry, network: &str) -> Vec<&'a registry::ResidencyEntry> {
+    let mut seen: Vec<&str> = Vec::new();
+    let mut windows: Vec<&'a registry::ResidencyEntry> = Vec::new();
+    for w in treasury_windows(registry, network, registry::DEFAULT_TREASURY_INSTANCE) {
+        if !seen.contains(&w.chain.as_str()) {
+            seen.push(&w.chain);
+            windows.push(w);
+        }
+    }
+    windows
+}
+
+/// Merge one bounty's rows from two residency windows. Same reasoning as
+/// `merge_spend` — the later window owns the status, the earlier one may be the
+/// only place a value column exists — with two additions.
+///
+/// `paid_out` is a RUNNING TOTAL per chain, so the two windows must be ADDED,
+/// not chosen between. Choosing would silently halve a bounty that paid on both
+/// sides of the migration. That also makes this the one merge in the file that
+/// is NOT idempotent under a repeated chain, which is why `bounty_windows`
+/// dedupes by chain before anybody loops over it.
+///
+/// And the `'unknown'` guard is `merge_referendum`'s, for the same reason: the
+/// post-migration events that carry no status at all (`BountyExtended`,
+/// `DepositPoked`, `BountyValueIncreased`) land as the sink's placeholder, and
+/// without this guard an Asset Hub value raise would erase a relay verdict.
+fn merge_bounty(prev: BountyRow, later: BountyRow) -> BountyRow {
+    let (status, status_height) = if later.status == "unknown" {
+        (prev.status, prev.status_height)
+    } else {
+        (later.status, later.status_height)
+    };
+    BountyRow {
+        instance: later.instance,
+        bounty_id: later.bounty_id,
+        child_id: later.child_id,
+        status,
+        status_height,
+        value: later.value.or(prev.value),
+        paid_out: add_money(prev.paid_out, later.paid_out),
+        bond: later.bond.or(prev.bond),
+        curator: later.curator.or(prev.curator),
+        beneficiary: later.beneficiary.or(prev.beneficiary),
+        beneficiary_location: later.beneficiary_location.or(prev.beneficiary_location),
+        payment_id: later.payment_id.or(prev.payment_id),
+        account_id: later.account_id.or(prev.account_id),
+        asset_ref: later.asset_ref.or(prev.asset_ref),
+        // the EARLIER window's, never `min()`: relay heights (~32M) and Asset
+        // Hub heights (~19M) are different number lines, so comparing them
+        // picks the smaller number rather than the earlier sighting. The
+        // windows are sorted by `from`, so `prev` IS the earlier one.
+        first_seen_height: prev.first_seen_height,
+    }
+}
+
+/// Add two decimal money strings. i128 rather than a decimal crate: the largest
+/// number in this domain is total issuance (~1.5e19 planck), and i128 holds
+/// ~1.7e38, so the headroom is nineteen orders of magnitude — and the add
+/// saturates, like `sum_decimal` above, so a corrupt row cannot panic a
+/// response. If EITHER side fails to parse there is no sum to report, so the
+/// later window's value is returned unchanged: visibly one window's number
+/// rather than an invisibly wrong total.
+fn add_money(a: Option<String>, b: Option<String>) -> Option<String> {
+    match (a, b) {
+        (None, x) | (x, None) => x,
+        (Some(a), Some(b)) => match (a.parse::<i128>(), b.parse::<i128>()) {
+            (Ok(x), Ok(y)) => Some(x.saturating_add(y).to_string()),
+            _ => Some(b),
+        },
+    }
+}
+
+/// WHERE THE TREASURY'S BOUNTY MONEY WENT — the outflow that leaves through the
+/// `SpendFunds` hook and appears in no treasury table (migration 0009).
+///
+/// Rows are merged per (bounty, child) across residency windows, exactly like
+/// spends, and `child_id` renders as null for a parent — the -1 in the table is
+/// a primary-key device and never a value the API emits.
+async fn list_bounties(
+    State(state): State<AppState>,
+    Path(network): Path<String>,
+    Query(q): Query<BountyQuery>,
+) -> Response {
+    let instance = bounty_instance(&q);
+    let limit = q.limit.unwrap_or(50).min(500);
+    let windows = bounty_windows(&state.registry, &network);
+    if windows.is_empty() {
+        return no_treasury_residency(
+            &instance,
+            &network,
+            state
+                .registry
+                .domain_for_treasury_instance(registry::DEFAULT_TREASURY_INSTANCE),
+        );
+    }
+
+    let mut merged: std::collections::BTreeMap<(u64, i64), BountyRow> =
+        std::collections::BTreeMap::new();
+    let mut segments = Vec::with_capacity(windows.len());
+    for w in &windows {
+        let rows = match state
+            .bounties
+            .bounties(&w.chain, &instance, q.status.as_deref(), limit)
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+        };
+        segments.push(serde_json::json!({
+            "chain": w.chain,
+            "from": w.from,
+            "to": w.to,
+            "bounties_indexed": rows.len(),
+        }));
+        for r in rows {
+            // the sentinel is fine as a MAP KEY (it sorts parents before their
+            // children, which is the order a page wants); it just never
+            // reaches the response
+            let key = (r.bounty_id, r.child_id.map_or(PARENT_SENTINEL, |c| c as i64));
+            let merged_row = match merged.remove(&key) {
+                None => r,
+                Some(prev) => merge_bounty(prev, r),
+            };
+            merged.insert(key, merged_row);
+        }
+    }
+    let mut bounties: Vec<&BountyRow> = merged.values().collect();
+    bounties.sort_by(|a, b| {
+        b.bounty_id
+            .cmp(&a.bounty_id)
+            .then_with(|| b.child_id.cmp(&a.child_id))
+    });
+    bounties.truncate(limit as usize);
+    Json(serde_json::json!({
+        "network": network,
+        "instance": instance,
+        "status": q.status,
+        "bounties": bounties,
+        "segments": segments,
+        "note": "bounty funding leaves the treasury through the SpendFunds hook and \
+                 emits no treasury event — these rows are the only record of it. \
+                 `paid_out` sums the payouts the pallets ANNOUNCE, and those are the \
+                 beneficiary's share NET OF THE CURATOR FEE, which no event carries: \
+                 a bounty spent more than this number says. The exact figures are on \
+                 the bounty's own derived account, which pallet-bounties MINTS into \
+                 when it funds the bounty — so `account_id` in /v1/balances, not \
+                 `value` minus `paid_out`, is what a bounty has left; see also \
+                 /v1/treasury/{network}/holdings.",
+    }))
+    .into_response()
+}
+
+/// One bounty's full story: the merged row, its per-chain event timeline, and
+/// what its payouts were denominated in. `?child=N` addresses a child bounty;
+/// without it the parent bounty itself.
+async fn get_bounty(
+    State(state): State<AppState>,
+    Path((network, id)): Path<(String, u64)>,
+    Query(q): Query<BountyQuery>,
+) -> Response {
+    let instance = bounty_instance(&q);
+    let windows = bounty_windows(&state.registry, &network);
+    if windows.is_empty() {
+        return no_treasury_residency(
+            &instance,
+            &network,
+            state
+                .registry
+                .domain_for_treasury_instance(registry::DEFAULT_TREASURY_INSTANCE),
+        );
+    }
+
+    let mut bounty: Option<BountyRow> = None;
+    let mut segments = Vec::with_capacity(windows.len());
+    for w in &windows {
+        match state.bounties.bounty(&w.chain, &instance, id, q.child).await {
+            // merge, never replace: only some events carry a curator, a value
+            // or a beneficiary, and they may sit in the earlier window
+            Ok(Some(b)) => {
+                bounty = Some(match bounty.take() {
+                    None => b,
+                    Some(prev) => merge_bounty(prev, b),
+                })
+            }
+            Ok(None) => {}
+            Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+        }
+        let events = match state
+            .bounties
+            .bounty_events(&w.chain, &instance, id, q.child)
+            .await
+        {
+            Ok(e) => e,
+            Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+        };
+        segments.push(serde_json::json!({
+            "chain": w.chain,
+            "from": w.from,
+            "to": w.to,
+            "events": events,
+        }));
+    }
+    let Some(bounty) = bounty else {
+        let which = match q.child {
+            Some(c) => format!("{id}-{c}"),
+            None => id.to_string(),
+        };
+        return error(
+            StatusCode::NOT_FOUND,
+            format!("bounty {network}/{instance}/{which} not indexed"),
+        );
+    };
+    // WHAT WAS THIS PAID IN? The same join a treasury spend resolves through,
+    // because a multi-asset bounty payout names its asset the same way. The two
+    // legacy pallets are native-token-only by construction, so a missing
+    // asset_ref there is an ANSWER, not a gap.
+    let asset = resolve_asset_ref(
+        &state,
+        &network,
+        &windows,
+        bounty.asset_ref.as_ref(),
+        bounty.paid_out.as_deref().or(bounty.value.as_deref()),
+        (instance != "multi_asset_bounties").then_some(
+            "pallet-bounties and pallet-child-bounties are native-token-only by \
+             construction — they have no asset concept to record",
+        ),
+        "no asset_location on this row — a multi-asset bounty carries one only \
+         once a payout has been processed",
+    )
+    .await;
+
+    Json(serde_json::json!({
+        "network": network,
+        "instance": instance,
+        "bounty_id": id,
+        // null, never -1: the sentinel is a primary-key device
+        "child_id": q.child,
+        "bounty": bounty,
+        "asset": asset,
         "segments": segments,
     }))
     .into_response()
@@ -3448,9 +4161,31 @@ async fn get_treasury_holdings(
                           so nothing here can be stale or unsourced; a USD view \
                           is a later slice with its own provenance",
             "not_covered": [
-                "bounty and child-bounty accounts — funding leaves the treasury \
-                 through the SpendFunds hook, which emits no treasury event at \
-                 all (see migration 0009); its own slice",
+                // NOW PARTLY COVERED, and the line says exactly how far. A
+                // bounty account appears here only once its bounty's EVENTS
+                // were indexed and `sync-bounty-accounts` derived its address,
+                // so a chain that has never been bounties-range'd shows none of
+                // its bounty money and this endpoint must not imply otherwise.
+                "bounty money is covered only as far as it has been INDEXED: a \
+                 bounty account appears above once its events were mapped \
+                 (bounties-range) and its address derived (sync-bounty-accounts). \
+                 Bounties before the first indexed range, and child bounties \
+                 whose events have not been seen, hold real money that is absent \
+                 here — the funding itself leaves the treasury through the \
+                 SpendFunds hook and emits no treasury event at all (migration \
+                 0009), so nothing else would reveal them",
+                "LEGACY CHILD BOUNTIES hold real money that is absent here on \
+                 purpose: pallet-child-bounties ≤37.0.0 derived a child's \
+                 account from a GLOBAL child id and 38.0.0 renumbered every \
+                 child bounty per parent, transferring the balances to new \
+                 addresses. This table records no era, so applying today's rule \
+                 would name addresses that never existed — dotlens refuses to \
+                 derive them rather than report a confident zero at a made-up \
+                 address",
+                "a concluded bounty (claimed, canceled, rejected) is registered \
+                 INACTIVE and is not swept: its account is emptied and removed \
+                 from pallet storage when the bounty ends. If one is ever \
+                 refunded after conclusion, this endpoint will not see it",
                 "positions on chains dotlens has not registered — notably the \
                  Hydration DCA accounts, the Omnipool POL and the money-market \
                  position (ECOSYSTEM §6 puts treasury assets across 7+ chains); \
@@ -4062,6 +4797,142 @@ mod tests {
             },
         );
 
+        // ---- bounties (slice 7) -----------------------------------------
+        // Bounty 22 STRADDLES the migration: proposed on the relay (where it
+        // also paid a child out once), active on Asset Hub. A child bounty of
+        // it, and a modern multi-asset bounty paid in USDT — the three
+        // instances a treasury page has to show as one thing.
+        let bounties = Arc::new(MemoryBountyIndex::new());
+        let curator = adapter_substrate::accounts::para_sovereign(1000);
+        let bounty_account = adapter_substrate::accounts::sub_account(
+            b"py/trsry",
+            &[
+                adapter_substrate::accounts::SubKey::Str("bt"),
+                adapter_substrate::accounts::SubKey::Index(22),
+            ],
+        )
+        .expect("derives");
+        bounties.insert_bounty(
+            "polkadot",
+            BountyRow {
+                instance: "bounties".into(),
+                bounty_id: 22,
+                child_id: None,
+                status: "proposed".into(),
+                value: Some("100000000000".into()),
+                paid_out: Some("250".into()),
+                bond: None,
+                curator: None,
+                beneficiary: None,
+                beneficiary_location: None,
+                payment_id: None,
+                account_id: None,
+                first_seen_height: 27_000_000,
+                status_height: 27_000_000,
+                asset_ref: None,
+            },
+        );
+        bounties.insert_event(
+            "polkadot",
+            "bounties",
+            (22, None),
+            BountyEventRow {
+                height: 27_000_000,
+                timestamp: Some(ts("2025-09-01T00:00:00Z")),
+                event_index: 1,
+                kind: "proposed".into(),
+                amount: None,
+                data: serde_json::json!({"index": 22}),
+            },
+        );
+        bounties.insert_bounty(
+            "polkadot-asset-hub",
+            BountyRow {
+                instance: "bounties".into(),
+                bounty_id: 22,
+                child_id: None,
+                status: "active".into(),
+                value: None,
+                paid_out: Some("1000".into()),
+                bond: None,
+                curator: Some(format!("0x{}", hex_lower(&curator))),
+                beneficiary: None,
+                beneficiary_location: None,
+                payment_id: None,
+                account_id: Some(format!("0x{}", hex_lower(&bounty_account))),
+                first_seen_height: 10_500_000,
+                status_height: 10_500_000,
+                asset_ref: None,
+            },
+        );
+        bounties.insert_event(
+            "polkadot-asset-hub",
+            "bounties",
+            (22, None),
+            BountyEventRow {
+                height: 10_500_000,
+                timestamp: Some(ts("2026-02-01T00:00:00Z")),
+                event_index: 0,
+                kind: "curator_accepted".into(),
+                amount: None,
+                data: serde_json::json!({"bounty_id": 22}),
+            },
+        );
+        bounties.insert_bounty(
+            "polkadot-asset-hub",
+            BountyRow {
+                instance: "child_bounties".into(),
+                bounty_id: 22,
+                child_id: Some(3),
+                status: "claimed".into(),
+                value: None,
+                paid_out: Some("500".into()),
+                bond: None,
+                curator: None,
+                beneficiary: Some(payee_hex.clone()),
+                beneficiary_location: None,
+                payment_id: None,
+                account_id: None,
+                first_seen_height: 10_600_000,
+                status_height: 10_600_000,
+                asset_ref: None,
+            },
+        );
+        // the modern generation: one id space, asset-denominated, and its
+        // payout names USDT exactly as a treasury spend does
+        bounties.insert_bounty(
+            "polkadot-asset-hub",
+            BountyRow {
+                instance: "multi_asset_bounties".into(),
+                bounty_id: 1,
+                child_id: None,
+                status: "claimed".into(),
+                value: Some("83760000000".into()),
+                paid_out: Some("83760000000".into()),
+                bond: None,
+                curator: None,
+                beneficiary: Some(payee_hex.clone()),
+                beneficiary_location: None,
+                payment_id: None,
+                account_id: None,
+                first_seen_height: 10_700_000,
+                status_height: 10_700_000,
+                asset_ref: Some(serde_json::json!({
+                    "location": {
+                        // `Here`: the chain that emitted the event holds it
+                        "chain": {"parents": 0, "interior": []},
+                        "asset": {"parents": 0, "interior": [
+                            {"PalletInstance": 50}, {"GeneralIndex": 1984}
+                        ]},
+                    },
+                    "key": null,
+                    "kind": {"V4": {"asset_id": {"parents": 0, "interior": {"X2": [
+                        {"PalletInstance": 50}, {"GeneralIndex": 1984}
+                    ]}}}},
+                })),
+            },
+        );
+
         AppState {
             registry,
             blocks,
@@ -4069,6 +4940,7 @@ mod tests {
             balances,
             gov,
             treasury,
+            bounties,
             assets,
             parse_account: Arc::new(|s| {
                 adapter_substrate::accounts::parse_account(s).map(|a| a.to_vec())
@@ -4398,7 +5270,12 @@ mod tests {
         assert_eq!(json["spend"]["amount"], "83760000000");
         assert_eq!(json["spend"]["beneficiary"], payee_hex_expected());
         assert_eq!(json["spend"]["valid_from"], 28_000_000);
-        assert_eq!(json["spend"]["first_seen_height"], 10_400_000);
+        // …including the FIRST SIGHTING, which is the relay approval. This line
+        // read 10_400_000 while `merge_spend` used `min()`: Asset Hub simply
+        // numbers its blocks lower than the relay, so the minimum of two
+        // incomparable number lines answered "which chain counts smaller"
+        // rather than "which happened first".
+        assert_eq!(json["spend"]["first_seen_height"], 28_000_000);
         // the asset is NOT DOT — the spend carries its own asset kind
         assert_eq!(
             json["spend"]["asset_kind"]["V4"]["asset_id"]["interior"]["X2"][1]["GeneralIndex"],
@@ -4575,6 +5452,147 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert_eq!(json["asset"]["resolved"], false);
         assert!(json["asset"]["reason"].as_str().unwrap().contains("treasury-range"));
+    }
+
+    /// The list surface for the outflow no treasury table can see — and the
+    /// rule migration 0011 makes a contract: the -1 is a primary-key device
+    /// and must never reach a reader.
+    #[tokio::test]
+    async fn bounties_merge_across_the_migration_and_never_leak_the_parent_sentinel() {
+        let app = router(test_state().await);
+        let (status, json) = get_json(&app, "/v1/bounties/polkadot").await;
+        assert_eq!(status, StatusCode::OK);
+        // the default instance is STATED, not implied
+        assert_eq!(json["instance"], "bounties");
+        let list = json["bounties"].as_array().unwrap();
+        assert_eq!(list.len(), 1, "one bounty, not one row per chain");
+        assert_eq!(list[0]["bounty_id"], 22);
+        // status from the LATER window…
+        assert_eq!(list[0]["status"], "active");
+        assert_eq!(list[0]["curator"], format!("0x{}", hex_lower(
+            &adapter_substrate::accounts::para_sovereign(1000)
+        )));
+        // …value from the EARLIER one, where the proposal was
+        assert_eq!(list[0]["value"], "100000000000");
+        // paid_out is a per-chain RUNNING TOTAL, so the windows ADD: choosing
+        // between them would report a bounty that paid on both sides of the
+        // migration as having paid only once
+        assert_eq!(list[0]["paid_out"], "1250");
+        // the EARLIER WINDOW's sighting, structurally — not min(27_000_000,
+        // 10_500_000), which would answer 10.5M because Asset Hub numbers its
+        // blocks lower, not because anything happened there first
+        assert_eq!(list[0]["first_seen_height"], 27_000_000);
+        // the parent renders as null, and the sentinel appears nowhere in the
+        // serialized body at all
+        assert!(list[0]["child_id"].is_null());
+        assert!(
+            !serde_json::to_string(&json).unwrap().contains("\"child_id\":-1"),
+            "the -1 sentinel must not survive serialization"
+        );
+        assert_eq!(json["segments"].as_array().unwrap().len(), 2);
+    }
+
+    /// A post-migration event that moves no status — a value raise, an
+    /// extension, a deposit poke — lands as the sink's 'unknown' placeholder.
+    /// Merging it naively would erase the relay's verdict, which is the same
+    /// defect `merge_referendum` was given its guard for.
+    #[test]
+    fn an_info_only_asset_hub_row_never_erases_a_relay_verdict() {
+        let row = |status: &str, height: u64, value: Option<&str>| BountyRow {
+            instance: "bounties".into(),
+            bounty_id: 22,
+            child_id: None,
+            status: status.into(),
+            value: value.map(str::to_string),
+            paid_out: None,
+            bond: None,
+            curator: None,
+            beneficiary: None,
+            beneficiary_location: None,
+            payment_id: None,
+            account_id: None,
+            first_seen_height: height,
+            status_height: height,
+            asset_ref: None,
+        };
+        let merged = merge_bounty(
+            row("active", 27_000_000, None),
+            row("unknown", 10_500_000, Some("100000000000")),
+        );
+        assert_eq!(merged.status, "active", "a placeholder is not a verdict");
+        assert_eq!(merged.status_height, 27_000_000, "the status keeps ITS height");
+        // …and the placeholder row's information still arrives
+        assert_eq!(merged.value.as_deref(), Some("100000000000"));
+    }
+
+    #[tokio::test]
+    async fn a_child_bounty_is_addressed_by_child_and_is_not_its_parent() {
+        let app = router(test_state().await);
+        let (status, json) =
+            get_json(&app, "/v1/bounties/polkadot/22?instance=child_bounties&child=3").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["bounty"]["child_id"], 3);
+        assert_eq!(json["child_id"], 3);
+        assert_eq!(json["bounty"]["status"], "claimed");
+        assert_eq!(json["bounty"]["paid_out"], "500");
+        assert_eq!(json["bounty"]["beneficiary"], payee_hex_expected());
+        // a native-token pallet says so as an ANSWER, not as a gap
+        assert_eq!(json["asset"]["resolved"], true);
+        assert_eq!(json["asset"]["asset"], "native");
+        assert!(json["asset"]["note"].as_str().unwrap().contains("native-token-only"));
+
+        // the same id WITHOUT ?child= is the parent bounty, which this pallet
+        // does not have — a child is not addressable as its parent
+        let (missing, _) = get_json(&app, "/v1/bounties/polkadot/22?instance=child_bounties").await;
+        assert_eq!(missing, StatusCode::NOT_FOUND);
+
+        // …and the legacy parent carries its DERIVED account, which is where
+        // the money actually is (value − paid_out is not a balance)
+        let (_, parent) = get_json(&app, "/v1/bounties/polkadot/22").await;
+        let expected = adapter_substrate::accounts::sub_account(
+            b"py/trsry",
+            &[
+                adapter_substrate::accounts::SubKey::Str("bt"),
+                adapter_substrate::accounts::SubKey::Index(22),
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            parent["bounty"]["account_id"],
+            format!("0x{}", hex_lower(&expected))
+        );
+    }
+
+    /// The slice's payoff: a bounty payout is denominated exactly like a
+    /// treasury spend and resolves through the same `core.assets` join, so
+    /// 83760000000 reads as 83,760 USDT in both places.
+    #[tokio::test]
+    async fn a_multi_asset_bounty_payout_resolves_to_the_asset_it_was_paid_in() {
+        let app = router(test_state().await);
+        let (status, json) =
+            get_json(&app, "/v1/bounties/polkadot/1?instance=multi_asset_bounties").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(json["bounty"]["child_id"].is_null(), "None IS the parent");
+        let asset = &json["asset"];
+        assert_eq!(asset["resolved"], true);
+        // no caller named a chain: `Here` resolved through the treasury's own
+        // residency windows
+        assert_eq!(asset["chain"], "polkadot-asset-hub");
+        assert_eq!(asset["asset"], "assets:1984");
+        assert_eq!(asset["symbol"], "USDT");
+        assert_eq!(asset["display"], "83760.000000");
+
+        // the modern instance is a DIFFERENT number line: bounty 1 there is not
+        // bounty 1 in the legacy pallet
+        let (missing, _) = get_json(&app, "/v1/bounties/polkadot/1").await;
+        assert_eq!(missing, StatusCode::NOT_FOUND);
+    }
+
+    /// The api crate depends on no adapter (Invariant 4), so the sentinel is
+    /// spelled twice. This is the only thing stopping the two copies drifting.
+    #[test]
+    fn the_parent_sentinel_agrees_with_the_adapter() {
+        assert_eq!(PARENT_SENTINEL, adapter_substrate::bounties::PARENT_SENTINEL);
     }
 
     #[test]

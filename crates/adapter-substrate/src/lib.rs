@@ -31,6 +31,11 @@ pub mod accounts;
 /// Pure — no I/O.
 pub mod balances;
 
+/// Bounty semantics: the three bounty pallets' event vocabularies mapped into
+/// one id space (parent + child), with the modern pallet's asset-denominated
+/// payouts normalized through `assets`. Pure — no I/O.
+pub mod bounties;
+
 /// Assets semantics: pallet-assets event→delta mapping (through the SAME
 /// balances tables, on an asset key), canonical XCM-location naming, and the
 /// metadata-driven storage plumbing that reads asset holdings from state.

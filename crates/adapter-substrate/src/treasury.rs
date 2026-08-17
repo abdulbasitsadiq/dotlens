@@ -83,6 +83,9 @@
 use canonical::CanonicalEvent;
 use ingest::treasury::{SpendFact, TreasuryMapper};
 
+// one spelling of an opaque scalar for both money mappers (see balances.rs)
+use crate::balances::json_scalar_string;
+
 /// 1 → 2 (Phase 2, slice 6): `AssetSpendApproved` now also emits the
 /// NORMALIZED `asset_location` (and `asset_key` where no metadata is needed).
 /// No existing field changed meaning — but rows written at version 1 have
@@ -384,7 +387,7 @@ fn field_account(data: &serde_json::Value, name: &str, index: usize) -> Option<[
 /// Option<NetworkId>, id: [u8;32] }` — so `network` renders as `{"None":[]}`,
 /// not JSON null — and v4/v5 `X1` wraps `[Junction; 1]`, so the junction sits
 /// one array deeper than the v3 shape.
-fn account_in_location(v: &serde_json::Value) -> Option<Vec<u8>> {
+pub(crate) fn account_in_location(v: &serde_json::Value) -> Option<Vec<u8>> {
     match v {
         serde_json::Value::Object(map) => {
             // VersionedLocatableAccount: the payee is account_id, never location
@@ -404,17 +407,6 @@ fn account_in_location(v: &serde_json::Value) -> Option<Vec<u8>> {
         }
         serde_json::Value::Array(items) => items.iter().find_map(account_in_location),
         _ => None,
-    }
-}
-
-/// A payment id is an opaque `Pay::Id` — a number for most paymasters, a
-/// composite for some. Render it as a stable string rather than pretending it
-/// is always an integer.
-fn json_scalar_string(v: &serde_json::Value) -> String {
-    match v {
-        serde_json::Value::String(s) => s.clone(),
-        serde_json::Value::Number(n) => n.to_string(),
-        other => other.to_string(),
     }
 }
 

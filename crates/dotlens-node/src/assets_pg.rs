@@ -567,6 +567,20 @@ pub async fn snapshot_holdings(
             asset_key: "native".into(),
             storage_prefix: None,
         });
+        // A LEGACY BOUNTY ACCOUNT IS PROBED FOR THE NATIVE ASSET ONLY.
+        // pallet-bounties and pallet-child-bounties are native-token-only by
+        // construction — they have no asset concept at all — so their
+        // (account × asset) product is hundreds of reads per bounty that can
+        // only ever answer zero, and bounty accounts outnumber pots by two
+        // orders of magnitude. Keyed on the INSTANCE, not on `role = 'bounty'`:
+        // the modern multi-asset generation genuinely holds assets, and
+        // skipping it would blind the endpoint to the very bounties this slice
+        // exists to see.
+        if a.role == "bounty"
+            && matches!(a.instance.as_deref(), Some("bounties" | "child_bounties"))
+        {
+            continue;
+        }
         for asset in &assets {
             // the native row is probed above through System.Account and has no
             // asset-pallet key by design — counting it as "skipped" would print
@@ -766,6 +780,8 @@ pub async fn sync_treasury_accounts(
                         "derived",
                         &ss58_encode(prefix, &account),
                         None,
+                        // a pot exists as long as its pallet does
+                        true,
                     )
                     .await?;
                     report.pots += 1;
@@ -790,6 +806,9 @@ pub async fn sync_treasury_accounts(
                 "registry",
                 &ss58_encode(prefix, &account),
                 seed.note.as_deref(),
+                // a seeded account is in the registry because somebody decided
+                // it is treasury money; only the registry retires it
+                true,
             )
             .await?;
             report.seeded += 1;
@@ -800,8 +819,16 @@ pub async fn sync_treasury_accounts(
     Ok(report)
 }
 
+/// Shared with `bounties_pg::sync_bounty_accounts`: a bounty account is a
+/// treasury account with a different `role`, and two writers of one table would
+/// eventually disagree about its conflict rule.
+///
+/// `active` is a PARAMETER rather than a hardcoded `true` because until it was,
+/// no caller could ever retire an account: the holdings sweep reads `where
+/// active`, and a bounty that has been claimed holds nothing and is gone from
+/// pallet storage, but would have been probed against every asset forever.
 #[allow(clippy::too_many_arguments)]
-async fn upsert_treasury_account(
+pub(crate) async fn upsert_treasury_account(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     chain_id: &str,
     account_id: &[u8; 32],
@@ -813,18 +840,19 @@ async fn upsert_treasury_account(
     source: &str,
     ss58: &str,
     note: Option<&str>,
+    active: bool,
 ) -> Result<()> {
     sqlx::query(
         "insert into treasury.treasury_accounts \
              (chain_id, account_id, role, network, instance, label, derivation, \
               source, ss58, note, active) \
-         values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,true) \
+         values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) \
          on conflict (chain_id, account_id, role) do update set \
              network = excluded.network, instance = excluded.instance, \
              label = excluded.label, derivation = excluded.derivation, \
              source = excluded.source, ss58 = excluded.ss58, \
              note = coalesce(excluded.note, treasury.treasury_accounts.note), \
-             active = true, updated_at = now()",
+             active = excluded.active, updated_at = now()",
     )
     .bind(chain_id)
     .bind(&account_id[..])
@@ -836,6 +864,7 @@ async fn upsert_treasury_account(
     .bind(source)
     .bind(ss58)
     .bind(note)
+    .bind(active)
     .execute(&mut **tx)
     .await
     .with_context(|| format!("upserting treasury account '{label}' on {chain_id}"))?;

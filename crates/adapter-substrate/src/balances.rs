@@ -259,6 +259,18 @@ pub(crate) fn json_account_bytes(v: &serde_json::Value) -> Option<[u8; 32]> {
     }
 }
 
+/// An opaque scalar rendered as a stable string rather than as whatever shape
+/// it happens to have — a payment id is a `Pay::Id`, a number for most
+/// paymasters and a composite for some, and both the treasury and the bounty
+/// mappers must spell one the same way.
+pub(crate) fn json_scalar_string(v: &serde_json::Value) -> String {
+    match v {
+        serde_json::Value::String(s) => s.clone(),
+        serde_json::Value::Number(n) => n.to_string(),
+        other => other.to_string(),
+    }
+}
+
 pub(crate) fn json_u128(v: &serde_json::Value) -> Option<u128> {
     match v {
         serde_json::Value::Number(n) => n.as_u64().map(u128::from),

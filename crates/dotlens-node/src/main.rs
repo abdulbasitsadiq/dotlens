@@ -19,13 +19,16 @@
 //!   dotlens-node gov-range <chain> <a> <b>    # map referendum timelines over a range
 //!   dotlens-node votes-range <chain> <a> <b>  # map votes + delegations over a range
 //!   dotlens-node treasury-range <chain> <a> <b>  # map treasury spends + pot flows
+//!   dotlens-node bounties-range <chain> <a> <b>  # map bounties (all three pallets)
+//!   dotlens-node sync-bounty-accounts         # register indexed bounties' own accounts
 //!   dotlens-node anchor-voting <chain> <acct> <track> [height]  # VotingFor state anchor
 //!   dotlens-node sync-tracks                  # decode gov tracks from metadata, exit
 //!   dotlens-node fetch-preimage <chain> <hash> <len> [height]  # fetch+decode one preimage
 //!   dotlens-node decode-preimages <chain> [height]   # decode all pending proposals
 //!
 //! Per-module followers are opt-in flags: LIVE_INGEST, DECODE_FOLLOW,
-//! BALANCES_FOLLOW, GOV_FOLLOW, VOTES_FOLLOW, TREASURY_FOLLOW, TIP_FOLLOW (all `=1`).
+//! BALANCES_FOLLOW, GOV_FOLLOW, VOTES_FOLLOW, TREASURY_FOLLOW, BOUNTIES_FOLLOW,
+//! TIP_FOLLOW (all `=1`).
 //!
 //! backfill accepts an optional worker count (`backfill <chain> <a> <b> 8`) —
 //! deterministic chunks, per-chunk checkpoints, re-run the same command to
@@ -55,6 +58,7 @@ struct Backends {
     balances: Arc<dyn api::BalanceIndex>,
     gov: Arc<dyn api::GovIndex>,
     treasury: Arc<dyn api::TreasuryIndex>,
+    bounties: Arc<dyn api::BountyIndex>,
     assets: Arc<dyn api::AssetIndex>,
     runtime_versions: Arc<dyn RuntimeVersionSink>,
     /// Kept for label sync/verify (they need direct SQL, not a trait).
@@ -72,6 +76,7 @@ fn memory_backends() -> Backends {
         balances: Arc::new(api::MemoryBalanceIndex::new()),
         gov: Arc::new(api::MemoryGovIndex::new()),
         treasury: Arc::new(api::MemoryTreasuryIndex::new()),
+        bounties: Arc::new(api::MemoryBountyIndex::new()),
         assets: Arc::new(api::MemoryAssetIndex::new()),
         runtime_versions: Arc::new(NoopRuntimeVersionSink),
         #[cfg(feature = "pg")]
@@ -104,6 +109,8 @@ enum Command {
     GovRange { chain: String, from: u64, to: u64 },
     VotesRange { chain: String, from: u64, to: u64 },
     TreasuryRange { chain: String, from: u64, to: u64 },
+    BountiesRange { chain: String, from: u64, to: u64 },
+    SyncBountyAccounts,
     AnchorVoting { chain: String, account: String, track: u32, height: Option<u64> },
     SyncTracks,
     SyncAssets { chain: String, height: Option<u64> },
@@ -171,6 +178,12 @@ fn parse_args() -> Result<Command> {
                 range("usage: dotlens-node treasury-range <chain> <from> <to>")?;
             Ok(Command::TreasuryRange { chain, from, to })
         }
+        Some("bounties-range") => {
+            let (chain, from, to) =
+                range("usage: dotlens-node bounties-range <chain> <from> <to>")?;
+            Ok(Command::BountiesRange { chain, from, to })
+        }
+        Some("sync-bounty-accounts") => Ok(Command::SyncBountyAccounts),
         Some("anchor-voting") => {
             let usage = "usage: dotlens-node anchor-voting <chain> <account> <track> [height]";
             let chain = args.get(1).context(usage)?.clone();
@@ -296,6 +309,7 @@ async fn main() -> Result<()> {
             balances: Arc::new(api::pg::PgBalanceIndex::new(pool.clone())),
             gov: Arc::new(api::pg::PgGovIndex::new(pool.clone())),
             treasury: Arc::new(api::pg::PgTreasuryIndex::new(pool.clone())),
+            bounties: Arc::new(api::pg::PgBountyIndex::new(pool.clone())),
             assets: Arc::new(api::pg::PgAssetIndex::new(pool.clone())),
             runtime_versions: Arc::new(PgRuntimeVersionSink::new(pool.clone())),
             pool: Some(pool),
@@ -381,6 +395,27 @@ async fn main() -> Result<()> {
         );
         return run_treasury_range(&registry, &backends, chain, *from, *to).await;
     }
+    if let Command::BountiesRange { chain, from, to } = &command {
+        anyhow::ensure!(
+            backends.persistent,
+            "bounties-range requires DATABASE_URL (canonical events + bounty facts must persist)"
+        );
+        return run_bounties_range(&registry, &backends, raw.as_ref(), chain, *from, *to).await;
+    }
+    if matches!(command, Command::SyncBountyAccounts) {
+        #[cfg(feature = "pg")]
+        if let Some(pool) = &backends.pool {
+            let report = dotlens_node::bounties_pg::sync_bounty_accounts(
+                pool,
+                registry.as_ref(),
+                raw.as_ref(),
+            )
+            .await?;
+            println!("bounty account sync: {report:?}");
+            return Ok(());
+        }
+        anyhow::bail!("sync-bounty-accounts requires the `pg` feature and DATABASE_URL");
+    }
     if let Command::AnchorVoting { chain, account, track, height } = &command {
         return run_anchor_voting(
             &registry, &backends, raw.as_ref(), chain, account, *track, *height,
@@ -459,6 +494,25 @@ async fn main() -> Result<()> {
             missing_metadata = ?ta.chains_missing_metadata,
             "treasury accounts synced"
         );
+        // …and every bounty we have indexed contributes its OWN account, which
+        // is where bounty money actually sits. Runs here rather than only on
+        // demand because the list has to grow as bounties are created, and
+        // because holdings sweeps read whatever is in the table.
+        let ba = dotlens_node::bounties_pg::sync_bounty_accounts(
+            pool,
+            registry.as_ref(),
+            raw.as_ref(),
+        )
+        .await?;
+        tracing::info!(
+            accounts = ba.accounts,
+            deactivated = ba.deactivated,
+            linked = ba.linked,
+            underivable = ba.underivable,
+            missing_metadata = ?ba.chains_missing_metadata,
+            no_treasury_pallet = ?ba.chains_without_treasury_pallet,
+            "bounty accounts synced"
+        );
     }
 
     // -- fixture ingestion (checkpointed, idempotent) -------------------------
@@ -486,6 +540,7 @@ async fn main() -> Result<()> {
     spawn_gov_followers(&registry, &backends);
     spawn_votes_followers(&registry, &backends);
     spawn_treasury_followers(&registry, &backends);
+    spawn_bounties_followers(&registry, &backends, &raw);
     spawn_tip_followers(&registry, &backends, &raw);
 
     // -- API ------------------------------------------------------------------
@@ -497,6 +552,7 @@ async fn main() -> Result<()> {
         balances: backends.balances.clone(),
         gov: backends.gov.clone(),
         treasury: backends.treasury.clone(),
+        bounties: backends.bounties.clone(),
         assets: backends.assets.clone(),
         // family-encoded address parsing is adapter-owned (Invariant 4); with
         // more families this becomes registry-driven dispatch
@@ -1303,6 +1359,143 @@ async fn run_treasury_range(
 #[cfg(not(feature = "pg"))]
 async fn run_treasury_range(_: &Registry, _: &Backends, _: &str, _: u64, _: u64) -> Result<()> {
     anyhow::bail!("treasury-range requires the `pg` feature")
+}
+
+/// Bounty followers: chase each chain's decode checkpoint, mapping all three
+/// bounty pallets into one table. Pure mapping over Pg — no network.
+///
+/// ELIGIBILITY IS THE `treasury` MODULE, not a `bounties` one, and that is a
+/// claim rather than a shortcut: bounty funds are sub-accounts of the TREASURY's
+/// pallet id and bounty funding is a treasury outflow, so a chain that carries
+/// the treasury is exactly the chain that can carry its bounties. Giving them a
+/// separate module would invite a chain to declare one without the other, which
+/// would describe nothing real.
+#[cfg_attr(not(feature = "pg"), allow(unused_variables))]
+fn spawn_bounties_followers(
+    registry: &Arc<Registry>,
+    backends: &Arc<Backends>,
+    raw: &Arc<dyn RawStore>,
+) {
+    if !env_flag("BOUNTIES_FOLLOW") {
+        tracing::info!("bounties follower disabled (set BOUNTIES_FOLLOW=1 to enable)");
+        return;
+    }
+    if !backends.persistent {
+        tracing::warn!("BOUNTIES_FOLLOW=1 but no DATABASE_URL — refusing to map into memory");
+        return;
+    }
+    #[cfg(feature = "pg")]
+    {
+        use adapter_substrate::bounties::SubstrateBountyMapper;
+
+        let poll = std::time::Duration::from_secs(
+            env_or("POLL_INTERVAL_SECS", "6").parse().unwrap_or(6),
+        );
+        for chain in registry.chains() {
+            if !chain.has_module("treasury") {
+                continue;
+            }
+            if chain.family != registry::ChainFamily::Substrate {
+                tracing::debug!(chain = %chain.id, "no bounty mapper for this family — skipped");
+                continue;
+            }
+            let Some(pool) = backends.pool.clone() else { continue };
+            let chain_id = chain.id.clone();
+            let backends = backends.clone();
+            let raw = raw.clone();
+            tokio::spawn(async move {
+                // read ONCE per follower, not per event: the treasury PalletId
+                // is a property of the runtime, and re-decoding metadata in the
+                // write path is slice 6's hoisted defect
+                let pallet_id = match dotlens_node::bounties_pg::treasury_pallet_id(
+                    &pool,
+                    raw.as_ref(),
+                    &chain_id,
+                )
+                .await
+                {
+                    Ok(id) => id.found(),
+                    Err(e) => {
+                        tracing::warn!(chain = %chain_id, error = %e,
+                            "treasury PalletId unavailable — bounty accounts stay null \
+                             until sync-bounty-accounts runs");
+                        None
+                    }
+                };
+                tracing::info!(chain = %chain_id, derives_accounts = pallet_id.is_some(),
+                    "bounties follower started");
+                let source = dotlens_node::balances_pg::PgEventSource::new(pool.clone());
+                let sink = dotlens_node::bounties_pg::PgBountySink::new(pool, pallet_id);
+                let deps = ingest::bounties::BountyDeps {
+                    checkpoints: backends.checkpoints.as_ref(),
+                    source: &source,
+                    sink: &sink,
+                };
+                ingest::bounties::bounties_follow(&chain_id, &SubstrateBountyMapper, &deps, poll)
+                    .await;
+            });
+        }
+    }
+}
+
+#[cfg(feature = "pg")]
+async fn run_bounties_range(
+    registry: &Registry,
+    backends: &Backends,
+    raw: &dyn RawStore,
+    chain: &str,
+    from: u64,
+    to: u64,
+) -> Result<()> {
+    use adapter_substrate::bounties::SubstrateBountyMapper;
+
+    let cfg = registry
+        .chain(chain)
+        .with_context(|| format!("unknown chain: {chain}"))?;
+    anyhow::ensure!(
+        cfg.family == registry::ChainFamily::Substrate,
+        "no bounty mapper for family {:?}",
+        cfg.family
+    );
+    let pool = backends
+        .pool
+        .as_ref()
+        .context("bounties-range requires DATABASE_URL")?;
+    let pallet_id = dotlens_node::bounties_pg::treasury_pallet_id(pool, raw, &cfg.id)
+        .await?
+        .found();
+    if pallet_id.is_none() {
+        tracing::warn!(
+            chain,
+            "no archived metadata carrying a treasury PalletId — bounty rows will land \
+             with a null account_id; run `sync-bounty-accounts` once metadata exists"
+        );
+    }
+    let source = dotlens_node::balances_pg::PgEventSource::new(pool.clone());
+    let sink = dotlens_node::bounties_pg::PgBountySink::new(pool.clone(), pallet_id);
+    let deps = ingest::bounties::BountyDeps {
+        checkpoints: backends.checkpoints.as_ref(),
+        source: &source,
+        sink: &sink,
+    };
+    let n = ingest::bounties::bounties_range(&cfg.id, &SubstrateBountyMapper, &deps, from, to)
+        .await
+        .with_context(|| format!("bounties-range {chain} {from}..={to}"))?;
+    tracing::info!(chain, from, to, mapped = n, "bounties-range complete");
+    println!("bounties-range {chain} {from}..={to}: mapped {n} blocks");
+    Ok(())
+}
+
+#[cfg(not(feature = "pg"))]
+async fn run_bounties_range(
+    _: &Registry,
+    _: &Backends,
+    _: &dyn RawStore,
+    _: &str,
+    _: u64,
+    _: u64,
+) -> Result<()> {
+    anyhow::bail!("bounties-range requires the `pg` feature")
 }
 
 /// Everything one preimage decode needs from a block context: the archived
