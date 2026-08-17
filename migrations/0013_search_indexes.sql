@@ -16,13 +16,21 @@
 -- after Phase 4's backfill of ~52M. Two of the three indexes below are that
 -- finding; the rule paid for itself the first time it was applied.
 --
--- These are deliberately NOT keyed on chain_id first. A block hash is
--- effectively globally unique, so "which chain has this hash" should be ONE
--- index probe that answers the chain, not M probes that ask every chain in
--- turn — and the resolver's job is precisely to answer without a chain being
--- named. Postgres only requires the partition key in a UNIQUE index; these are
--- non-unique, so a bare `(hash)` index is legal on a partitioned table and
--- creates one child index per partition.
+-- These are deliberately NOT keyed on chain_id first: the resolver's job is to
+-- answer "which chain has this hash" WITHOUT a chain being named, so the caller
+-- has nothing to put in a leading chain_id column. Postgres only requires the
+-- partition key in a UNIQUE index; these are non-unique, so a bare `(hash)`
+-- index is legal on a partitioned table and creates one child index per
+-- partition.
+--
+-- CORRECTED AFTER MEASURING (do not size a fan-out from the earlier claim here,
+-- which said this made the lookup "ONE index probe, not M probes"): it IS M
+-- probes. `explain` shows an `Append` over a Bitmap Index Scan on EVERY
+-- partition's hash child index — five of them at four chains plus the default —
+-- because that is what partitioning does. What survives, and is the actual
+-- justification, is that each of those is an O(log n) index probe rather than a
+-- scan, and that the caller still names no chain. The count grows with CHAINS,
+-- not with rows.
 create index blocks_hash_idx on core.blocks (hash);
 
 -- `core.transactions.hash` is NULLABLE (an inherent has none), and a partial

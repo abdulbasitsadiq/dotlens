@@ -245,6 +245,32 @@ pub async fn referenda_needing_preimages(
     .context("listing referenda needing preimages")
 }
 
+/// One referendum's proposal: (proposal JSON, hash, len).
+///
+/// The simulation path's way in — it needs the BYTES behind a referendum, and
+/// this says where to find them (Inline body, or the (hash, len) that keys the
+/// archived preimage). Returns None when the referendum is not indexed at all,
+/// which the caller must distinguish from a referendum with no proposal.
+#[allow(clippy::type_complexity)]
+pub async fn referendum_proposal(
+    pool: &PgPool,
+    chain_id: &str,
+    class: &str,
+    referendum_id: i64,
+) -> Result<Option<(Option<serde_json::Value>, Option<String>, Option<i64>)>> {
+    let row: Option<(Option<serde_json::Value>, Option<String>, Option<i64>)> = sqlx::query_as(
+        "select proposal, proposal_hash, proposal_len from gov.referenda \
+         where chain_id = $1 and class = $2 and referendum_id = $3",
+    )
+    .bind(chain_id)
+    .bind(class)
+    .bind(referendum_id)
+    .fetch_optional(pool)
+    .await
+    .with_context(|| format!("reading referendum {chain_id}/{class}/{referendum_id}"))?;
+    Ok(row)
+}
+
 /// Fill proposal_hash/len for an Inline proposal after hashing its bytes —
 /// coalesce-only (never overwrites a mapper-written value), so the preimage
 /// join works for inline referenda too.

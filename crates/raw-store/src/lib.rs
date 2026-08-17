@@ -64,6 +64,30 @@ pub mod keys {
     pub fn preimage(chain: &str, hash_hex: &str, len: u64) -> String {
         format!("raw/{chain}/preimage/{hash_hex}/{len}.scale")
     }
+    /// Metadata at an explicit metadata VERSION, fetched through the
+    /// `Metadata_metadata_at_version` runtime API rather than `state_getMetadata`
+    /// (which serves v14 on every runtime we index). Kept beside, not instead of,
+    /// `metadata()`: the v14 blob decodes blocks and the v15 blob is the only one
+    /// carrying the runtime-API section, so both are real artifacts of the same
+    /// spec_version and neither may overwrite the other.
+    pub fn metadata_at_version(chain: &str, runtime_version: u32, meta_version: u32) -> String {
+        format!("raw/{chain}/meta/{runtime_version}/metadata-v{meta_version}.scale")
+    }
+    /// One simulation artifact, keyed by the STATE it ran against (block hash)
+    /// and the exact input (hash of the encoded params) — the same two things
+    /// that key `sim.simulation_results`.
+    ///
+    /// Height is deliberately absent from the key: two forks at one height are
+    /// two states and would collide under a height key, which write-once storage
+    /// would then report as an overwrite of an object that was never wrong.
+    /// `item` names the runtime-API method as well as the direction —
+    /// `DryRunApi_dry_run_call.params.scale` (what we sent) and
+    /// `.response.scale` (what came back) — because Tier 2 and `dry_run_xcm`
+    /// will file artifacts in this same directory, and bytes whose meaning
+    /// depends on knowing which call produced them are not evidence.
+    pub fn simulation(chain: &str, block_hash_hex: &str, input_hash_hex: &str, item: &str) -> String {
+        format!("raw/{chain}/sim/{block_hash_hex}/{input_hash_hex}/{item}")
+    }
     /// Unfinalized blocks are HASH-KEYED: forks at one height coexist under
     /// write-once immutability, and superseded blocks stay archived.
     /// `short_hash` = hex hash without 0x, truncated by the caller.

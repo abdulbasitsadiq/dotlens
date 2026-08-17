@@ -6,6 +6,7 @@ members = [
     "crates/raw-store",
     "crates/ingest",
     "crates/adapter-substrate",
+    "crates/sim",
     "crates/api",
     "crates/dotlens-node",
 ]
@@ -50,6 +51,7 @@ canonical = { path = "crates/canonical" }
 raw-store = { path = "crates/raw-store" }
 ingest = { path = "crates/ingest" }
 adapter-substrate = { path = "crates/adapter-substrate" }
+sim = { path = "crates/sim" }
 api = { path = "crates/api" }
 
 [profile.dev]

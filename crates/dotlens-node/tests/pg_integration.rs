@@ -2504,3 +2504,177 @@ async fn bounty_facts_converge_and_derived_accounts_join_the_treasury_list() {
 
     db.drop_db().await;
 }
+
+/// Tier 1 results are immutable observations keyed by STATE + INPUT (Phase 3,
+/// slice 1). The three properties that matter, and each has bitten a projection
+/// elsewhere in this project: a recorded answer is never rewritten, two states
+/// hold two answers, and the read path returns them newest-state first.
+#[tokio::test]
+async fn simulation_results_are_immutable_per_state_and_read_back_newest_first() {
+    use api::SimIndex as _;
+    use dotlens_node::sim_pg::{insert_simulation, simulation_at, PgSimStore};
+    use sim::{SimRecord, SimStore as _};
+
+    let Some(db) = TestDb::create().await else { return };
+    let reg = seeds();
+    sync_registry(&db.pool, &reg).await.expect("registry sync");
+
+    let call_hash = format!("0x{}", "ab".repeat(32));
+    // 2^65 planck: a dry-run event body carries the same big numbers a real one
+    // does, and it must survive JSONB as a decimal STRING, not a float.
+    let big = "36893488147419103232";
+    let record = |block: &str, input: &str, height: u64, status: &str| SimRecord {
+        chain_id: "polkadot-asset-hub".into(),
+        at_block_hash: block.into(),
+        input_hash: input.into(),
+        at_height: height,
+        tier: sim::TIER_DRY_RUN.into(),
+        call_hash: call_hash.clone(),
+        call_summary: Some("multiassetbounties.fund_bounty".into()),
+        origin_spec: "Origins:MediumSpender".into(),
+        origin_json: serde_json::json!({"resolved": "Origins:MediumSpender"}),
+        xcm_version: 4,
+        status: status.into(),
+        // NULL for api_error, and the distinction is the point: "the call
+        // failed" and "we never got to try" are different facts, and 0014 says
+        // api_error means no dispatch was attempted. A fixture that writes
+        // `false` there would teach the wrong shape (slice 7's green-test-with-
+        // a-wrong-number, one column over).
+        dispatch_ok: (status != "api_error").then(|| status == "executed"),
+        dispatch_error: (status == "dispatch_failed")
+            .then(|| serde_json::json!({"error": "assets.NoAccount"})),
+        emitted_events: serde_json::json!([
+            {"name": "balances.Withdraw", "data": {"amount": big}}
+        ]),
+        event_count: 1,
+        local_xcm: None,
+        forwarded_xcms: serde_json::json!([]),
+        effects: serde_json::json!({"Ok": [{"emitted_events": []}]}),
+        note: None,
+        spec_version: 2_003_002,
+        api_version: 2,
+        metadata_version: 15,
+        sim_version: 1,
+        raw_location: format!(
+            "raw/polkadot-asset-hub/sim/{block}/{input}/DryRunApi_dry_run_call.response.scale"
+        ),
+    };
+
+    let first = record("0xaa", "0x01", 19_000_000, "dispatch_failed");
+    insert_simulation(&db.pool, &first).await.expect("insert");
+
+    let back = simulation_at(&db.pool, "polkadot-asset-hub", "0xaa", "0x01", "dry_run")
+        .await
+        .expect("read")
+        .expect("row exists");
+    assert_eq!(back.status, "dispatch_failed");
+    assert_eq!(back.event_count, 1);
+    assert_eq!(back.spec_version, 2_003_002);
+    assert_eq!(
+        back.emitted_events[0]["data"]["amount"], big,
+        "a u128 planck amount survives JSONB as a decimal string"
+    );
+
+    // Same state, same input, a DIFFERENT answer: refused silently, and the
+    // first answer stands. Overwriting would erase the evidence that a runtime
+    // gave two different answers to one question — which is the only thing that
+    // could ever tell us something is wrong.
+    let contradiction = record("0xaa", "0x01", 19_000_000, "executed");
+    insert_simulation(&db.pool, &contradiction)
+        .await
+        .expect("second insert is a no-op, not an error");
+    let back = simulation_at(&db.pool, "polkadot-asset-hub", "0xaa", "0x01", "dry_run")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        back.status, "dispatch_failed",
+        "an immutable observation is never rewritten"
+    );
+
+    // The TIER is part of the key, so a fork answer at the same state and input
+    // is a SEPARATE row — and, crucially, a Tier 2 lookup does not find the
+    // Tier 1 row and report it as cached.
+    let mut fork = record("0xaa", "0x01", 19_000_000, "executed");
+    fork.tier = "fork".into();
+    insert_simulation(&db.pool, &fork)
+        .await
+        .expect("a different tier is a different row");
+    assert_eq!(
+        simulation_at(&db.pool, "polkadot-asset-hub", "0xaa", "0x01", "fork")
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        "executed",
+        "the fork tier keeps its own answer"
+    );
+
+    // A DIFFERENT state is a different answer and gets its own row — this is
+    // why the key is the block hash and not the height.
+    insert_simulation(&db.pool, &record("0xbb", "0x01", 19_000_500, "executed"))
+        .await
+        .expect("insert at another state");
+    // …and the same state with a different INPUT (another origin, say) too.
+    insert_simulation(&db.pool, &record("0xbb", "0x02", 19_000_500, "api_error"))
+        .await
+        .expect("insert with another input");
+
+    let (rows,): (i64,) = sqlx::query_as("select count(*) from sim.simulation_results")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(rows, 4);
+
+    // The read path: newest state first, then the full key as tie-break, so the
+    // order is TOTAL — two backends cannot disagree and `limit` cannot wobble.
+    let index = api::pg::PgSimIndex::new(db.pool.clone());
+    let all = index
+        .simulations("polkadot-asset-hub", &call_hash, 10)
+        .await
+        .expect("read back");
+    assert_eq!(all.len(), 4);
+    assert_eq!(all[0].at_height, 19_000_500);
+    assert_eq!(all[0].input_hash, "0x01", "ties break on input_hash, ascending");
+    assert_eq!(all[1].input_hash, "0x02");
+    assert_eq!(all[2].at_height, 19_000_000);
+    assert_eq!(
+        (all[2].tier.as_str(), all[3].tier.as_str()),
+        ("dry_run", "fork"),
+        "two tiers at one state are ordered, not arbitrary"
+    );
+    assert_eq!(all[0].metadata_version, 15, "lineage survives the round trip");
+    let one = index
+        .simulations("polkadot-asset-hub", &call_hash, 1)
+        .await
+        .unwrap();
+    assert_eq!(one.len(), 1);
+    assert_eq!(one[0].at_height, 19_000_500);
+
+    // Another chain's answer is never borrowed, and an unknown call is empty.
+    assert!(index
+        .simulations("polkadot", &call_hash, 10)
+        .await
+        .unwrap()
+        .is_empty());
+    assert!(index
+        .simulations("polkadot-asset-hub", &format!("0x{}", "cd".repeat(32)), 10)
+        .await
+        .unwrap()
+        .is_empty());
+
+    // The SimStore trait the orchestration drives goes through the same rows.
+    let store = PgSimStore::new(db.pool.clone());
+    assert!(store
+        .get("polkadot-asset-hub", "0xaa", "0x01", "dry_run")
+        .await
+        .unwrap()
+        .is_some());
+    assert!(store
+        .get("polkadot-asset-hub", "0xaa", "0xff", "dry_run")
+        .await
+        .unwrap()
+        .is_none());
+
+    db.drop_db().await;
+}

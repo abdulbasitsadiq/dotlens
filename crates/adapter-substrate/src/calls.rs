@@ -50,8 +50,21 @@ pub fn decode_call(metadata_blob: &[u8], call_bytes: &[u8]) -> Result<DecodedCal
         .map_err(|e| format!("metadata blob undecodable: {e}"))?;
 
     let (call_ty, types) = runtime_call_type(&prefixed)?;
+    decode_call_with(&types, call_ty, call_bytes)
+}
+
+/// Same decode against a registry + call type the caller already resolved.
+///
+/// The dry-run path uses this: the type it must encode against is the one the
+/// `DryRunApi` method DECLARES for its `call` parameter, which is stricter than
+/// re-deriving `extrinsic.call_ty` and costs no second metadata decode.
+pub fn decode_call_with(
+    types: &scale_info::PortableRegistry,
+    call_ty: u32,
+    call_bytes: &[u8],
+) -> Result<DecodedCall, String> {
     let mut cursor = call_bytes;
-    let value = scale_value::scale::decode_as_type(&mut cursor, call_ty, &types)
+    let value = scale_value::scale::decode_as_type(&mut cursor, call_ty, types)
         .map_err(|e| format!("RuntimeCall decode: {e}"))?;
     if !cursor.is_empty() {
         return Err(format!(

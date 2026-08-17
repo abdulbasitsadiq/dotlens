@@ -242,13 +242,117 @@ impl SubstrateSource {
         &self,
         hash: subxt::utils::H256,
     ) -> Result<u32, SourceError> {
+        Ok(self.runtime_version_info(hash).await?.spec_version)
+    }
+
+    /// spec_version PLUS the runtime's self-declared API list.
+    ///
+    /// `apis` is how a chain says which runtime APIs it implements and at which
+    /// version — `[["0x…8 bytes", 2], …]`, the 8 bytes being blake2b-64 of the
+    /// trait name. subxt's typed `RuntimeVersion` keeps only the two fields it
+    /// needs and flattens the rest into `other`, so the list is read from there
+    /// rather than being lost. This is the ONLY honest way to ask "can this
+    /// chain dry-run" before trying: the alternative is to send a request and
+    /// interpret an RPC error, which cannot distinguish "not implemented" from
+    /// "the node is unwell".
+    pub async fn runtime_version_info(
+        &self,
+        hash: subxt::utils::H256,
+    ) -> Result<RuntimeVersionInfo, SourceError> {
         let rv = self
             .with_failover("state_getRuntimeVersion", |m| async move {
                 m.state_get_runtime_version(Some(hash)).await
             })
             .await?;
-        Ok(rv.spec_version)
+        Ok(RuntimeVersionInfo {
+            spec_version: rv.spec_version,
+            apis: rv.other.get("apis").cloned().unwrap_or(serde_json::Value::Null),
+        })
     }
+
+    /// Execute a runtime API method against the state at `hash`.
+    ///
+    /// `function` is the wire name (`Trait_method`, e.g.
+    /// `DryRunApi_dry_run_call`) and `params` is the plain concatenation of the
+    /// SCALE-encoded arguments — runtime API parameters carry no length prefix
+    /// and no tuple wrapper.
+    ///
+    /// READ-ONLY BY CONSTRUCTION, and worth being explicit about since this is
+    /// the first place dotlens asks a runtime to EXECUTE something: `state_call`
+    /// runs the wasm against a transient overlay the node discards, so nothing
+    /// it writes reaches the chain, no signature is involved, nothing is
+    /// gossiped and no key exists anywhere in this process (ARCHITECTURE §11a —
+    /// dotlens never holds a key and never submits an extrinsic).
+    pub async fn state_call(
+        &self,
+        function: &str,
+        params: &[u8],
+        hash: subxt::utils::H256,
+    ) -> Result<Vec<u8>, SourceError> {
+        self.with_failover("state_call", |m| {
+            let function = function.to_string();
+            let params = params.to_vec();
+            async move {
+                m.state_call(&function, Some(params.as_slice()), Some(hash))
+                    .await
+            }
+        })
+        .await
+    }
+
+    /// Metadata at an explicit VERSION, via `Metadata_metadata_at_version`.
+    ///
+    /// This pays the debt `metadata_at` has carried since Phase 1 slice 2:
+    /// `state_getMetadata` returns v14 on every runtime we index, and v14 has no
+    /// runtime-API section, so nothing that calls a runtime API can be built
+    /// from it. `None` = this runtime does not offer that version, which is data
+    /// (ask `metadata_versions` for what it does offer).
+    ///
+    /// THE RETURN IS DOUBLY ENCODED: the API returns `Option<OpaqueMetadata>`,
+    /// and `OpaqueMetadata` is a newtype over `Vec<u8>` whose CONTENTS are the
+    /// SCALE encoding of `RuntimeMetadataPrefixed` (the `meta` magic + version
+    /// byte + body). Decoding once gives you bytes, not metadata.
+    pub async fn metadata_at_version(
+        &self,
+        version: u32,
+        hash: subxt::utils::H256,
+    ) -> Result<Option<Vec<u8>>, SourceError> {
+        use parity_scale_codec::{Decode, Encode};
+        let raw = self
+            .state_call("Metadata_metadata_at_version", &version.encode(), hash)
+            .await?;
+        Option::<Vec<u8>>::decode(&mut &raw[..]).map_err(|e| {
+            SourceError::Rpc(format!(
+                "Metadata_metadata_at_version({version}) did not return Option<OpaqueMetadata>: {e}"
+            ))
+        })
+    }
+
+    /// The metadata versions this runtime can produce (expect `[14, 15, 16]`).
+    pub async fn metadata_versions(
+        &self,
+        hash: subxt::utils::H256,
+    ) -> Result<Vec<u32>, SourceError> {
+        use parity_scale_codec::Decode;
+        let raw = self
+            .state_call("Metadata_metadata_versions", &[], hash)
+            .await?;
+        Vec::<u32>::decode(&mut &raw[..]).map_err(|e| {
+            SourceError::Rpc(format!(
+                "Metadata_metadata_versions did not return Vec<u32>: {e}"
+            ))
+        })
+    }
+}
+
+/// What `state_getRuntimeVersion` tells us, including the part subxt's typed
+/// struct discards.
+#[derive(Debug, Clone)]
+pub struct RuntimeVersionInfo {
+    pub spec_version: u32,
+    /// The raw `apis` JSON: `[["0x…", version], …]`, or `Null` if the node did
+    /// not send one. Interpreted by `dryrun::declared_api_version`.
+    pub apis: serde_json::Value,
 }
 
 fn hex32(h: &subxt::utils::H256) -> String {

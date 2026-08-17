@@ -64,6 +64,11 @@ pub mod votes;
 /// that `WhitelistedCallDispatched` fires for a FAILED call too.
 pub mod whitelist;
 
+/// Tier 1 simulation: build a `DryRunApi::dry_run_call` request out of the
+/// runtime's own metadata and read the answer back. Pure — no I/O; the RPC is
+/// `source::SubstrateSource::state_call` and the wiring is in dotlens-node.
+pub mod dryrun;
+
 use canonical::{CanonicalBlock, CanonicalEvent, CanonicalTransaction, Lineage};
 use serde::{Deserialize, Serialize};
 

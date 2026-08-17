@@ -38,6 +38,14 @@ pub mod whitelist_pg;
 #[cfg(feature = "pg")]
 pub mod tip_pg;
 
+/// Tier 1 simulation results (Phase 3, slice 1) — immutable observations.
+#[cfg(feature = "pg")]
+pub mod sim_pg;
+
+/// The live `sim::DryRunner`: RPC + raw store + the pure adapter half.
+#[cfg(feature = "live")]
+pub mod sim_run;
+
 /// Deterministic contiguous chunking for concurrent backfill: same inputs →
 /// same chunks → per-chunk checkpoints (`raw_backfill:{a}-{b}`) resume exactly
 /// after any crash, whatever the worker count next run uses for OTHER ranges.

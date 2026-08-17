@@ -12,6 +12,9 @@ live = ["dep:subxt", "dep:async-trait", "dep:tokio", "dep:tracing"]
 [dependencies]
 canonical.workspace = true
 ingest.workspace = true
+# the tier-agnostic simulation vocabulary this crate implements the Substrate
+# half of (same direction as the `ingest` dependency: generic ← protocol)
+sim.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
@@ -29,3 +32,11 @@ subxt = { workspace = true, optional = true }
 async-trait = { workspace = true, optional = true }
 tokio = { workspace = true, optional = true }
 tracing = { workspace = true, optional = true }
+
+[dev-dependencies]
+# The dry-run tests build their fixtures the only honest way available offline:
+# real Rust types with real TypeInfo, registered in a real scale_info registry
+# and encoded with real codec — so one side of every shape assertion is decoded
+# from bytes rather than hand-written to match the other (slice 6's lesson).
+parity-scale-codec = { workspace = true, features = ["derive"] }
+scale-info = { workspace = true, features = ["derive"] }

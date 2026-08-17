@@ -405,6 +405,150 @@ pub struct AssetRow {
     pub xcm_location: Option<serde_json::Value>,
 }
 
+/// One recorded Tier 1 simulation (`sim.simulation_results`).
+///
+/// An IMMUTABLE OBSERVATION: what this runtime, at this exact state, answered
+/// when asked this exact question. Serving it is a read like any other — the API
+/// never triggers a dry run itself. That is deliberate, not a missing feature: a
+/// public GET must not fan out to an external node (ROADMAP's cost rules), and
+/// the [Simulate] button belongs to Tier 2's job queue, which is where a request
+/// that costs real work gets to be a POST.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SimulationRow {
+    pub chain_id: String,
+    pub at_height: u64,
+    pub at_block_hash: String,
+    pub input_hash: String,
+    pub tier: String,
+    pub call_hash: String,
+    pub call_summary: Option<String>,
+    pub origin_spec: String,
+    pub origin: serde_json::Value,
+    pub xcm_version: u32,
+    /// executed | dispatch_failed | api_error — see the migration on why
+    /// `dispatch_failed` is a result rather than an error.
+    pub status: String,
+    pub dispatch_ok: Option<bool>,
+    pub dispatch_error: Option<serde_json::Value>,
+    pub emitted_events: serde_json::Value,
+    pub event_count: u32,
+    pub local_xcm: Option<serde_json::Value>,
+    pub forwarded_xcms: serde_json::Value,
+    pub effects: serde_json::Value,
+    pub note: Option<String>,
+    pub spec_version: u64,
+    pub api_version: u32,
+    pub metadata_version: u32,
+    pub sim_version: u32,
+    pub raw_location: String,
+    pub observed_at: Option<DateTime<Utc>>,
+}
+
+/// Read side of `sim.simulation_results`.
+#[async_trait]
+pub trait SimIndex: Send + Sync {
+    /// Recorded simulations of one call on one chain, newest state first.
+    ///
+    /// The ordering is `at_height desc, input_hash, at_block_hash, tier` — the
+    /// full primary key after the height — and BOTH backends must produce it
+    /// exactly, ties included, or `limit` returns different rows from each. The
+    /// tail keys are not padding: two forks at one height share a height AND an
+    /// input hash (same call, same origin → same params) and differ only by
+    /// block hash, and two TIERS differ in neither.
+    async fn simulations(
+        &self,
+        chain_id: &str,
+        call_hash: &str,
+        limit: u32,
+    ) -> Result<Vec<SimulationRow>, IndexError>;
+}
+
+/// The empty backend — what a memory-mode node serves, and what every endpoint
+/// sees before a single simulation has been run.
+#[derive(Default)]
+pub struct MemorySimIndex {
+    rows: RwLock<Vec<SimulationRow>>,
+}
+
+impl MemorySimIndex {
+    pub fn new() -> Self {
+        Self::default()
+    }
+    pub fn insert(&self, row: SimulationRow) {
+        self.rows.write().expect("lock").push(row);
+    }
+}
+
+#[async_trait]
+impl SimIndex for MemorySimIndex {
+    async fn simulations(
+        &self,
+        chain_id: &str,
+        call_hash: &str,
+        limit: u32,
+    ) -> Result<Vec<SimulationRow>, IndexError> {
+        let rows = self.rows.read().map_err(|e| IndexError(e.to_string()))?;
+        let mut out: Vec<SimulationRow> = rows
+            .iter()
+            .filter(|r| r.chain_id == chain_id && r.call_hash == call_hash)
+            .cloned()
+            .collect();
+        // byte-identical ordering to the Pg backend (Rust's String Ord is
+        // byte-wise, which is what `collate "C"` asks Postgres for), including
+        // the at_block_hash tie-break — without it two forks at one height are
+        // an unstable pair and `limit 1` disagrees between backends
+        out.sort_by(|a, b| {
+            b.at_height
+                .cmp(&a.at_height)
+                .then_with(|| a.input_hash.cmp(&b.input_hash))
+                .then_with(|| a.at_block_hash.cmp(&b.at_block_hash))
+                .then_with(|| a.tier.cmp(&b.tier))
+        });
+        out.truncate(limit as usize);
+        Ok(out)
+    }
+}
+
+/// What a Tier 1 answer does NOT model. Repeated in every simulation response
+/// because a preview that is silent about its limits is worse than none: each
+/// line here is a real difference between this answer and what enactment would
+/// do, and the first three are why Tier 2 exists at all.
+pub fn sim_not_covered() -> Vec<&'static str> {
+    vec![
+        "the state is the state at the block named here, NOT the state at enactment — a \
+         referendum that would pass in a week is previewed against today's balances, \
+         today's whitelist entries and today's scheduler agenda",
+        "the call is dispatched directly, so no transaction extension runs: no signature \
+         check, no nonce, no mortality, no fee withdrawal and no length or weight limit",
+        "a whitelisted-call flow needs its authorization to already exist in storage; \
+         previewing one before the Fellowship has whitelisted it fails honestly rather \
+         than predicting the enacted outcome (Tier 2 sets that state up — Phase 3)",
+        "forwarded_xcms is not what the DESTINATION would do — the receiving side is \
+         dry_run_xcm on that chain, which lands with the XCM module",
+        "forwarded_xcms IS NOT ALWAYS ATTRIBUTABLE TO THE SIMULATED CALL, and on the \
+         Polkadot relay it is not attributable at all: measured at relay #24448717 and \
+         #24448722, a `system.remark` under Root — which queues nothing — returns 64 \
+         destinations carrying 74 messages, including a real 8,935 DOT \
+         ReserveAssetDeposited bound for parachain 2040. Two DIFFERENT calls at one state, \
+         and one call at two states, all return byte-identical lists, so the content is a \
+         property of the STATE (the relay router enumerating every parachain's existing \
+         downward queue) and not of the call. Asset Hub does not behave this way: every \
+         call simulated there returns an empty list. Until a later slice differences the \
+         answer against a no-op run at the same state, treat a non-empty forwarded_xcms as \
+         'messages present', never as 'this call would send these'",
+        "a status of `executed` is about the OUTER call: utility.batch returns Ok when an \
+         inner call fails (emitting BatchInterrupted) and force_batch carries on past one \
+         (ItemFailed), so a half-applied batch dispatches successfully. Such a run carries a \
+         `note` saying so, but the authority is emitted_events, not the status",
+        "no fee estimate: XcmPaymentApi is not called by this tier yet",
+        "the dispatch origin is supplied by the caller and is NOT derived from the \
+         referendum's track — the track→origin map lives in runtime Rust, not in any \
+         artifact we index. The chain does record it once, in the submitting \
+         `referenda.submit` call's `proposal_origin` argument; reading that back as a \
+         suggested origin is a later slice",
+    ]
+}
+
 /// Read side of `core.assets`.
 #[async_trait]
 pub trait AssetIndex: Send + Sync {
@@ -1944,6 +2088,90 @@ pub mod pg {
         }
     }
 
+    /// Postgres-backed simulation reads over `sim.simulation_results`.
+    pub struct PgSimIndex {
+        pool: PgPool,
+    }
+
+    impl PgSimIndex {
+        pub fn new(pool: PgPool) -> Self {
+            Self { pool }
+        }
+    }
+
+    #[async_trait]
+    impl super::SimIndex for PgSimIndex {
+        async fn simulations(
+            &self,
+            chain_id: &str,
+            call_hash: &str,
+            limit: u32,
+        ) -> Result<Vec<super::SimulationRow>, IndexError> {
+            // (chain_id, call_hash, at_height desc) is simulation_results_call_idx
+            // verbatim — the index and its one reader ship together (0014).
+            //
+            // Read by COLUMN NAME rather than into a tuple: this row has 24
+            // columns and sqlx only implements FromRow for tuples up to 16, so a
+            // tuple here does not compile. Naming the columns is also the safer
+            // shape for a row this wide — a reordered select cannot silently
+            // transpose two same-typed fields.
+            use sqlx::Row as _;
+            let rows = sqlx::query(
+                "select chain_id, at_height, at_block_hash, input_hash, tier, call_hash, \
+                        call_summary, origin_spec, origin_json, xcm_version, status, \
+                        dispatch_ok, dispatch_error, emitted_events, event_count, local_xcm, \
+                        forwarded_xcms, effects, note, spec_version, api_version, \
+                        metadata_version, sim_version, raw_location, observed_at \
+                 from sim.simulation_results \
+                 where chain_id = $1 and call_hash = $2 \
+                 order by at_height desc, input_hash collate \"C\", \
+                          at_block_hash collate \"C\", tier collate \"C\" \
+                 limit $3",
+            )
+            .bind(chain_id)
+            .bind(call_hash)
+            .bind(limit as i64)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| IndexError(e.to_string()))?;
+
+            let err = |e: sqlx::Error| IndexError(e.to_string());
+            rows.into_iter()
+                .map(|r| {
+                    Ok(super::SimulationRow {
+                        chain_id: r.try_get("chain_id").map_err(err)?,
+                        at_height: r.try_get::<i64, _>("at_height").map_err(err)? as u64,
+                        at_block_hash: r.try_get("at_block_hash").map_err(err)?,
+                        input_hash: r.try_get("input_hash").map_err(err)?,
+                        tier: r.try_get("tier").map_err(err)?,
+                        call_hash: r.try_get("call_hash").map_err(err)?,
+                        call_summary: r.try_get("call_summary").map_err(err)?,
+                        origin_spec: r.try_get("origin_spec").map_err(err)?,
+                        origin: r.try_get("origin_json").map_err(err)?,
+                        xcm_version: r.try_get::<i32, _>("xcm_version").map_err(err)? as u32,
+                        status: r.try_get("status").map_err(err)?,
+                        dispatch_ok: r.try_get("dispatch_ok").map_err(err)?,
+                        dispatch_error: r.try_get("dispatch_error").map_err(err)?,
+                        emitted_events: r.try_get("emitted_events").map_err(err)?,
+                        event_count: r.try_get::<i32, _>("event_count").map_err(err)? as u32,
+                        local_xcm: r.try_get("local_xcm").map_err(err)?,
+                        forwarded_xcms: r.try_get("forwarded_xcms").map_err(err)?,
+                        effects: r.try_get("effects").map_err(err)?,
+                        note: r.try_get("note").map_err(err)?,
+                        spec_version: r.try_get::<i64, _>("spec_version").map_err(err)? as u64,
+                        api_version: r.try_get::<i32, _>("api_version").map_err(err)? as u32,
+                        metadata_version: r
+                            .try_get::<i32, _>("metadata_version")
+                            .map_err(err)? as u32,
+                        sim_version: r.try_get::<i32, _>("sim_version").map_err(err)? as u32,
+                        raw_location: r.try_get("raw_location").map_err(err)?,
+                        observed_at: r.try_get("observed_at").map_err(err)?,
+                    })
+                })
+                .collect()
+        }
+    }
+
     /// Postgres-backed asset registry reads over `core.assets`.
     pub struct PgAssetIndex {
         pool: PgPool,
@@ -3100,6 +3328,7 @@ pub struct AppState {
     pub treasury: Arc<dyn TreasuryIndex>,
     pub bounties: Arc<dyn BountyIndex>,
     pub assets: Arc<dyn AssetIndex>,
+    pub sim: Arc<dyn SimIndex>,
     pub parse_account: AccountParser,
 }
 
@@ -3124,6 +3353,7 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/bounties/{network}", get(list_bounties))
         .route("/v1/bounties/{network}/{id}", get(get_bounty))
         .route("/v1/assets/{chain}", get(list_assets))
+        .route("/v1/sim/{chain}/calls/{call_hash}", get(get_simulations))
         .route("/v1/search", get(get_search))
         .route("/v1/domains/{network}/{domain}", get(resolve_domain))
         .with_state(state)
@@ -3715,13 +3945,114 @@ async fn get_gov_referendum(
         }
     }
 
+    // …and any Tier 1 previews of it. THIS IS THE KILLER FLOW (PRODUCT.md gap
+    // 4): the same page that says what a referendum DOES can now say what it
+    // WOULD DO. Recorded runs only — rendering never triggers one — and they are
+    // gathered across the same residency chains, since a call previewed on the
+    // relay and on Asset Hub are two different answers.
+    const SIM_PER_WINDOW: u32 = 10;
+    let mut simulations: Vec<SimulationRow> = Vec::new();
+    let mut sim_truncated = false;
+    if let Some(hash) = &referendum.proposal_hash {
+        for w in gov_windows(&state.registry, &network, &class) {
+            match state.sim.simulations(&w.chain, hash, SIM_PER_WINDOW).await {
+                Ok(rows) => {
+                    sim_truncated |= rows.len() as u32 == SIM_PER_WINDOW;
+                    simulations.extend(rows);
+                }
+                Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+            }
+        }
+    }
+    // Sort the MERGED list, not each window: concatenating windows leaves the
+    // array grouped by chain, so `simulations[0]` would be the oldest chain's
+    // newest run rather than the newest run. Same ordering the index promises.
+    simulations.sort_by(|a, b| {
+        b.at_height
+            .cmp(&a.at_height)
+            .then_with(|| a.input_hash.cmp(&b.input_hash))
+            .then_with(|| a.at_block_hash.cmp(&b.at_block_hash))
+            .then_with(|| a.tier.cmp(&b.tier))
+    });
+
+    // Three different situations that all produce an empty list, and they are
+    // NOT the same claim. Saying "nobody previewed this" when we never had a
+    // hash to look one up by would be asserting something we did not check.
+    let sim_coverage = match (&referendum.proposal_hash, simulations.is_empty()) {
+        (None, _) => serde_json::json!({
+            "recorded_only": "this referendum has no proposal hash indexed yet, so no \
+                              simulation could be looked up at all — run `decode-preimages` \
+                              for this chain first (an Inline proposal gets its hash filled \
+                              in there)",
+            "not_covered": sim_not_covered(),
+        }),
+        (Some(_), true) => serde_json::json!({
+            "recorded_only": "no Tier 1 preview has been run for this proposal; that is an \
+                              absence of simulations, not a claim about the call",
+            "not_covered": sim_not_covered(),
+        }),
+        (Some(_), false) => serde_json::json!({
+            "truncated": sim_truncated,
+            "not_covered": sim_not_covered(),
+        }),
+    };
+
     Json(serde_json::json!({
         "network": network,
         "class": class,
         "referendum_id": id,
         "referendum": referendum,
         "preimage": preimage,
+        "simulations": simulations,
+        "simulation_coverage": sim_coverage,
         "segments": segments,
+    }))
+    .into_response()
+}
+
+#[derive(Deserialize)]
+struct SimQuery {
+    limit: Option<u64>,
+}
+
+/// Recorded Tier 1 simulations of one call, on one chain.
+///
+/// CHAIN-SCOPED, not network-scoped, and unlike almost everything else here
+/// that is not an oversight: a simulation is an answer a PARTICULAR runtime gave
+/// about a PARTICULAR state, so the chain is part of the question rather than
+/// something to resolve away. The same call previewed on the relay and on Asset
+/// Hub is two different answers and both are worth having.
+async fn get_simulations(
+    State(state): State<AppState>,
+    Path((chain, call_hash)): Path<(String, String)>,
+    Query(q): Query<SimQuery>,
+) -> Response {
+    if state.registry.chain(&chain).is_none() {
+        return error(
+            StatusCode::NOT_FOUND,
+            format!("unknown chain '{chain}'"),
+        );
+    }
+    let hash = normalize_call_hash(&call_hash);
+    // clamped at 1, not 0: `?limit=0` would return an empty list under a
+    // coverage note that says "nobody has previewed this call", which would be
+    // this endpoint stating something false about the data on the caller's own
+    // instruction
+    let limit = q.limit.unwrap_or(10).clamp(1, 100) as u32;
+    let rows = match state.sim.simulations(&chain, &hash, limit).await {
+        Ok(r) => r,
+        Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    };
+    Json(serde_json::json!({
+        "chain": chain,
+        "call_hash": hash,
+        "simulations": rows,
+        "coverage": {
+            "recorded_only": "this endpoint serves simulations that were RUN; it never \
+                              starts one. An empty list means nobody has previewed this \
+                              call at any state, not that the call does nothing",
+            "not_covered": sim_not_covered(),
+        },
     }))
     .into_response()
 }
@@ -4998,6 +5329,51 @@ pub(crate) mod tests {
             },
         );
 
+        // A Tier 1 preview of ref 1500's proposal, recorded on the chain the
+        // referendum CONCLUDED on. Deliberately a dispatch_failed row: the
+        // shape most likely to be mis-rendered as "no result" is the one worth
+        // pinning in a route test.
+        let sim = Arc::new(MemorySimIndex::new());
+        sim.insert(SimulationRow {
+            chain_id: "polkadot-asset-hub".into(),
+            at_height: 19_000_500,
+            at_block_hash: format!("0x{}", "cd".repeat(32)),
+            input_hash: format!("0x{}", "01".repeat(32)),
+            tier: "dry_run".into(),
+            call_hash: format!("0x{}", "ab".repeat(32)),
+            call_summary: Some("multiassetbounties.fund_bounty".into()),
+            origin_spec: "Origins:MediumSpender".into(),
+            origin: serde_json::json!({
+                "resolved": "Origins:MediumSpender",
+                "pallet_index": 20,
+                "variant_index": 33,
+                "account": null,
+            }),
+            xcm_version: 4,
+            status: "dispatch_failed".into(),
+            dispatch_ok: Some(false),
+            dispatch_error: Some(serde_json::json!({
+                "error": "assets.NoAccount",
+                "raw": {"Module": [{"index": 50, "error": [1, 0, 0, 0]}]},
+            })),
+            emitted_events: serde_json::json!([
+                {"name": "balances.Withdraw", "data": {"amount": "20895000000"}}
+            ]),
+            event_count: 1,
+            local_xcm: None,
+            forwarded_xcms: serde_json::json!([]),
+            effects: serde_json::json!({"Ok": [{"emitted_events": []}]}),
+            note: None,
+            spec_version: 2_003_002,
+            api_version: 2,
+            metadata_version: 15,
+            sim_version: 1,
+            raw_location: "raw/polkadot-asset-hub/sim/cd/01/\
+                           DryRunApi_dry_run_call.response.scale"
+                .into(),
+            observed_at: None,
+        });
+
         // governance stitched across the migration: ref 1500 submitted +
         // deciding on the relay, concluded on Asset Hub; ref 1400 decided on
         // the relay with only an info-event row ('unknown') on AH
@@ -5697,6 +6073,7 @@ pub(crate) mod tests {
             treasury,
             bounties,
             assets,
+            sim,
             parse_account: Arc::new(|s| {
                 adapter_substrate::accounts::parse_account(s).map(|a| a.to_vec())
             }),
@@ -5867,6 +6244,93 @@ pub(crate) mod tests {
         assert_eq!(s2, StatusCode::NOT_FOUND);
         let (s3, _) = get_json(&app, "/v1/gov/nowhere/referenda/1500").await;
         assert_eq!(s3, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn a_referendum_carries_what_it_would_do_beside_what_it_does() {
+        let app = router(test_state().await);
+        let (status, json) = get_json(&app, "/v1/gov/polkadot/referenda/1500").await;
+        assert_eq!(status, StatusCode::OK);
+
+        // The request names polkadot and a referendum id — never a chain — yet
+        // the preview recorded on Asset Hub is found, through the same residency
+        // walk the preimage uses.
+        let sims = json["simulations"].as_array().expect("simulations list");
+        assert_eq!(sims.len(), 1);
+        assert_eq!(sims[0]["chain_id"], "polkadot-asset-hub");
+        assert_eq!(sims[0]["call_summary"], "multiassetbounties.fund_bounty");
+
+        // A failed dispatch is a RESULT and must read as one: an answer with a
+        // reason, not an empty response that looks like nothing happened.
+        assert_eq!(sims[0]["status"], "dispatch_failed");
+        assert_eq!(sims[0]["dispatch_ok"], false);
+        assert_eq!(sims[0]["dispatch_error"]["error"], "assets.NoAccount");
+        // and it carries its own lineage, like every other row we serve
+        assert_eq!(sims[0]["spec_version"], 2_003_002);
+        assert_eq!(sims[0]["api_version"], 2);
+        assert_eq!(sims[0]["at_block_hash"], format!("0x{}", "cd".repeat(32)));
+        assert_eq!(sims[0]["metadata_version"], 15);
+        assert!(sims[0]["raw_location"]
+            .as_str()
+            .unwrap()
+            .ends_with("DryRunApi_dry_run_call.response.scale"));
+
+        // the limits ship WITH the answer, every time
+        let gaps = json["simulation_coverage"]["not_covered"]
+            .as_array()
+            .expect("not_covered list");
+        assert!(gaps.iter().any(|g| g.as_str().unwrap().contains("NOT the state at enactment")));
+        assert!(gaps.iter().any(|g| g.as_str().unwrap().contains("proposal_origin")));
+
+        // A referendum we HAVE no proposal hash for must not be described as one
+        // nobody previewed: we never looked, and saying otherwise would assert
+        // something unchecked. Ref 1400 has no hash on either chain.
+        let (_, j1400) = get_json(&app, "/v1/gov/polkadot/referenda/1400").await;
+        assert!(j1400["simulations"].as_array().unwrap().is_empty());
+        let why = j1400["simulation_coverage"]["recorded_only"].as_str().unwrap();
+        assert!(why.contains("no proposal hash indexed yet"), "{why}");
+        assert!(
+            !why.contains("no Tier 1 preview has been run"),
+            "an empty list because we could not look is a different claim from an empty \
+             list because we looked and found nothing: {why}"
+        );
+    }
+
+    #[tokio::test]
+    async fn simulations_are_served_by_call_hash_and_never_started_by_a_get() {
+        let app = router(test_state().await);
+        // upper case, 0X prefix — normalized the same way the whitelist hash is
+        let (status, json) = get_json(
+            &app,
+            &format!("/v1/sim/polkadot-asset-hub/calls/0X{}", "AB".repeat(32)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["call_hash"], format!("0x{}", "ab".repeat(32)));
+        assert_eq!(json["simulations"].as_array().unwrap().len(), 1);
+        assert_eq!(json["simulations"][0]["origin_spec"], "Origins:MediumSpender");
+        assert_eq!(json["simulations"][0]["event_count"], 1);
+
+        // The same call on the chain it was NOT simulated on is empty — a
+        // simulation belongs to one runtime and one state, and this endpoint
+        // will not borrow another chain's answer.
+        let (_, relay) = get_json(
+            &app,
+            &format!("/v1/sim/polkadot/calls/0x{}", "ab".repeat(32)),
+        )
+        .await;
+        assert!(relay["simulations"].as_array().unwrap().is_empty());
+        assert!(relay["coverage"]["recorded_only"]
+            .as_str()
+            .unwrap()
+            .contains("never starts one"));
+
+        let (s, _) = get_json(
+            &app,
+            &format!("/v1/sim/nowhere/calls/0x{}", "ab".repeat(32)),
+        )
+        .await;
+        assert_eq!(s, StatusCode::NOT_FOUND, "an unknown chain is refused, not empty");
     }
 
     #[tokio::test]

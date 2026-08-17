@@ -25,6 +25,18 @@
 //!   dotlens-node sync-tracks                  # decode gov tracks from metadata, exit
 //!   dotlens-node fetch-preimage <chain> <hash> <len> [height]  # fetch+decode one preimage
 //!   dotlens-node decode-preimages <chain> [height]   # decode all pending proposals
+//!   dotlens-node simulate-call <chain> <0x-call> <origin> [height]   # Tier 1 dry run
+//!   dotlens-node simulate-referendum <chain> <class> <id> <origin> [height]
+//!
+//! `origin` is root | none | signed:<ss58|0x-hex> | <Pallet>:<Variant> (e.g.
+//! `Origins:MediumSpender`). It is REQUIRED and never inferred from a track:
+//! the track→origin map lives in runtime Rust, not in any artifact we index, so
+//! guessing it would silently simulate the wrong thing. SIM_XCM_VERSION (default
+//! 4) sets the XCM version returned programs are rendered in.
+//!
+//! PASS A HEIGHT if you want the answer to be reusable: results are keyed by the
+//! block HASH they ran against, so omitting it pins the finalized head and every
+//! run is a fresh state — correct, but never a cache hit.
 //!
 //!   dotlens-node whitelist-range <chain> <from> <to>   # map whitelist events
 //!
@@ -62,6 +74,7 @@ struct Backends {
     treasury: Arc<dyn api::TreasuryIndex>,
     bounties: Arc<dyn api::BountyIndex>,
     assets: Arc<dyn api::AssetIndex>,
+    sim: Arc<dyn api::SimIndex>,
     runtime_versions: Arc<dyn RuntimeVersionSink>,
     /// Kept for label sync/verify (they need direct SQL, not a trait).
     #[cfg(feature = "pg")]
@@ -80,6 +93,7 @@ fn memory_backends() -> Backends {
         treasury: Arc::new(api::MemoryTreasuryIndex::new()),
         bounties: Arc::new(api::MemoryBountyIndex::new()),
         assets: Arc::new(api::MemoryAssetIndex::new()),
+        sim: Arc::new(api::MemorySimIndex::new()),
         runtime_versions: Arc::new(NoopRuntimeVersionSink),
         #[cfg(feature = "pg")]
         pool: None,
@@ -121,6 +135,19 @@ enum Command {
     TreasuryHoldings { chain: String, height: Option<u64> },
     FetchPreimage { chain: String, hash: String, len: u64, height: Option<u64> },
     DecodePreimages { chain: String, height: Option<u64> },
+    SimulateCall {
+        chain: String,
+        call_hex: String,
+        origin: String,
+        height: Option<u64>,
+    },
+    SimulateReferendum {
+        chain: String,
+        class: String,
+        referendum_id: i64,
+        origin: String,
+        height: Option<u64>,
+    },
 }
 
 fn parse_args() -> Result<Command> {
@@ -244,6 +271,33 @@ fn parse_args() -> Result<Command> {
             };
             Ok(Command::DecodePreimages { chain, height })
         }
+        Some("simulate-call") => {
+            let usage =
+                "usage: dotlens-node simulate-call <chain> <0x-call-hex> <origin> [height]\n\
+                 origin: root | none | signed:<ss58|0x-hex> | <Pallet>:<Variant>";
+            let chain = args.get(1).context(usage)?.clone();
+            let call_hex = args.get(2).context(usage)?.clone();
+            let origin = args.get(3).context(usage)?.clone();
+            let height = match args.get(4) {
+                Some(h) => Some(h.parse::<u64>().context(usage)?),
+                None => None,
+            };
+            Ok(Command::SimulateCall { chain, call_hex, origin, height })
+        }
+        Some("simulate-referendum") => {
+            let usage =
+                "usage: dotlens-node simulate-referendum <chain> <class> <id> <origin> [height]\n\
+                 origin: root | none | signed:<ss58|0x-hex> | <Pallet>:<Variant>";
+            let chain = args.get(1).context(usage)?.clone();
+            let class = args.get(2).context(usage)?.clone();
+            let referendum_id: i64 = args.get(3).context(usage)?.parse().context(usage)?;
+            let origin = args.get(4).context(usage)?.clone();
+            let height = match args.get(5) {
+                Some(h) => Some(h.parse::<u64>().context(usage)?),
+                None => None,
+            };
+            Ok(Command::SimulateReferendum { chain, class, referendum_id, origin, height })
+        }
         Some("anchor-balance") => {
             let usage = "usage: dotlens-node anchor-balance <chain> <account> <height>";
             let chain = args.get(1).context(usage)?.clone();
@@ -319,6 +373,7 @@ async fn main() -> Result<()> {
             treasury: Arc::new(api::pg::PgTreasuryIndex::new(pool.clone())),
             bounties: Arc::new(api::pg::PgBountyIndex::new(pool.clone())),
             assets: Arc::new(api::pg::PgAssetIndex::new(pool.clone())),
+            sim: Arc::new(api::pg::PgSimIndex::new(pool.clone())),
             runtime_versions: Arc::new(PgRuntimeVersionSink::new(pool.clone())),
             pool: Some(pool),
             persistent: true,
@@ -474,6 +529,19 @@ async fn main() -> Result<()> {
     if let Command::DecodePreimages { chain, height } = &command {
         return run_decode_preimages(&registry, &backends, raw.as_ref(), chain, *height).await;
     }
+    if let Command::SimulateCall { chain, call_hex, origin, height } = &command {
+        let bytes = decode_call_hex(call_hex)?;
+        return run_simulate(
+            &registry, &backends, raw.as_ref(), chain, bytes, origin, *height, None,
+        )
+        .await;
+    }
+    if let Command::SimulateReferendum { chain, class, referendum_id, origin, height } = &command {
+        return run_simulate_referendum(
+            &registry, &backends, raw.as_ref(), chain, class, *referendum_id, origin, *height,
+        )
+        .await;
+    }
 
     // -- account labels: derive + project on every start (idempotent) ---------
     #[cfg(feature = "pg")]
@@ -570,6 +638,7 @@ async fn main() -> Result<()> {
         treasury: backends.treasury.clone(),
         bounties: backends.bounties.clone(),
         assets: backends.assets.clone(),
+        sim: backends.sim.clone(),
         // family-encoded address parsing is adapter-owned (Invariant 4); with
         // more families this becomes registry-driven dispatch
         parse_account: Arc::new(|s| {
@@ -1920,6 +1989,209 @@ fn parse_h256(s: &str) -> Result<[u8; 32]> {
     let bytes = hex::decode(hexpart).context("hash is not hex")?;
     <[u8; 32]>::try_from(bytes.as_slice())
         .map_err(|_| anyhow::anyhow!("hash must be 32 bytes, got {}", bytes.len()))
+}
+
+/// `0x…` (or bare hex) call bytes → SCALE. Rejected loudly rather than
+/// truncated: half a call decodes into a different call.
+fn decode_call_hex(hex_str: &str) -> Result<Vec<u8>> {
+    let trimmed = hex_str.trim();
+    let body = trimmed.strip_prefix("0x").unwrap_or(trimmed);
+    let bytes = hex::decode(body).context("call bytes are not hex")?;
+    anyhow::ensure!(!bytes.is_empty(), "call bytes are empty");
+    Ok(bytes)
+}
+
+/// simulate-call / simulate-referendum: one Tier 1 dry run, recorded.
+///
+/// THE CHAIN IS NAMED HERE ON PURPOSE, unlike almost every other command. A
+/// simulation is an answer about one runtime at one state, so "which chain" is
+/// part of the question rather than something residency should resolve away —
+/// previewing a relay-era call against Asset Hub is a legitimate thing to ask
+/// for, and it must not be silently redirected.
+#[cfg(all(feature = "pg", feature = "live"))]
+#[allow(clippy::too_many_arguments)]
+async fn run_simulate(
+    registry: &Registry,
+    backends: &Backends,
+    raw: &dyn RawStore,
+    chain: &str,
+    call_bytes: Vec<u8>,
+    origin_spec: &str,
+    height: Option<u64>,
+    referendum: Option<(String, i64)>,
+) -> Result<()> {
+    use adapter_substrate::source::SubstrateSource;
+    use dotlens_node::sim_pg::PgSimStore;
+    use dotlens_node::sim_run::SubstrateDryRunner;
+
+    let pool = backends.pool.as_ref().context("simulate requires DATABASE_URL")?;
+    let cfg = registry
+        .chain(chain)
+        .with_context(|| format!("unknown chain: {chain}"))?;
+    let origin = sim::OriginSpec::parse(origin_spec, |s| {
+        adapter_substrate::accounts::parse_account(s).map_err(|e| e.to_string())
+    })
+    .map_err(|e| anyhow::anyhow!(e))?;
+
+    let xcm_version: u32 = env_or("SIM_XCM_VERSION", "4")
+        .parse()
+        .context("SIM_XCM_VERSION must be a number")?;
+
+    let source = SubstrateSource::new(&cfg.id, cfg.endpoints.rpc.clone())
+        .map_err(|e| anyhow::anyhow!(e))?;
+    let runner = SubstrateDryRunner::new(&cfg.id, &source, raw, backends.receipts.as_ref());
+    let store = PgSimStore::new(pool.clone());
+
+    let req = sim::SimRequest {
+        chain_id: cfg.id.clone(),
+        at_height: height,
+        call: call_bytes,
+        origin,
+        origin_spec: origin_spec.to_string(),
+        xcm_version,
+    };
+    let run = sim::run_simulation(&runner, &store, raw, backends.receipts.as_ref(), &req)
+        .await
+        .map_err(|e| anyhow::anyhow!(e))?;
+    let r = &run.record;
+
+    if let Some((class, id)) = &referendum {
+        println!("referendum {chain}/{class}/{id}");
+    }
+    println!(
+        "simulate {chain} at #{} (spec {}, DryRunApi v{}){}",
+        r.at_height,
+        r.spec_version,
+        r.api_version,
+        if run.cached { " [recorded earlier]" } else { "" }
+    );
+    println!(
+        "  call     {} ({})",
+        r.call_summary.as_deref().unwrap_or("?"),
+        r.call_hash
+    );
+    println!("  origin   {} → {}", r.origin_spec, r.origin_json["resolved"]);
+    println!("  status   {}", r.status);
+    if let Some(e) = &r.dispatch_error {
+        println!("  error    {}", e["error"]);
+    }
+    println!("  events   {}", r.event_count);
+    for ev in r.emitted_events.as_array().into_iter().flatten() {
+        println!("    - {}", ev["name"].as_str().unwrap_or("?"));
+    }
+    let forwarded = r.forwarded_xcms.as_array().map(Vec::len).unwrap_or(0);
+    println!("  xcm      local {} · forwarded to {} destination(s)",
+        if r.local_xcm.is_some() { "yes" } else { "none" },
+        forwarded
+    );
+    println!("  evidence {}", r.raw_location);
+    Ok(())
+}
+
+/// simulate-referendum: the same dry run, sourced from an indexed proposal.
+///
+/// The bytes come from the RAW STORE first (the archived preimage value, which
+/// is what `decode-preimages` filed) and from the referendum's own Inline
+/// proposal second. Never re-fetched from state here: if we never archived the
+/// preimage, that is a coverage gap with a named fix, not something to paper
+/// over with a live read that might now return nothing.
+#[cfg(all(feature = "pg", feature = "live"))]
+#[allow(clippy::too_many_arguments)]
+async fn run_simulate_referendum(
+    registry: &Registry,
+    backends: &Backends,
+    raw: &dyn RawStore,
+    chain: &str,
+    class: &str,
+    referendum_id: i64,
+    origin_spec: &str,
+    height: Option<u64>,
+) -> Result<()> {
+    use adapter_substrate::calls;
+
+    let pool = backends
+        .pool
+        .as_ref()
+        .context("simulate-referendum requires DATABASE_URL")?;
+    let cfg = registry
+        .chain(chain)
+        .with_context(|| format!("unknown chain: {chain}"))?;
+    let (proposal, proposal_hash, proposal_len) =
+        dotlens_node::gov_pg::referendum_proposal(pool, &cfg.id, class, referendum_id)
+            .await?
+            .with_context(|| {
+                format!("referendum {chain}/{class}/{referendum_id} is not indexed")
+            })?;
+
+    let call_bytes = match (&proposal, &proposal_hash, proposal_len) {
+        // Inline: the bytes are in the referendum itself.
+        (Some(p), _, _) if p.get("Inline").is_some() => calls::json_bytes(
+            p.get("Inline").expect("checked"),
+        )
+        .context("this referendum's Inline proposal is not a byte sequence")?,
+        // Lookup: the archived preimage value (compact length prefix + call).
+        (_, Some(hash), Some(len)) => {
+            let key = raw_store::keys::preimage(
+                &cfg.id,
+                hash.trim_start_matches("0x"),
+                len as u64,
+            );
+            let stored = raw.get(&key).with_context(|| {
+                format!(
+                    "no archived preimage at {key} — run `decode-preimages {chain}` first \
+                     (a preimage cleared from state after enactment can no longer be fetched, \
+                     which is a coverage gap, not a retry)"
+                )
+            })?;
+            <Vec<u8> as parity_scale_codec::Decode>::decode(&mut &stored[..])
+                .map_err(|e| anyhow::anyhow!("archived preimage is not a BoundedVec<u8>: {e}"))?
+        }
+        _ => anyhow::bail!(
+            "referendum {chain}/{class}/{referendum_id} has no proposal bytes to simulate \
+             (no Inline body and no (hash, len) to find an archived preimage by)"
+        ),
+    };
+
+    // The hash we simulate under must be the hash of the bytes we ran, always.
+    if let Some(hash) = &proposal_hash {
+        let computed = format!("0x{}", hex::encode(calls::blake2_256(&call_bytes)));
+        anyhow::ensure!(
+            &computed == hash,
+            "the bytes for {chain}/{class}/{referendum_id} hash to {computed}, not the \
+             recorded proposal hash {hash} — refusing to record a simulation under a hash \
+             it did not run"
+        );
+    }
+
+    run_simulate(
+        registry,
+        backends,
+        raw,
+        chain,
+        call_bytes,
+        origin_spec,
+        height,
+        Some((class.to_string(), referendum_id)),
+    )
+    .await
+}
+
+#[cfg(not(all(feature = "pg", feature = "live")))]
+#[allow(clippy::too_many_arguments)]
+async fn run_simulate(
+    _: &Registry, _: &Backends, _: &dyn RawStore, _: &str, _: Vec<u8>, _: &str, _: Option<u64>,
+    _: Option<(String, i64)>,
+) -> Result<()> {
+    anyhow::bail!("simulate-call requires the `pg` and `live` features")
+}
+
+#[cfg(not(all(feature = "pg", feature = "live")))]
+#[allow(clippy::too_many_arguments)]
+async fn run_simulate_referendum(
+    _: &Registry, _: &Backends, _: &dyn RawStore, _: &str, _: &str, _: i64, _: &str,
+    _: Option<u64>,
+) -> Result<()> {
+    anyhow::bail!("simulate-referendum requires the `pg` and `live` features")
 }
 
 #[cfg(not(all(feature = "pg", feature = "live")))]
