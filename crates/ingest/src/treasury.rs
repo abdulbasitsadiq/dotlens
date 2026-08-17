@@ -8,9 +8,8 @@
 //!
 //! Checkpoint module: `treasury`.
 
-use crate::balances::{BlockEvents, EventSource};
-use crate::decode::MODULE_DECODE;
-use crate::{Checkpoint, CheckpointError, CheckpointStore};
+use crate::module::{self, impl_module_error, EventSource, FactWriter, ModuleRun};
+use crate::{CheckpointError, CheckpointStore};
 use async_trait::async_trait;
 use canonical::CanonicalEvent;
 
@@ -36,6 +35,8 @@ pub enum TreasuryWorkerError {
     #[error(transparent)]
     Checkpoint(#[from] CheckpointError),
 }
+
+impl_module_error!(TreasuryWorkerError);
 
 /// One treasury fact from one event.
 ///
@@ -128,6 +129,40 @@ pub struct TreasuryDeps<'a> {
     pub sink: &'a dyn TreasurySink,
 }
 
+/// Bridges the treasury sink to the runtime's generic writer. The at-most-one-
+/// fact-per-event CONTRACT above stays the SINK's to enforce.
+struct SinkBridge<'a>(&'a dyn TreasurySink);
+
+#[async_trait]
+impl<'a> FactWriter<SpendFact> for SinkBridge<'a> {
+    async fn write_facts(
+        &self,
+        chain_id: &str,
+        height: u64,
+        runtime_version: u32,
+        mapper_version: u32,
+        rows: &[(u32, SpendFact)],
+    ) -> Result<(), String> {
+        self.0
+            .write(chain_id, height, runtime_version, mapper_version, rows)
+            .await
+    }
+}
+
+fn run<'a>(
+    mapper: &'a dyn TreasuryMapper,
+    deps: &'a TreasuryDeps<'a>,
+) -> ModuleRun<'a, SpendFact> {
+    ModuleRun {
+        module: MODULE_TREASURY,
+        checkpoints: deps.checkpoints,
+        source: deps.source,
+        map: Box::new(move |ev: &CanonicalEvent| mapper.facts(ev)),
+        mapper_version: mapper.mapper_version(),
+        sink: Box::new(SinkBridge(deps.sink)),
+    }
+}
+
 /// Map heights `from..=to`. Behind the frontier: reprocess freely (insert-ignore
 /// + guarded upsert converge), checkpoint untouched. Past it: rows first,
 /// checkpoint last (crash = re-map, never skip).
@@ -138,75 +173,7 @@ pub async fn treasury_range(
     from: u64,
     to: u64,
 ) -> Result<u64, TreasuryWorkerError> {
-    let frontier = deps
-        .checkpoints
-        .get(chain_id, MODULE_TREASURY)
-        .await?
-        .map(|cp| cp.last_height);
-    let mut processed = 0u64;
-
-    for height in from..=to {
-        let behind_frontier = frontier.is_some_and(|f| height <= f);
-        let block: Option<BlockEvents> = deps
-            .source
-            .decoded_events(chain_id, height)
-            .await
-            .map_err(TreasuryWorkerError::Source)?;
-        let Some(block) = block else {
-            tracing::debug!(chain = %chain_id, height, "no canonical block — skipped");
-            if !behind_frontier {
-                advance(deps, chain_id, height).await?;
-            }
-            continue;
-        };
-
-        let mut rows: Vec<(u32, SpendFact)> = Vec::new();
-        for ev in &block.events {
-            let facts = mapper.facts(ev).map_err(|reason| TreasuryWorkerError::Mapper {
-                chain: chain_id.to_string(),
-                height,
-                event_index: ev.index,
-                event: ev.name.clone(),
-                reason,
-            })?;
-            for f in facts {
-                rows.push((ev.index, f));
-            }
-        }
-        if !rows.is_empty() {
-            deps.sink
-                .write(
-                    chain_id,
-                    height,
-                    block.runtime_version,
-                    mapper.mapper_version(),
-                    &rows,
-                )
-                .await
-                .map_err(TreasuryWorkerError::Sink)?;
-        }
-        if !behind_frontier {
-            advance(deps, chain_id, height).await?;
-        }
-        processed += 1;
-    }
-    Ok(processed)
-}
-
-async fn advance(
-    deps: &TreasuryDeps<'_>,
-    chain_id: &str,
-    height: u64,
-) -> Result<(), CheckpointError> {
-    deps.checkpoints
-        .advance(Checkpoint {
-            chain_id: chain_id.to_string(),
-            module: MODULE_TREASURY.to_string(),
-            last_height: height,
-            last_hash: "-".to_string(),
-            updated_at: chrono::Utc::now(),
-        })
-        .await
+    module::run_range(chain_id, &run(mapper, deps), from, to).await
 }
 
 /// One follower step: chase the decode (`blocks`) checkpoint. First run starts
@@ -216,16 +183,7 @@ pub async fn treasury_tick(
     mapper: &dyn TreasuryMapper,
     deps: &TreasuryDeps<'_>,
 ) -> Result<u64, TreasuryWorkerError> {
-    let Some(decode_cp) = deps.checkpoints.get(chain_id, MODULE_DECODE).await? else {
-        return Ok(0);
-    };
-    let target = decode_cp.last_height;
-    let from = match deps.checkpoints.get(chain_id, MODULE_TREASURY).await? {
-        Some(cp) if cp.last_height >= target => return Ok(0),
-        Some(cp) => cp.last_height + 1,
-        None => target,
-    };
-    treasury_range(chain_id, mapper, deps, from, target).await
+    module::run_tick(chain_id, &run(mapper, deps)).await
 }
 
 /// Follow forever, same backoff discipline as the other followers.
@@ -235,29 +193,17 @@ pub async fn treasury_follow(
     deps: &TreasuryDeps<'_>,
     poll: std::time::Duration,
 ) {
-    let mut consecutive_failures = 0u32;
-    loop {
-        match treasury_tick(chain_id, mapper, deps).await {
-            Ok(n) => {
-                consecutive_failures = 0;
-                if n > 0 {
-                    tracing::debug!(chain = %chain_id, blocks = n, "treasury tick");
-                }
-            }
-            Err(e) => {
-                consecutive_failures += 1;
-                tracing::warn!(chain = %chain_id, error = %e, consecutive_failures,
-                    "treasury tick failed");
-            }
-        }
-        let factor = 1 + consecutive_failures.min(10);
-        tokio::time::sleep(poll * factor).await;
-    }
+    module::run_follow::<SpendFact, TreasuryWorkerError>(chain_id, &run(mapper, deps), poll).await
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Both moved out of the file header when `advance` did; the tests below are
+    // otherwise untouched, which is the point of this refactor.
+    use crate::decode::MODULE_DECODE;
+    use crate::module::BlockEvents;
+    use crate::Checkpoint;
     use crate::MemoryCheckpointStore;
     use std::collections::HashMap;
     use std::sync::Mutex;

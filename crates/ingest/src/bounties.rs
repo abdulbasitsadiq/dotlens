@@ -14,9 +14,8 @@
 //!
 //! Checkpoint module: `bounties`.
 
-use crate::balances::{BlockEvents, EventSource};
-use crate::decode::MODULE_DECODE;
-use crate::{Checkpoint, CheckpointError, CheckpointStore};
+use crate::module::{self, impl_module_error, EventSource, FactWriter, ModuleRun};
+use crate::{CheckpointError, CheckpointStore};
 use async_trait::async_trait;
 use canonical::CanonicalEvent;
 
@@ -44,6 +43,8 @@ pub enum BountyWorkerError {
     #[error(transparent)]
     Checkpoint(#[from] CheckpointError),
 }
+
+impl_module_error!(BountyWorkerError);
 
 /// One bounty fact from one event.
 ///
@@ -142,6 +143,36 @@ pub struct BountyDeps<'a> {
     pub sink: &'a dyn BountySink,
 }
 
+/// Bridges the bounty sink to the runtime's generic writer.
+struct SinkBridge<'a>(&'a dyn BountySink);
+
+#[async_trait]
+impl<'a> FactWriter<BountyFact> for SinkBridge<'a> {
+    async fn write_facts(
+        &self,
+        chain_id: &str,
+        height: u64,
+        runtime_version: u32,
+        mapper_version: u32,
+        rows: &[(u32, BountyFact)],
+    ) -> Result<(), String> {
+        self.0
+            .write(chain_id, height, runtime_version, mapper_version, rows)
+            .await
+    }
+}
+
+fn run<'a>(mapper: &'a dyn BountyMapper, deps: &'a BountyDeps<'a>) -> ModuleRun<'a, BountyFact> {
+    ModuleRun {
+        module: MODULE_BOUNTIES,
+        checkpoints: deps.checkpoints,
+        source: deps.source,
+        map: Box::new(move |ev: &CanonicalEvent| mapper.facts(ev)),
+        mapper_version: mapper.mapper_version(),
+        sink: Box::new(SinkBridge(deps.sink)),
+    }
+}
+
 /// Map heights `from..=to`. Behind the frontier: reprocess freely (insert-ignore
 /// + guarded upsert converge, and the accumulating `paid_out` is guarded by the
 /// fact insert), checkpoint untouched. Past it: rows first, checkpoint last
@@ -153,75 +184,7 @@ pub async fn bounties_range(
     from: u64,
     to: u64,
 ) -> Result<u64, BountyWorkerError> {
-    let frontier = deps
-        .checkpoints
-        .get(chain_id, MODULE_BOUNTIES)
-        .await?
-        .map(|cp| cp.last_height);
-    let mut processed = 0u64;
-
-    for height in from..=to {
-        let behind_frontier = frontier.is_some_and(|f| height <= f);
-        let block: Option<BlockEvents> = deps
-            .source
-            .decoded_events(chain_id, height)
-            .await
-            .map_err(BountyWorkerError::Source)?;
-        let Some(block) = block else {
-            tracing::debug!(chain = %chain_id, height, "no canonical block — skipped");
-            if !behind_frontier {
-                advance(deps, chain_id, height).await?;
-            }
-            continue;
-        };
-
-        let mut rows: Vec<(u32, BountyFact)> = Vec::new();
-        for ev in &block.events {
-            let facts = mapper.facts(ev).map_err(|reason| BountyWorkerError::Mapper {
-                chain: chain_id.to_string(),
-                height,
-                event_index: ev.index,
-                event: ev.name.clone(),
-                reason,
-            })?;
-            for f in facts {
-                rows.push((ev.index, f));
-            }
-        }
-        if !rows.is_empty() {
-            deps.sink
-                .write(
-                    chain_id,
-                    height,
-                    block.runtime_version,
-                    mapper.mapper_version(),
-                    &rows,
-                )
-                .await
-                .map_err(BountyWorkerError::Sink)?;
-        }
-        if !behind_frontier {
-            advance(deps, chain_id, height).await?;
-        }
-        processed += 1;
-    }
-    Ok(processed)
-}
-
-async fn advance(
-    deps: &BountyDeps<'_>,
-    chain_id: &str,
-    height: u64,
-) -> Result<(), CheckpointError> {
-    deps.checkpoints
-        .advance(Checkpoint {
-            chain_id: chain_id.to_string(),
-            module: MODULE_BOUNTIES.to_string(),
-            last_height: height,
-            last_hash: "-".to_string(),
-            updated_at: chrono::Utc::now(),
-        })
-        .await
+    module::run_range(chain_id, &run(mapper, deps), from, to).await
 }
 
 /// One follower step: chase the decode (`blocks`) checkpoint. First run starts
@@ -231,16 +194,7 @@ pub async fn bounties_tick(
     mapper: &dyn BountyMapper,
     deps: &BountyDeps<'_>,
 ) -> Result<u64, BountyWorkerError> {
-    let Some(decode_cp) = deps.checkpoints.get(chain_id, MODULE_DECODE).await? else {
-        return Ok(0);
-    };
-    let target = decode_cp.last_height;
-    let from = match deps.checkpoints.get(chain_id, MODULE_BOUNTIES).await? {
-        Some(cp) if cp.last_height >= target => return Ok(0),
-        Some(cp) => cp.last_height + 1,
-        None => target,
-    };
-    bounties_range(chain_id, mapper, deps, from, target).await
+    module::run_tick(chain_id, &run(mapper, deps)).await
 }
 
 /// Follow forever, same backoff discipline as the other followers.
@@ -250,29 +204,17 @@ pub async fn bounties_follow(
     deps: &BountyDeps<'_>,
     poll: std::time::Duration,
 ) {
-    let mut consecutive_failures = 0u32;
-    loop {
-        match bounties_tick(chain_id, mapper, deps).await {
-            Ok(n) => {
-                consecutive_failures = 0;
-                if n > 0 {
-                    tracing::debug!(chain = %chain_id, blocks = n, "bounties tick");
-                }
-            }
-            Err(e) => {
-                consecutive_failures += 1;
-                tracing::warn!(chain = %chain_id, error = %e, consecutive_failures,
-                    "bounties tick failed");
-            }
-        }
-        let factor = 1 + consecutive_failures.min(10);
-        tokio::time::sleep(poll * factor).await;
-    }
+    module::run_follow::<BountyFact, BountyWorkerError>(chain_id, &run(mapper, deps), poll).await
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Both moved out of the file header when `advance` did; the tests below are
+    // otherwise untouched, which is the point of this refactor.
+    use crate::decode::MODULE_DECODE;
+    use crate::module::BlockEvents;
+    use crate::Checkpoint;
     use crate::MemoryCheckpointStore;
     use std::collections::HashMap;
     use std::sync::Mutex;

@@ -10,6 +10,7 @@ pub mod bounties;
 pub mod decode;
 pub mod gov;
 pub mod live;
+pub mod module;
 pub mod tip;
 pub mod treasury;
 pub mod votes;

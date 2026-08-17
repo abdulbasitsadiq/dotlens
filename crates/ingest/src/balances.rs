@@ -14,11 +14,19 @@
 //! conflict-ignored, cheap) and never regresses it; heights the canonical
 //! store hasn't decoded yet are skipped and advanced past (decode gap-fill +
 //! a later `balances-range` re-run covers them).
+//!
+//! The loop that enforces all of the above now lives once, in `crate::module`;
+//! this file is the balances vocabulary plus the wiring that hands it over.
 
-use crate::decode::MODULE_DECODE;
-use crate::{Checkpoint, CheckpointError, CheckpointStore};
+use crate::module::{self, impl_module_error, FactWriter, ModuleRun};
+use crate::{CheckpointError, CheckpointStore};
 use async_trait::async_trait;
 use canonical::CanonicalEvent;
+
+/// `BlockEvents`/`EventSource` moved to `crate::module` when the four other
+/// domain workers stopped being able to pretend they were borrowing them from
+/// balances. Re-exported so `ingest::balances::EventSource` keeps resolving.
+pub use crate::module::{BlockEvents, EventSource};
 
 pub const MODULE_BALANCES: &str = "balances";
 
@@ -42,6 +50,8 @@ pub enum BalancesWorkerError {
     #[error(transparent)]
     Checkpoint(#[from] CheckpointError),
 }
+
+impl_module_error!(BalancesWorkerError);
 
 /// One account's balance movement from one event. Amounts are unsigned
 /// magnitude + sign so u128-scale balances never squeeze through i128.
@@ -67,23 +77,6 @@ pub trait DeltaMapper: Send + Sync {
     fn mapper_version(&self) -> u32;
 }
 
-/// The decoded events of one canonical block, as the worker needs them.
-pub struct BlockEvents {
-    pub runtime_version: u32,
-    pub events: Vec<CanonicalEvent>,
-}
-
-/// Where canonical events come from (node-side: core.blocks + core.events).
-/// `None` = this height isn't decoded (a decode gap) — skip, don't fail.
-#[async_trait]
-pub trait EventSource: Send + Sync {
-    async fn decoded_events(
-        &self,
-        chain_id: &str,
-        height: u64,
-    ) -> Result<Option<BlockEvents>, String>;
-}
-
 /// Where deltas land (node-side: balances.balance_changes, insert-ignore).
 #[async_trait]
 pub trait DeltaSink: Send + Sync {
@@ -103,6 +96,38 @@ pub struct BalancesDeps<'a> {
     pub sink: &'a dyn DeltaSink,
 }
 
+/// Bridges the balances sink to the runtime's generic writer. The domain trait
+/// keeps its own name and its own doc; this is the two-line adapter that lets
+/// one loop serve five schemas.
+struct SinkBridge<'a>(&'a dyn DeltaSink);
+
+#[async_trait]
+impl<'a> FactWriter<BalanceDelta> for SinkBridge<'a> {
+    async fn write_facts(
+        &self,
+        chain_id: &str,
+        height: u64,
+        runtime_version: u32,
+        mapper_version: u32,
+        rows: &[(u32, BalanceDelta)],
+    ) -> Result<(), String> {
+        self.0
+            .write(chain_id, height, runtime_version, mapper_version, rows)
+            .await
+    }
+}
+
+fn run<'a>(mapper: &'a dyn DeltaMapper, deps: &'a BalancesDeps<'a>) -> ModuleRun<'a, BalanceDelta> {
+    ModuleRun {
+        module: MODULE_BALANCES,
+        checkpoints: deps.checkpoints,
+        source: deps.source,
+        map: Box::new(move |ev: &CanonicalEvent| mapper.deltas(ev)),
+        mapper_version: mapper.mapper_version(),
+        sink: Box::new(SinkBridge(deps.sink)),
+    }
+}
+
 /// Map heights `from..=to`. Heights behind the frontier are reprocessed
 /// freely (insert-ignore makes it a no-op) without touching the checkpoint;
 /// past it, rows first, checkpoint last (crash = re-map, never skip).
@@ -113,82 +138,7 @@ pub async fn balances_range(
     from: u64,
     to: u64,
 ) -> Result<u64, BalancesWorkerError> {
-    let frontier = deps
-        .checkpoints
-        .get(chain_id, MODULE_BALANCES)
-        .await?
-        .map(|cp| cp.last_height);
-    let mut processed = 0u64;
-
-    for height in from..=to {
-        let behind_frontier = frontier.is_some_and(|f| height <= f);
-        let block = deps
-            .source
-            .decoded_events(chain_id, height)
-            .await
-            .map_err(BalancesWorkerError::Source)?;
-        let Some(block) = block else {
-            // decode gap: skip. Ahead of the frontier we still advance so the
-            // follower never wedges on a hole; the height gets its deltas when
-            // decode gap-fill + balances-range revisit it.
-            tracing::debug!(chain = %chain_id, height, "no canonical block — skipped");
-            if !behind_frontier {
-                advance(deps, chain_id, height, "-").await?;
-            }
-            continue;
-        };
-
-        let mut rows: Vec<(u32, BalanceDelta)> = Vec::new();
-        for ev in &block.events {
-            let deltas =
-                mapper
-                    .deltas(ev)
-                    .map_err(|reason| BalancesWorkerError::Mapper {
-                        chain: chain_id.to_string(),
-                        height,
-                        event_index: ev.index,
-                        event: ev.name.clone(),
-                        reason,
-                    })?;
-            for d in deltas {
-                rows.push((ev.index, d));
-            }
-        }
-        if !rows.is_empty() {
-            deps.sink
-                .write(
-                    chain_id,
-                    height,
-                    block.runtime_version,
-                    mapper.mapper_version(),
-                    &rows,
-                )
-                .await
-                .map_err(BalancesWorkerError::Sink)?;
-        }
-        if !behind_frontier {
-            advance(deps, chain_id, height, "-").await?;
-        }
-        processed += 1;
-    }
-    Ok(processed)
-}
-
-async fn advance(
-    deps: &BalancesDeps<'_>,
-    chain_id: &str,
-    height: u64,
-    hash: &str,
-) -> Result<(), CheckpointError> {
-    deps.checkpoints
-        .advance(Checkpoint {
-            chain_id: chain_id.to_string(),
-            module: MODULE_BALANCES.to_string(),
-            last_height: height,
-            last_hash: hash.to_string(),
-            updated_at: chrono::Utc::now(),
-        })
-        .await
+    module::run_range(chain_id, &run(mapper, deps), from, to).await
 }
 
 /// One follower step: chase the decode (`blocks`) checkpoint. First run starts
@@ -199,16 +149,7 @@ pub async fn balances_tick(
     mapper: &dyn DeltaMapper,
     deps: &BalancesDeps<'_>,
 ) -> Result<u64, BalancesWorkerError> {
-    let Some(decode_cp) = deps.checkpoints.get(chain_id, MODULE_DECODE).await? else {
-        return Ok(0); // nothing decoded yet
-    };
-    let target = decode_cp.last_height;
-    let from = match deps.checkpoints.get(chain_id, MODULE_BALANCES).await? {
-        Some(cp) if cp.last_height >= target => return Ok(0),
-        Some(cp) => cp.last_height + 1,
-        None => target, // first run: start at the decode tip
-    };
-    balances_range(chain_id, mapper, deps, from, target).await
+    module::run_tick(chain_id, &run(mapper, deps)).await
 }
 
 /// Follow forever, same backoff discipline as the other followers.
@@ -218,28 +159,17 @@ pub async fn balances_follow(
     deps: &BalancesDeps<'_>,
     poll: std::time::Duration,
 ) {
-    let mut consecutive_failures = 0u32;
-    loop {
-        match balances_tick(chain_id, mapper, deps).await {
-            Ok(n) => {
-                consecutive_failures = 0;
-                if n > 0 {
-                    tracing::debug!(chain = %chain_id, blocks = n, "balances tick");
-                }
-            }
-            Err(e) => {
-                consecutive_failures += 1;
-                tracing::warn!(chain = %chain_id, error = %e, consecutive_failures, "balances tick failed");
-            }
-        }
-        let factor = 1 + consecutive_failures.min(10);
-        tokio::time::sleep(poll * factor).await;
-    }
+    module::run_follow::<BalanceDelta, BalancesWorkerError>(chain_id, &run(mapper, deps), poll)
+        .await
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Both moved out of the file header when `advance` did; the tests below are
+    // otherwise untouched, which is the point of this refactor.
+    use crate::decode::MODULE_DECODE;
+    use crate::Checkpoint;
     use crate::MemoryCheckpointStore;
     use std::collections::HashMap;
     use std::sync::Mutex;

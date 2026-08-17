@@ -13,9 +13,8 @@
 //! never regresses it; heights the canonical store hasn't decoded yet are
 //! skipped and advanced past.
 
-use crate::balances::{BlockEvents, EventSource};
-use crate::decode::MODULE_DECODE;
-use crate::{Checkpoint, CheckpointError, CheckpointStore};
+use crate::module::{self, impl_module_error, EventSource, FactWriter, ModuleRun};
+use crate::{CheckpointError, CheckpointStore};
 use async_trait::async_trait;
 use canonical::CanonicalEvent;
 
@@ -41,6 +40,8 @@ pub enum VotesWorkerError {
     #[error(transparent)]
     Checkpoint(#[from] CheckpointError),
 }
+
+impl_module_error!(VotesWorkerError);
 
 /// One vote fact from one event.
 ///
@@ -131,6 +132,39 @@ pub struct VotesDeps<'a> {
     pub sink: &'a dyn VoteSink,
 }
 
+/// Bridges the vote sink to the runtime's generic writer. The at-most-one-fact-
+/// per-kind-per-event CONTRACT above is the SINK's to enforce, and still is —
+/// the shared runtime hands over whatever the mapper produced, exactly as the
+/// hand-written loop did.
+struct SinkBridge<'a>(&'a dyn VoteSink);
+
+#[async_trait]
+impl<'a> FactWriter<VoteFact> for SinkBridge<'a> {
+    async fn write_facts(
+        &self,
+        chain_id: &str,
+        height: u64,
+        runtime_version: u32,
+        mapper_version: u32,
+        rows: &[(u32, VoteFact)],
+    ) -> Result<(), String> {
+        self.0
+            .write(chain_id, height, runtime_version, mapper_version, rows)
+            .await
+    }
+}
+
+fn run<'a>(mapper: &'a dyn VoteMapper, deps: &'a VotesDeps<'a>) -> ModuleRun<'a, VoteFact> {
+    ModuleRun {
+        module: MODULE_VOTES,
+        checkpoints: deps.checkpoints,
+        source: deps.source,
+        map: Box::new(move |ev: &CanonicalEvent| mapper.facts(ev)),
+        mapper_version: mapper.mapper_version(),
+        sink: Box::new(SinkBridge(deps.sink)),
+    }
+}
+
 /// Map heights `from..=to`. Heights behind the frontier are reprocessed freely
 /// (insert-ignore + guarded upserts make it converge) without touching the
 /// checkpoint; past it, rows first, checkpoint last (crash = re-map, never skip).
@@ -141,75 +175,7 @@ pub async fn votes_range(
     from: u64,
     to: u64,
 ) -> Result<u64, VotesWorkerError> {
-    let frontier = deps
-        .checkpoints
-        .get(chain_id, MODULE_VOTES)
-        .await?
-        .map(|cp| cp.last_height);
-    let mut processed = 0u64;
-
-    for height in from..=to {
-        let behind_frontier = frontier.is_some_and(|f| height <= f);
-        let block: Option<BlockEvents> = deps
-            .source
-            .decoded_events(chain_id, height)
-            .await
-            .map_err(VotesWorkerError::Source)?;
-        let Some(block) = block else {
-            tracing::debug!(chain = %chain_id, height, "no canonical block — skipped");
-            if !behind_frontier {
-                advance(deps, chain_id, height).await?;
-            }
-            continue;
-        };
-
-        let mut rows: Vec<(u32, VoteFact)> = Vec::new();
-        for ev in &block.events {
-            let facts = mapper.facts(ev).map_err(|reason| VotesWorkerError::Mapper {
-                chain: chain_id.to_string(),
-                height,
-                event_index: ev.index,
-                event: ev.name.clone(),
-                reason,
-            })?;
-            for f in facts {
-                rows.push((ev.index, f));
-            }
-        }
-        if !rows.is_empty() {
-            deps.sink
-                .write(
-                    chain_id,
-                    height,
-                    block.runtime_version,
-                    mapper.mapper_version(),
-                    &rows,
-                )
-                .await
-                .map_err(VotesWorkerError::Sink)?;
-        }
-        if !behind_frontier {
-            advance(deps, chain_id, height).await?;
-        }
-        processed += 1;
-    }
-    Ok(processed)
-}
-
-async fn advance(
-    deps: &VotesDeps<'_>,
-    chain_id: &str,
-    height: u64,
-) -> Result<(), CheckpointError> {
-    deps.checkpoints
-        .advance(Checkpoint {
-            chain_id: chain_id.to_string(),
-            module: MODULE_VOTES.to_string(),
-            last_height: height,
-            last_hash: "-".to_string(),
-            updated_at: chrono::Utc::now(),
-        })
-        .await
+    module::run_range(chain_id, &run(mapper, deps), from, to).await
 }
 
 /// One follower step: chase the decode (`blocks`) checkpoint. First run starts
@@ -219,16 +185,7 @@ pub async fn votes_tick(
     mapper: &dyn VoteMapper,
     deps: &VotesDeps<'_>,
 ) -> Result<u64, VotesWorkerError> {
-    let Some(decode_cp) = deps.checkpoints.get(chain_id, MODULE_DECODE).await? else {
-        return Ok(0); // nothing decoded yet
-    };
-    let target = decode_cp.last_height;
-    let from = match deps.checkpoints.get(chain_id, MODULE_VOTES).await? {
-        Some(cp) if cp.last_height >= target => return Ok(0),
-        Some(cp) => cp.last_height + 1,
-        None => target, // first run: start at the decode tip
-    };
-    votes_range(chain_id, mapper, deps, from, target).await
+    module::run_tick(chain_id, &run(mapper, deps)).await
 }
 
 /// Follow forever, same backoff discipline as the other followers.
@@ -238,28 +195,17 @@ pub async fn votes_follow(
     deps: &VotesDeps<'_>,
     poll: std::time::Duration,
 ) {
-    let mut consecutive_failures = 0u32;
-    loop {
-        match votes_tick(chain_id, mapper, deps).await {
-            Ok(n) => {
-                consecutive_failures = 0;
-                if n > 0 {
-                    tracing::debug!(chain = %chain_id, blocks = n, "votes tick");
-                }
-            }
-            Err(e) => {
-                consecutive_failures += 1;
-                tracing::warn!(chain = %chain_id, error = %e, consecutive_failures, "votes tick failed");
-            }
-        }
-        let factor = 1 + consecutive_failures.min(10);
-        tokio::time::sleep(poll * factor).await;
-    }
+    module::run_follow::<VoteFact, VotesWorkerError>(chain_id, &run(mapper, deps), poll).await
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Both moved out of the file header when `advance` did; the tests below are
+    // otherwise untouched, which is the point of this refactor.
+    use crate::decode::MODULE_DECODE;
+    use crate::module::BlockEvents;
+    use crate::Checkpoint;
     use crate::MemoryCheckpointStore;
     use std::collections::HashMap;
     use std::sync::Mutex;
