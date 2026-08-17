@@ -6,6 +6,14 @@ relay: polkadot
 para_id: 1000
 network: polkadot
 ss58_prefix: 0
+
+# Short names the search grammar's `on <chain>` suffix accepts. DATA, so a
+# chain added later brings its own and api::search needs no edit.
+aliases:
+  - ah
+  - assethub
+  - hub
+  - pah
 lifecycle:
   - status: live
     from: "2021-06-01T00:00:00Z"   # Statemint-era launch, approximate — verify exact genesis date (ecosystem-verifier) before Phase 1

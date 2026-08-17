@@ -119,6 +119,22 @@ pub struct ChainConfig {
     /// Well-known non-derivable accounts to label (source = "registry").
     #[serde(default)]
     pub accounts: Vec<AccountSeed>,
+    /// Short names a human may type for this chain in the search grammar's
+    /// `on <chain>` suffix — `ah`, `relay`, `ppl`. DATA, never a code list, so
+    /// a chain registered in Phase 3 brings its own aliases with it and the
+    /// resolver needs no edit (Invariant 2). The chain's `id` and `name` always
+    /// resolve too and need not be repeated here.
+    #[serde(default)]
+    pub aliases: Vec<String>,
+}
+
+/// Fold a chain token to its comparable form: lower-case, separators removed.
+/// `Asset Hub`, `asset-hub`, `asset_hub` and `assethub` are one word.
+fn normalize_alias(s: &str) -> String {
+    s.chars()
+        .filter(|c| c.is_alphanumeric())
+        .flat_map(|c| c.to_lowercase())
+        .collect()
 }
 
 impl ChainConfig {
@@ -317,6 +333,40 @@ impl Registry {
 
     pub fn chains(&self) -> impl Iterator<Item = &ChainConfig> {
         self.chains.values()
+    }
+
+    /// Resolve a human-typed chain token — an id, a name, or a seeded alias.
+    /// Case- and separator-insensitive, because `Asset Hub`, `asset-hub` and
+    /// `assethub` are the same word to a person typing quickly.
+    ///
+    /// Returns None rather than guessing: the search grammar treats an
+    /// unrecognized `on <token>` as a parse failure it can report, never as a
+    /// silently dropped filter (slice 4's finding, where a query parameter was
+    /// accepted and ignored).
+    pub fn chain_by_alias(&self, token: &str) -> Option<&ChainConfig> {
+        let want = normalize_alias(token);
+        if want.is_empty() {
+            return None;
+        }
+        self.chains.values().find(|c| {
+            normalize_alias(&c.id) == want
+                || normalize_alias(&c.name) == want
+                || c.aliases.iter().any(|a| normalize_alias(a) == want)
+        })
+    }
+
+    /// Every token that resolves to a chain, for the grammar reference and for
+    /// "did you mean" — generated from the registry, so it cannot drift.
+    pub fn chain_aliases(&self) -> Vec<(&str, &str)> {
+        let mut out: Vec<(&str, &str)> = Vec::new();
+        for c in self.chains.values() {
+            out.push((c.id.as_str(), c.id.as_str()));
+            for a in &c.aliases {
+                out.push((a.as_str(), c.id.as_str()));
+            }
+        }
+        out.sort();
+        out
     }
 
     /// Which chain hosts `domain` on `network` at time `at`?

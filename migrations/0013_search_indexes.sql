@@ -1,0 +1,69 @@
+-- 0013_search_indexes: the indexes the resolver reads (Phase 2, slice 10).
+--
+-- THE COST RULE THIS FILE EXISTS TO HONOUR (ROADMAP §Phase 2, search resolver):
+-- "The ambiguous fan-out is bounded, not a scan — N kinds × M chains of POINT
+-- lookups on indexed keys, issued concurrently. It stays that way only if every
+-- probed key is actually indexed: verify that when the slice lands, per chain
+-- added."
+--
+-- The audit was run and it FAILED on the most important shape in the whole
+-- grammar. **`core.blocks.hash` and `core.transactions.hash` had no index** —
+-- only `blocks (chain_id, height)`, `transactions (chain_id, block_height,
+-- tx_index)`, `transactions_signer_idx` and `events_name_idx` existed. So the
+-- single most common thing a person pastes into a search box, a 32-byte hash,
+-- would have sequential-scanned both tables on every query, across every
+-- partition. That is invisible today at ~200 indexed blocks and catastrophic
+-- after Phase 4's backfill of ~52M. Two of the three indexes below are that
+-- finding; the rule paid for itself the first time it was applied.
+--
+-- These are deliberately NOT keyed on chain_id first. A block hash is
+-- effectively globally unique, so "which chain has this hash" should be ONE
+-- index probe that answers the chain, not M probes that ask every chain in
+-- turn — and the resolver's job is precisely to answer without a chain being
+-- named. Postgres only requires the partition key in a UNIQUE index; these are
+-- non-unique, so a bare `(hash)` index is legal on a partitioned table and
+-- creates one child index per partition.
+create index blocks_hash_idx on core.blocks (hash);
+
+-- `core.transactions.hash` is NULLABLE (an inherent has none), and a partial
+-- index keeps the inherents — the majority of rows on a quiet parachain — out
+-- of it entirely.
+create index transactions_hash_idx on core.transactions (hash) where hash is not null;
+
+-- Migration 0010 deliberately did NOT index `core.assets.symbol`, with the note
+-- "add it WITH its reader". This is that reader: `api::search` resolves a bare
+-- symbol — `USDT` — to every representation carrying it, on every chain, which
+-- is a question no chain-shaped explorer can even ask (PRODUCT.md gap 6).
+--
+-- WHY LOWER(symbol): people type `usdt`, the chain stores `USDt`. A functional
+-- index on the folded form keeps the lookup an index probe instead of a scan.
+-- The `symbol is not null` predicate keeps it off rows that can never match — a
+-- foreign asset whose metadata was never read has no symbol, and there are more
+-- of those than there are named assets.
+create index assets_symbol_idx on core.assets (lower(symbol)) where symbol is not null;
+
+-- THE REST OF THE AUDIT, recorded so the next codeword re-runs it rather than
+-- assuming. Every other v1 probe was already covered:
+--
+--   block height   → core.blocks             PK (chain_id, height)
+--   block-index    → core.transactions       PK (chain_id, block_height, tx_index)
+--   SS58 / 0x-32   → core.account_labels     PK (chain_id, account_id)
+--   preimage hash  → gov.preimages           PK (chain_id, proposal_hash, len)
+--   whitelist hash → gov.whitelisted_calls   PK (chain_id, call_hash)      [0012]
+--   referendum id  → gov.referenda           PK (chain_id, class, referendum_id)
+--   track id       → gov.tracks              PK (chain_id, pallet, track_id)
+--   bounty id      → treasury.bounties       PK (chain_id, instance, bounty_id, child_id)
+--   para id        → the registry, in memory — no query at all
+--
+-- ONE KNOWN IMPERFECTION, stated rather than papered over: `treasury.spends` is
+-- keyed (chain_id, INSTANCE, spend_kind, spend_id), so `spend 265` — which
+-- names no instance — cannot use the PK as a prefix. v1 therefore probes the
+-- registry's treasury instances explicitly (three today) rather than scanning,
+-- which is correct but is N small probes where the other kinds need one. If
+-- instances ever proliferate, reshape that PK or add (chain_id, spend_kind,
+-- spend_id); do not let the resolver quietly start scanning.
+--
+-- A future CHAIN adds rows to these same tables, so the probe set does not grow
+-- with chains — only with KINDS. That is why a new codeword must re-run this
+-- audit, and why this comment lists what was checked rather than just what was
+-- created.

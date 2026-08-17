@@ -18,6 +18,13 @@ relay: polkadot
 para_id: 1001
 network: polkadot
 ss58_prefix: 0
+
+# Short names the search grammar's `on <chain>` suffix accepts. DATA, so a
+# chain added later brings its own and api::search needs no edit.
+aliases:
+  - col
+  - collectives
+  - fellowship
 lifecycle:
   - status: live
     from: "2022-11-21T11:36:30Z"   # VERIFIED 2026-08-16: block #1

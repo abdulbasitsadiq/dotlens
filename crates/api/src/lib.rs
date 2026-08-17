@@ -12,6 +12,8 @@ use axum::{
 };
 use canonical::{AccountLabel, CanonicalBlock};
 use chrono::{DateTime, Utc};
+pub mod search;
+
 use registry::Registry;
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -28,6 +30,24 @@ pub trait BlockIndex: Send + Sync {
     async fn get(&self, chain_id: &str, height: u64) -> Result<Option<CanonicalBlock>, IndexError>;
     async fn insert(&self, block: CanonicalBlock) -> Result<(), IndexError>;
     async fn count(&self) -> Result<u64, IndexError>;
+    /// Which (chain, height) carries this block hash?
+    ///
+    /// Added for the search resolver, and deliberately NOT chain-scoped: a block
+    /// hash is effectively globally unique, so the useful question is "which
+    /// chain is this on", which is exactly what a caller who pasted a hash into
+    /// a box cannot tell us. Backed by `blocks_hash_idx` (migration 0013 — there
+    /// was no index on this column at all before that, which is why the roadmap
+    /// made the index audit part of this slice).
+    ///
+    /// Returns EVERY match rather than the first: two chains sharing a hash
+    /// would be extraordinary, but the resolver's contract is to list what it
+    /// found and let the caller see the ambiguity.
+    async fn blocks_by_hash(&self, hash: &str) -> Result<Vec<(String, u64)>, IndexError>;
+    /// Which (chain, height, index) carries this extrinsic hash? Same reasoning.
+    async fn extrinsics_by_hash(
+        &self,
+        hash: &str,
+    ) -> Result<Vec<(String, u64, u32)>, IndexError>;
 }
 
 #[derive(Default)]
@@ -66,6 +86,34 @@ impl BlockIndex for MemoryBlockIndex {
     async fn count(&self) -> Result<u64, IndexError> {
         let map = self.inner.read().map_err(|e| IndexError(e.to_string()))?;
         Ok(map.len() as u64)
+    }
+    async fn blocks_by_hash(&self, hash: &str) -> Result<Vec<(String, u64)>, IndexError> {
+        let map = self.inner.read().map_err(|e| IndexError(e.to_string()))?;
+        let mut out: Vec<(String, u64)> = map
+            .values()
+            .filter(|b| b.hash == hash)
+            .map(|b| (b.chain_id.clone(), b.height))
+            .collect();
+        // deterministic, and identical to the Pg backend's ORDER BY
+        out.sort();
+        Ok(out)
+    }
+    async fn extrinsics_by_hash(
+        &self,
+        hash: &str,
+    ) -> Result<Vec<(String, u64, u32)>, IndexError> {
+        let map = self.inner.read().map_err(|e| IndexError(e.to_string()))?;
+        let mut out: Vec<(String, u64, u32)> = map
+            .values()
+            .flat_map(|b| {
+                b.transactions
+                    .iter()
+                    .filter(|t| t.hash.as_deref() == Some(hash))
+                    .map(|t| (b.chain_id.clone(), b.height, t.index))
+            })
+            .collect();
+        out.sort();
+        Ok(out)
     }
 }
 
@@ -361,6 +409,20 @@ pub struct AssetRow {
 #[async_trait]
 pub trait AssetIndex: Send + Sync {
     async fn assets(&self, chain_id: &str) -> Result<Vec<AssetRow>, IndexError>;
+    /// Every representation carrying this SYMBOL, across every chain.
+    ///
+    /// The search resolver's reader for `assets_symbol_idx`, which migration
+    /// 0010 deliberately deferred with the note "add it WITH its reader"
+    /// (0013 creates it). Case-insensitive because people type `usdt` and the
+    /// chain stores `USDt`.
+    ///
+    /// Not chain-scoped, on purpose: "one logical asset, every representation,
+    /// every chain" is the question no chain-shaped explorer can ask
+    /// (PRODUCT.md gap 6), and scoping it by chain would throw that away.
+    async fn assets_by_symbol(
+        &self,
+        symbol: &str,
+    ) -> Result<Vec<(String, AssetRow)>, IndexError>;
 }
 
 #[derive(Default)]
@@ -389,6 +451,26 @@ impl AssetIndex for MemoryAssetIndex {
         let mut rows = map.get(chain_id).cloned().unwrap_or_default();
         rows.sort_by(|a, b| a.asset_key.cmp(&b.asset_key));
         Ok(rows)
+    }
+    async fn assets_by_symbol(
+        &self,
+        symbol: &str,
+    ) -> Result<Vec<(String, AssetRow)>, IndexError> {
+        let want = symbol.to_lowercase();
+        let map = self.assets.read().map_err(|e| IndexError(e.to_string()))?;
+        let mut out: Vec<(String, AssetRow)> = map
+            .iter()
+            .flat_map(|(chain, rows)| {
+                rows.iter()
+                    .filter(|r| {
+                        r.symbol.as_deref().map(str::to_lowercase).as_deref() == Some(&want)
+                    })
+                    .map(move |r| (chain.clone(), r.clone()))
+            })
+            .collect();
+        // same ordering as the Pg backend, so both return the same subset
+        out.sort_by(|(ac, ar), (bc, br)| (ac, &ar.asset_key).cmp(&(bc, &br.asset_key)));
+        Ok(out)
     }
 }
 
@@ -1400,6 +1482,39 @@ pub mod pg {
 
     #[async_trait]
     impl BlockIndex for PgBlockIndex {
+        async fn blocks_by_hash(&self, hash: &str) -> Result<Vec<(String, u64)>, IndexError> {
+            // index probe on blocks_hash_idx (0013), NOT a scan; and never a
+            // prefix match — a partial hash is a range scan and is the one
+            // thing in this grammar that genuinely does not scale.
+            let rows: Vec<(String, i64)> = sqlx::query_as(
+                "select chain_id, height from core.blocks where hash = $1 \
+                 order by chain_id collate \"C\", height",
+            )
+            .bind(hash)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| IndexError(e.to_string()))?;
+            Ok(rows.into_iter().map(|(c, h)| (c, h as u64)).collect())
+        }
+
+        async fn extrinsics_by_hash(
+            &self,
+            hash: &str,
+        ) -> Result<Vec<(String, u64, u32)>, IndexError> {
+            let rows: Vec<(String, i64, i32)> = sqlx::query_as(
+                "select chain_id, block_height, tx_index from core.transactions \
+                 where hash = $1 order by chain_id collate \"C\", block_height, tx_index",
+            )
+            .bind(hash)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| IndexError(e.to_string()))?;
+            Ok(rows
+                .into_iter()
+                .map(|(c, h, i)| (c, h as u64, i as u32))
+                .collect())
+        }
+
         async fn get(
             &self,
             chain_id: &str,
@@ -1842,6 +1957,69 @@ pub mod pg {
 
     #[async_trait]
     impl super::AssetIndex for PgAssetIndex {
+        async fn assets_by_symbol(
+            &self,
+            symbol: &str,
+        ) -> Result<Vec<(String, super::AssetRow)>, IndexError> {
+            // `lower(symbol)` matches assets_symbol_idx (0013) EXACTLY — a
+            // functional index is only used when the query spells the
+            // expression the same way, so this is not a stylistic choice.
+            type Row = (
+                String,
+                String,
+                String,
+                Option<String>,
+                Option<String>,
+                Option<i32>,
+                Option<String>,
+                Option<String>,
+                Option<String>,
+                Option<serde_json::Value>,
+            );
+            let rows: Vec<Row> = sqlx::query_as(
+                "select chain_id, asset_key, representation_kind, symbol, name, decimals, \
+                        supply::text, status, location_key, xcm_location \
+                 from core.assets where lower(symbol) = lower($1) \
+                 order by chain_id collate \"C\", asset_key collate \"C\"",
+            )
+            .bind(symbol)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| IndexError(e.to_string()))?;
+            Ok(rows
+                .into_iter()
+                .map(
+                    |(
+                        chain_id,
+                        asset_key,
+                        representation_kind,
+                        symbol,
+                        name,
+                        decimals,
+                        supply,
+                        status,
+                        location_key,
+                        xcm_location,
+                    )| {
+                        (
+                            chain_id,
+                            super::AssetRow {
+                                asset_key,
+                                representation_kind,
+                                symbol,
+                                name,
+                                decimals: decimals.map(|d| d as u32),
+                                supply,
+                                status,
+                                location_key,
+                                xcm_location,
+                            },
+                        )
+                    },
+                )
+                .collect())
+        }
+
         async fn assets(&self, chain_id: &str) -> Result<Vec<super::AssetRow>, IndexError> {
             type Row = (
                 String,
@@ -2946,6 +3124,7 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/bounties/{network}", get(list_bounties))
         .route("/v1/bounties/{network}/{id}", get(get_bounty))
         .route("/v1/assets/{chain}", get(list_assets))
+        .route("/v1/search", get(get_search))
         .route("/v1/domains/{network}/{domain}", get(resolve_domain))
         .with_state(state)
 }
@@ -3175,7 +3354,7 @@ fn gov_windows<'a>(
 /// Deduplicated by chain. That means if two classes ever share a chain, the
 /// segment carries the FIRST class's window bounds — fine while the public and
 /// fellowship instances live apart, worth revisiting if they converge.
-fn all_gov_windows<'a>(
+pub(crate) fn all_gov_windows<'a>(
     registry: &'a Registry,
     network: &str,
 ) -> Vec<&'a registry::ResidencyEntry> {
@@ -3220,6 +3399,40 @@ fn merge_referendum(prev: ReferendumRow, later: ReferendumRow) -> ReferendumRow 
         proposal_hash: later.proposal_hash.or(prev.proposal_hash),
         proposal_len: later.proposal_len.or(prev.proposal_len),
         submitted_at_height: prev.submitted_at_height.or(later.submitted_at_height),
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct SearchQuery {
+    q: Option<String>,
+}
+
+/// THE resolver: given an arbitrary blob a user pasted, say what it is.
+///
+/// One endpoint, one grammar, one response shape — the omnibox is a CLIENT of
+/// this, not a separate path, which is why the payload carries kind/chain/why
+/// per candidate rather than a display string (ROADMAP §Phase 2).
+///
+/// A parse failure is a 400 with what WOULD have worked; zero candidates is a
+/// 200 with an empty list, because "nothing indexed matches this" and "this
+/// input made no sense" are different answers and a caller must be able to tell
+/// them apart.
+async fn get_search(State(state): State<AppState>, Query(q): Query<SearchQuery>) -> Response {
+    let raw = q.q.unwrap_or_default();
+    match search::parse(&raw, &state.registry) {
+        Ok(query) => {
+            let body = search::resolve(&query, &state, &raw).await;
+            Json(body).into_response()
+        }
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "query": raw,
+                "error": e.message,
+                "expected": e.expected,
+            })),
+        )
+            .into_response(),
     }
 }
 
@@ -4699,14 +4912,14 @@ fn error(status: StatusCode, message: String) -> Response {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use axum::body::Body;
     use axum::http::Request;
     use std::path::Path as FsPath;
     use tower::util::ServiceExt;
 
-    async fn test_state() -> AppState {
+    pub(crate) async fn test_state() -> AppState {
         let seeds = FsPath::new(env!("CARGO_MANIFEST_DIR")).join("../../registry-seeds");
         let registry = Arc::new(Registry::load_from_dir(&seeds).expect("seeds"));
         let blocks: Arc<dyn BlockIndex> = Arc::new(MemoryBlockIndex::new());
