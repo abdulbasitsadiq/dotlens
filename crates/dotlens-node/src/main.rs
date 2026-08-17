@@ -39,6 +39,7 @@
 //! run is a fresh state — correct, but never a cache hit.
 //!
 //!   dotlens-node whitelist-range <chain> <from> <to>   # map whitelist events
+//!   dotlens-node xcm-range <chain> <from> <to>         # map XCM message facts
 //!
 //! Per-module followers are opt-in flags: LIVE_INGEST, DECODE_FOLLOW,
 //! BALANCES_FOLLOW, GOV_FOLLOW, VOTES_FOLLOW, TREASURY_FOLLOW, BOUNTIES_FOLLOW,
@@ -75,6 +76,7 @@ struct Backends {
     bounties: Arc<dyn api::BountyIndex>,
     assets: Arc<dyn api::AssetIndex>,
     sim: Arc<dyn api::SimIndex>,
+    xcm: Arc<dyn api::XcmIndex>,
     runtime_versions: Arc<dyn RuntimeVersionSink>,
     /// Kept for label sync/verify (they need direct SQL, not a trait).
     #[cfg(feature = "pg")]
@@ -94,6 +96,7 @@ fn memory_backends() -> Backends {
         bounties: Arc::new(api::MemoryBountyIndex::new()),
         assets: Arc::new(api::MemoryAssetIndex::new()),
         sim: Arc::new(api::MemorySimIndex::new()),
+        xcm: Arc::new(api::MemoryXcmIndex::new()),
         runtime_versions: Arc::new(NoopRuntimeVersionSink),
         #[cfg(feature = "pg")]
         pool: None,
@@ -127,6 +130,7 @@ enum Command {
     TreasuryRange { chain: String, from: u64, to: u64 },
     BountiesRange { chain: String, from: u64, to: u64 },
     WhitelistRange { chain: String, from: u64, to: u64 },
+    XcmRange { chain: String, from: u64, to: u64 },
     SyncBountyAccounts,
     AnchorVoting { chain: String, account: String, track: u32, height: Option<u64> },
     SyncTracks,
@@ -217,6 +221,10 @@ fn parse_args() -> Result<Command> {
             let (chain, from, to) =
                 range("usage: dotlens-node whitelist-range <chain> <from> <to>")?;
             Ok(Command::WhitelistRange { chain, from, to })
+        }
+        Some("xcm-range") => {
+            let (chain, from, to) = range("usage: dotlens-node xcm-range <chain> <from> <to>")?;
+            Ok(Command::XcmRange { chain, from, to })
         }
         Some("sync-bounty-accounts") => Ok(Command::SyncBountyAccounts),
         Some("anchor-voting") => {
@@ -374,6 +382,7 @@ async fn main() -> Result<()> {
             bounties: Arc::new(api::pg::PgBountyIndex::new(pool.clone())),
             assets: Arc::new(api::pg::PgAssetIndex::new(pool.clone())),
             sim: Arc::new(api::pg::PgSimIndex::new(pool.clone())),
+            xcm: Arc::new(api::pg::PgXcmIndex::new(pool.clone())),
             runtime_versions: Arc::new(PgRuntimeVersionSink::new(pool.clone())),
             pool: Some(pool),
             persistent: true,
@@ -471,6 +480,13 @@ async fn main() -> Result<()> {
             "whitelist-range requires DATABASE_URL (canonical events + whitelist facts must persist)"
         );
         return run_whitelist_range(&registry, &backends, chain, *from, *to).await;
+    }
+    if let Command::XcmRange { chain, from, to } = &command {
+        anyhow::ensure!(
+            backends.persistent,
+            "xcm-range requires DATABASE_URL (canonical events + xcm facts must persist)"
+        );
+        return run_xcm_range(&registry, &backends, chain, *from, *to).await;
     }
     if matches!(command, Command::SyncBountyAccounts) {
         #[cfg(feature = "pg")]
@@ -625,6 +641,7 @@ async fn main() -> Result<()> {
     spawn_treasury_followers(&registry, &backends);
     spawn_bounties_followers(&registry, &backends, &raw);
     spawn_whitelist_followers(&registry, &backends);
+    spawn_xcm_followers(&registry, &backends);
     spawn_tip_followers(&registry, &backends, &raw);
 
     // -- API ------------------------------------------------------------------
@@ -639,6 +656,7 @@ async fn main() -> Result<()> {
         bounties: backends.bounties.clone(),
         assets: backends.assets.clone(),
         sim: backends.sim.clone(),
+        xcm: backends.xcm.clone(),
         // family-encoded address parsing is adapter-owned (Invariant 4); with
         // more families this becomes registry-driven dispatch
         parse_account: Arc::new(|s| {
@@ -1638,6 +1656,89 @@ fn spawn_whitelist_followers(registry: &Arc<Registry>, backends: &Arc<Backends>)
             });
         }
     }
+}
+
+/// XCM followers, gated on the `xcm` module — which relay, Asset Hub,
+/// Collectives, People and Hydration all declare.
+fn spawn_xcm_followers(registry: &Arc<Registry>, backends: &Arc<Backends>) {
+    if !env_flag("XCM_FOLLOW") {
+        tracing::info!("xcm follower disabled (set XCM_FOLLOW=1 to enable)");
+        return;
+    }
+    if !backends.persistent {
+        tracing::warn!("XCM_FOLLOW=1 but no DATABASE_URL — refusing to map into memory");
+        return;
+    }
+    #[cfg(feature = "pg")]
+    {
+        use adapter_substrate::xcm::SubstrateXcmMapper;
+
+        let poll = std::time::Duration::from_secs(
+            env_or("POLL_INTERVAL_SECS", "6").parse().unwrap_or(6),
+        );
+        for chain in registry.chains() {
+            if !chain.has_module("xcm") {
+                continue;
+            }
+            if chain.family != registry::ChainFamily::Substrate {
+                tracing::debug!(chain = %chain.id, "no xcm mapper for this family — skipped");
+                continue;
+            }
+            let Some(pool) = backends.pool.clone() else { continue };
+            let chain_id = chain.id.clone();
+            let backends = backends.clone();
+            tokio::spawn(async move {
+                tracing::info!(chain = %chain_id, "xcm follower started");
+                let source = dotlens_node::balances_pg::PgEventSource::new(pool.clone());
+                let sink = dotlens_node::xcm_pg::PgXcmSink::new(pool);
+                let deps = ingest::xcm::XcmDeps {
+                    checkpoints: backends.checkpoints.as_ref(),
+                    source: &source,
+                    sink: &sink,
+                };
+                ingest::xcm::xcm_follow(&chain_id, &SubstrateXcmMapper, &deps, poll).await;
+            });
+        }
+    }
+}
+
+#[cfg(feature = "pg")]
+async fn run_xcm_range(
+    registry: &Registry,
+    backends: &Backends,
+    chain: &str,
+    from: u64,
+    to: u64,
+) -> Result<()> {
+    use adapter_substrate::xcm::SubstrateXcmMapper;
+
+    let cfg = registry
+        .chain(chain)
+        .with_context(|| format!("unknown chain: {chain}"))?;
+    anyhow::ensure!(
+        cfg.family == registry::ChainFamily::Substrate,
+        "no xcm mapper for family {:?}",
+        cfg.family
+    );
+    let pool = backends.pool.as_ref().context("xcm-range requires DATABASE_URL")?;
+    let source = dotlens_node::balances_pg::PgEventSource::new(pool.clone());
+    let sink = dotlens_node::xcm_pg::PgXcmSink::new(pool.clone());
+    let deps = ingest::xcm::XcmDeps {
+        checkpoints: backends.checkpoints.as_ref(),
+        source: &source,
+        sink: &sink,
+    };
+    let n = ingest::xcm::xcm_range(&cfg.id, &SubstrateXcmMapper, &deps, from, to)
+        .await
+        .with_context(|| format!("xcm-range {chain} {from}..={to}"))?;
+    tracing::info!(chain, from, to, mapped = n, "xcm-range complete");
+    println!("xcm-range {chain} {from}..={to}: mapped {n} blocks");
+    Ok(())
+}
+
+#[cfg(not(feature = "pg"))]
+async fn run_xcm_range(_: &Registry, _: &Backends, _: &str, _: u64, _: u64) -> Result<()> {
+    anyhow::bail!("xcm-range requires the `pg` feature")
 }
 
 #[cfg(feature = "pg")]

@@ -64,6 +64,10 @@ pub mod votes;
 /// that `WhitelistedCallDispatched` fires for a FAILED call too.
 pub mod whitelist;
 
+/// XCM message facts: the sending and receiving halves of a cross-chain
+/// message, recorded separately and never joined here. Pure — no I/O.
+pub mod xcm;
+
 /// Tier 1 simulation: build a `DryRunApi::dry_run_call` request out of the
 /// runtime's own metadata and read the answer back. Pure — no I/O; the RPC is
 /// `source::SubstrateSource::state_call` and the wiring is in dotlens-node.

@@ -405,6 +405,137 @@ pub struct AssetRow {
     pub xcm_location: Option<serde_json::Value>,
 }
 
+/// One XCM observation (`xcm.messages`) — one chain's half of one message.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct XcmMessageRow {
+    pub chain_id: String,
+    pub block_height: u64,
+    pub event_index: u32,
+    /// sent | received | local
+    pub side: String,
+    /// hrmp | ump | dmp | local | unknown
+    pub transport: String,
+    pub message_id: Option<String>,
+    /// topic | wire_hash | ambiguous | none — see `xcm_not_covered()`.
+    pub id_kind: String,
+    pub counterparty: Option<String>,
+    pub origin_location: Option<serde_json::Value>,
+    pub destination: Option<serde_json::Value>,
+    pub message: Option<serde_json::Value>,
+    pub forwarded: bool,
+    pub status: String,
+    pub success: Option<bool>,
+    pub error: Option<serde_json::Value>,
+    pub weight_used: Option<serde_json::Value>,
+    pub runtime_version: u64,
+    pub mapper_version: u32,
+}
+
+/// Read side of `xcm.messages`.
+#[async_trait]
+pub trait XcmIndex: Send + Sync {
+    /// Recent observations on one chain, newest first.
+    async fn messages(&self, chain_id: &str, limit: u32)
+        -> Result<Vec<XcmMessageRow>, IndexError>;
+    /// Every observation carrying this id, on ANY chain — the seam the
+    /// correlation slice will read: the halves we have, never a journey we
+    /// inferred. NOTE the search grammar still REFUSES `xcm 0x…` ("XCM journeys
+    /// land in Phase 3") and that refusal stays accurate: journeys are what has
+    /// not shipped. Wiring the codeword to these observations is search v2.
+    async fn by_message_id(&self, message_id: &str) -> Result<Vec<XcmMessageRow>, IndexError>;
+}
+
+#[derive(Default)]
+pub struct MemoryXcmIndex {
+    rows: RwLock<Vec<XcmMessageRow>>,
+}
+
+impl MemoryXcmIndex {
+    pub fn new() -> Self {
+        Self::default()
+    }
+    pub fn insert(&self, row: XcmMessageRow) {
+        self.rows.write().expect("lock").push(row);
+    }
+}
+
+#[async_trait]
+impl XcmIndex for MemoryXcmIndex {
+    async fn messages(
+        &self,
+        chain_id: &str,
+        limit: u32,
+    ) -> Result<Vec<XcmMessageRow>, IndexError> {
+        let rows = self.rows.read().map_err(|e| IndexError(e.to_string()))?;
+        let mut out: Vec<XcmMessageRow> =
+            rows.iter().filter(|r| r.chain_id == chain_id).cloned().collect();
+        // identical to the Pg ordering, tie-break included
+        out.sort_by(|a, b| {
+            b.block_height
+                .cmp(&a.block_height)
+                .then_with(|| a.event_index.cmp(&b.event_index))
+        });
+        out.truncate(limit as usize);
+        Ok(out)
+    }
+    async fn by_message_id(&self, message_id: &str) -> Result<Vec<XcmMessageRow>, IndexError> {
+        let rows = self.rows.read().map_err(|e| IndexError(e.to_string()))?;
+        let mut out: Vec<XcmMessageRow> = rows
+            .iter()
+            .filter(|r| r.message_id.as_deref() == Some(message_id))
+            .cloned()
+            .collect();
+        out.sort_by(|a, b| {
+            a.chain_id
+                .cmp(&b.chain_id)
+                .then_with(|| a.block_height.cmp(&b.block_height))
+                .then_with(|| a.event_index.cmp(&b.event_index))
+        });
+        Ok(out)
+    }
+}
+
+/// What an XCM row is NOT. Shipped with every XCM response, because the gap
+/// between "we recorded both halves" and "this is one journey" is the entire
+/// difficulty of this module, and a consumer who assumes the former would build
+/// on sand.
+pub fn xcm_not_covered() -> Vec<&'static str> {
+    vec![
+        "these are one-sided OBSERVATIONS, not journeys: a `sent` row and a `received` row \
+         carrying the same id are strong evidence of one message, but nothing here asserts \
+         it — the correlation layer that does is a later slice",
+        "there are TWO ids per message and `id_kind` says which one a row holds: `topic` \
+         (pallet_xcm's message_id, derived from frame_system::unique — not a hash of \
+         anything and not recomputable), `wire_hash` (blake2_256 of the queued bytes), and \
+         `ambiguous` (messageQueue's id, which is the topic if the message carried one and \
+         the receiving runtime sets TrailingSetTopicAsId, else the wire hash — the event \
+         does not say which)",
+        "a chain may emit NO `Sent` for executor-forwarded messages if it does not wire an \
+         XcmEventEmitter — Hydration does exactly this, so its outbound traffic appears only \
+         as queue-pallet wire hashes and a sender-side view built on `Sent` would show it as \
+         nearly silent",
+        "topic propagation ACROSS a hop only exists from staging-xcm-executor 20.0.0 (Jul \
+         2025), and `Sent` for forwarded legs only from 19.1.0 — the Polkadot relay runtime \
+         indexed here at spec 1003004 has neither, so multi-hop journeys from that era have \
+         unrelated ids per leg",
+        "DMP has no sender-side hash event at all: the relay computes one and discards it, \
+         and parachains_dmp emits nothing. Relay→parachain is topic-or-nothing",
+        "a `sent` with no `received` is a legitimate outcome, not necessarily a gap in our \
+         indexing: weight-starved XCMP enqueueing drops whole batches with no event on \
+         either side",
+        "`status: processed` with `success: true` means the message queue discarded the \
+         message as handled — pallet-message-queue's own doc says it 'solely' means that. It \
+         is not a claim that the XCM achieved what it intended",
+        "a chain appears here at all only if its registry seed enables the `xcm` module — \
+         /v1/chains lists which do. An absent half may therefore be a chain WE do not map \
+         rather than a chain nobody indexed, and the two are not the same claim",
+        "HRMP channel history is absent on purpose: channels open and close at SESSION \
+         boundaries with no event, so an events-only channel table would miss every genesis \
+         channel and every offboarding teardown. It needs a storage snapshot, which is its \
+         own slice",
+    ]
+}
+
 /// One recorded Tier 1 simulation (`sim.simulation_results`).
 ///
 /// An IMMUTABLE OBSERVATION: what this runtime, at this exact state, answered
@@ -2088,6 +2219,85 @@ pub mod pg {
         }
     }
 
+    /// Postgres-backed XCM reads over `xcm.messages`.
+    pub struct PgXcmIndex {
+        pool: PgPool,
+    }
+
+    impl PgXcmIndex {
+        pub fn new(pool: PgPool) -> Self {
+            Self { pool }
+        }
+    }
+
+    impl PgXcmIndex {
+        fn row(r: &sqlx::postgres::PgRow) -> Result<super::XcmMessageRow, IndexError> {
+            use sqlx::Row as _;
+            let err = |e: sqlx::Error| IndexError(e.to_string());
+            Ok(super::XcmMessageRow {
+                chain_id: r.try_get("chain_id").map_err(err)?,
+                block_height: r.try_get::<i64, _>("block_height").map_err(err)? as u64,
+                event_index: r.try_get::<i32, _>("event_index").map_err(err)? as u32,
+                side: r.try_get("side").map_err(err)?,
+                transport: r.try_get("transport").map_err(err)?,
+                message_id: r.try_get("message_id").map_err(err)?,
+                id_kind: r.try_get("id_kind").map_err(err)?,
+                counterparty: r.try_get("counterparty").map_err(err)?,
+                origin_location: r.try_get("origin_location").map_err(err)?,
+                destination: r.try_get("destination").map_err(err)?,
+                message: r.try_get("message").map_err(err)?,
+                forwarded: r.try_get("forwarded").map_err(err)?,
+                status: r.try_get("status").map_err(err)?,
+                success: r.try_get("success").map_err(err)?,
+                error: r.try_get("error").map_err(err)?,
+                weight_used: r.try_get("weight_used").map_err(err)?,
+                runtime_version: r.try_get::<i64, _>("runtime_version").map_err(err)? as u64,
+                mapper_version: r.try_get::<i32, _>("mapper_version").map_err(err)? as u32,
+            })
+        }
+    }
+
+    const XCM_COLS: &str = "chain_id, block_height, event_index, side, transport, message_id, \
+         id_kind, counterparty, origin_location, destination, message, forwarded, status, \
+         success, error, weight_used, runtime_version, mapper_version";
+
+    #[async_trait]
+    impl super::XcmIndex for PgXcmIndex {
+        async fn messages(
+            &self,
+            chain_id: &str,
+            limit: u32,
+        ) -> Result<Vec<super::XcmMessageRow>, IndexError> {
+            let rows = sqlx::query(&format!(
+                "select {XCM_COLS} from xcm.messages where chain_id = $1 \
+                 order by block_height desc, event_index limit $2"
+            ))
+            .bind(chain_id)
+            .bind(limit as i64)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| IndexError(e.to_string()))?;
+            rows.iter().map(Self::row).collect()
+        }
+
+        async fn by_message_id(
+            &self,
+            message_id: &str,
+        ) -> Result<Vec<super::XcmMessageRow>, IndexError> {
+            // messages_id_idx (0015) — a point probe per partition, never a scan
+            // and never a prefix match.
+            let rows = sqlx::query(&format!(
+                "select {XCM_COLS} from xcm.messages where message_id = $1 \
+                 order by chain_id collate \"C\", block_height, event_index"
+            ))
+            .bind(message_id)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| IndexError(e.to_string()))?;
+            rows.iter().map(Self::row).collect()
+        }
+    }
+
     /// Postgres-backed simulation reads over `sim.simulation_results`.
     pub struct PgSimIndex {
         pool: PgPool,
@@ -3329,6 +3539,7 @@ pub struct AppState {
     pub bounties: Arc<dyn BountyIndex>,
     pub assets: Arc<dyn AssetIndex>,
     pub sim: Arc<dyn SimIndex>,
+    pub xcm: Arc<dyn XcmIndex>,
     pub parse_account: AccountParser,
 }
 
@@ -3354,6 +3565,8 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/bounties/{network}/{id}", get(get_bounty))
         .route("/v1/assets/{chain}", get(list_assets))
         .route("/v1/sim/{chain}/calls/{call_hash}", get(get_simulations))
+        .route("/v1/xcm/{chain}/messages", get(list_xcm_messages))
+        .route("/v1/xcm/messages/{message_id}", get(get_xcm_message))
         .route("/v1/search", get(get_search))
         .route("/v1/domains/{network}/{domain}", get(resolve_domain))
         .with_state(state)
@@ -4013,6 +4226,75 @@ async fn get_gov_referendum(
 #[derive(Deserialize)]
 struct SimQuery {
     limit: Option<u64>,
+}
+
+/// Recent XCM observations on one chain.
+async fn list_xcm_messages(
+    State(state): State<AppState>,
+    Path(chain): Path<String>,
+    Query(q): Query<SimQuery>,
+) -> Response {
+    if state.registry.chain(&chain).is_none() {
+        return error(StatusCode::NOT_FOUND, format!("unknown chain '{chain}'"));
+    }
+    let limit = q.limit.unwrap_or(25).clamp(1, 200) as u32;
+    let rows = match state.xcm.messages(&chain, limit).await {
+        Ok(r) => r,
+        Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    };
+    Json(serde_json::json!({
+        "chain": chain,
+        "messages": rows,
+        "coverage": { "not_covered": xcm_not_covered() },
+    }))
+    .into_response()
+}
+
+/// Every observation carrying one id, on any chain.
+///
+/// THE SHAPE OF THIS RESPONSE IS THE POINT. It returns the halves we have and
+/// labels each one's `id_kind`; it does NOT return a journey. Two rows here —
+/// one `sent` on Asset Hub, one `received` on Hydration — are what a journey is
+/// made of, and saying so is the correlation slice's job, not this endpoint's.
+/// Until then the honest answer to "what happened to this message" is "here is
+/// every place that id was seen".
+async fn get_xcm_message(
+    State(state): State<AppState>,
+    Path(message_id): Path<String>,
+) -> Response {
+    let id = normalize_call_hash(&message_id);
+    let rows = match state.xcm.by_message_id(&id).await {
+        Ok(r) => r,
+        Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    };
+    let sides: Vec<&str> = rows.iter().map(|r| r.side.as_str()).collect();
+    let reads_as = match (
+        sides.contains(&"sent"),
+        sides.contains(&"received"),
+        rows.is_empty(),
+    ) {
+        (_, _, true) => "no chain we index has seen this id — which is not the same as the \
+                         message not existing, since a journey through an unindexed chain \
+                         leaves no row here",
+        (true, true, _) => "both halves are on record: one chain reported sending this id and \
+                            another reported processing it. That is strong evidence of one \
+                            message and is still not an assertion — see coverage.not_covered",
+        (true, false, _) => "only the SENDING half is on record. That can mean the message is \
+                             still in flight, that the receiving chain is not indexed here, or \
+                             that it was dropped in transit — the three are indistinguishable \
+                             from this side",
+        (false, true, _) => "only the RECEIVING half is on record. The sending chain is either \
+                             not indexed here or does not emit a sender event for forwarded \
+                             messages",
+        _ => "observations recorded, but neither a send nor a receive among them",
+    };
+    Json(serde_json::json!({
+        "message_id": id,
+        "observations": rows,
+        "reads_as": reads_as,
+        "coverage": { "not_covered": xcm_not_covered() },
+    }))
+    .into_response()
 }
 
 /// Recorded Tier 1 simulations of one call, on one chain.
@@ -5374,6 +5656,39 @@ pub(crate) mod tests {
             observed_at: None,
         });
 
+        // Two halves of one XCM: Asset Hub says it sent topic 0xee to para 2034,
+        // Hydration says it processed 0xee. Deliberately the AMBIGUOUS-id case
+        // on the receiving side, because that is what a real messageQueue row is.
+        let xcm = Arc::new(MemoryXcmIndex::new());
+        let xcm_row = |chain: &str, height: u64, side: &str, id_kind: &str| XcmMessageRow {
+            chain_id: chain.into(),
+            block_height: height,
+            event_index: 4,
+            side: side.into(),
+            transport: "hrmp".into(),
+            message_id: Some(format!("0x{}", "ee".repeat(32))),
+            id_kind: id_kind.into(),
+            counterparty: Some(if side == "sent" { "para:2034" } else { "para:1000" }.into()),
+            origin_location: None,
+            destination: None,
+            message: None,
+            forwarded: false,
+            status: if side == "sent" { "sent" } else { "processed" }.into(),
+            success: (side != "sent").then_some(true),
+            error: None,
+            weight_used: None,
+            runtime_version: 2_003_002,
+            mapper_version: 1,
+        };
+        xcm.insert(xcm_row("polkadot-asset-hub", 19_000_900, "sent", "topic"));
+        xcm.insert(xcm_row("hydration", 7_000_100, "received", "ambiguous"));
+        // an older, unrelated observation on the same chain, to pin ordering
+        xcm.insert(XcmMessageRow {
+            block_height: 19_000_100,
+            message_id: Some(format!("0x{}", "11".repeat(32))),
+            ..xcm_row("polkadot-asset-hub", 19_000_100, "sent", "wire_hash")
+        });
+
         // governance stitched across the migration: ref 1500 submitted +
         // deciding on the relay, concluded on Asset Hub; ref 1400 decided on
         // the relay with only an info-event row ('unknown') on AH
@@ -6074,6 +6389,7 @@ pub(crate) mod tests {
             bounties,
             assets,
             sim,
+            xcm,
             parse_account: Arc::new(|s| {
                 adapter_substrate::accounts::parse_account(s).map(|a| a.to_vec())
             }),
@@ -6294,6 +6610,49 @@ pub(crate) mod tests {
             "an empty list because we could not look is a different claim from an empty \
              list because we looked and found nothing: {why}"
         );
+    }
+
+    #[tokio::test]
+    async fn an_xcm_id_returns_the_halves_we_have_and_refuses_to_call_them_a_journey() {
+        let app = router(test_state().await);
+        let id = format!("0x{}", "ee".repeat(32));
+
+        // Both halves, on two chains, found by id alone — no chain named.
+        let (status, json) = get_json(&app, &format!("/v1/xcm/messages/{}", id.to_uppercase())).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["message_id"], id, "0X… normalises like every other hash");
+        let obs = json["observations"].as_array().unwrap();
+        assert_eq!(obs.len(), 2);
+        assert_eq!(obs[0]["chain_id"], "hydration", "chain-ordered, C collation");
+        assert_eq!(obs[0]["side"], "received");
+        assert_eq!(obs[1]["chain_id"], "polkadot-asset-hub");
+        assert_eq!(obs[1]["side"], "sent");
+
+        // THE CLAIM THIS ENDPOINT REFUSES TO MAKE: the two rows are evidence,
+        // not an assertion that they are one message.
+        let reads_as = json["reads_as"].as_str().unwrap();
+        assert!(reads_as.contains("still not an assertion"), "{reads_as}");
+        // and the two ids are labelled differently, because they ARE different
+        assert_eq!(obs[1]["id_kind"], "topic");
+        assert_eq!(obs[0]["id_kind"], "ambiguous");
+
+        // An id nobody saw is not "the message does not exist".
+        let (_, none) = get_json(&app, &format!("/v1/xcm/messages/0x{}", "99".repeat(32))).await;
+        assert!(none["observations"].as_array().unwrap().is_empty());
+        assert!(none["reads_as"].as_str().unwrap().contains("unindexed chain"));
+
+        // Per-chain listing: newest first, and an unknown chain 404s.
+        let (_, ah) = get_json(&app, "/v1/xcm/polkadot-asset-hub/messages").await;
+        let rows = ah["messages"].as_array().unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0]["block_height"], 19_000_900);
+        assert!(ah["coverage"]["not_covered"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s.as_str().unwrap().contains("one-sided OBSERVATIONS")));
+        let (s, _) = get_json(&app, "/v1/xcm/nowhere/messages").await;
+        assert_eq!(s, StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]

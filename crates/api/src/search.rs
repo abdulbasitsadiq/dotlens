@@ -1003,7 +1003,7 @@ mod tests {
     #[test]
     fn an_unknown_chain_is_refused_rather_than_ignored() {
         let r = reg();
-        let err = parse("block 100 on hydration", &r).unwrap_err();
+        let err = parse("block 100 on atlantis", &r).unwrap_err();
         assert!(err.message.contains("unknown chain"), "{}", err.message);
         assert!(!err.expected.is_empty(), "must say what WOULD work");
         assert!(err.expected.iter().any(|e| e == "ah"));

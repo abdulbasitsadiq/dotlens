@@ -64,3 +64,5 @@ modules:
   - treasury               # the Fellowship and Ambassador SUB-treasuries are
                            # pallet-treasury instances here — separate money
                            # from the main treasury on Asset Hub
+  - xcm                    # the whitelist flow reaches Asset Hub by XCM Transact —
+                           # this chain's sending half of it

@@ -41,3 +41,7 @@ modules:
   - governance             # historical only — governance resided here pre-2025-11-04;
                            # the post-migration relay runtime has no referenda pallet,
                            # so live mapping is a no-op and tracks sync yields zero rows
+  - xcm                    # the relay is half the transport story: it RECEIVES every
+                           # UMP message (messageQueue, origin Ump(Para(id))) and SENDS
+                           # every DMP one. Without this the xcm follower never starts
+                           # here and half of every journey is invisible.

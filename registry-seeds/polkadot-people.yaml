@@ -57,5 +57,6 @@ modules:
   - events
   - accounts
   - balances
+  - xcm
   # no `identity` module yet — the domain is registered (residency below) so
   # that resolution is already correct when Phase 5 implements it

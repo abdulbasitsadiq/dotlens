@@ -1,0 +1,134 @@
+# Hydration (para 2034) — the third plug-and-play test, and the first chain
+# dotlens indexes that is NOT a system parachain.
+#
+# THE REBRAND IS DISPLAY-ONLY. "HydraDX" became "Hydration" in June 2024, but
+# the runtime's `spec_name` is still `hydradx`, the crate is still
+# `runtime/hydradx`, and the canonical repo `galacticcouncil/HydraDX-node` now
+# redirects to `galacticcouncil/hydration-node`. Anything keying chains off
+# spec_name sees `hydradx`.
+id: hydration
+name: Hydration
+family: substrate
+relay: polkadot
+para_id: 2034
+network: polkadot
+
+# NOT 63, which is what the ss58-registry still says and what every older doc
+# repeats. The runtime constant `System.SS58Prefix` is 0 as of commit 0f3ecb255
+# ("Change address prefix", 2025-04-14), first released in v38.0.0 (2025-05-13,
+# spec_version 312) — Hydration adopting the unified format from Polkadot
+# referendum 1217. The chain spec carries NO ss58Format, so `system_properties`
+# will not answer this; the runtime constant is authoritative.
+#
+# VERIFIED ON-CHAIN 2026-08-17 at spec 435: the `System.SS58Prefix` constant
+# decodes to `0x0000` = 0, and `system_properties` returns exactly
+# {"tokenDecimals":12,"tokenSymbol":"HDX"} with NO ss58Format — so both halves
+# of the claim above are confirmed, including WHY the usual RPC cannot answer it.
+#
+# CONSEQUENCE FOR US: addresses written down before mid-2025 are in the `7…`
+# (prefix 63) form and the same account renders as `13…` today. `parse_account`
+# must accept both, and a label seeded from an old source will not match a
+# freshly derived one by string comparison.
+ss58_prefix: 0
+
+aliases:
+  - hdx
+  - hydradx
+  - hydra
+
+lifecycle:
+  # Won Polkadot auction #9 (Feb 2022), onboarded with the auction 6–11 cohort.
+  # parachains.info: lease 1 2022-03-16 → 2024-01-16; lease 2 (auction #56,
+  # self-funded 30k DOT) 2024-01-21 → 2025-11-22; now on Coretime, ACTIVE,
+  # holding cores 31/30/24 with a coretime end date of 2026-09-22.
+  #
+  # VERIFIED ON-CHAIN 2026-08-17, the same way Collectives and People were pinned
+  # in Phase 2 slice 4: `Timestamp.Now` at BLOCK #1 (block 0 carries none) reads
+  # 1647056178400 ms, on two independent archive endpoints, at block #1 hash
+  # 0x4764be7684ad55ab619a1e6c83ea1b595681ee3d3393f37930464c98cbcddaa7. So the
+  # chain started producing blocks FOUR DAYS before the lease-1 date every
+  # secondary source repeats — the same "chain is live ≠ the calendar entry"
+  # gap the People chain showed, and the reason this is read rather than cited.
+  - status: live
+    from: "2022-03-12T03:36:18Z"
+
+endpoints:
+  # From polkadot-js/apps `productionRelayPolkadot.ts` @ master, paraId 2034.
+  #
+  # PROBED 2026-08-17, for liveness AND archive depth (a dead seed endpoint cost
+  # this project a backfill stall in Phase 1 slice 6, so liveness alone is not
+  # the bar): the first two both serve state at BLOCK #1 — full archive — and
+  # rpc.hydradx.cloud alone carried a 240-block backfill with no rotation.
+  # rpc.helikon.io/hydradx answered HTTP 400 to JSON-RPC over https, i.e. it is
+  # reachable but WS-only; it is kept as the third fallback rather than removed,
+  # since the node dials wss and never https, but it is untested on that path.
+  rpc:
+    - wss://rpc.hydradx.cloud
+    - wss://hydration-rpc.n.dwellir.com
+    - wss://rpc.helikon.io/hydradx
+  # DELIBERATELY NOT SEEDED — removed upstream, and a dead seed endpoint cost
+  # this project a backfill stall once already (Phase 1 slice 6, Dwellir):
+  #   wss://hydration.ibp.network            removed 2026-06-07, apps-config 062d31a
+  #   wss://hydration.dotters.network        removed 2026-06-07, same commit
+  #   wss://hydradx.api.onfinality.io/public-ws   commented out, polkadot-js/apps#9986
+  #   wss://api-hydradx.dwellir.com          superseded by the .n.dwellir.com host
+
+capabilities:
+  blocks: true
+  extrinsics: true
+  events: true
+  runtime_metadata: true
+  xcm:
+    min_version: 3
+  # Its OWN OpenGov — `referenda = 37`, `conviction_voting = 36`,
+  # `pallet_custom_origins = 38`, 10 tracks (root … economic_parameters).
+  # NOT enabled as a module here: the gov mapper maps pallet name → class, and
+  # `convictionvoting`/`referenda` on Hydration would silently merge into
+  # Polkadot's `referenda` id space. `ref 42 on hydration` is a Phase 3 search
+  # scope axis (ROADMAP), and it needs its own class first.
+  governance: false
+
+modules:
+  - blocks
+  - extrinsics
+  - events
+  - xcm
+
+# ---------------------------------------------------------------------------
+# WHY `balances` IS NOT IN THAT LIST, and it is the most important thing on this
+# page. Money lives in THREE places on Hydration and our balances mapper reads
+# only the first:
+#   pallet_balances (7)  — HDX ONLY (asset id 0), `AccountStore = System`, so
+#                          our existing System.Account anchor decoder does work.
+#   orml_tokens    (77)  — EVERYTHING else: DOT, USDT, USDC, vDOT, LRNA,
+#                          stablepool shares. Keyed (AccountId, AssetId=u32),
+#                          with its own `tokens.*` event vocabulary.
+#   pallet_evm     (90)  — aTokens (aDOT). The money market is an AAVE V3 FORK
+#                          IN THE EVM, not a pallet; `pallet_liquidation` (76)
+#                          is only the Substrate-side liquidator.
+# Enabling `balances` here would index HDX and report the Polkadot treasury's
+# position on this chain as nothing — the same shape of silent hole as the
+# ≈$592k stablecoin gap measured in Phase 2 slice 6, one chain over. The
+# orml-tokens arm is its own slice; until it lands, saying nothing is honest and
+# saying HDX-only would not be.
+#
+# ONE TRAP FOR THAT FUTURE SLICE, recorded now: Hydration runs a FORK of
+# orml-currencies (`pallet_currencies = 79`) specifically because "the latest
+# versions of the orml-currencies pallet don't emit events" (their comment). So
+# one movement may surface as BOTH a `currencies.*` event and an underlying
+# `tokens.*`/`balances.*` event — the double-count shape that `DustLost` +
+# `BurnedDebt` produced in slice 6. Verify the overlap on live data before
+# mapping both.
+#
+# XCM-relevant pallets, for the mapper: polkadotXcm 107, cumulusXcm 109,
+# xcmpQueue 111, messageQueue 114 (index 113 retired — was DmpQueue), ormlXcm
+# 135, xTokens 137. The call filter blocks most PolkadotXcm calls, so user
+# transfers go through xTokens, not polkadotXcm.
+#
+# AND THE FINDING THAT SHAPES THE XCM MAPPER: Hydration sets
+# `type XcmEventEmitter = ();`, whose impl is an empty body. It therefore emits
+# NO `polkadotXcm.Sent` for executor-forwarded messages — which is most of its
+# outbound traffic. Its only outbound record is
+# `xcmpQueue.XcmpMessageSent{message_hash}` /
+# `parachainSystem.UpwardMessageSent{message_hash}`. A sender-side view built on
+# `Sent` alone would show this chain as almost silent.

@@ -15,6 +15,7 @@ pub mod tip;
 pub mod treasury;
 pub mod votes;
 pub mod whitelist;
+pub mod xcm;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};

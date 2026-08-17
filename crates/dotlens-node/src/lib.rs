@@ -38,6 +38,10 @@ pub mod whitelist_pg;
 #[cfg(feature = "pg")]
 pub mod tip_pg;
 
+/// XCM message facts (Phase 3, slice 2) — append-only, one row per event.
+#[cfg(feature = "pg")]
+pub mod xcm_pg;
+
 /// Tier 1 simulation results (Phase 3, slice 1) — immutable observations.
 #[cfg(feature = "pg")]
 pub mod sim_pg;

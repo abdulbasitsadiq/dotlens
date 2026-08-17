@@ -510,6 +510,54 @@ mod tests {
         assert!(people.endpoints.rpc.iter().all(|e| e.starts_with("wss://")));
     }
 
+    /// The third plug-and-play test, and the first NON-SYSTEM parachain: a chain
+    /// joins by adding one YAML file (Invariant 2).
+    #[test]
+    fn hydration_registers_as_data_with_no_adapter_change() {
+        let reg = Registry::load_from_dir(&seeds_dir()).unwrap();
+        let h = reg.chain("hydration").expect("hydration seeded");
+        assert_eq!(h.para_id, Some(2034));
+        assert_eq!(h.relay.as_deref(), Some("polkadot"));
+        assert_eq!(h.family, ChainFamily::Substrate);
+        // NOT 63 — the runtime constant moved to 0 in v38.0.0 (2025-05-13) with
+        // the unified address format, and the ss58-registry is stale.
+        assert_eq!(h.ss58_prefix, Some(0));
+        assert!(h.endpoints.rpc.iter().all(|e| e.starts_with("wss://")));
+        assert!(h.has_module("xcm"), "the xcm follower is gated on this");
+        // `balances` is DELIBERATELY off: pallet-balances holds HDX only, and
+        // every other asset lives in orml-tokens or in EVM storage, so enabling
+        // it would report the treasury's position here as nothing.
+        assert!(!h.has_module("balances"));
+        // It runs its own OpenGov, whose pallet names collide with Polkadot's —
+        // enabling the module before the class is scoped would merge two id
+        // spaces.
+        assert!(!h.has_module("governance"));
+        // Every chain that can carry XCM traffic must declare the module, or its
+        // follower silently never starts — the defect the treasury slice paid
+        // for, and the reason this asserts the whole set rather than Hydration
+        // alone. The relay is half the transport story: it RECEIVES every UMP
+        // message and SENDS every DMP one.
+        for chain in [
+            "polkadot",
+            "polkadot-asset-hub",
+            "polkadot-collectives",
+            "polkadot-people",
+            "hydration",
+        ] {
+            assert!(
+                reg.chain(chain).expect(chain).has_module("xcm"),
+                "{chain} must declare the xcm module"
+            );
+        }
+        for alias in ["hdx", "hydradx", "hydra"] {
+            assert_eq!(
+                reg.chain_by_alias(alias).map(|c| c.id.as_str()),
+                Some("hydration"),
+                "a chain brings its own aliases; api::search needs no edit"
+            );
+        }
+    }
+
     #[test]
     fn fellowship_and_identity_residency_resolve() {
         let reg = Registry::load_from_dir(&seeds_dir()).unwrap();

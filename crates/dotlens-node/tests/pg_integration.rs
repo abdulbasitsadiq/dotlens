@@ -723,7 +723,7 @@ async fn sibling_sovereign_labels_appear_when_a_chain_registers() {
     std::fs::write(
         dir.join("test-para.yaml"),
         "id: test-para\nname: Test Para\nfamily: substrate\nrelay: polkadot\n\
-         para_id: 2034\nnetwork: polkadot\nss58_prefix: 0\n",
+         para_id: 2999\nnetwork: polkadot\nss58_prefix: 0\n",
     )
     .unwrap();
     let reg = Registry::load_from_dir(&dir).expect("temp registry loads");
@@ -752,8 +752,8 @@ async fn sibling_sovereign_labels_appear_when_a_chain_registers() {
         }
     };
     // test-para's sovereign: on the relay (para) and on AH (sibl)
-    assert!(exists("para_sovereign", "polkadot", "para:2034").await);
-    assert!(exists("sibl_sovereign", "polkadot-asset-hub", "sibl:2034").await);
+    assert!(exists("para_sovereign", "polkadot", "para:2999").await);
+    assert!(exists("sibl_sovereign", "polkadot-asset-hub", "sibl:2999").await);
     // and AH's sibling sovereign appears on test-para — both directions
     assert!(exists("sibl_sovereign", "test-para", "sibl:1000").await);
 
@@ -764,16 +764,22 @@ async fn sibling_sovereign_labels_appear_when_a_chain_registers() {
     assert!(exists("sibl_sovereign", "polkadot-asset-hub", "sibl:1001").await);
     assert!(exists("sibl_sovereign", "polkadot-collectives", "sibl:1004").await);
     assert!(exists("sibl_sovereign", "polkadot-people", "sibl:1000").await);
+    // …and for Hydration, the first NON-SYSTEM parachain, added by Phase 3
+    // slice 2 as a seed file and nothing else. Its sovereign appears on every
+    // sibling and on the relay because a registration is data.
+    assert!(exists("para_sovereign", "polkadot", "para:2034").await);
+    assert!(exists("sibl_sovereign", "polkadot-asset-hub", "sibl:2034").await);
+    assert!(exists("sibl_sovereign", "hydration", "sibl:1000").await);
 
     // ss58 agrees with the adapter's own derivation (self-consistency)
     let expected = adapter_substrate::frame_decoder::ss58_encode(
         0,
-        &adapter_substrate::accounts::sibling_sovereign(2034),
+        &adapter_substrate::accounts::sibling_sovereign(2999),
     );
     let (ss58,): (Option<String>,) = sqlx::query_as(
         "select ss58 from core.account_labels \
          where kind = 'sibl_sovereign' and chain_scope = 'polkadot-asset-hub' \
-           and derivation = 'sibl:2034'",
+           and derivation = 'sibl:2999'",
     )
     .fetch_one(&db.pool)
     .await
@@ -2501,6 +2507,162 @@ async fn bounty_facts_converge_and_derived_accounts_join_the_treasury_list() {
     .await
     .unwrap();
     assert_eq!(accounts, 2, "bounty account sync must be idempotent");
+
+    db.drop_db().await;
+}
+
+/// XCM facts are one-sided observations that land in the right partition, and
+/// the two id SHAPES the chains emit must normalise to one joinable value
+/// (Phase 3, slice 2).
+#[tokio::test]
+async fn xcm_facts_partition_by_chain_and_the_two_id_shapes_join() {
+    use adapter_substrate::xcm::SubstrateXcmMapper;
+    use api::XcmIndex as _;
+    use canonical::{CanonicalBlock, CanonicalEvent, Lineage};
+
+    let Some(db) = TestDb::create().await else { return };
+    let reg = seeds();
+    sync_registry(&db.pool, &reg).await.expect("registry sync");
+
+    let topic = format!("0x{}", "ee".repeat(32));
+    let ev = |index: u32, name: &str, data: serde_json::Value| CanonicalEvent {
+        index,
+        transaction_index: Some(0),
+        name: name.into(),
+        data,
+    };
+    // `[u8;32]` on the sending side, `H256` (one array deeper) on the receiving
+    // side — the shape difference that would silently kill every correlation.
+    let bytes32 = serde_json::json!(vec![0xeeu8; 32]);
+    let h256 = serde_json::json!([vec![0xeeu8; 32]]);
+
+    let block = |chain: &str, height: u64, events: Vec<CanonicalEvent>| CanonicalBlock {
+        chain_id: chain.into(),
+        height,
+        hash: format!("0x{height:064x}"),
+        parent_hash: format!("0x{:064x}", height - 1),
+        timestamp: Some("2026-08-17T00:00:00Z".parse().unwrap()),
+        finalized: true,
+        lineage: Lineage {
+            runtime_version: 2_003_002,
+            decoder_version: 2,
+            raw_location: format!("raw/{chain}/test/{height}"),
+        },
+        transactions: vec![],
+        events,
+    };
+
+    let blocks = api::pg::PgBlockIndex::new(db.pool.clone());
+    api::BlockIndex::insert(
+        &blocks,
+        block(
+            "polkadot-asset-hub",
+            900,
+            vec![
+                ev(0, "polkadotxcm.Sent", serde_json::json!({
+                    "origin": {"parents": 0, "interior": {"Here": []}},
+                    "destination": {"parents": 1, "interior": {"X1": [{"Parachain": [2034]}]}},
+                    "message": [{"WithdrawAsset": []}],
+                    "message_id": bytes32,
+                })),
+                // the SAME message's transport-level record, a second id
+                ev(1, "xcmpqueue.XcmpMessageSent", serde_json::json!({
+                    "message_hash": serde_json::json!(vec![0x77u8; 32]),
+                })),
+                ev(2, "balances.Transfer", serde_json::json!({})),
+            ],
+        ),
+    )
+    .await
+    .expect("insert AH block");
+    api::BlockIndex::insert(
+        &blocks,
+        block(
+            "hydration",
+            100,
+            vec![ev(0, "messagequeue.Processed", serde_json::json!({
+                "id": h256,
+                "origin": {"Sibling": [1000]},
+                "weight_used": {"ref_time": 1_000},
+                "success": true,
+            }))],
+        ),
+    )
+    .await
+    .expect("insert Hydration block");
+
+    let source = dotlens_node::balances_pg::PgEventSource::new(db.pool.clone());
+    let sink = dotlens_node::xcm_pg::PgXcmSink::new(db.pool.clone());
+    let checkpoints = ingest::pg::PgCheckpointStore::new(db.pool.clone());
+    let deps = ingest::xcm::XcmDeps { checkpoints: &checkpoints, source: &source, sink: &sink };
+    ingest::xcm::xcm_range("polkadot-asset-hub", &SubstrateXcmMapper, &deps, 900, 900)
+        .await
+        .expect("map AH");
+    ingest::xcm::xcm_range("hydration", &SubstrateXcmMapper, &deps, 100, 100)
+        .await
+        .expect("map Hydration");
+
+    // balances.Transfer produced nothing; the two XCM events produced two rows.
+    let (rows,): (i64,) = sqlx::query_as("select count(*) from xcm.messages")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(rows, 3);
+    for (part, want) in [
+        ("xcm.messages_p_polkadot_asset_hub", 2),
+        ("xcm.messages_p_hydration", 1),
+        ("xcm.messages_default", 0),
+    ] {
+        let (n,): (i64,) = sqlx::query_as(&format!("select count(*) from {part}"))
+            .fetch_one(&db.pool)
+            .await
+            .unwrap_or_else(|e| panic!("counting {part}: {e}"));
+        assert_eq!(n, want, "{part} — a new chain must get its own partition");
+    }
+
+    // THE JOIN THIS MODULE EXISTS FOR: one id, two chains, two sides — found
+    // without naming a chain, and only because [u8;32] and H256 normalised to
+    // the same hex.
+    let index = api::pg::PgXcmIndex::new(db.pool.clone());
+    let both = index.by_message_id(&topic).await.expect("by id");
+    assert_eq!(both.len(), 2, "the sending and receiving halves");
+    assert_eq!(both[0].chain_id, "hydration");
+    assert_eq!((both[0].side.as_str(), both[0].id_kind.as_str()), ("received", "ambiguous"));
+    assert_eq!(both[0].transport, "hrmp");
+    assert_eq!(both[0].counterparty.as_deref(), Some("para:1000"));
+    assert_eq!((both[1].side.as_str(), both[1].id_kind.as_str()), ("sent", "topic"));
+    assert_eq!(both[1].counterparty.as_deref(), Some("para:2034"));
+    assert!(!both[1].forwarded);
+
+    // The transport-level row is a DIFFERENT id for the same message — recorded
+    // separately on purpose, never merged into the topic.
+    let wire = index
+        .by_message_id(&format!("0x{}", "77".repeat(32)))
+        .await
+        .unwrap();
+    assert_eq!(wire.len(), 1);
+    assert_eq!(wire[0].id_kind, "wire_hash");
+
+    // The checkpoint proves MODULE_XCM is this module's own key: get the
+    // constant wrong (share another module's) and two workers corrupt one
+    // checkpoint while every test still passes. `ingest::xcm` ships no worker
+    // tests, so this is the only assertion that pins it.
+    let cp = ingest::CheckpointStore::get(&checkpoints, "hydration", ingest::xcm::MODULE_XCM)
+        .await
+        .expect("checkpoint read")
+        .expect("the xcm worker advanced its own checkpoint");
+    assert_eq!(cp.last_height, 100);
+    assert_eq!(cp.module, ingest::xcm::MODULE_XCM);
+
+    // Re-mapping is a no-op — append-only, insert-ignore.
+    ingest::xcm::xcm_range("polkadot-asset-hub", &SubstrateXcmMapper, &deps, 900, 900)
+        .await
+        .expect("replay");
+    let (again,): (i64,) = sqlx::query_as("select count(*) from xcm.messages")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(again, 3, "re-running a range must not duplicate facts");
 
     db.drop_db().await;
 }
