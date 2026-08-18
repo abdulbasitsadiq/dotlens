@@ -37,8 +37,54 @@
 //! calls at one state and for one call at two states (64 destinations, 74 real
 //! in-flight messages) because the relay's router reports every parachain's
 //! existing downward queue; Asset Hub returns an empty list for the same call.
-//! This file records what the runtime said, verbatim; attribution needs a
-//! difference against a no-op run at the same state, which is a later slice.
+//! This file records what the runtime said, verbatim; attribution is a
+//! difference against a no-op run at the same state, which slice 5 builds out of
+//! `noop_call` below and `sim::attribute_forwarded`.
+//!
+//! ---------------------------------------------------------------------------
+//! **PHASE 3, SLICE 5 — THE RECEIVING SIDE.** `dry_run_xcm(origin_location, xcm)`
+//! is the other method on the same trait, and it answers the question this
+//! file's own `not_covered` had to refuse: what the DESTINATION would do.
+//!
+//! THREE FACTS ABOUT IT, EACH VERIFIED AGAINST PINNED UPSTREAM SOURCE
+//! (`xcm-runtime-apis` 0.4.0 / 0.6.0 / 0.7.0 `src/dry_run.rs`), because each one
+//! would otherwise have been a guess with a plausible wrong answer:
+//!   1. **Its signature is IDENTICAL in DryRunApi v1 and v2.** Only
+//!      `dry_run_call` changed: v2's three-argument form is the plain
+//!      declaration and the OLD two-argument one carries `#[changed_in(2)]`.
+//!      `dry_run_xcm` is declared once and takes no version parameter at all, so
+//!      there is no arity fork here and nothing to fold into the input hash
+//!      beyond the two parameters — the VERSION of the program is inside its own
+//!      bytes, because a `VersionedXcm` is a tagged enum. That version is also
+//!      the version the ANSWER comes back in (`pallet_xcm` reads
+//!      `xcm.identify_version()` and converts the forwarded messages into it),
+//!      which is why a baseline must be built at the subject's version and not
+//!      at the newest one.
+//!   2. **`XcmDryRunEffects` has NO `local_xcm` field.** It is
+//!      `{execution_result: Outcome, emitted_events, forwarded_xcms}` — three
+//!      fields where `CallDryRunEffects` has four. Reading it with the call
+//!      shape's field list would halt on a field that was never there.
+//!   3. **`execution_result` is an XCM `Outcome`, not a dispatch `Result`**, and
+//!      it has THREE states rather than two: `Complete{used}`,
+//!      `Incomplete{used, error}` and `Error(..)`. The last one means execution
+//!      NEVER STARTED — a barrier rejection — which is the single most valuable
+//!      answer a receiving-side preview can give, and is exactly what a sender
+//!      cannot see from its own chain. It is recorded as `not_started` rather
+//!      than under upstream's own name, because "Error" reads as a failure of
+//!      the request. And the SHAPE of those variants changed between XCM v4
+//!      (`Incomplete{used, error: Error}`, `Error{error}`) and v5
+//!      (`Incomplete{used, error: InstructionError{index, error}}`,
+//!      `Error(InstructionError)`), so this file reads the VARIANT NAME — stable
+//!      across both — and keeps the payload verbatim. Same device
+//!      `xcm::facts_for_event` already uses on `polkadotXcm.Attempted`.
+//!
+//! AND ONE FACT THAT MAKES THE STITCH POSSIBLE AT ALL: `forwarded_xcms` carries
+//! `VersionedXcm<()>` while `dry_run_xcm` wants `VersionedXcm<Call>` — and their
+//! SCALE encodings are identical, because the only place the type parameter
+//! appears is inside `DoubleEncoded<T>`, whose `decoded: Option<T>` field is
+//! `#[codec(skip)]` and whose derive carries `#[codec(encode_bound())]`
+//! (staging-xcm 24.0.0 `src/double_encoded.rs:29-33`). A message this chain
+//! queued can therefore be handed straight to the next chain's `dry_run_xcm`.
 
 use crate::calls::{self, DecodedCall};
 use crate::frame_decoder::value_to_json;
@@ -46,16 +92,37 @@ use frame_metadata::{RuntimeMetadata, RuntimeMetadataPrefixed};
 use parity_scale_codec::Decode;
 use scale_info::{PortableRegistry, TypeDef, TypeDefPrimitive};
 use scale_value::{Composite, Value, ValueDef};
-use sim::{OriginSpec, SimError, SimEvent, SimOutcome, SimStatus};
+use sim::{
+    LocationSpec, OriginSpec, SimError, SimEvent, SimOutcome, SimStatus, XcmSimOutcome,
+    XcmSimStatus,
+};
 
 /// Lineage for every row this runner writes. Bump when the INTERPRETATION of a
 /// response changes; rows below it rebuild from the archived bytes.
-pub const DRY_RUN_VERSION: u32 = 1;
+///
+/// **2 (slice 5)** — not because `dry_run_call`'s reading changed (it did not:
+/// every column a v1 row carries still means exactly what it meant), but because
+/// this runner now also writes `sim.xcm_simulations` rows and links a call row
+/// to its baseline. One version stamp covers one runner, and a row that cannot
+/// say which runner wrote it is not lineage. Rebuilding a v1 row from its
+/// archived response would produce a byte-identical v2 row.
+pub const DRY_RUN_VERSION: u32 = 2;
 
 pub const DRY_RUN_API: &str = "DryRunApi";
 pub const DRY_RUN_CALL_METHOD: &str = "dry_run_call";
+pub const DRY_RUN_XCM_METHOD: &str = "dry_run_xcm";
 /// The wire name is `Trait_method` (sp-api's `prefix_function_with_trait`).
 pub const DRY_RUN_CALL_FUNCTION: &str = "DryRunApi_dry_run_call";
+pub const DRY_RUN_XCM_FUNCTION: &str = "DryRunApi_dry_run_xcm";
+
+/// The pallet and call the baseline no-op is built from, looked up BY NAME in
+/// the runtime's own registry and never by index. `system.remark` is the
+/// smallest call in FRAME that provably queues nothing and is dispatchable under
+/// Root on every runtime we index — which is also the call the relay measurement
+/// in slice 1 was made with, so the baseline is literally the experiment that
+/// found the problem.
+const NOOP_PALLET: &str = "System";
+const NOOP_CALL: &str = "remark";
 
 /// BLAKE2b with an **8-byte digest** — how `sp_api` derives the runtime-API ids
 /// in `RuntimeVersion.apis` (`Blake2b::<U8>::digest(trait_name)`).
@@ -130,9 +197,22 @@ pub struct DryRunContext {
     /// Read from the metadata's ARITY, never from a version number.
     xcm_version_ty: Option<u32>,
     output_ty: u32,
+    /// `dry_run_xcm`'s three type ids, or `None` on a runtime whose metadata
+    /// does not declare the method. Upstream has declared it in every published
+    /// version of the trait, so `None` is not expected — which is exactly why it
+    /// is an Option and not an assumption.
+    xcm: Option<XcmMethod>,
     /// v16 declares the API version in metadata; v15 does not. Informational —
     /// `RuntimeVersion.apis` remains the portable source.
     metadata_api_version: Option<u32>,
+}
+
+/// The `dry_run_xcm` method as this runtime declares it.
+#[derive(Debug, Clone, Copy)]
+struct XcmMethod {
+    origin_location_ty: u32,
+    program_ty: u32,
+    output_ty: u32,
 }
 
 /// Pull the DryRunApi method + pallet error map out of a v15/v16 metadata. One
@@ -164,12 +244,28 @@ macro_rules! dry_run_method {
             .iter()
             .map(|i| (i.name.to_string(), i.ty.id))
             .collect();
+        // The second method on the same trait. ABSENT IS DATA, not an error:
+        // this context is built for every simulation, and a chain that can dry
+        // run calls but not XCM must still be able to dry run calls.
+        let xcm: Option<(Vec<(String, u32)>, u32)> = api
+            .methods
+            .iter()
+            .find(|f| f.name == DRY_RUN_XCM_METHOD)
+            .map(|f| {
+                (
+                    f.inputs
+                        .iter()
+                        .map(|i| (i.name.to_string(), i.ty.id))
+                        .collect(),
+                    f.output.id,
+                )
+            });
         let pallets: Vec<(u8, String, Option<u32>)> = m
             .pallets
             .iter()
             .map(|p| (p.index, p.name.to_string(), p.error.as_ref().map(|e| e.ty.id)))
             .collect();
-        (m.types.clone(), pallets, inputs, method.output.id)
+        (m.types.clone(), pallets, inputs, method.output.id, xcm)
     }};
 }
 
@@ -182,7 +278,7 @@ impl DryRunContext {
     fn from_metadata_inner(metadata_blob: &[u8]) -> Result<Self, String> {
         let prefixed = RuntimeMetadataPrefixed::decode(&mut &metadata_blob[..])
             .map_err(|e| format!("metadata blob undecodable: {e}"))?;
-        let (types, pallets, inputs, output_ty) = match &prefixed.1 {
+        let (types, pallets, inputs, output_ty, xcm_method) = match &prefixed.1 {
             RuntimeMetadata::V15(m) => dry_run_method!(m),
             RuntimeMetadata::V16(m) => dry_run_method!(m),
             RuntimeMetadata::V14(_) => {
@@ -227,6 +323,33 @@ impl DryRunContext {
                 ))
             }
         };
+
+        // Same treatment for the XCM method, and it needs no version fork: the
+        // declaration is byte-for-byte the same in DryRunApi v1 and v2. An
+        // unfamiliar parameter list halts rather than being encoded positionally
+        // — two Locations in the wrong order is a well-formed request that
+        // previews a message from the wrong sender.
+        let xcm = match xcm_method {
+            None => None,
+            Some((inputs, output)) => {
+                let names: Vec<&str> = inputs.iter().map(|(n, _)| n.as_str()).collect();
+                match names.as_slice() {
+                    ["origin_location", "xcm"] => Some(XcmMethod {
+                        origin_location_ty: inputs[0].1,
+                        program_ty: inputs[1].1,
+                        output_ty: output,
+                    }),
+                    other => {
+                        return Err(format!(
+                            "{DRY_RUN_XCM_METHOD} has parameters {other:?}, not the \
+                             (origin_location, xcm) shape every published version of the trait \
+                             declares — refusing to guess how to encode them"
+                        ))
+                    }
+                }
+            }
+        };
+
         Ok(Self {
             types,
             pallets,
@@ -234,6 +357,7 @@ impl DryRunContext {
             call_ty,
             xcm_version_ty,
             output_ty,
+            xcm,
             metadata_api_version,
         })
     }
@@ -242,6 +366,11 @@ impl DryRunContext {
     /// the shapes they need in a `scale_info::Registry` — the v15 walk above
     /// cannot be exercised offline, because every metadata blob in `fixtures/`
     /// is v14 by construction.
+    ///
+    /// The signature is unchanged from slice 1 on purpose: `dry_run_xcm`'s three
+    /// type ids arrive through [`Self::with_xcm`] instead, so every existing
+    /// call site keeps compiling and a context built without them is a
+    /// call-only context rather than a half-initialised one.
     pub fn from_parts(
         types: PortableRegistry,
         pallets: Vec<(u8, String, Option<u32>)>,
@@ -257,8 +386,34 @@ impl DryRunContext {
             call_ty,
             xcm_version_ty,
             output_ty,
+            xcm: None,
             metadata_api_version: None,
         }
+    }
+
+    /// Attach `dry_run_xcm`'s declared type ids to a context built by
+    /// [`Self::from_parts`].
+    pub fn with_xcm(mut self, origin_location_ty: u32, program_ty: u32, output_ty: u32) -> Self {
+        self.xcm = Some(XcmMethod {
+            origin_location_ty,
+            program_ty,
+            output_ty,
+        });
+        self
+    }
+
+    /// Does this runtime's metadata declare `dry_run_xcm`?
+    pub fn has_xcm(&self) -> bool {
+        self.xcm.is_some()
+    }
+
+    fn xcm_method(&self) -> Result<XcmMethod, String> {
+        self.xcm.ok_or_else(|| {
+            format!(
+                "this runtime's metadata declares {DRY_RUN_API} but no {DRY_RUN_XCM_METHOD} \
+                 method, so the receiving side of a journey cannot be previewed on it"
+            )
+        })
     }
 
     /// 3 for DryRunApi v2, 2 for v1 — as the runtime's metadata declares it.
@@ -399,6 +554,530 @@ impl DryRunContext {
             "account": account.map(|w| format!("0x{}", hex::encode(w))),
         });
         Ok((bytes, json))
+    }
+
+    // ------------------------------------------------------ the baseline call
+
+    /// The SCALE bytes of `system.remark()` with an empty payload — the no-op
+    /// whose `forwarded_xcms` is the ambient queue at a state.
+    ///
+    /// Built from the runtime's own `RuntimeCall` enum by NAME, exactly like an
+    /// origin: two variant indices and a compact zero. Nothing is hardcoded, so
+    /// a runtime that spells its system pallet differently is refused with the
+    /// names it does have rather than sent three bytes that mean something else.
+    ///
+    /// AND THE SHAPE IS CHECKED, not just the name. A call named `remark` whose
+    /// single argument is not a byte sequence is a different call, and building
+    /// a "no-op" out of it would silently make the baseline a real transaction.
+    /// The last line decodes what was built and refuses anything that does not
+    /// read back as `system.remark`.
+    pub fn noop_call(&self) -> Result<Vec<u8>, SimError> {
+        self.noop_call_inner().map_err(SimError::Encode)
+    }
+
+    fn noop_call_inner(&self) -> Result<Vec<u8>, String> {
+        let pallets = self.variants_of(self.call_ty, "the runtime's RuntimeCall")?;
+        let pallet = find_variant(pallets, NOOP_PALLET).ok_or_else(|| {
+            format!(
+                "no '{NOOP_PALLET}' pallet in this runtime's RuntimeCall, so no baseline no-op \
+                 can be built; it has: {}",
+                variant_names(pallets)
+            )
+        })?;
+        let inner_ty = match pallet.fields.len() {
+            1 => pallet.fields[0].ty.id,
+            n => {
+                return Err(format!(
+                    "RuntimeCall variant '{}' holds {n} fields, not one pallet Call enum",
+                    pallet.name
+                ))
+            }
+        };
+        let calls = self.variants_of(inner_ty, &format!("pallet '{}'", pallet.name))?;
+        let call = find_variant(calls, NOOP_CALL).ok_or_else(|| {
+            format!(
+                "'{NOOP_PALLET}' has no '{NOOP_CALL}' call in this runtime; it has: {}",
+                variant_names(calls)
+            )
+        })?;
+        match call.fields.len() {
+            1 if self.is_byte_sequence(call.fields[0].ty.id) => {}
+            _ => {
+                return Err(format!(
+                    "'{}.{}' does not take a single byte sequence on this runtime, so it is not \
+                     the no-op this baseline needs",
+                    pallet.name, call.name
+                ))
+            }
+        }
+
+        // compact(0) is a single zero byte: the empty Vec<u8> argument.
+        let bytes = vec![pallet.index, call.index, 0u8];
+        let decoded = calls::decode_call_with(&self.types, self.call_ty, &bytes)
+            .map_err(|e| format!("the baseline no-op we built does not decode: {e}"))?;
+        let want = format!("{NOOP_PALLET}.{NOOP_CALL}").to_ascii_lowercase();
+        if decoded.summary.to_ascii_lowercase() != want {
+            return Err(format!(
+                "the baseline no-op we built reads back as '{}', not '{want}' — refusing to \
+                 dispatch it",
+                decoded.summary
+            ));
+        }
+        Ok(bytes)
+    }
+
+    // ------------------------------------------------------------ dry_run_xcm
+
+    /// An origin LOCATION, built from the registry-resolved relationship between
+    /// two chains and encoded against the type the runtime declares for
+    /// `origin_location`.
+    ///
+    /// Returns the bytes and the location as the runtime's own registry renders
+    /// it — obtained by DECODING what was just encoded, so the JSON in the
+    /// recorded row is never a second hand-built copy of the same guess and a
+    /// shape the runtime would reject cannot be filed as one it accepted.
+    ///
+    /// WHY THIS IS BUILT RATHER THAN COPIED FROM THE SENDER: the sender's
+    /// `forwarded_xcms` names the DESTINATION in the sender's frame, and the
+    /// receiver needs the SENDER in the receiver's frame — the mirror image.
+    /// Asset Hub addressing `{parents:1, X1[Parachain(2034)]}` arrives on
+    /// Hydration as `{parents:1, X1[Parachain(1000)]}`, and handing the
+    /// destination back unchanged would preview a message a chain sent to
+    /// itself. The mirror is computed from registry data (para ids and relay
+    /// membership), which is the same derivation `counterparty_mirror` already
+    /// checks observed journeys with.
+    ///
+    /// The VERSION is the newest `V<n>` variant the runtime declares, read from
+    /// the registry rather than pinned: a receiving runtime always understands
+    /// its own latest, while an older one risks a `VersionedConversionFailed`
+    /// that says nothing about the message.
+    pub fn encode_location(
+        &self,
+        spec: &LocationSpec,
+    ) -> Result<(Vec<u8>, serde_json::Value), SimError> {
+        self.encode_location_inner(spec).map_err(SimError::Encode)
+    }
+
+    fn encode_location_inner(
+        &self,
+        spec: &LocationSpec,
+    ) -> Result<(Vec<u8>, serde_json::Value), String> {
+        let m = self.xcm_method()?;
+        let variants = self.variants_of(m.origin_location_ty, "VersionedLocation")?;
+        let version = newest_version_variant(variants).ok_or_else(|| {
+            format!(
+                "the origin_location type declares no V<n> variant; it has: {}",
+                variant_names(variants)
+            )
+        })?;
+
+        let junction = Value::variant(
+            "Parachain",
+            Composite::Unnamed(vec![Value::u128(spec.para_id().unwrap_or_default() as u128)]),
+        );
+        let interior = match spec.para_id() {
+            // X1's PAYLOAD IS ITS OWN LAYER, and getting that wrong does not
+            // fail at the boundary — it fails deep inside scale-encode with a
+            // shape error. From XCM v4 the field is `[Junction; 1]`, so the
+            // value handed to it must be a COMPOSITE (which scale-value's
+            // encoder length-checks against the array in `visit_array`), not the
+            // junction variant itself: `encode_variant` has no array arm and no
+            // fallback, so a bare variant there can never encode. XCM v3's
+            // `X1(Junction)` accepts the same one-element composite through the
+            // encoder's peel-one-value arm, so one construction serves both.
+            //
+            // The project's own rendering says the same thing from the other
+            // side: a decoded X1 reads `{"X1": [[{"Parachain": [2034]}]]}` —
+            // two layers, not one.
+            Some(_) => Value::variant(
+                "X1",
+                Composite::Unnamed(vec![Value::unnamed_composite(vec![junction])]),
+            ),
+            None => Value::variant("Here", Composite::Unnamed(vec![])),
+        };
+        let location = Value::named_composite(vec![
+            ("parents".to_string(), Value::u128(spec.parents() as u128)),
+            ("interior".to_string(), interior),
+        ]);
+        let versioned = Value::variant(version.name.clone(), Composite::Unnamed(vec![location]));
+
+        let mut bytes = Vec::new();
+        scale_value::scale::encode_as_type(
+            &versioned,
+            m.origin_location_ty,
+            &self.types,
+            &mut bytes,
+        )
+        .map_err(|e| format!("encoding origin location {}: {e}", spec.as_token()))?;
+
+        // Decode it straight back. This is the check AND the rendering: bytes
+        // that do not read as a location are refused here rather than sent, and
+        // what the row records is the runtime's own shape.
+        let mut cursor = &bytes[..];
+        let value = scale_value::scale::decode_as_type(&mut cursor, m.origin_location_ty, &self.types)
+            .map_err(|e| format!("the origin location we encoded does not decode back: {e}"))?;
+        if !cursor.is_empty() {
+            return Err(format!(
+                "{} trailing bytes after re-reading the origin location we built",
+                cursor.len()
+            ));
+        }
+        Ok((bytes, json_of(&value)))
+    }
+
+    /// The SCALE bytes of an EMPTY `VersionedXcm` **at a named XCM version** —
+    /// the receiving side's no-op.
+    ///
+    /// A program with no instructions executes nothing, so whatever the runtime
+    /// reports as forwarded beside it was already in flight. Same role as
+    /// `noop_call` on the sending side, and the same reason: without it, a
+    /// previewed hop on a chain whose router enumerates ambient queues would
+    /// report other people's traffic as its own onward legs.
+    ///
+    /// THE VERSION IS A PARAMETER AND NOT A CHOICE, which is the one thing about
+    /// this function that is not obvious. `pallet_xcm::dry_run_xcm` renders its
+    /// WHOLE ANSWER in the version of the program it was given — it reads
+    /// `xcm.identify_version()` and converts the router's messages into it — so
+    /// a baseline built at the newest version while the subject arrived as V4
+    /// produces two forwarded lists that render differently and can never be
+    /// differenced. Every ambient message would then be attributed to the run,
+    /// which is precisely the defect this baseline exists to prevent, one hop
+    /// along. Worse, converting an ambient V5 message down for a V4 subject can
+    /// fail outright, so the two runs would not even agree on succeeding.
+    ///
+    /// Two bytes on today's runtimes (a version index and a compact zero), but
+    /// they are BUILT and then CHECKED: the encoding is decoded back and must
+    /// read as an empty instruction list. A "no-op" that turned out to execute
+    /// something would subtract this run's own messages from its own
+    /// attribution, which is the one failure mode a baseline must not have.
+    pub fn encode_empty_program(&self, xcm_version: u32) -> Result<Vec<u8>, SimError> {
+        self.encode_empty_program_inner(xcm_version)
+            .map_err(SimError::Encode)
+    }
+
+    fn encode_empty_program_inner(&self, xcm_version: u32) -> Result<Vec<u8>, String> {
+        let m = self.xcm_method()?;
+        let variants = self.variants_of(m.program_ty, "VersionedXcm")?;
+        let want = format!("V{xcm_version}");
+        let version = find_variant(variants, &want).ok_or_else(|| {
+            format!(
+                "this runtime's VersionedXcm has no {want} variant, so no baseline can be \
+                 built at the subject program's own version; it has: {}",
+                variant_names(variants)
+            )
+        })?;
+        // `Xcm` is a newtype over `Vec<Instruction>`; an empty unnamed composite
+        // encodes into it as a compact zero, and scale-encode's newtype
+        // unwrapping handles the layer between.
+        let empty = Value::unnamed_composite(Vec::<Value<()>>::new());
+        let versioned = Value::variant(version.name.clone(), Composite::Unnamed(vec![empty]));
+
+        let mut bytes = Vec::new();
+        scale_value::scale::encode_as_type(&versioned, m.program_ty, &self.types, &mut bytes)
+            .map_err(|e| format!("encoding the empty baseline program: {e}"))?;
+
+        let mut cursor = &bytes[..];
+        let value = scale_value::scale::decode_as_type(&mut cursor, m.program_ty, &self.types)
+            .map_err(|e| format!("the empty program we built does not decode back: {e}"))?;
+        if !cursor.is_empty() {
+            return Err(format!(
+                "{} trailing bytes after re-reading the empty program",
+                cursor.len()
+            ));
+        }
+        match instruction_list(&json_of(&value)) {
+            Some(list) if list.is_empty() => Ok(bytes),
+            _ => Err(
+                "the program we built as a baseline does not read back as an empty instruction \
+                 list — refusing to use it, because a baseline that executes anything would \
+                 subtract a run's own messages from its own attribution"
+                    .into(),
+            ),
+        }
+    }
+
+    /// `origin_location ++ xcm`. Plain concatenation of two already-encoded
+    /// parameters, with no version byte appended: `dry_run_xcm` has taken
+    /// exactly these two arguments in every published version of the trait.
+    pub fn encode_xcm_params(
+        &self,
+        origin_location: &[u8],
+        program: &[u8],
+    ) -> Result<Vec<u8>, SimError> {
+        self.xcm_method().map_err(SimError::Encode)?;
+        let mut params = Vec::with_capacity(origin_location.len() + program.len());
+        params.extend_from_slice(origin_location);
+        params.extend_from_slice(program);
+        Ok(params)
+    }
+
+    /// Decode a `VersionedXcm` against the type `dry_run_xcm` declares for its
+    /// `xcm` parameter — which doubles as the check that the bytes a caller
+    /// pasted are a program this runtime could accept at all.
+    pub fn decode_program(&self, program: &[u8]) -> Result<serde_json::Value, SimError> {
+        let m = self.xcm_method().map_err(SimError::Encode)?;
+        let mut cursor = program;
+        let value = scale_value::scale::decode_as_type(&mut cursor, m.program_ty, &self.types)
+            .map_err(|e| {
+                SimError::Encode(format!(
+                    "these bytes are not a VersionedXcm for this runtime: {e}"
+                ))
+            })?;
+        if !cursor.is_empty() {
+            return Err(SimError::Encode(format!(
+                "{} trailing bytes after the XCM program — truncated or not a program at all",
+                cursor.len()
+            )));
+        }
+        Ok(json_of(&value))
+    }
+
+    /// One message out of a recorded CALL simulation's `forwarded_xcms`, as
+    /// BYTES that can be handed to the destination chain's `dry_run_xcm`.
+    ///
+    /// THE BYTES ARE RE-ENCODED, NOT SLICED, and that is worth stating plainly
+    /// because it is the one place in this project where a wire artifact is
+    /// reconstructed rather than kept. `scale_value`'s decoder annotates every
+    /// node with the type id it was decoded against (the same property
+    /// `calls.rs` detects nested calls by), so a forwarded message can be
+    /// re-encoded against its own declared type — and the result is verified by
+    /// decoding it again and requiring the rendering to match, byte range and
+    /// all. A re-encoding that does not round-trip is refused rather than sent.
+    ///
+    /// It reads the ARCHIVED RESPONSE, not the database row: the row holds our
+    /// JSON rendering, and re-encoding from a rendering would be a guess about
+    /// what the rendering dropped. The bytes are the evidence, which is why they
+    /// were archived.
+    ///
+    /// `VersionedXcm<()>` here becomes `VersionedXcm<Call>` there, and the two
+    /// encode identically — see the module header on `DoubleEncoded`.
+    pub fn forwarded_program(
+        &self,
+        call_response: &[u8],
+        destination_index: usize,
+        message_index: usize,
+    ) -> Result<ForwardedProgram, SimError> {
+        self.forwarded_program_inner(call_response, destination_index, message_index)
+            .map_err(SimError::Decode)
+    }
+
+    fn forwarded_program_inner(
+        &self,
+        call_response: &[u8],
+        destination_index: usize,
+        message_index: usize,
+    ) -> Result<ForwardedProgram, String> {
+        let mut cursor = call_response;
+        let value = scale_value::scale::decode_as_type(&mut cursor, self.output_ty, &self.types)
+            .map_err(|e| format!("archived dry-run response decode: {e}"))?;
+        let ValueDef::Variant(outer) = &value.value else {
+            return Err("archived response is not a Result variant".into());
+        };
+        if outer.name != "Ok" {
+            return Err(format!(
+                "the archived response is `{}`, which carries no forwarded messages",
+                outer.name
+            ));
+        }
+        let effects = variant_inner(outer).ok_or("dry-run Ok carries no effects payload")?;
+        let forwarded =
+            named(effects, "forwarded_xcms").ok_or("effects has no forwarded_xcms field")?;
+        let ValueDef::Composite(Composite::Unnamed(entries)) = &forwarded.value else {
+            return Err("forwarded_xcms is not a sequence".into());
+        };
+        let entry = entries.get(destination_index).ok_or_else(|| {
+            format!(
+                "forwarded_xcms has {} destination(s); there is no index {destination_index}",
+                entries.len()
+            )
+        })?;
+        let ValueDef::Composite(Composite::Unnamed(parts)) = &entry.value else {
+            return Err("a forwarded_xcms entry is not a (destination, messages) pair".into());
+        };
+        let (Some(dest), Some(messages)) = (parts.first(), parts.get(1)) else {
+            return Err("a forwarded_xcms entry has fewer than two parts".into());
+        };
+        let ValueDef::Composite(Composite::Unnamed(list)) = &messages.value else {
+            return Err("a forwarded_xcms entry's messages are not a sequence".into());
+        };
+        let message = list.get(message_index).ok_or_else(|| {
+            format!(
+                "destination {destination_index} carries {} message(s); there is no index \
+                 {message_index}",
+                list.len()
+            )
+        })?;
+
+        // `context` IS the type id this node was decoded against.
+        let program_ty = message.context;
+        let mut bytes = Vec::new();
+        scale_value::scale::encode_as_type(message, program_ty, &self.types, &mut bytes)
+            .map_err(|e| format!("re-encoding forwarded message {destination_index}/{message_index}: {e}"))?;
+
+        let mut check = &bytes[..];
+        let round_trip = scale_value::scale::decode_as_type(&mut check, program_ty, &self.types)
+            .map_err(|e| format!("the re-encoded forwarded message does not decode back: {e}"))?;
+        if !check.is_empty() {
+            return Err(format!(
+                "{} trailing bytes after re-reading the message we re-encoded",
+                check.len()
+            ));
+        }
+        let program = json_of(message);
+        if json_of(&round_trip) != program {
+            return Err(
+                "re-encoding this forwarded message did not round-trip — refusing to preview \
+                 bytes that are not the message the runtime reported"
+                    .into(),
+            );
+        }
+
+        Ok(ForwardedProgram {
+            destination: json_of(dest),
+            destination_index,
+            message_index,
+            program,
+            bytes,
+        })
+    }
+
+    /// `dry_run_xcm` response bytes → outcome.
+    ///
+    /// Reads `XcmDryRunEffects`, which is NOT `CallDryRunEffects`: three fields,
+    /// no `local_xcm`, and an `execution_result` that is an XCM `Outcome` with
+    /// three states rather than a dispatch `Result` with two.
+    pub fn interpret_xcm(&self, response: &[u8]) -> Result<XcmSimOutcome, SimError> {
+        self.interpret_xcm_inner(response).map_err(SimError::Decode)
+    }
+
+    fn interpret_xcm_inner(&self, response: &[u8]) -> Result<XcmSimOutcome, String> {
+        let m = self.xcm_method()?;
+        let mut cursor = response;
+        let value = scale_value::scale::decode_as_type(&mut cursor, m.output_ty, &self.types)
+            .map_err(|e| format!("dry-run-xcm response decode: {e}"))?;
+        if !cursor.is_empty() {
+            return Err(format!(
+                "{} trailing bytes after the dry-run-xcm response — the declared output type \
+                 and the bytes disagree",
+                cursor.len()
+            ));
+        }
+        let effects_json = json_of(&value);
+
+        let ValueDef::Variant(outer) = &value.value else {
+            return Err("dry-run-xcm response is not a Result variant".into());
+        };
+        match outer.name.as_str() {
+            "Err" => {
+                let reason = variant_inner(outer)
+                    .and_then(|v| match &v.value {
+                        ValueDef::Variant(e) => Some(e.name.clone()),
+                        _ => None,
+                    })
+                    .unwrap_or_else(|| "unknown".into());
+                Ok(XcmSimOutcome {
+                    status: XcmSimStatus::ApiError,
+                    weight_used: None,
+                    xcm_error: None,
+                    events: vec![],
+                    forwarded_xcms: vec![],
+                    effects: effects_json,
+                    note: Some(format!(
+                        "the runtime's dry-run API refused the request ({reason}); the program \
+                         was never executed"
+                    )),
+                })
+            }
+            "Ok" => {
+                let effects = variant_inner(outer).ok_or("dry-run-xcm Ok carries no payload")?;
+                let execution = named(effects, "execution_result")
+                    .ok_or("effects has no execution_result field")?;
+                let ValueDef::Variant(outcome) = &execution.value else {
+                    return Err("execution_result is not an Outcome variant".into());
+                };
+
+                // ONLY THE VARIANT NAME IS READ. The payloads changed shape
+                // between XCM v4 and v5 (Incomplete's `error` became an
+                // InstructionError, and Error went from a named field to a
+                // newtype), and the names did not — the same reason
+                // `xcm::facts_for_event` reads `Attempted` this way.
+                let (status, note) = match outcome.name.as_str() {
+                    "Complete" => (XcmSimStatus::Complete, None),
+                    "Incomplete" => (
+                        XcmSimStatus::Incomplete,
+                        Some(
+                            "the program STARTED and did not finish — the arrival would be \
+                             recorded as processed, with success=false, exactly like an \
+                             observed Outcome::Incomplete"
+                                .to_string(),
+                        ),
+                    ),
+                    // Upstream names this variant `Error`. It is not an error of
+                    // ours and not an API failure: the program never began.
+                    "Error" => (
+                        XcmSimStatus::NotStarted,
+                        Some(
+                            "execution NEVER STARTED (Outcome::Error) — typically a barrier \
+                             rejection or a version the receiver cannot read. The sending chain \
+                             cannot see this: it would still record a successful send"
+                                .to_string(),
+                        ),
+                    ),
+                    other => {
+                        return Err(format!(
+                            "execution_result variant '{other}' is none of Complete, Incomplete \
+                             or Error — the Outcome enum has changed and this reading must be \
+                             re-checked rather than guessed at"
+                        ))
+                    }
+                };
+
+                let weight_used = variant_field(outcome, "used").map(json_of);
+                // v4: `Incomplete { used, error }` / `Error { error }` — a named
+                // field. v5: `Error(InstructionError)` — a newtype. Both, in
+                // that order, and neither invented.
+                let xcm_error = match status {
+                    XcmSimStatus::Complete | XcmSimStatus::ApiError => None,
+                    _ => variant_field(outcome, "error")
+                        .or_else(|| variant_inner(outcome))
+                        .map(json_of),
+                };
+
+                let events_value =
+                    named(effects, "emitted_events").ok_or("effects has no emitted_events field")?;
+                let events = self.read_events(events_value)?;
+                let forwarded = named(effects, "forwarded_xcms")
+                    .ok_or("effects has no forwarded_xcms field")?;
+                let forwarded_xcms = read_forwarded(forwarded)?;
+
+                Ok(XcmSimOutcome {
+                    status,
+                    weight_used,
+                    xcm_error,
+                    events,
+                    forwarded_xcms,
+                    effects: effects_json,
+                    note,
+                })
+            }
+            other => Err(format!(
+                "dry-run-xcm response variant '{other}' is neither Ok nor Err"
+            )),
+        }
+    }
+
+    /// Is this type a `Vec<u8>`? Guards the baseline no-op's one argument.
+    fn is_byte_sequence(&self, ty_id: u32) -> bool {
+        let Some(ty) = self.types.resolve(ty_id) else {
+            return false;
+        };
+        match &ty.type_def {
+            TypeDef::Sequence(s) => matches!(
+                self.types.resolve(s.type_param.id).map(|t| &t.type_def),
+                Some(TypeDef::Primitive(TypeDefPrimitive::U8))
+            ),
+            _ => false,
+        }
     }
 
     /// Response bytes → outcome. Every field is looked up BY NAME and a missing
@@ -663,6 +1342,127 @@ impl DryRunContext {
 
 // ------------------------------------------------------------------- helpers
 
+/// One message lifted out of a recorded call simulation's `forwarded_xcms`,
+/// ready to be previewed on the chain it is addressed to.
+#[derive(Debug, Clone)]
+pub struct ForwardedProgram {
+    /// The destination as the SENDER addressed it — not the origin the receiver
+    /// will be told, which is its mirror image.
+    pub destination: serde_json::Value,
+    pub destination_index: usize,
+    pub message_index: usize,
+    pub program: serde_json::Value,
+    /// Re-encoded and round-trip verified — see `forwarded_program`.
+    pub bytes: Vec<u8>,
+}
+
+/// The highest `V<n>` variant an enum declares (`VersionedLocation`,
+/// `VersionedXcm`). Read from the registry so the choice follows the runtime
+/// rather than a constant that ages.
+fn newest_version_variant<'a>(
+    variants: &'a [scale_info::Variant<scale_info::form::PortableForm>],
+) -> Option<&'a scale_info::Variant<scale_info::form::PortableForm>> {
+    variants
+        .iter()
+        .filter_map(|v| {
+            v.name
+                .strip_prefix('V')
+                .and_then(|d| d.parse::<u32>().ok())
+                .map(|n| (n, v))
+        })
+        .max_by_key(|(n, _)| *n)
+        .map(|(_, v)| v)
+}
+
+/// A NAMED field of a variant (`Complete { used }`). Returns `None` for a
+/// newtype variant, which is what makes the v4/v5 `Outcome::Error` fallback in
+/// `interpret_xcm` an either/or rather than a guess.
+fn variant_field<'a>(v: &'a scale_value::Variant<u32>, name: &str) -> Option<&'a Value<u32>> {
+    match &v.values {
+        Composite::Named(items) => items.iter().find(|(n, _)| n == name).map(|(_, v)| v),
+        Composite::Unnamed(_) => None,
+    }
+}
+
+/// "WithdrawAsset → BuyExecution → DepositAsset" from a decoded `VersionedXcm`.
+///
+/// List-view text only — the authority is always the `program` column. The peel
+/// is the same one `xcm::instructions` documents: `Xcm` is a newtype over
+/// `Vec<Instruction>`, so an empty program renders as `[[]]` and reading the
+/// outer array's length would call every program non-empty.
+pub fn program_summary(program: &serde_json::Value) -> String {
+    const SHOWN: usize = 6;
+    let Some(list) = instruction_list(program) else {
+        return "(unreadable program)".into();
+    };
+    if list.is_empty() {
+        return "(empty program)".into();
+    }
+    let names: Vec<&str> = list
+        .iter()
+        .take(SHOWN)
+        .map(|i| {
+            i.as_object()
+                .filter(|m| m.len() == 1)
+                .and_then(|m| m.keys().next())
+                .map(|s| s.as_str())
+                .unwrap_or("?")
+        })
+        .collect();
+    let mut text = names.join(" → ");
+    if list.len() > SHOWN {
+        text.push_str(&format!(" → +{} more", list.len() - SHOWN));
+    }
+    text
+}
+
+/// The XCM version a decoded `VersionedXcm` carries — the `V<n>` key it renders
+/// under. `None` when the shape is not a single-key version wrapper, which is
+/// the honest answer for bytes that are not a versioned program.
+///
+/// It exists because the BASELINE must be built at this exact version (see
+/// [`DryRunContext::encode_empty_program`]), and reading it from the decoded
+/// program is the only place the answer is unambiguous: the encoded bytes' first
+/// byte is the codec INDEX, which happens to equal the version today and is not
+/// promised to.
+pub fn program_version(program: &serde_json::Value) -> Option<u32> {
+    let map = program.as_object()?;
+    if map.len() != 1 {
+        return None;
+    }
+    map.keys().next()?.strip_prefix('V')?.parse().ok()
+}
+
+/// The instruction list inside a decoded `VersionedXcm`.
+///
+/// THE NESTING IS DEEPER HERE THAN ANYWHERE ELSE IN THE PROJECT, and counting it
+/// wrong is how a program silently reads as one instruction called "V5".
+/// `VersionedXcm::V5(Xcm(Vec<Instruction>))` is a newtype VARIANT over a newtype
+/// STRUCT over a Vec, and this decoder renders each of those layers, so the JSON
+/// is `{"V5": [[[…instructions…]]]}` — one object key and then THREE array
+/// layers, where `xcm::instructions` (which reads a bare `Xcm`, not a versioned
+/// one) sees only two.
+///
+/// So the peel is a bounded loop rather than a fixed count: strip the version
+/// key, then keep unwrapping single-element arrays whose only element is itself
+/// an array. It terminates on the real list because an XCM instruction is an
+/// enum variant and renders as an OBJECT — never as a bare array — which is the
+/// same argument `xcm::instructions` rests on, applied repeatedly.
+fn instruction_list(program: &serde_json::Value) -> Option<&Vec<serde_json::Value>> {
+    let mut cur = match program.as_object() {
+        Some(map) if map.len() == 1 => map.values().next()?,
+        _ => program,
+    };
+    for _ in 0..4 {
+        let items = cur.as_array()?;
+        match items.as_slice() {
+            [only] if only.is_array() => cur = only,
+            _ => return cur.as_array(),
+        }
+    }
+    cur.as_array()
+}
+
 fn find_variant<'a>(
     variants: &'a [scale_info::Variant<scale_info::form::PortableForm>],
     name: &str,
@@ -899,7 +1699,122 @@ mod tests {
         execution_result: Result<TPostInfo, TDispatchErrorWithPostInfo>,
         emitted_events: Vec<TRuntimeEvent>,
         local_xcm: Option<TVersionedXcm>,
-        forwarded_xcms: Vec<(TVersionedLocation, Vec<TVersionedXcm>)>,
+        // The FORWARDED messages are real programs, not opaque bytes, because
+        // the re-encoding test below is only worth anything against a shape with
+        // nesting in it — a version wrapper, an Xcm newtype, and a DoubleEncoded
+        // inside an instruction.
+        forwarded_xcms: Vec<(TVersionedLocation, Vec<TProgram>)>,
+    }
+
+    // ------------------------------------------------- the dry_run_xcm shapes
+    // Mimics of the real types, close enough that the assertions are about
+    // encodings rather than about our own fixtures: compact para ids, X1 as a
+    // one-element ARRAY (as XCM v4/v5 declare it), `DoubleEncoded` carrying only
+    // its `encoded` field, and BOTH Outcome shapes.
+
+    #[derive(Encode, Decode, TypeInfo, Debug, PartialEq)]
+    enum TJunction {
+        Parachain(#[codec(compact)] u32),
+    }
+
+    #[derive(Encode, Decode, TypeInfo, Debug, PartialEq)]
+    enum TJunctions {
+        Here,
+        X1([TJunction; 1]),
+    }
+
+    #[derive(Encode, Decode, TypeInfo, Debug, PartialEq)]
+    struct TLocation {
+        parents: u8,
+        interior: TJunctions,
+    }
+
+    #[derive(Encode, Decode, TypeInfo, Debug, PartialEq)]
+    enum TVersionedLoc {
+        #[codec(index = 3)]
+        V3(TLocation),
+        #[codec(index = 4)]
+        V4(TLocation),
+        #[codec(index = 5)]
+        V5(TLocation),
+    }
+
+    /// Codec-identical to the real `DoubleEncoded<T>`, whose `decoded` field is
+    /// `#[codec(skip)]` — which is why `VersionedXcm<()>` and
+    /// `VersionedXcm<Call>` encode the same and a forwarded message can be
+    /// handed to another chain's dry_run_xcm.
+    #[derive(Encode, Decode, TypeInfo, Debug, PartialEq, Clone)]
+    struct TDoubleEncoded {
+        encoded: Vec<u8>,
+    }
+
+    #[derive(Encode, Decode, TypeInfo, Debug, PartialEq, Clone)]
+    enum TInstruction {
+        ClearOrigin,
+        Transact { call: TDoubleEncoded },
+        SetTopic([u8; 32]),
+    }
+
+    /// `Xcm` is a NEWTYPE over the instruction list — the layer that makes an
+    /// empty program render as `[[]]` and never as `[]`.
+    #[derive(Encode, Decode, TypeInfo, Debug, PartialEq, Clone)]
+    struct TXcm(Vec<TInstruction>);
+
+    #[derive(Encode, Decode, TypeInfo, Debug, PartialEq, Clone)]
+    enum TProgram {
+        #[codec(index = 4)]
+        V4(TXcm),
+        #[codec(index = 5)]
+        V5(TXcm),
+    }
+
+    #[derive(Encode, Decode, TypeInfo, Debug, PartialEq)]
+    struct TWeight {
+        ref_time: u64,
+        proof_size: u64,
+    }
+
+    #[derive(Encode, Decode, TypeInfo, Debug, PartialEq)]
+    enum TXcmError {
+        Barrier,
+        UntrustedReserveLocation,
+    }
+
+    #[derive(Encode, Decode, TypeInfo, Debug, PartialEq)]
+    struct TInstructionError {
+        index: u8,
+        error: TXcmError,
+    }
+
+    /// XCM v5: `Error` is a NEWTYPE over InstructionError.
+    #[derive(Encode, Decode, TypeInfo)]
+    enum TOutcomeV5 {
+        Complete {
+            used: TWeight,
+        },
+        Incomplete {
+            used: TWeight,
+            error: TInstructionError,
+        },
+        Error(TInstructionError),
+    }
+
+    /// XCM v4: `Error` is a STRUCT variant and `Incomplete.error` is a bare
+    /// Error. Same three names, different payloads — which is why only the name
+    /// is read.
+    #[derive(Encode, Decode, TypeInfo)]
+    enum TOutcomeV4 {
+        Complete { used: TWeight },
+        Incomplete { used: TWeight, error: TXcmError },
+        Error { error: TXcmError },
+    }
+
+    /// `XcmDryRunEffects` — THREE fields, and no `local_xcm`.
+    #[derive(Encode, Decode, TypeInfo)]
+    struct TXcmEffects<O> {
+        execution_result: O,
+        emitted_events: Vec<TRuntimeEvent>,
+        forwarded_xcms: Vec<(TVersionedLocation, Vec<TProgram>)>,
     }
 
     #[derive(Encode, Decode, TypeInfo)]
@@ -909,6 +1824,7 @@ mod tests {
     }
 
     type TOutput = Result<TEffects, TApiError>;
+    type TXcmOutput<O> = Result<TXcmEffects<O>, TApiError>;
 
     /// A minimal RuntimeCall so `call_ty` resolves to something real.
     #[allow(non_camel_case_types)]
@@ -925,6 +1841,49 @@ mod tests {
 
     fn context() -> DryRunContext {
         context_with_origin::<TOriginCaller>()
+    }
+
+    /// A context that also declares `dry_run_xcm`, with the Outcome shape of
+    /// whichever XCM version the test is about. Everything is registered in ONE
+    /// registry, because the type ids the two methods hand each other (a
+    /// forwarded message's own id, for instance) only mean anything within one.
+    fn xcm_context<O: TypeInfo + 'static>() -> DryRunContext {
+        let mut registry = Registry::new();
+        let origin = registry.register_type(&MetaType::new::<TOriginCaller>()).id;
+        let call = registry.register_type(&MetaType::new::<TRuntimeCall>()).id;
+        let xcm_version = registry.register_type(&MetaType::new::<u32>()).id;
+        let output = registry.register_type(&MetaType::new::<TOutput>()).id;
+        let assets_error = registry.register_type(&MetaType::new::<TAssetsError>()).id;
+        let location = registry.register_type(&MetaType::new::<TVersionedLoc>()).id;
+        let program = registry.register_type(&MetaType::new::<TProgram>()).id;
+        let xcm_output = registry
+            .register_type(&MetaType::new::<TXcmOutput<O>>())
+            .id;
+        let types: PortableRegistry = registry.into();
+        DryRunContext::from_parts(
+            types,
+            vec![
+                (0, "System".into(), None),
+                (50, "Assets".into(), Some(assets_error)),
+            ],
+            origin,
+            call,
+            Some(xcm_version),
+            output,
+        )
+        .with_xcm(location, program, xcm_output)
+    }
+
+    fn program(instructions: Vec<TInstruction>) -> TProgram {
+        TProgram::V5(TXcm(instructions))
+    }
+
+    fn transact(payload: &[u8]) -> TInstruction {
+        TInstruction::Transact {
+            call: TDoubleEncoded {
+                encoded: payload.to_vec(),
+            },
+        }
     }
 
     fn context_with_origin<O: TypeInfo + 'static>() -> DryRunContext {
@@ -1125,10 +2084,21 @@ mod tests {
                     parents: 1,
                     parachain: 2034,
                 },
-                vec![TVersionedXcm::V4(vec![9])],
+                vec![forwarded_message()],
             )],
         });
         out.encode()
+    }
+
+    /// The message the re-encoding test lifts back out — deliberately one with
+    /// every layer in it: a version wrapper, the Xcm newtype, a DoubleEncoded
+    /// payload and a 32-byte topic.
+    fn forwarded_message() -> TProgram {
+        program(vec![
+            TInstruction::ClearOrigin,
+            transact(&[0x00, 0x07, 0xff]),
+            TInstruction::SetTopic([9u8; 32]),
+        ])
     }
 
     fn ok_post() -> TPostInfo {
@@ -1287,6 +2257,329 @@ mod tests {
         assert!(err.contains("trailing"), "{err}");
         assert!(ctx.interpret(&[0xff, 0xff, 0xff]).is_err());
         assert!(ctx.interpret(&[]).is_err());
+    }
+
+    // ------------------------------------------------- dry_run_xcm (slice 5)
+
+    #[test]
+    fn an_origin_location_is_built_from_the_registry_and_decodes_as_the_real_type() {
+        let ctx = xcm_context::<TOutcomeV5>();
+
+        // A SIBLING: parents 1, X1[Parachain(n)]. The strong form of the
+        // assertion — the bytes we built decode back through codec into the real
+        // Rust value, so encoder and decoder are not two copies of one guess.
+        let (bytes, json) = ctx
+            .encode_location(&LocationSpec::Sibling(1000))
+            .expect("sibling encodes");
+        assert_eq!(
+            TVersionedLoc::decode(&mut &bytes[..]).unwrap(),
+            TVersionedLoc::V5(TLocation {
+                parents: 1,
+                interior: TJunctions::X1([TJunction::Parachain(1000)]),
+            }),
+            "an unnamed composite of one encodes into X1's one-element ARRAY"
+        );
+        assert!(
+            json.get("V5").is_some(),
+            "the NEWEST version the runtime declares is chosen, read from the registry \
+             rather than pinned: {json}"
+        );
+
+        // A CHILD is the same para id at parents 0 — the distinction that stops
+        // every downward message being called HRMP.
+        let (bytes, _) = ctx
+            .encode_location(&LocationSpec::Child(2034))
+            .expect("child encodes");
+        assert_eq!(
+            TVersionedLoc::decode(&mut &bytes[..]).unwrap(),
+            TVersionedLoc::V5(TLocation {
+                parents: 0,
+                interior: TJunctions::X1([TJunction::Parachain(2034)]),
+            })
+        );
+
+        let (bytes, _) = ctx
+            .encode_location(&LocationSpec::Parent)
+            .expect("parent encodes");
+        assert_eq!(
+            TVersionedLoc::decode(&mut &bytes[..]).unwrap(),
+            TVersionedLoc::V5(TLocation {
+                parents: 1,
+                interior: TJunctions::Here,
+            })
+        );
+
+        let (bytes, _) = ctx.encode_location(&LocationSpec::Here).expect("here encodes");
+        assert_eq!(
+            TVersionedLoc::decode(&mut &bytes[..]).unwrap(),
+            TVersionedLoc::V5(TLocation {
+                parents: 0,
+                interior: TJunctions::Here,
+            })
+        );
+
+        // A call-only context has no dry_run_xcm and says so instead of
+        // encoding something.
+        let err = context()
+            .encode_location(&LocationSpec::Parent)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("dry_run_xcm"), "{err}");
+    }
+
+    #[test]
+    fn both_baselines_are_built_by_name_and_checked_before_use() {
+        let ctx = xcm_context::<TOutcomeV5>();
+
+        // THE SENDING SIDE: system.remark(), two variant indices and a compact
+        // zero, byte-identical to what codec produces for the real call.
+        let noop = ctx.noop_call().expect("the no-op builds");
+        assert_eq!(
+            noop,
+            TRuntimeCall::System(TSystemCall::remark { remark: vec![] }).encode()
+        );
+        assert_eq!(ctx.decode_call(&noop).unwrap().summary, "system.remark");
+
+        // THE RECEIVING SIDE: an empty program, which executes nothing — AT A
+        // NAMED VERSION, because dry_run_xcm answers in the version it was
+        // asked in, and a baseline at another version cannot be differenced
+        // against its subject.
+        let empty = ctx.encode_empty_program(5).expect("the empty program builds");
+        assert_eq!(empty, TProgram::V5(TXcm(vec![])).encode());
+        assert_eq!(
+            program_summary(&ctx.decode_program(&empty).unwrap()),
+            "(empty program)",
+            "and it reads back as empty — a baseline that executed anything would \
+             subtract a run's own messages from its own attribution"
+        );
+        // …and the SAME call at v4 produces v4 bytes, which is the whole point.
+        let empty4 = ctx.encode_empty_program(4).expect("v4 builds too");
+        assert_eq!(empty4, TProgram::V4(TXcm(vec![])).encode());
+        assert_ne!(empty, empty4);
+        assert_eq!(
+            program_version(&ctx.decode_program(&empty4).unwrap()),
+            Some(4),
+            "and the version a program carries is readable back out of it — which is how \
+             the baseline learns which one to build"
+        );
+        // A version this runtime does not declare is refused, not approximated.
+        let err = ctx.encode_empty_program(2).unwrap_err().to_string();
+        assert!(err.contains("V2") && err.contains("V4, V5"), "{err}");
+    }
+
+    #[test]
+    fn an_xcm_outcome_has_three_states_and_error_means_execution_never_started() {
+        let ctx = xcm_context::<TOutcomeV5>();
+        let effects = |o: TOutcomeV5| -> Vec<u8> {
+            let out: TXcmOutput<TOutcomeV5> = Ok(TXcmEffects {
+                execution_result: o,
+                emitted_events: vec![TRuntimeEvent::Balances(TBalancesEvent::Transfer {
+                    from: TAccount([1u8; 32]),
+                    to: TAccount([2u8; 32]),
+                    amount: 5,
+                })],
+                forwarded_xcms: vec![(
+                    TVersionedLocation::V4 {
+                        parents: 1,
+                        parachain: 2000,
+                    },
+                    vec![forwarded_message()],
+                )],
+            });
+            out.encode()
+        };
+        let weight = || TWeight {
+            ref_time: 100,
+            proof_size: 200,
+        };
+
+        let complete = ctx
+            .interpret_xcm(&effects(TOutcomeV5::Complete { used: weight() }))
+            .expect("interprets");
+        assert_eq!(complete.status, XcmSimStatus::Complete);
+        assert_eq!(complete.weight_used.as_ref().unwrap()["ref_time"], 100);
+        assert!(complete.xcm_error.is_none());
+        assert!(complete.note.is_none());
+        assert_eq!(complete.events.len(), 1);
+        assert_eq!(complete.events[0].name, "balances.Transfer");
+        assert_eq!(complete.forwarded_xcms.len(), 1);
+
+        // STARTED and stopped partway — the same fact an observed
+        // Outcome::Incomplete records, previewed before it happens.
+        let incomplete = ctx
+            .interpret_xcm(&effects(TOutcomeV5::Incomplete {
+                used: weight(),
+                error: TInstructionError {
+                    index: 2,
+                    error: TXcmError::UntrustedReserveLocation,
+                },
+            }))
+            .expect("interprets");
+        assert_eq!(incomplete.status, XcmSimStatus::Incomplete);
+        assert!(incomplete.weight_used.is_some());
+        let err = incomplete.xcm_error.expect("carries the reason");
+        assert_eq!(
+            err["index"], 2,
+            "XCM v5 names the failing instruction, and that index is kept"
+        );
+
+        // NEVER STARTED. Upstream calls this variant `Error`; it is not an error
+        // of ours, and it is the answer the sending chain cannot give — its own
+        // `Sent` would look perfectly successful.
+        let rejected = ctx
+            .interpret_xcm(&effects(TOutcomeV5::Error(TInstructionError {
+                index: 0,
+                error: TXcmError::Barrier,
+            })))
+            .expect("interprets");
+        assert_eq!(rejected.status, XcmSimStatus::NotStarted);
+        assert_eq!(rejected.status.as_str(), "not_started");
+        assert!(
+            rejected.weight_used.is_none(),
+            "nothing ran, so no weight was used"
+        );
+        let why = rejected.xcm_error.expect("a rejection names its reason");
+        assert_eq!(why["index"], 0, "v5 isolates the offending instruction");
+        assert_eq!(
+            why["error"],
+            serde_json::json!({"Barrier": []}),
+            "a unit variant renders as an empty ARRAY, never as a bare string"
+        );
+        let note = rejected.note.expect("a rejection must say what it means");
+        assert!(note.contains("NEVER STARTED"), "{note}");
+
+        // The API refusing is a fourth, different thing: nothing was attempted
+        // at all, so there is no outcome to report.
+        let out: TXcmOutput<TOutcomeV5> = Err(TApiError::VersionedConversionFailed);
+        let refused = ctx.interpret_xcm(&out.encode()).expect("interprets");
+        assert_eq!(refused.status, XcmSimStatus::ApiError);
+        assert!(refused.events.is_empty());
+        assert!(refused.forwarded_xcms.is_empty());
+
+        // And a response that does not fit the declared output is loud.
+        let mut bad = effects(TOutcomeV5::Complete { used: weight() });
+        bad.push(0xff);
+        assert!(ctx.interpret_xcm(&bad).unwrap_err().to_string().contains("trailing"));
+    }
+
+    #[test]
+    fn the_v4_outcome_shape_reads_as_the_same_three_states() {
+        // v4's `Error` is a STRUCT variant and its `Incomplete.error` is a bare
+        // Error rather than an InstructionError. The variant NAMES did not
+        // change, which is why only they are read — and this test is the proof
+        // that reading them is enough.
+        let ctx = xcm_context::<TOutcomeV4>();
+        let effects = |o: TOutcomeV4| -> Vec<u8> {
+            let out: TXcmOutput<TOutcomeV4> = Ok(TXcmEffects {
+                execution_result: o,
+                emitted_events: vec![],
+                forwarded_xcms: vec![],
+            });
+            out.encode()
+        };
+
+        let rejected = ctx
+            .interpret_xcm(&effects(TOutcomeV4::Error {
+                error: TXcmError::Barrier,
+            }))
+            .expect("interprets");
+        assert_eq!(rejected.status, XcmSimStatus::NotStarted);
+        assert_eq!(
+            rejected.xcm_error.unwrap(),
+            serde_json::json!({"Barrier": []}),
+            "a v4 rejection carries no instruction index, and none is invented — the \
+             payload is the bare Error, kept in the shape the runtime rendered it"
+        );
+
+        let incomplete = ctx
+            .interpret_xcm(&effects(TOutcomeV4::Incomplete {
+                used: TWeight {
+                    ref_time: 1,
+                    proof_size: 2,
+                },
+                error: TXcmError::Barrier,
+            }))
+            .expect("interprets");
+        assert_eq!(incomplete.status, XcmSimStatus::Incomplete);
+        assert_eq!(incomplete.weight_used.unwrap()["proof_size"], 2);
+    }
+
+    #[test]
+    fn a_forwarded_message_re_encodes_to_the_bytes_the_runtime_reported() {
+        let ctx = xcm_context::<TOutcomeV5>();
+        let response = effects(Ok(ok_post()));
+
+        let lifted = ctx
+            .forwarded_program(&response, 0, 0)
+            .expect("the message is lifted back out");
+        // THE ASSERTION THE WHOLE STITCH RESTS ON: re-encoding a decoded value
+        // against its own declared type reproduces the encoder's bytes exactly,
+        // DoubleEncoded payload and 32-byte topic included. If this ever stops
+        // holding, the next chain would be previewed on a message the first one
+        // did not send.
+        assert_eq!(
+            lifted.bytes,
+            forwarded_message().encode(),
+            "re-encoded, not sliced — and byte-identical to codec's own output"
+        );
+        assert_eq!(lifted.destination_index, 0);
+        assert_eq!(lifted.message_index, 0);
+        assert_eq!(lifted.destination["V4"]["parachain"], 2034);
+        assert_eq!(
+            program_summary(&lifted.program),
+            "ClearOrigin → Transact → SetTopic",
+            "read through the version wrapper AND the Xcm newtype layer"
+        );
+        // …and those bytes are exactly what the other chain's dry_run_xcm would
+        // accept as its `xcm` parameter.
+        assert_eq!(ctx.decode_program(&lifted.bytes).unwrap(), lifted.program);
+
+        // Indices that do not exist are refused with the counts, never with an
+        // empty program.
+        let err = ctx.forwarded_program(&response, 3, 0).unwrap_err().to_string();
+        assert!(err.contains("1 destination"), "{err}");
+        let err = ctx.forwarded_program(&response, 0, 5).unwrap_err().to_string();
+        assert!(err.contains("1 message"), "{err}");
+    }
+
+    #[test]
+    fn a_program_summary_survives_every_layer_and_never_invents_one() {
+        let ctx = xcm_context::<TOutcomeV5>();
+        let three = program(vec![
+            TInstruction::ClearOrigin,
+            transact(&[1]),
+            TInstruction::SetTopic([0u8; 32]),
+        ])
+        .encode();
+        assert_eq!(
+            program_summary(&ctx.decode_program(&three).unwrap()),
+            "ClearOrigin → Transact → SetTopic"
+        );
+
+        // ONE instruction is the case a fixed-depth peel gets wrong: the
+        // innermost list has a single element, and it is an OBJECT, which is
+        // what stops the unwrapping at the right layer.
+        let one = program(vec![TInstruction::ClearOrigin]).encode();
+        assert_eq!(
+            program_summary(&ctx.decode_program(&one).unwrap()),
+            "ClearOrigin"
+        );
+
+        assert_eq!(
+            program_summary(&serde_json::json!({"V5": [[[]]]})),
+            "(empty program)"
+        );
+        assert_eq!(program_summary(&serde_json::json!("nonsense")), "(unreadable program)");
+
+        // Bytes that are not a program at all are refused rather than summarised.
+        assert!(ctx.decode_program(&[0xff, 0xff]).is_err());
+        let mut trailing = one.clone();
+        trailing.push(0x00);
+        assert!(ctx
+            .decode_program(&trailing)
+            .unwrap_err()
+            .to_string()
+            .contains("trailing"));
     }
 
     #[test]

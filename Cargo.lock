@@ -91,6 +91,7 @@ dependencies = [
  "registry",
  "serde",
  "serde_json",
+ "sim",
  "sqlx",
  "thiserror 1.0.69",
  "tokio",

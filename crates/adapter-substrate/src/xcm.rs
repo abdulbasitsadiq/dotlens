@@ -544,7 +544,12 @@ fn transport_for_destination(dest: &serde_json::Value) -> &'static str {
 /// the worst kind of wrong: it reads as a fact, joins like a fact, and would
 /// have made the journey endpoint's counterparty mirror contradict itself the
 /// day Kusama is registered.
-fn location_counterparty(dest: &serde_json::Value) -> Option<String> {
+/// PUBLIC SINCE SLICE 5, unchanged: the simulation path resolves a `dry_run_call`
+/// destination to a registered chain, and it must do so with the SAME reading
+/// that recorded the observed rows — a preview and an observation that disagreed
+/// about which chain a message was addressed to would be worse than either
+/// alone.
+pub fn location_counterparty(dest: &serde_json::Value) -> Option<String> {
     if let Some(network) = global_consensus(dest) {
         // The para id is kept, but only INSIDE the consensus that owns it.
         return Some(match find_parachain(dest) {

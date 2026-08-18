@@ -27,6 +27,17 @@
 //!   dotlens-node decode-preimages <chain> [height]   # decode all pending proposals
 //!   dotlens-node simulate-call <chain> <0x-call> <origin> [height]   # Tier 1 dry run
 //!   dotlens-node simulate-referendum <chain> <class> <id> <origin> [height]
+//!   dotlens-node simulate-xcm <chain> <origin-location> <0x-program> [height]
+//!   dotlens-node simulate-forwarded <chain> <at-block-hash> <input-hash> [height]
+//!
+//! `simulate-xcm` is the RECEIVING side: what a chain would do with a program
+//! that arrived from `origin-location` (here | parent | sibling:<para> |
+//! child:<para> — a sibling and a child are the same para id at different parent
+//! counts, so `para:<n>` is refused as ambiguous). `simulate-forwarded` takes a
+//! recorded call simulation, works out which of its forwarded messages are
+//! actually ITS OWN by differencing against the no-op baseline recorded beside
+//! it, resolves each destination to a registered chain, and previews the leg
+//! there — stopping and saying so at a destination dotlens does not index.
 //!
 //! `origin` is root | none | signed:<ss58|0x-hex> | <Pallet>:<Variant> (e.g.
 //! `Origins:MediumSpender`). It is REQUIRED and never inferred from a track:
@@ -80,6 +91,7 @@ struct Backends {
     bounties: Arc<dyn api::BountyIndex>,
     assets: Arc<dyn api::AssetIndex>,
     sim: Arc<dyn api::SimIndex>,
+    xcm_sim: Arc<dyn api::XcmSimIndex>,
     xcm: Arc<dyn api::XcmIndex>,
     runtime_versions: Arc<dyn RuntimeVersionSink>,
     /// Kept for label sync/verify (they need direct SQL, not a trait).
@@ -100,6 +112,7 @@ fn memory_backends() -> Backends {
         bounties: Arc::new(api::MemoryBountyIndex::new()),
         assets: Arc::new(api::MemoryAssetIndex::new()),
         sim: Arc::new(api::MemorySimIndex::new()),
+        xcm_sim: Arc::new(api::MemoryXcmSimIndex::new()),
         xcm: Arc::new(api::MemoryXcmIndex::new()),
         runtime_versions: Arc::new(NoopRuntimeVersionSink),
         #[cfg(feature = "pg")]
@@ -155,6 +168,18 @@ enum Command {
         class: String,
         referendum_id: i64,
         origin: String,
+        height: Option<u64>,
+    },
+    SimulateXcm {
+        chain: String,
+        origin_location: String,
+        program_hex: String,
+        height: Option<u64>,
+    },
+    SimulateForwarded {
+        chain: String,
+        at_block_hash: String,
+        input_hash: String,
         height: Option<u64>,
     },
 }
@@ -316,6 +341,38 @@ fn parse_args() -> Result<Command> {
             };
             Ok(Command::SimulateReferendum { chain, class, referendum_id, origin, height })
         }
+        Some("simulate-xcm") => {
+            let usage =
+                "usage: dotlens-node simulate-xcm <chain> <origin-location> <0x-program-hex> \
+                 [height]\n\
+                 origin-location: here | parent | sibling:<para> | child:<para>";
+            let chain = args.get(1).context(usage)?.clone();
+            let origin_location = args.get(2).context(usage)?.clone();
+            let program_hex = args.get(3).context(usage)?.clone();
+            let height = match args.get(4) {
+                Some(h) => Some(h.parse::<u64>().context(usage)?),
+                None => None,
+            };
+            Ok(Command::SimulateXcm { chain, origin_location, program_hex, height })
+        }
+        Some("simulate-forwarded") => {
+            // BOTH coordinates are required, and that is not verbosity. A
+            // simulation is keyed by (chain, BLOCK HASH, input hash): the same
+            // question asked at two states shares an input hash and differs only
+            // by block hash, so an input hash alone would make the lookup pick
+            // one of two answers on the caller's behalf. `simulate-call` prints
+            // both, in the evidence path.
+            let usage = "usage: dotlens-node simulate-forwarded <chain> <at-block-hash> \
+                         <input-hash> [destination-height]";
+            let chain = args.get(1).context(usage)?.clone();
+            let at_block_hash = args.get(2).context(usage)?.clone();
+            let input_hash = args.get(3).context(usage)?.clone();
+            let height = match args.get(4) {
+                Some(h) => Some(h.parse::<u64>().context(usage)?),
+                None => None,
+            };
+            Ok(Command::SimulateForwarded { chain, at_block_hash, input_hash, height })
+        }
         Some("anchor-balance") => {
             let usage = "usage: dotlens-node anchor-balance <chain> <account> <height>";
             let chain = args.get(1).context(usage)?.clone();
@@ -392,6 +449,7 @@ async fn main() -> Result<()> {
             bounties: Arc::new(api::pg::PgBountyIndex::new(pool.clone())),
             assets: Arc::new(api::pg::PgAssetIndex::new(pool.clone())),
             sim: Arc::new(api::pg::PgSimIndex::new(pool.clone())),
+            xcm_sim: Arc::new(api::pg::PgXcmSimIndex::new(pool.clone())),
             xcm: Arc::new(api::pg::PgXcmIndex::new(pool.clone())),
             runtime_versions: Arc::new(PgRuntimeVersionSink::new(pool.clone())),
             pool: Some(pool),
@@ -563,7 +621,7 @@ async fn main() -> Result<()> {
         return run_decode_preimages(&registry, &backends, raw.as_ref(), chain, *height).await;
     }
     if let Command::SimulateCall { chain, call_hex, origin, height } = &command {
-        let bytes = decode_call_hex(call_hex)?;
+        let bytes = decode_scale_hex(call_hex, "call")?;
         return run_simulate(
             &registry, &backends, raw.as_ref(), chain, bytes, origin, *height, None,
         )
@@ -572,6 +630,19 @@ async fn main() -> Result<()> {
     if let Command::SimulateReferendum { chain, class, referendum_id, origin, height } = &command {
         return run_simulate_referendum(
             &registry, &backends, raw.as_ref(), chain, class, *referendum_id, origin, *height,
+        )
+        .await;
+    }
+    if let Command::SimulateXcm { chain, origin_location, program_hex, height } = &command {
+        let bytes = decode_scale_hex(program_hex, "program")?;
+        return run_simulate_xcm(
+            &registry, &backends, raw.as_ref(), chain, origin_location, bytes, *height, None,
+        )
+        .await;
+    }
+    if let Command::SimulateForwarded { chain, at_block_hash, input_hash, height } = &command {
+        return run_simulate_forwarded(
+            &registry, &backends, raw.as_ref(), chain, at_block_hash, input_hash, *height,
         )
         .await;
     }
@@ -674,6 +745,7 @@ async fn main() -> Result<()> {
         bounties: backends.bounties.clone(),
         assets: backends.assets.clone(),
         sim: backends.sim.clone(),
+        xcm_sim: backends.xcm_sim.clone(),
         xcm: backends.xcm.clone(),
         // family-encoded address parsing is adapter-owned (Invariant 4); with
         // more families this becomes registry-driven dispatch
@@ -2213,13 +2285,25 @@ fn parse_h256(s: &str) -> Result<[u8; 32]> {
         .map_err(|_| anyhow::anyhow!("hash must be 32 bytes, got {}", bytes.len()))
 }
 
-/// `0x…` (or bare hex) call bytes → SCALE. Rejected loudly rather than
-/// truncated: half a call decodes into a different call.
-fn decode_call_hex(hex_str: &str) -> Result<Vec<u8>> {
+/// `0x…` (or bare hex) SCALE bytes — a `RuntimeCall` for `simulate-call`, a
+/// `VersionedXcm` for `simulate-xcm`. Rejected loudly rather than truncated:
+/// half a call decodes into a different call, and half a program into a
+/// different program.
+/// `0x`-prefix a hex identifier that may have been copied from a raw-store path,
+/// where the prefix is not part of the key. Lower-cased for the same reason
+/// `normalize_call_hash` is: `0X…` is what `to_uppercase()` produces and it must
+/// not 404.
+fn prefixed(hash: &str) -> String {
+    let t = hash.trim().to_ascii_lowercase();
+    let body = t.strip_prefix("0x").unwrap_or(&t);
+    format!("0x{body}")
+}
+
+fn decode_scale_hex(hex_str: &str, what: &str) -> Result<Vec<u8>> {
     let trimmed = hex_str.trim();
     let body = trimmed.strip_prefix("0x").unwrap_or(trimmed);
-    let bytes = hex::decode(body).context("call bytes are not hex")?;
-    anyhow::ensure!(!bytes.is_empty(), "call bytes are empty");
+    let bytes = hex::decode(body).with_context(|| format!("{what} bytes are not hex"))?;
+    anyhow::ensure!(!bytes.is_empty(), "{what} bytes are empty");
     Ok(bytes)
 }
 
@@ -2398,6 +2482,244 @@ async fn run_simulate_referendum(
     .await
 }
 
+/// simulate-xcm: one Tier 1 preview of an arriving PROGRAM (Phase 3, slice 5).
+///
+/// The chain is named here for the same reason it is on `simulate-call`, and one
+/// more: this is the RECEIVING side, so "which chain" is not a routing detail but
+/// the entire question — the same program is accepted on one chain and rejected
+/// at another's barrier.
+#[cfg(all(feature = "pg", feature = "live"))]
+#[allow(clippy::too_many_arguments)]
+async fn run_simulate_xcm(
+    registry: &Registry,
+    backends: &Backends,
+    raw: &dyn RawStore,
+    chain: &str,
+    origin_location: &str,
+    program: Vec<u8>,
+    height: Option<u64>,
+    source: Option<sim::ProgramSource>,
+) -> Result<()> {
+    use adapter_substrate::source::SubstrateSource;
+    use dotlens_node::sim_pg::PgXcmSimStore;
+    use dotlens_node::sim_run::SubstrateDryRunner;
+
+    let pool = backends
+        .pool
+        .as_ref()
+        .context("simulate-xcm requires DATABASE_URL")?;
+    let cfg = registry
+        .chain(chain)
+        .with_context(|| format!("unknown chain: {chain}"))?;
+    let origin = sim::LocationSpec::parse(origin_location).map_err(|e| anyhow::anyhow!(e))?;
+
+    let source_chain = SubstrateSource::new(&cfg.id, cfg.endpoints.rpc.clone())
+        .map_err(|e| anyhow::anyhow!(e))?;
+    let runner = SubstrateDryRunner::new(&cfg.id, &source_chain, raw, backends.receipts.as_ref());
+    let store = PgXcmSimStore::new(pool.clone());
+
+    let req = sim::XcmSimRequest {
+        chain_id: cfg.id.clone(),
+        at_height: height,
+        origin,
+        program,
+        source,
+    };
+    let run = sim::run_xcm_simulation(&runner, &store, raw, backends.receipts.as_ref(), &req)
+        .await
+        .map_err(|e| anyhow::anyhow!(e))?;
+    print_xcm_run(&run);
+    Ok(())
+}
+
+#[cfg(all(feature = "pg", feature = "live"))]
+fn print_xcm_run(run: &sim::XcmSimRun) {
+    let r = &run.record;
+    println!(
+        "simulate-xcm {} at #{} (spec {}, DryRunApi v{}){}",
+        r.chain_id,
+        r.at_height,
+        r.spec_version,
+        r.api_version,
+        if run.cached { " [recorded earlier]" } else { "" }
+    );
+    println!(
+        "  program  {} ({})",
+        r.program_summary.as_deref().unwrap_or("?"),
+        r.program_hash
+    );
+    println!("  from     {} {}", r.origin_ref, r.origin_location);
+    println!("  outcome  {}", r.status);
+    if let Some(e) = &r.xcm_error {
+        println!("  error    {e}");
+    }
+    if let Some(n) = &r.note {
+        println!("  note     {n}");
+    }
+    println!("  events   {}", r.event_count);
+    for ev in r.emitted_events.as_array().into_iter().flatten() {
+        println!("    - {}", ev["name"].as_str().unwrap_or("?"));
+    }
+    println!("  evidence {}", r.raw_location);
+}
+
+/// simulate-forwarded: follow a recorded call simulation's OWN messages to the
+/// chains they are addressed to (Phase 3, slice 5) — the stitch.
+///
+/// THE ATTRIBUTION IS A PRECONDITION, NOT A GARNISH. A recorded run with no
+/// baseline is refused rather than followed, because on the relay the forwarded
+/// list is 74 messages that belong to other people, and previewing them here
+/// would attribute somebody else's traffic to the referendum being examined.
+/// Slice 1 measured that; this command is where believing it costs something.
+#[cfg(all(feature = "pg", feature = "live"))]
+async fn run_simulate_forwarded(
+    registry: &Registry,
+    backends: &Backends,
+    raw: &dyn RawStore,
+    chain: &str,
+    at_block_hash: &str,
+    input_hash: &str,
+    height: Option<u64>,
+) -> Result<()> {
+    use dotlens_node::sim_run::{origin_of, resolve_destination, SubstrateDryRunner};
+
+    let pool = backends
+        .pool
+        .as_ref()
+        .context("simulate-forwarded requires DATABASE_URL")?;
+    let cfg = registry
+        .chain(chain)
+        .with_context(|| format!("unknown chain: {chain}"))?;
+
+    // Both coordinates are stored WITH the `0x` prefix and printed WITHOUT it in
+    // the evidence path (`raw/<chain>/sim/<block>/<input>/…`), which is exactly
+    // where a person copies them from. Normalizing here is the difference
+    // between a working paste and a "no recorded simulation" that looks like the
+    // run never happened.
+    let at_block_hash = &prefixed(at_block_hash);
+    let input_hash = &prefixed(input_hash);
+
+    let subject = dotlens_node::sim_pg::simulation_at(
+        pool,
+        &cfg.id,
+        at_block_hash,
+        input_hash,
+        sim::TIER_DRY_RUN,
+    )
+    .await?
+    .with_context(|| {
+        format!(
+            "no recorded simulation {input_hash} at {at_block_hash} on {chain} — run \
+             `simulate-call` (or `simulate-referendum`) first; this command never starts one"
+        )
+    })?;
+
+    let baseline_hash = subject.baseline_input_hash.clone().context(
+        "this simulation was recorded without a baseline, so its forwarded_xcms is not \
+         attributable to the call — on the relay that list is dominated by messages already \
+         in flight. Re-run the simulation to record a baseline; following an unattributed \
+         list would preview other people's traffic as this call's",
+    )?;
+    let baseline = dotlens_node::sim_pg::simulation_at(
+        pool,
+        &cfg.id,
+        at_block_hash,
+        &baseline_hash,
+        sim::TIER_DRY_RUN,
+    )
+    .await?
+    .with_context(|| format!("the recorded baseline {baseline_hash} is missing"))?;
+
+    let attribution = sim::attribute_forwarded(&subject.forwarded_xcms, &baseline.forwarded_xcms);
+    println!(
+        "forwarded from {} at #{} ({}): {} message(s) total, {} already in flight, \
+         {} attributable to this call",
+        cfg.id,
+        subject.at_height,
+        subject.call_summary.as_deref().unwrap_or("?"),
+        attribution.total_messages,
+        attribution.ambient_messages,
+        attribution.attributed_messages
+    );
+    if attribution.destinations.is_empty() {
+        println!("  nothing to follow: this call queues no messages of its own");
+        return Ok(());
+    }
+
+    // The archived response is where the message BYTES come from. The database
+    // row holds our rendering of them, and re-encoding a rendering would be a
+    // guess about what the rendering dropped.
+    let response = raw.get(&subject.raw_location).with_context(|| {
+        format!(
+            "the archived response {} is missing, so no forwarded message can be lifted back \
+             out of it",
+            subject.raw_location
+        )
+    })?;
+    let source_rpc = adapter_substrate::source::SubstrateSource::new(
+        &cfg.id,
+        cfg.endpoints.rpc.clone(),
+    )
+    .map_err(|e| anyhow::anyhow!(e))?;
+    let source_runner =
+        SubstrateDryRunner::new(&cfg.id, &source_rpc, raw, backends.receipts.as_ref());
+    let ctx = source_runner
+        .context_for(subject.spec_version, subject.metadata_version)
+        .map_err(|e| anyhow::anyhow!(e))?;
+
+    for destination in &attribution.destinations {
+        let target = match resolve_destination(registry, cfg, &destination.destination) {
+            Ok(t) => t,
+            Err(why) => {
+                // THE COVERAGE EDGE, STATED. Not a skip and not a failure: the
+                // journey is followed as far as dotlens can see and then stops
+                // on purpose, naming where it stopped.
+                println!("  ↦ STOPS HERE: {why}");
+                continue;
+            }
+        };
+        let Some(origin) = origin_of(target, cfg) else {
+            println!(
+                "  ↦ STOPS HERE: the registry cannot say how {} would address {} — no origin \
+                 location to preview it from",
+                target.id, cfg.id
+            );
+            continue;
+        };
+
+        for message in &destination.messages {
+            let lifted = ctx
+                .forwarded_program(&response, destination.destination_index, message.message_index)
+                .map_err(|e| anyhow::anyhow!(e))?;
+            println!(
+                "  ↦ {} (as {}) · destination {} message {}",
+                target.id,
+                origin.as_spec(),
+                destination.destination_index,
+                message.message_index
+            );
+            run_simulate_xcm(
+                registry,
+                backends,
+                raw,
+                &target.id,
+                &origin.as_spec(),
+                lifted.bytes,
+                height,
+                Some(sim::ProgramSource {
+                    chain_id: cfg.id.clone(),
+                    at_block_hash: subject.at_block_hash.clone(),
+                    input_hash: subject.input_hash.clone(),
+                    forwarded_index: destination.destination_index as u32,
+                    message_index: message.message_index as u32,
+                }),
+            )
+            .await?;
+        }
+    }
+    Ok(())
+}
+
 #[cfg(not(all(feature = "pg", feature = "live")))]
 #[allow(clippy::too_many_arguments)]
 async fn run_simulate(
@@ -2405,6 +2727,22 @@ async fn run_simulate(
     _: Option<(String, i64)>,
 ) -> Result<()> {
     anyhow::bail!("simulate-call requires the `pg` and `live` features")
+}
+
+#[cfg(not(all(feature = "pg", feature = "live")))]
+#[allow(clippy::too_many_arguments)]
+async fn run_simulate_xcm(
+    _: &Registry, _: &Backends, _: &dyn RawStore, _: &str, _: &str, _: Vec<u8>, _: Option<u64>,
+    _: Option<sim::ProgramSource>,
+) -> Result<()> {
+    anyhow::bail!("simulate-xcm requires the `pg` and `live` features")
+}
+
+#[cfg(not(all(feature = "pg", feature = "live")))]
+async fn run_simulate_forwarded(
+    _: &Registry, _: &Backends, _: &dyn RawStore, _: &str, _: &str, _: &str, _: Option<u64>,
+) -> Result<()> {
+    anyhow::bail!("simulate-forwarded requires the `pg` and `live` features")
 }
 
 #[cfg(not(all(feature = "pg", feature = "live")))]

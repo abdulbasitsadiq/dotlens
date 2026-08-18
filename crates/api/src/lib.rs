@@ -772,6 +772,51 @@ pub struct SimulationRow {
     pub sim_version: u32,
     pub raw_location: String,
     pub observed_at: Option<DateTime<Utc>>,
+    /// The no-op run at the same state whose `forwarded_xcms` is the ambient
+    /// queue. `None` = no baseline, and every reader is told so rather than left
+    /// to assume the forwarded list is this call's doing.
+    pub baseline_input_hash: Option<String>,
+}
+
+/// One recorded `dry_run_xcm` — what a chain would do with a program that
+/// ARRIVED, as opposed to a call it dispatched (`sim.xcm_simulations`).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct XcmSimulationRow {
+    pub chain_id: String,
+    pub at_height: u64,
+    pub at_block_hash: String,
+    pub input_hash: String,
+    pub tier: String,
+    pub program_hash: String,
+    pub program: serde_json::Value,
+    pub program_summary: Option<String>,
+    pub origin_location: serde_json::Value,
+    pub origin_ref: String,
+    /// complete | incomplete | not_started | api_error. `not_started` is
+    /// upstream's `Outcome::Error` renamed: execution never began, which is a
+    /// barrier rejection rather than a failure of the request — and the answer
+    /// the SENDING chain structurally cannot give, since its own `Sent` would
+    /// look perfectly successful.
+    pub status: String,
+    pub weight_used: Option<serde_json::Value>,
+    pub xcm_error: Option<serde_json::Value>,
+    pub emitted_events: serde_json::Value,
+    pub event_count: u32,
+    pub forwarded_xcms: serde_json::Value,
+    pub baseline_input_hash: Option<String>,
+    pub effects: serde_json::Value,
+    pub note: Option<String>,
+    pub source_chain_id: Option<String>,
+    pub source_at_block_hash: Option<String>,
+    pub source_input_hash: Option<String>,
+    pub source_forwarded_index: Option<u32>,
+    pub source_message_index: Option<u32>,
+    pub spec_version: u64,
+    pub api_version: u32,
+    pub metadata_version: u32,
+    pub sim_version: u32,
+    pub raw_location: String,
+    pub observed_at: Option<DateTime<Utc>>,
 }
 
 /// Read side of `sim.simulation_results`.
@@ -791,6 +836,107 @@ pub trait SimIndex: Send + Sync {
         call_hash: &str,
         limit: u32,
     ) -> Result<Vec<SimulationRow>, IndexError>;
+
+    /// One row by its full key. Used to fetch a row's BASELINE, which is an
+    /// ordinary recorded simulation and not a special kind of thing — the whole
+    /// point of running the no-op through the same path.
+    async fn simulation_at(
+        &self,
+        chain_id: &str,
+        at_block_hash: &str,
+        input_hash: &str,
+        tier: &str,
+    ) -> Result<Option<SimulationRow>, IndexError>;
+}
+
+/// Read side of `sim.xcm_simulations`.
+#[async_trait]
+pub trait XcmSimIndex: Send + Sync {
+    /// Recorded previews of one PROGRAM on one chain, newest state first.
+    async fn xcm_simulations(
+        &self,
+        chain_id: &str,
+        program_hash: &str,
+        limit: u32,
+    ) -> Result<Vec<XcmSimulationRow>, IndexError>;
+
+    /// One row by its full key — used to fetch a row's BASELINE, exactly as
+    /// [`SimIndex::simulation_at`] does on the sending side.
+    async fn xcm_simulation_at(
+        &self,
+        chain_id: &str,
+        at_block_hash: &str,
+        input_hash: &str,
+        tier: &str,
+    ) -> Result<Option<XcmSimulationRow>, IndexError>;
+
+    /// The legs previewed FROM one call simulation — the stitch, read from the
+    /// provenance columns rather than guessed at from program bytes. Two
+    /// identical programs queued by two different calls are two facts, and only
+    /// the source columns can tell them apart.
+    async fn legs(
+        &self,
+        source_chain_id: &str,
+        source_input_hash: &str,
+        limit: u32,
+    ) -> Result<Vec<XcmSimulationRow>, IndexError>;
+}
+
+/// Which of a run's forwarded messages are its own — rendered once, for both the
+/// sending and the receiving side.
+///
+/// ONE BUILDER, TWO CALLERS, because the three shapes it distinguishes are the
+/// whole honesty of the feature and they must not drift apart: no baseline at
+/// all, a baseline link whose row is missing, and a real difference. The middle
+/// one is not pedantry — a recorded link pointing at nothing is a bug, and
+/// collapsing it into "no baseline" would hide it.
+fn attribution_json(
+    baseline_hash: Option<&str>,
+    baseline: Option<(&serde_json::Value, Option<&str>)>,
+    subject_forwarded: &serde_json::Value,
+) -> serde_json::Value {
+    let Some(hash) = baseline_hash else {
+        return serde_json::json!({
+            "baseline": null,
+            "reads_as": "no no-op run was recorded at this state, so NOTHING in \
+                         forwarded_xcms is attributable to this run — read it as 'messages \
+                         present', never as 'this would send these'",
+        });
+    };
+    let Some((baseline_forwarded, baseline_label)) = baseline else {
+        return serde_json::json!({
+            "baseline": hash,
+            "reads_as": "this row names a baseline that is not in the index — the link is \
+                         recorded and the row it points at is missing, so nothing is \
+                         attributed here",
+        });
+    };
+    let a = sim::attribute_forwarded(subject_forwarded, baseline_forwarded);
+    let reads_as = if a.total_messages == 0 {
+        "no forwarded messages were reported at all, so this run queues nothing of its own"
+            .to_string()
+    } else if a.attributed_messages == 0 {
+        "every message in forwarded_xcms was already in flight at this state: this run \
+         queues nothing of its own"
+            .to_string()
+    } else {
+        format!(
+            "{} of {} forwarded message(s) are this run's own; the other {} were already in \
+             flight at this state",
+            a.attributed_messages,
+            a.total_messages,
+            a.total_messages - a.attributed_messages
+        )
+    };
+    serde_json::json!({
+        "baseline": hash,
+        "baseline_run": baseline_label,
+        "attributed_messages": a.attributed_messages,
+        "ambient_messages": a.ambient_messages,
+        "total_messages": a.total_messages,
+        "destinations": a.destinations,
+        "reads_as": reads_as,
+    })
 }
 
 /// The empty backend — what a memory-mode node serves, and what every endpoint
@@ -837,6 +983,121 @@ impl SimIndex for MemorySimIndex {
         out.truncate(limit as usize);
         Ok(out)
     }
+
+    async fn simulation_at(
+        &self,
+        chain_id: &str,
+        at_block_hash: &str,
+        input_hash: &str,
+        tier: &str,
+    ) -> Result<Option<SimulationRow>, IndexError> {
+        let rows = self.rows.read().map_err(|e| IndexError(e.to_string()))?;
+        Ok(rows
+            .iter()
+            .find(|r| {
+                r.chain_id == chain_id
+                    && r.at_block_hash == at_block_hash
+                    && r.input_hash == input_hash
+                    && r.tier == tier
+            })
+            .cloned())
+    }
+}
+
+/// The empty XCM-simulation backend — what a memory-mode node serves.
+#[derive(Default)]
+pub struct MemoryXcmSimIndex {
+    rows: RwLock<Vec<XcmSimulationRow>>,
+}
+
+impl MemoryXcmSimIndex {
+    pub fn new() -> Self {
+        Self::default()
+    }
+    pub fn insert(&self, row: XcmSimulationRow) {
+        self.rows.write().expect("lock").push(row);
+    }
+}
+
+#[async_trait]
+impl XcmSimIndex for MemoryXcmSimIndex {
+    async fn xcm_simulations(
+        &self,
+        chain_id: &str,
+        program_hash: &str,
+        limit: u32,
+    ) -> Result<Vec<XcmSimulationRow>, IndexError> {
+        let rows = self.rows.read().map_err(|e| IndexError(e.to_string()))?;
+        let mut out: Vec<XcmSimulationRow> = rows
+            .iter()
+            .filter(|r| r.chain_id == chain_id && r.program_hash == program_hash)
+            .cloned()
+            .collect();
+        sort_xcm_rows(&mut out);
+        out.truncate(limit as usize);
+        Ok(out)
+    }
+
+    async fn xcm_simulation_at(
+        &self,
+        chain_id: &str,
+        at_block_hash: &str,
+        input_hash: &str,
+        tier: &str,
+    ) -> Result<Option<XcmSimulationRow>, IndexError> {
+        let rows = self.rows.read().map_err(|e| IndexError(e.to_string()))?;
+        Ok(rows
+            .iter()
+            .find(|r| {
+                r.chain_id == chain_id
+                    && r.at_block_hash == at_block_hash
+                    && r.input_hash == input_hash
+                    && r.tier == tier
+            })
+            .cloned())
+    }
+
+    async fn legs(
+        &self,
+        source_chain_id: &str,
+        source_input_hash: &str,
+        limit: u32,
+    ) -> Result<Vec<XcmSimulationRow>, IndexError> {
+        let rows = self.rows.read().map_err(|e| IndexError(e.to_string()))?;
+        let mut out: Vec<XcmSimulationRow> = rows
+            .iter()
+            .filter(|r| {
+                r.source_chain_id.as_deref() == Some(source_chain_id)
+                    && r.source_input_hash.as_deref() == Some(source_input_hash)
+            })
+            .cloned()
+            .collect();
+        // Legs are ordered by their position in the sender's own list, not by
+        // height: they are a SEQUENCE the sender produced, and "newest first"
+        // would shuffle a journey's own legs.
+        out.sort_by(|a, b| {
+            a.source_forwarded_index
+                .cmp(&b.source_forwarded_index)
+                .then_with(|| a.source_message_index.cmp(&b.source_message_index))
+                .then_with(|| a.chain_id.cmp(&b.chain_id))
+                .then_with(|| a.at_block_hash.cmp(&b.at_block_hash))
+        });
+        out.truncate(limit as usize);
+        Ok(out)
+    }
+}
+
+/// Byte-identical ordering to the Pg backend (Rust's String Ord is byte-wise,
+/// which is what `collate "C"` asks Postgres for), full key as the tie-break —
+/// without it `limit` returns different rows from the two backends.
+fn sort_xcm_rows(rows: &mut [XcmSimulationRow]) {
+    rows.sort_by(|a, b| {
+        b.at_height
+            .cmp(&a.at_height)
+            .then_with(|| a.input_hash.cmp(&b.input_hash))
+            .then_with(|| a.at_block_hash.cmp(&b.at_block_hash))
+            .then_with(|| a.tier.cmp(&b.tier))
+    });
 }
 
 /// What a Tier 1 answer does NOT model. Repeated in every simulation response
@@ -853,19 +1114,18 @@ pub fn sim_not_covered() -> Vec<&'static str> {
         "a whitelisted-call flow needs its authorization to already exist in storage; \
          previewing one before the Fellowship has whitelisted it fails honestly rather \
          than predicting the enacted outcome (Tier 2 sets that state up — Phase 3)",
-        "forwarded_xcms is not what the DESTINATION would do — the receiving side is \
-         dry_run_xcm on that chain, which lands with the XCM module",
-        "forwarded_xcms IS NOT ALWAYS ATTRIBUTABLE TO THE SIMULATED CALL, and on the \
-         Polkadot relay it is not attributable at all: measured at relay #24448717 and \
-         #24448722, a `system.remark` under Root — which queues nothing — returns 64 \
-         destinations carrying 74 messages, including a real 8,935 DOT \
-         ReserveAssetDeposited bound for parachain 2040. Two DIFFERENT calls at one state, \
-         and one call at two states, all return byte-identical lists, so the content is a \
-         property of the STATE (the relay router enumerating every parachain's existing \
-         downward queue) and not of the call. Asset Hub does not behave this way: every \
-         call simulated there returns an empty list. Until a later slice differences the \
-         answer against a no-op run at the same state, treat a non-empty forwarded_xcms as \
-         'messages present', never as 'this call would send these'",
+        "forwarded_xcms is not what the DESTINATION would do — that is dry_run_xcm ON THAT \
+         CHAIN, and it is a separate run that somebody has to have made",
+        "forwarded_xcms IS NOT ALWAYS ATTRIBUTABLE TO THE SIMULATED CALL, and a raw list on \
+         a simulation row is never claimed to be: measured at relay #24448717 and #24448722, \
+         a `system.remark` under Root — which queues nothing — returns 64 destinations \
+         carrying 74 messages, including a real 8,935 DOT ReserveAssetDeposited bound for \
+         parachain 2040, byte-identical across two different calls and two different blocks. \
+         The list is a property of the STATE (the relay router enumerating every parachain's \
+         existing downward queue), not of the call; Asset Hub returns an empty list for the \
+         same shape of call. Read it as 'messages present at this state', never as 'this \
+         call would send these' — /v1/sim/{chain}/calls/{call_hash} differences it against \
+         the no-op baseline recorded beside it and reports what is attributable",
         "a status of `executed` is about the OUTER call: utility.batch returns Ok when an \
          inner call fails (emitting BatchInterrupted) and force_batch carries on past one \
          (ItemFailed), so a half-applied batch dispatches successfully. Such a run carries a \
@@ -876,6 +1136,66 @@ pub fn sim_not_covered() -> Vec<&'static str> {
          artifact we index. The chain does record it once, in the submitting \
          `referenda.submit` call's `proposal_origin` argument; reading that back as a \
          suggested origin is a later slice",
+    ]
+}
+
+/// The limits of the ATTRIBUTION, shipped by the two endpoints that compute one
+/// and by nothing else.
+///
+/// SEPARATE FROM `sim_not_covered` ON PURPOSE, and it carries no line about
+/// `legs`. These lines name a field — `forwarded_attribution` — and a line that
+/// describes a field belongs only to responses that HAVE the field. This project
+/// has twice shipped a shared `not_covered` helper whose first line was false on
+/// the second endpoint that served it (slice 3's journey list, slice 4's
+/// boundary sentence); `legs` exists on the call endpoint alone and is described
+/// there alone.
+pub fn sim_attribution_not_covered() -> Vec<&'static str> {
+    vec![
+        "`forwarded_attribution` is forwarded_xcms MINUS a no-op run at the same state, and \
+         it is the only half of this response that may be read as 'this run would send \
+         these'. When it reports `baseline: null` no no-op was recorded and nothing here is \
+         attributable at all",
+        "attribution is a MULTISET DIFFERENCE by exact rendering, so a message this run \
+         really sends that is byte-identical to one already in flight is counted as ambient \
+         and drops out of the attributed set. That under-claims rather than over-claims — \
+         and the raw forwarded_xcms is kept beside it so the discrepancy is visible",
+    ]
+}
+
+/// What a PREVIEWED ARRIVAL does not model. Shipped with every `dry_run_xcm`
+/// response and with every `legs` entry, because the receiving side has limits
+/// the sending side does not — and two of them are about TIME rather than about
+/// XCM.
+pub fn xcm_sim_not_covered() -> Vec<&'static str> {
+    vec![
+        "the receiving chain is previewed at ITS OWN state now, not at the state the message \
+         would actually arrive in. A cross-chain message takes blocks to travel and the two \
+         chains do not share a clock, so a leg previewed against today's Hydration is a \
+         statement about today's reserves, fees and asset registry",
+        "delivery is ASSUMED. This answers 'if this program arrived, what would happen' — it \
+         does not model the channel: a message that is never queued, dropped by a \
+         weight-starved XCMP enqueue, or stuck behind an unopened HRMP channel would still \
+         preview exactly like one that arrives",
+        "a status of `not_started` is upstream's Outcome::Error and means execution never \
+         began — usually a barrier rejection. It is the one outcome the SENDING chain cannot \
+         see: its own `Sent` event, and therefore our own indexed sending half, would look \
+         perfectly successful",
+        "the origin location is what the caller (or the registry, for a followed leg) said the \
+         sender is. Barriers and origin conversion turn on exactly that value, so a preview \
+         from the wrong origin fails plausibly rather than obviously",
+        "this row's own forwarded_xcms carries the same ambient-traffic caveat the call side \
+         does. On /v1/sim/{chain}/xcm/{program_hash} it is differenced against the \
+         EMPTY-PROGRAM run recorded at the same state and the result is \
+         `forwarded_attribution`; anywhere a row is embedded WITHOUT that field — as a `leg` \
+         of a call simulation, say — the list is raw, and reads as 'messages present at this \
+         state' and never as 'this program would send these'",
+        "the baseline is an empty program AT THE SUBJECT'S OWN XCM VERSION, because \
+         dry_run_xcm renders its forwarded list in the version it was asked in. A subject at \
+         V4 and a baseline at V5 would produce two lists that cannot be differenced, and \
+         every ambient message would then be attributed to this program",
+        "no fee estimate and no weight limit: XcmPaymentApi is not called by this tier yet, so \
+         a program that would run out of purchased weight on arrival is not distinguished \
+         here from one that would not",
     ]
 }
 
@@ -2570,8 +2890,72 @@ pub mod pg {
         }
     }
 
+    /// Every column `SimulationRow` needs, named once so the two readers below
+    /// cannot drift apart — a `select` that lists them in two places is a
+    /// transposition waiting for a column of the same type to be added.
+    const SIM_COLUMNS: &str = "chain_id, at_height, at_block_hash, input_hash, tier, call_hash, \
+         call_summary, origin_spec, origin_json, xcm_version, status, dispatch_ok, \
+         dispatch_error, emitted_events, event_count, local_xcm, forwarded_xcms, effects, note, \
+         spec_version, api_version, metadata_version, sim_version, raw_location, observed_at, \
+         baseline_input_hash";
+
+    fn sim_row(r: &sqlx::postgres::PgRow) -> Result<super::SimulationRow, IndexError> {
+        use sqlx::Row as _;
+        let err = |e: sqlx::Error| IndexError(e.to_string());
+        Ok(super::SimulationRow {
+            chain_id: r.try_get("chain_id").map_err(err)?,
+            at_height: r.try_get::<i64, _>("at_height").map_err(err)? as u64,
+            at_block_hash: r.try_get("at_block_hash").map_err(err)?,
+            input_hash: r.try_get("input_hash").map_err(err)?,
+            tier: r.try_get("tier").map_err(err)?,
+            call_hash: r.try_get("call_hash").map_err(err)?,
+            call_summary: r.try_get("call_summary").map_err(err)?,
+            origin_spec: r.try_get("origin_spec").map_err(err)?,
+            origin: r.try_get("origin_json").map_err(err)?,
+            xcm_version: r.try_get::<i32, _>("xcm_version").map_err(err)? as u32,
+            status: r.try_get("status").map_err(err)?,
+            dispatch_ok: r.try_get("dispatch_ok").map_err(err)?,
+            dispatch_error: r.try_get("dispatch_error").map_err(err)?,
+            emitted_events: r.try_get("emitted_events").map_err(err)?,
+            event_count: r.try_get::<i32, _>("event_count").map_err(err)? as u32,
+            local_xcm: r.try_get("local_xcm").map_err(err)?,
+            forwarded_xcms: r.try_get("forwarded_xcms").map_err(err)?,
+            effects: r.try_get("effects").map_err(err)?,
+            note: r.try_get("note").map_err(err)?,
+            spec_version: r.try_get::<i64, _>("spec_version").map_err(err)? as u64,
+            api_version: r.try_get::<i32, _>("api_version").map_err(err)? as u32,
+            metadata_version: r.try_get::<i32, _>("metadata_version").map_err(err)? as u32,
+            sim_version: r.try_get::<i32, _>("sim_version").map_err(err)? as u32,
+            raw_location: r.try_get("raw_location").map_err(err)?,
+            observed_at: r.try_get("observed_at").map_err(err)?,
+            baseline_input_hash: r.try_get("baseline_input_hash").map_err(err)?,
+        })
+    }
+
     #[async_trait]
     impl super::SimIndex for PgSimIndex {
+        async fn simulation_at(
+            &self,
+            chain_id: &str,
+            at_block_hash: &str,
+            input_hash: &str,
+            tier: &str,
+        ) -> Result<Option<super::SimulationRow>, IndexError> {
+            // The full primary key, so this is a single-row lookup on it.
+            let row = sqlx::query(&format!(
+                "select {SIM_COLUMNS} from sim.simulation_results \
+                 where chain_id = $1 and at_block_hash = $2 and input_hash = $3 and tier = $4"
+            ))
+            .bind(chain_id)
+            .bind(at_block_hash)
+            .bind(input_hash)
+            .bind(tier)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| IndexError(e.to_string()))?;
+            row.as_ref().map(sim_row).transpose()
+        }
+
         async fn simulations(
             &self,
             chain_id: &str,
@@ -2581,24 +2965,18 @@ pub mod pg {
             // (chain_id, call_hash, at_height desc) is simulation_results_call_idx
             // verbatim — the index and its one reader ship together (0014).
             //
-            // Read by COLUMN NAME rather than into a tuple: this row has 24
+            // Read by COLUMN NAME rather than into a tuple: this row has 26
             // columns and sqlx only implements FromRow for tuples up to 16, so a
             // tuple here does not compile. Naming the columns is also the safer
             // shape for a row this wide — a reordered select cannot silently
             // transpose two same-typed fields.
-            use sqlx::Row as _;
-            let rows = sqlx::query(
-                "select chain_id, at_height, at_block_hash, input_hash, tier, call_hash, \
-                        call_summary, origin_spec, origin_json, xcm_version, status, \
-                        dispatch_ok, dispatch_error, emitted_events, event_count, local_xcm, \
-                        forwarded_xcms, effects, note, spec_version, api_version, \
-                        metadata_version, sim_version, raw_location, observed_at \
-                 from sim.simulation_results \
+            let rows = sqlx::query(&format!(
+                "select {SIM_COLUMNS} from sim.simulation_results \
                  where chain_id = $1 and call_hash = $2 \
                  order by at_height desc, input_hash collate \"C\", \
                           at_block_hash collate \"C\", tier collate \"C\" \
-                 limit $3",
-            )
+                 limit $3"
+            ))
             .bind(chain_id)
             .bind(call_hash)
             .bind(limit as i64)
@@ -2606,40 +2984,151 @@ pub mod pg {
             .await
             .map_err(|e| IndexError(e.to_string()))?;
 
-            let err = |e: sqlx::Error| IndexError(e.to_string());
-            rows.into_iter()
-                .map(|r| {
-                    Ok(super::SimulationRow {
-                        chain_id: r.try_get("chain_id").map_err(err)?,
-                        at_height: r.try_get::<i64, _>("at_height").map_err(err)? as u64,
-                        at_block_hash: r.try_get("at_block_hash").map_err(err)?,
-                        input_hash: r.try_get("input_hash").map_err(err)?,
-                        tier: r.try_get("tier").map_err(err)?,
-                        call_hash: r.try_get("call_hash").map_err(err)?,
-                        call_summary: r.try_get("call_summary").map_err(err)?,
-                        origin_spec: r.try_get("origin_spec").map_err(err)?,
-                        origin: r.try_get("origin_json").map_err(err)?,
-                        xcm_version: r.try_get::<i32, _>("xcm_version").map_err(err)? as u32,
-                        status: r.try_get("status").map_err(err)?,
-                        dispatch_ok: r.try_get("dispatch_ok").map_err(err)?,
-                        dispatch_error: r.try_get("dispatch_error").map_err(err)?,
-                        emitted_events: r.try_get("emitted_events").map_err(err)?,
-                        event_count: r.try_get::<i32, _>("event_count").map_err(err)? as u32,
-                        local_xcm: r.try_get("local_xcm").map_err(err)?,
-                        forwarded_xcms: r.try_get("forwarded_xcms").map_err(err)?,
-                        effects: r.try_get("effects").map_err(err)?,
-                        note: r.try_get("note").map_err(err)?,
-                        spec_version: r.try_get::<i64, _>("spec_version").map_err(err)? as u64,
-                        api_version: r.try_get::<i32, _>("api_version").map_err(err)? as u32,
-                        metadata_version: r
-                            .try_get::<i32, _>("metadata_version")
-                            .map_err(err)? as u32,
-                        sim_version: r.try_get::<i32, _>("sim_version").map_err(err)? as u32,
-                        raw_location: r.try_get("raw_location").map_err(err)?,
-                        observed_at: r.try_get("observed_at").map_err(err)?,
-                    })
-                })
-                .collect()
+            rows.iter().map(sim_row).collect()
+        }
+    }
+
+    /// Postgres-backed reads over `sim.xcm_simulations`.
+    pub struct PgXcmSimIndex {
+        pool: PgPool,
+    }
+
+    impl PgXcmSimIndex {
+        pub fn new(pool: PgPool) -> Self {
+            Self { pool }
+        }
+    }
+
+    const XCM_SIM_COLUMNS: &str = "chain_id, at_height, at_block_hash, input_hash, tier, \
+         program_hash, program, program_summary, origin_location, origin_ref, status, \
+         weight_used, xcm_error, emitted_events, event_count, forwarded_xcms, \
+         baseline_input_hash, effects, note, source_chain_id, source_at_block_hash, \
+         source_input_hash, source_forwarded_index, source_message_index, spec_version, \
+         api_version, metadata_version, sim_version, raw_location, observed_at";
+
+    fn xcm_sim_row(r: &sqlx::postgres::PgRow) -> Result<super::XcmSimulationRow, IndexError> {
+        use sqlx::Row as _;
+        let err = |e: sqlx::Error| IndexError(e.to_string());
+        Ok(super::XcmSimulationRow {
+            chain_id: r.try_get("chain_id").map_err(err)?,
+            at_height: r.try_get::<i64, _>("at_height").map_err(err)? as u64,
+            at_block_hash: r.try_get("at_block_hash").map_err(err)?,
+            input_hash: r.try_get("input_hash").map_err(err)?,
+            tier: r.try_get("tier").map_err(err)?,
+            program_hash: r.try_get("program_hash").map_err(err)?,
+            program: r.try_get("program").map_err(err)?,
+            program_summary: r.try_get("program_summary").map_err(err)?,
+            origin_location: r.try_get("origin_location").map_err(err)?,
+            origin_ref: r.try_get("origin_ref").map_err(err)?,
+            status: r.try_get("status").map_err(err)?,
+            weight_used: r.try_get("weight_used").map_err(err)?,
+            xcm_error: r.try_get("xcm_error").map_err(err)?,
+            emitted_events: r.try_get("emitted_events").map_err(err)?,
+            event_count: r.try_get::<i32, _>("event_count").map_err(err)? as u32,
+            forwarded_xcms: r.try_get("forwarded_xcms").map_err(err)?,
+            baseline_input_hash: r.try_get("baseline_input_hash").map_err(err)?,
+            effects: r.try_get("effects").map_err(err)?,
+            note: r.try_get("note").map_err(err)?,
+            source_chain_id: r.try_get("source_chain_id").map_err(err)?,
+            source_at_block_hash: r.try_get("source_at_block_hash").map_err(err)?,
+            source_input_hash: r.try_get("source_input_hash").map_err(err)?,
+            source_forwarded_index: r
+                .try_get::<Option<i32>, _>("source_forwarded_index")
+                .map_err(err)?
+                .map(|n| n as u32),
+            source_message_index: r
+                .try_get::<Option<i32>, _>("source_message_index")
+                .map_err(err)?
+                .map(|n| n as u32),
+            spec_version: r.try_get::<i64, _>("spec_version").map_err(err)? as u64,
+            api_version: r.try_get::<i32, _>("api_version").map_err(err)? as u32,
+            metadata_version: r.try_get::<i32, _>("metadata_version").map_err(err)? as u32,
+            sim_version: r.try_get::<i32, _>("sim_version").map_err(err)? as u32,
+            raw_location: r.try_get("raw_location").map_err(err)?,
+            observed_at: r.try_get("observed_at").map_err(err)?,
+        })
+    }
+
+    #[async_trait]
+    impl super::XcmSimIndex for PgXcmSimIndex {
+        async fn xcm_simulation_at(
+            &self,
+            chain_id: &str,
+            at_block_hash: &str,
+            input_hash: &str,
+            tier: &str,
+        ) -> Result<Option<super::XcmSimulationRow>, IndexError> {
+            let row = sqlx::query(&format!(
+                "select {XCM_SIM_COLUMNS} from sim.xcm_simulations \
+                 where chain_id = $1 and at_block_hash = $2 and input_hash = $3 and tier = $4"
+            ))
+            .bind(chain_id)
+            .bind(at_block_hash)
+            .bind(input_hash)
+            .bind(tier)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| IndexError(e.to_string()))?;
+            row.as_ref().map(xcm_sim_row).transpose()
+        }
+
+        async fn xcm_simulations(
+            &self,
+            chain_id: &str,
+            program_hash: &str,
+            limit: u32,
+        ) -> Result<Vec<super::XcmSimulationRow>, IndexError> {
+            // (chain_id, program_hash, at_height desc) is
+            // xcm_simulations_program_idx's leading columns — it covers the
+            // WHERE and the leading sort key, and the tail of the ORDER BY (the
+            // rest of the primary key, which the two backends must agree on) is
+            // an incremental sort over a tiny tied group. 0018 says the same.
+            let rows = sqlx::query(&format!(
+                "select {XCM_SIM_COLUMNS} from sim.xcm_simulations \
+                 where chain_id = $1 and program_hash = $2 \
+                 order by at_height desc, input_hash collate \"C\", \
+                          at_block_hash collate \"C\", tier collate \"C\" \
+                 limit $3"
+            ))
+            .bind(chain_id)
+            .bind(program_hash)
+            .bind(limit as i64)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| IndexError(e.to_string()))?;
+            rows.iter().map(xcm_sim_row).collect()
+        }
+
+        async fn legs(
+            &self,
+            source_chain_id: &str,
+            source_input_hash: &str,
+            limit: u32,
+        ) -> Result<Vec<super::XcmSimulationRow>, IndexError> {
+            // Ordered by the SENDER's own list positions: legs are a sequence
+            // the sender produced, and "newest first" would shuffle them.
+            //
+            // `nulls first` matches Rust's `None < Some` in the Memory backend.
+            // Unreachable today — the five source columns are written
+            // all-or-nothing and this query filters on one of them being
+            // non-null — but the two backends' orderings are a contract, and a
+            // contract that holds by accident is one nobody will notice
+            // breaking.
+            let rows = sqlx::query(&format!(
+                "select {XCM_SIM_COLUMNS} from sim.xcm_simulations \
+                 where source_chain_id = $1 and source_input_hash = $2 \
+                 order by source_forwarded_index nulls first, \
+                          source_message_index nulls first, \
+                          chain_id collate \"C\", at_block_hash collate \"C\" \
+                 limit $3"
+            ))
+            .bind(source_chain_id)
+            .bind(source_input_hash)
+            .bind(limit as i64)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| IndexError(e.to_string()))?;
+            rows.iter().map(xcm_sim_row).collect()
         }
     }
 
@@ -3800,6 +4289,7 @@ pub struct AppState {
     pub bounties: Arc<dyn BountyIndex>,
     pub assets: Arc<dyn AssetIndex>,
     pub sim: Arc<dyn SimIndex>,
+    pub xcm_sim: Arc<dyn XcmSimIndex>,
     pub xcm: Arc<dyn XcmIndex>,
     pub parse_account: AccountParser,
 }
@@ -3826,6 +4316,7 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/bounties/{network}/{id}", get(get_bounty))
         .route("/v1/assets/{chain}", get(list_assets))
         .route("/v1/sim/{chain}/calls/{call_hash}", get(get_simulations))
+        .route("/v1/sim/{chain}/xcm/{program_hash}", get(get_xcm_simulations))
         .route("/v1/xcm/{chain}/messages", get(list_xcm_messages))
         .route("/v1/xcm/messages/{message_id}", get(get_xcm_message))
         .route("/v1/xcm/journeys/{message_id}", get(get_xcm_journey))
@@ -4468,6 +4959,18 @@ async fn get_gov_referendum(
         }),
         (Some(_), false) => serde_json::json!({
             "truncated": sim_truncated,
+            // THE ATTRIBUTION IS NOT COMPUTED HERE, and saying so is the point.
+            // Working out which forwarded messages a call is responsible for
+            // costs a second read PER SIMULATION, and this response already
+            // carries up to SIM_PER_WINDOW of them per residency window — so the
+            // raw `forwarded_xcms` on each row below is exactly what the
+            // not_covered list warns it is, and the endpoint that differences it
+            // is named rather than implied.
+            "attribution_elsewhere": "each simulation here carries its raw forwarded_xcms, \
+                                      which is NOT attributable to the call on its own. \
+                                      /v1/sim/{chain}/calls/{call_hash} differences it \
+                                      against the recorded no-op baseline and reports the \
+                                      previewed arrivals",
             "not_covered": sim_not_covered(),
         }),
     };
@@ -5001,24 +5504,180 @@ async fn get_simulations(
         );
     }
     let hash = normalize_call_hash(&call_hash);
-    // clamped at 1, not 0: `?limit=0` would return an empty list under a
+    // Clamped at 1, not 0: `?limit=0` would return an empty list under a
     // coverage note that says "nobody has previewed this call", which would be
     // this endpoint stating something false about the data on the caller's own
-    // instruction
-    let limit = q.limit.unwrap_or(10).clamp(1, 100) as u32;
+    // instruction.
+    //
+    // AND CLAMPED AT 25 RATHER THAN 100 SINCE SLICE 5, because the endpoint went
+    // from one query to 2N+1: every row now costs a baseline lookup and a legs
+    // lookup. Both are single-key reads on indexes that exist, but 201 round
+    // trips on a public GET is not a shape to leave lying around.
+    let limit = q.limit.unwrap_or(10).clamp(1, 25) as u32;
     let rows = match state.sim.simulations(&chain, &hash, limit).await {
         Ok(r) => r,
         Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     };
+
+    // Each row is enriched with the two things a raw forwarded list cannot say
+    // on its own: WHICH of those messages this call is responsible for, and what
+    // the destinations did with the ones anybody previewed. Both are reads over
+    // rows that already carry lineage — the attribution is a pure difference of
+    // two stored columns and is deliberately not materialised anywhere, the same
+    // argument that kept `treasury.consolidated_position` and the XCM journey
+    // out of the schema.
+    //
+    // COST, stated because it is two extra queries PER ROW: the limit is clamped
+    // to 100 and defaults to 10, and both reads are single-key lookups on
+    // indexes that exist. This endpoint is not the omnibox.
+    let mut simulations = Vec::with_capacity(rows.len());
+    for row in rows {
+        let baseline = match &row.baseline_input_hash {
+            None => None,
+            Some(h) => {
+                match state
+                    .sim
+                    .simulation_at(&chain, &row.at_block_hash, h, &row.tier)
+                    .await
+                {
+                    Ok(b) => b,
+                    Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+                }
+            }
+        };
+        let attribution = attribution_json(
+            row.baseline_input_hash.as_deref(),
+            baseline
+                .as_ref()
+                .map(|b| (&b.forwarded_xcms, b.call_summary.as_deref())),
+            &row.forwarded_xcms,
+        );
+
+        let legs = match state.xcm_sim.legs(&chain, &row.input_hash, 25).await {
+            Ok(l) => l,
+            Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+        };
+        // NO SILENT DEFAULT HERE. `unwrap_or(json!({}))` would serve a
+        // simulation with no chain, no status and no lineage, and
+        // `unwrap_or_default()` on the legs would render `null` where `[]` means
+        // "nobody followed them" — a distinction this endpoint's own coverage
+        // text turns on. Unreachable today, which is exactly when such a default
+        // gets written and then survives a shape change (the same argument
+        // `SimRecord::new` makes about `event_count` beside an empty list).
+        let (mut value, legs) = match (
+            serde_json::to_value(&row),
+            serde_json::to_value(&legs),
+        ) {
+            (Ok(v), Ok(l)) => (v, l),
+            _ => {
+                return error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "a recorded simulation could not be serialized".to_string(),
+                )
+            }
+        };
+        if let Some(obj) = value.as_object_mut() {
+            obj.insert("forwarded_attribution".into(), attribution);
+            obj.insert("legs".into(), legs);
+        }
+        simulations.push(value);
+    }
+
     Json(serde_json::json!({
         "chain": chain,
         "call_hash": hash,
-        "simulations": rows,
+        "simulations": simulations,
         "coverage": {
             "recorded_only": "this endpoint serves simulations that were RUN; it never \
                               starts one. An empty list means nobody has previewed this \
                               call at any state, not that the call does nothing",
+            // `legs` lives on THIS endpoint only, so its caveat does too rather
+            // than riding in a shared list that another response also serves.
+            "legs_are_recorded_too": "`legs` holds the previewed ARRIVALS of this call's own \
+                                      forwarded messages, run by `simulate-forwarded`. An \
+                                      empty list means nobody followed them; a destination \
+                                      dotlens does not index is followed to that boundary \
+                                      and no further, and leaves no leg behind. A leg is \
+                                      rendered here with its RAW forwarded_xcms — the \
+                                      difference for a leg's own onward messages is on \
+                                      /v1/sim/{chain}/xcm/{program_hash}",
             "not_covered": sim_not_covered(),
+            "attribution_not_covered": sim_attribution_not_covered(),
+            "arrival_not_covered": xcm_sim_not_covered(),
+        },
+    }))
+    .into_response()
+}
+
+/// Recorded Tier 1 previews of one arriving PROGRAM, on one chain.
+///
+/// The program hash is blake2b-256 of the encoded `VersionedXcm`, so anyone
+/// holding the same bytes can recompute it and ask this question without
+/// dotlens' help — the same property `call_hash` has on the sending side.
+async fn get_xcm_simulations(
+    State(state): State<AppState>,
+    Path((chain, program_hash)): Path<(String, String)>,
+    Query(q): Query<SimQuery>,
+) -> Response {
+    if state.registry.chain(&chain).is_none() {
+        return error(StatusCode::NOT_FOUND, format!("unknown chain '{chain}'"));
+    }
+    let hash = normalize_call_hash(&program_hash);
+    let limit = q.limit.unwrap_or(10).clamp(1, 25) as u32;
+    let rows = match state.xcm_sim.xcm_simulations(&chain, &hash, limit).await {
+        Ok(r) => r,
+        Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    };
+
+    // The SAME difference the call side gets, over the same builder. Shipping it
+    // on only one of the two tables would have left the identical defect one hop
+    // along the journey this slice exists to follow — which is what the
+    // migration's own comment promises, and a promise made in a schema is kept
+    // in a reader or not at all.
+    let mut simulations = Vec::with_capacity(rows.len());
+    for row in rows {
+        let baseline = match &row.baseline_input_hash {
+            None => None,
+            Some(h) => {
+                match state
+                    .xcm_sim
+                    .xcm_simulation_at(&chain, &row.at_block_hash, h, &row.tier)
+                    .await
+                {
+                    Ok(b) => b,
+                    Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+                }
+            }
+        };
+        let attribution = attribution_json(
+            row.baseline_input_hash.as_deref(),
+            baseline
+                .as_ref()
+                .map(|b| (&b.forwarded_xcms, b.program_summary.as_deref())),
+            &row.forwarded_xcms,
+        );
+        let Ok(mut value) = serde_json::to_value(&row) else {
+            return error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "a recorded preview could not be serialized".to_string(),
+            );
+        };
+        if let Some(obj) = value.as_object_mut() {
+            obj.insert("forwarded_attribution".into(), attribution);
+        }
+        simulations.push(value);
+    }
+
+    Json(serde_json::json!({
+        "chain": chain,
+        "program_hash": hash,
+        "simulations": simulations,
+        "coverage": {
+            "recorded_only": "this endpoint serves previews that were RUN; it never starts \
+                              one. An empty list means nobody has previewed this program on \
+                              this chain, not that the program does nothing",
+            "not_covered": xcm_sim_not_covered(),
+            "attribution_not_covered": sim_attribution_not_covered(),
         },
     }))
     .into_response()
@@ -6217,6 +6876,18 @@ pub(crate) mod tests {
     use std::path::Path as FsPath;
     use tower::util::ServiceExt;
 
+    /// A `VersionedLocation` and a `VersionedXcm` in the shapes this decoder
+    /// really produces — the attribution below compares them by exact rendering,
+    /// so hand-writing two different shapes on the two sides would make the
+    /// difference pass for the wrong reason.
+    fn sim_destination(para: u32) -> serde_json::Value {
+        serde_json::json!({"V4": [{"parents": 1, "interior":
+            {"X1": [[{"Parachain": [para]}]]}}]})
+    }
+    fn sim_msg(n: u32) -> serde_json::Value {
+        serde_json::json!({"V4": [[[{"Transact": {"call": {"encoded": [n]}}}]]]})
+    }
+
     pub(crate) async fn test_state() -> AppState {
         let seeds = FsPath::new(env!("CARGO_MANIFEST_DIR")).join("../../registry-seeds");
         let registry = Arc::new(Registry::load_from_dir(&seeds).expect("seeds"));
@@ -6328,16 +6999,169 @@ pub(crate) mod tests {
             ]),
             event_count: 1,
             local_xcm: None,
-            forwarded_xcms: serde_json::json!([]),
+            // TWO messages to one destination, of which ONE was already in
+            // flight — the relay's shape in miniature, so the difference below
+            // is a real subtraction rather than a copy.
+            forwarded_xcms: serde_json::json!([
+                {"destination": sim_destination(2034), "messages": [sim_msg(1), sim_msg(9)]}
+            ]),
             effects: serde_json::json!({"Ok": [{"emitted_events": []}]}),
             note: None,
             spec_version: 2_003_002,
             api_version: 2,
             metadata_version: 15,
-            sim_version: 1,
+            sim_version: 2,
             raw_location: "raw/polkadot-asset-hub/sim/cd/01/\
                            DryRunApi_dry_run_call.response.scale"
                 .into(),
+            observed_at: None,
+            baseline_input_hash: Some(format!("0x{}", "02".repeat(32))),
+        });
+        // THE BASELINE: an ordinary recorded row, which is the whole design —
+        // `system.remark()` at the same state, whose forwarded list is the
+        // ambient queue. It is its own baseline.
+        sim.insert(SimulationRow {
+            chain_id: "polkadot-asset-hub".into(),
+            at_height: 19_000_500,
+            at_block_hash: format!("0x{}", "cd".repeat(32)),
+            input_hash: format!("0x{}", "02".repeat(32)),
+            tier: "dry_run".into(),
+            call_hash: format!("0x{}", "ba".repeat(32)),
+            call_summary: Some("system.remark".into()),
+            origin_spec: "root".into(),
+            origin: serde_json::json!({"resolved": "system:Root"}),
+            xcm_version: 4,
+            status: "executed".into(),
+            dispatch_ok: Some(true),
+            dispatch_error: None,
+            emitted_events: serde_json::json!([]),
+            event_count: 0,
+            local_xcm: None,
+            forwarded_xcms: serde_json::json!([
+                {"destination": sim_destination(2034), "messages": [sim_msg(1)]}
+            ]),
+            effects: serde_json::json!({"Ok": []}),
+            note: None,
+            spec_version: 2_003_002,
+            api_version: 2,
+            metadata_version: 15,
+            sim_version: 2,
+            raw_location: "raw/polkadot-asset-hub/sim/cd/02/\
+                           DryRunApi_dry_run_call.response.scale"
+                .into(),
+            observed_at: None,
+            baseline_input_hash: Some(format!("0x{}", "02".repeat(32))),
+        });
+        // A THIRD row with NO baseline at all — every row recorded before slice
+        // 5 looks like this, and the endpoint must say so rather than let the
+        // raw list read as attributed.
+        sim.insert(SimulationRow {
+            chain_id: "polkadot-asset-hub".into(),
+            at_height: 19_000_400,
+            at_block_hash: format!("0x{}", "ce".repeat(32)),
+            input_hash: format!("0x{}", "03".repeat(32)),
+            tier: "dry_run".into(),
+            call_hash: format!("0x{}", "cc".repeat(32)),
+            call_summary: Some("system.remark".into()),
+            origin_spec: "root".into(),
+            origin: serde_json::json!({"resolved": "system:Root"}),
+            xcm_version: 4,
+            status: "executed".into(),
+            dispatch_ok: Some(true),
+            dispatch_error: None,
+            emitted_events: serde_json::json!([]),
+            event_count: 0,
+            local_xcm: None,
+            forwarded_xcms: serde_json::json!([
+                {"destination": sim_destination(2040), "messages": [sim_msg(5)]}
+            ]),
+            effects: serde_json::json!({"Ok": []}),
+            note: None,
+            spec_version: 2_003_002,
+            api_version: 2,
+            metadata_version: 15,
+            sim_version: 1,
+            raw_location: "raw/polkadot-asset-hub/sim/ce/03/\
+                           DryRunApi_dry_run_call.response.scale"
+                .into(),
+            observed_at: None,
+            baseline_input_hash: None,
+        });
+
+        // ONE PREVIEWED ARRIVAL, stitched to the subject above by its source
+        // columns: the message the call really queued, previewed on the chain it
+        // was addressed to — and REJECTED AT THE BARRIER, which is the outcome
+        // the sending chain structurally cannot see.
+        let xcm_sim = Arc::new(MemoryXcmSimIndex::new());
+        xcm_sim.insert(XcmSimulationRow {
+            chain_id: "hydration".into(),
+            at_height: 13_663_124,
+            at_block_hash: format!("0x{}", "de".repeat(32)),
+            input_hash: format!("0x{}", "04".repeat(32)),
+            tier: "dry_run".into(),
+            program_hash: format!("0x{}", "aa".repeat(32)),
+            program: sim_msg(9),
+            program_summary: Some("ReserveAssetDeposited → BuyExecution → DepositAsset".into()),
+            origin_location: serde_json::json!({"V4": [{"parents": 1, "interior":
+                {"X1": [[{"Parachain": [1000]}]]}}]}),
+            origin_ref: "para:1000".into(),
+            status: "not_started".into(),
+            weight_used: None,
+            xcm_error: Some(serde_json::json!({"index": 0, "error": {"Barrier": []}})),
+            emitted_events: serde_json::json!([]),
+            event_count: 0,
+            forwarded_xcms: serde_json::json!([]),
+            baseline_input_hash: Some(format!("0x{}", "05".repeat(32))),
+            effects: serde_json::json!({"Ok": []}),
+            note: Some("execution NEVER STARTED (Outcome::Error)".into()),
+            source_chain_id: Some("polkadot-asset-hub".into()),
+            source_at_block_hash: Some(format!("0x{}", "cd".repeat(32))),
+            source_input_hash: Some(format!("0x{}", "01".repeat(32))),
+            source_forwarded_index: Some(0),
+            source_message_index: Some(1),
+            spec_version: 435,
+            api_version: 2,
+            metadata_version: 15,
+            sim_version: 2,
+            raw_location: "raw/hydration/sim/de/04/DryRunApi_dry_run_xcm.response.scale".into(),
+            observed_at: None,
+        });
+        // ITS BASELINE: the empty program at the same state, whose forwarded
+        // list is Hydration's ambient queue. An ordinary row, its own baseline —
+        // and the reason the arrival endpoint can difference anything at all.
+        xcm_sim.insert(XcmSimulationRow {
+            chain_id: "hydration".into(),
+            at_height: 13_663_124,
+            at_block_hash: format!("0x{}", "de".repeat(32)),
+            input_hash: format!("0x{}", "05".repeat(32)),
+            tier: "dry_run".into(),
+            program_hash: format!("0x{}", "bb".repeat(32)),
+            program: serde_json::json!({"V4": [[[]]]}),
+            program_summary: Some("(empty program)".into()),
+            origin_location: serde_json::json!({"V4": [{"parents": 1, "interior":
+                {"X1": [[{"Parachain": [1000]}]]}}]}),
+            origin_ref: "para:1000".into(),
+            status: "complete".into(),
+            weight_used: Some(serde_json::json!({"ref_time": 0, "proof_size": 0})),
+            xcm_error: None,
+            emitted_events: serde_json::json!([]),
+            event_count: 0,
+            forwarded_xcms: serde_json::json!([
+                {"destination": sim_destination(2030), "messages": [sim_msg(3)]}
+            ]),
+            baseline_input_hash: Some(format!("0x{}", "05".repeat(32))),
+            effects: serde_json::json!({"Ok": []}),
+            note: None,
+            source_chain_id: None,
+            source_at_block_hash: None,
+            source_input_hash: None,
+            source_forwarded_index: None,
+            source_message_index: None,
+            spec_version: 435,
+            api_version: 2,
+            metadata_version: 15,
+            sim_version: 2,
+            raw_location: "raw/hydration/sim/de/05/DryRunApi_dry_run_xcm.response.scale".into(),
             observed_at: None,
         });
 
@@ -7200,6 +8024,7 @@ pub(crate) mod tests {
             bounties,
             assets,
             sim,
+            xcm_sim,
             xcm,
             parse_account: Arc::new(|s| {
                 adapter_substrate::accounts::parse_account(s).map(|a| a.to_vec())
@@ -7702,6 +8527,149 @@ pub(crate) mod tests {
         )
         .await;
         assert_eq!(s, StatusCode::NOT_FOUND, "an unknown chain is refused, not empty");
+    }
+
+    #[tokio::test]
+    async fn a_forwarded_list_is_differenced_against_its_baseline_and_the_leg_is_stitched() {
+        let app = router(test_state().await);
+        let (status, json) = get_json(
+            &app,
+            &format!("/v1/sim/polkadot-asset-hub/calls/0x{}", "ab".repeat(32)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let sim = &json["simulations"][0];
+
+        // THE RAW LIST IS UNCHANGED and still says two messages — nothing is
+        // hidden, the difference is reported BESIDE it.
+        assert_eq!(sim["forwarded_xcms"][0]["messages"].as_array().unwrap().len(), 2);
+
+        let a = &sim["forwarded_attribution"];
+        assert_eq!(a["total_messages"], 2);
+        assert_eq!(a["ambient_messages"], 1);
+        assert_eq!(
+            a["attributed_messages"], 1,
+            "one of the two was already in flight at this state and belongs to nobody here"
+        );
+        assert_eq!(a["baseline_run"], "system.remark");
+        assert_eq!(a["destinations"][0]["destination_index"], 0);
+        assert_eq!(
+            a["destinations"][0]["messages"][0]["message_index"], 1,
+            "the index is the position in the SUBJECT's own list — what a follower needs \
+             to ask for the right bytes"
+        );
+        assert!(a["reads_as"].as_str().unwrap().contains("1 of 2"));
+
+        // THE LEG: the message this call really queued, previewed where it was
+        // addressed, and REJECTED AT THE BARRIER — the outcome the sending chain
+        // cannot see, since its own Sent event would look perfectly successful.
+        let legs = sim["legs"].as_array().expect("legs list");
+        assert_eq!(legs.len(), 1);
+        assert_eq!(legs[0]["chain_id"], "hydration");
+        assert_eq!(legs[0]["status"], "not_started");
+        assert_eq!(
+            legs[0]["origin_ref"], "para:1000",
+            "Hydration is told the sender is para 1000 — the MIRROR of the destination \
+             Asset Hub addressed, not the destination itself"
+        );
+        assert_eq!(legs[0]["source_message_index"], 1, "it is the ATTRIBUTED message");
+        assert_eq!(legs[0]["xcm_error"]["error"], serde_json::json!({"Barrier": []}));
+
+        // THE COVERAGE LISTS ARE PINNED BY PROPERTY, not by wording, because
+        // this project has twice shipped a shared not_covered helper whose first
+        // line was false on the second endpoint that served it. The rule: a line
+        // that names a field belongs only to a response that HAS the field.
+        let covers = |v: &serde_json::Value| -> String {
+            v.as_array()
+                .expect("a list")
+                .iter()
+                .map(|l| l.as_str().unwrap_or_default())
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        let arrival = covers(&json["coverage"]["arrival_not_covered"]);
+        assert!(
+            arrival.contains("not_started") && arrival.contains("barrier"),
+            "an arrival's own limits ship with it — the receiving side has limits the \
+             sending side does not: {arrival}"
+        );
+        assert!(
+            !covers(&json["coverage"]["attribution_not_covered"]).contains("`legs`"),
+            "the attribution list is served by the arrival endpoint too, which has no legs"
+        );
+
+        // …and the REFERENDUM response, which computes no attribution, must not
+        // describe fields it does not carry.
+        let (_, referendum) = get_json(&app, "/v1/gov/polkadot/referenda/1500").await;
+        let gaps = covers(&referendum["simulation_coverage"]["not_covered"]);
+        assert!(
+            !gaps.contains("forwarded_attribution") && !gaps.contains("`legs`"),
+            "the shared list must not name fields only /v1/sim/.../calls/... carries: {gaps}"
+        );
+        assert!(referendum["simulation_coverage"]["attribution_elsewhere"]
+            .as_str()
+            .unwrap()
+            .contains("/v1/sim/"));
+
+        // A ROW WITH NO BASELINE claims nothing at all, which is every row
+        // recorded before this slice.
+        let (_, older) = get_json(
+            &app,
+            &format!("/v1/sim/polkadot-asset-hub/calls/0x{}", "cc".repeat(32)),
+        )
+        .await;
+        let a = &older["simulations"][0]["forwarded_attribution"];
+        assert_eq!(a["baseline"], serde_json::Value::Null);
+        assert!(a["attributed_messages"].is_null(), "nothing is counted without a baseline");
+        assert!(a["reads_as"].as_str().unwrap().contains("messages present"));
+        assert!(
+            older["simulations"][0]["legs"].as_array().unwrap().is_empty(),
+            "nobody followed it"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_arriving_program_is_served_by_its_program_hash() {
+        let app = router(test_state().await);
+        let (status, json) = get_json(
+            &app,
+            &format!("/v1/sim/hydration/xcm/0X{}", "AA".repeat(32)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["program_hash"], format!("0x{}", "aa".repeat(32)));
+        let rows = json["simulations"].as_array().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["status"], "not_started");
+        assert_eq!(rows[0]["origin_ref"], "para:1000");
+        assert_eq!(rows[0]["source_chain_id"], "polkadot-asset-hub");
+        assert!(rows[0]["raw_location"]
+            .as_str()
+            .unwrap()
+            .contains("DryRunApi_dry_run_xcm"));
+
+        // THE ARRIVAL SIDE GETS THE SAME DIFFERENCE the call side does — the
+        // migration promises it, and a promise made in a schema is kept in a
+        // reader or not at all. This leg forwards nothing of its own, and
+        // Hydration's ambient queue holds one message that is nobody's here.
+        let a = &rows[0]["forwarded_attribution"];
+        assert_eq!(a["baseline"], format!("0x{}", "05".repeat(32)));
+        assert_eq!(a["baseline_run"], "(empty program)");
+        assert_eq!(a["ambient_messages"], 1);
+        assert_eq!(a["total_messages"], 0);
+        assert_eq!(a["attributed_messages"], 0);
+        assert!(a["reads_as"].as_str().unwrap().contains("nothing of its own"));
+
+        // The same program on a chain nobody previewed it on is empty, not
+        // borrowed from another runtime's answer.
+        let (_, ah) = get_json(
+            &app,
+            &format!("/v1/sim/polkadot-asset-hub/xcm/0x{}", "aa".repeat(32)),
+        )
+        .await;
+        assert!(ah["simulations"].as_array().unwrap().is_empty());
+        let (s, _) = get_json(&app, &format!("/v1/sim/nowhere/xcm/0x{}", "aa".repeat(32))).await;
+        assert_eq!(s, StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]

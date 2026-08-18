@@ -2918,6 +2918,11 @@ async fn simulation_results_are_immutable_per_state_and_read_back_newest_first()
         raw_location: format!(
             "raw/polkadot-asset-hub/sim/{block}/{input}/DryRunApi_dry_run_call.response.scale"
         ),
+        // No baseline on these rows: this test is about immutability and
+        // ordering, and every row recorded before slice 5 looks exactly like
+        // this. `a_previewed_arrival_is_its_own_row_and_the_baseline_link_is_a_key`
+        // is where the link is exercised.
+        baseline_input_hash: None,
     };
 
     let first = record("0xaa", "0x01", 19_000_000, "dispatch_failed");
@@ -3035,6 +3040,255 @@ async fn simulation_results_are_immutable_per_state_and_read_back_newest_first()
         .await
         .unwrap()
         .is_none());
+
+    db.drop_db().await;
+}
+
+/// The receiving side gets its own table, and the baseline link is a KEY into
+/// the sending side's (Phase 3, slice 5).
+///
+/// Four properties, each of which would be invisible until it mattered: an
+/// arrival is immutable per (state, input) like a call is; the baseline link
+/// resolves through the ORDINARY simulation read, because a baseline is an
+/// ordinary row; legs come back in the SENDER's list order rather than newest
+/// first; and a preview of a program with no source is not mistaken for a leg of
+/// anything.
+#[tokio::test]
+async fn a_previewed_arrival_is_its_own_row_and_the_baseline_link_is_a_key() {
+    use api::{SimIndex as _, XcmSimIndex as _};
+    use dotlens_node::sim_pg::{
+        insert_simulation, insert_xcm_simulation, xcm_simulation_at, PgXcmSimStore,
+    };
+    use sim::{SimRecord, XcmSimRecord, XcmSimStore as _};
+
+    let Some(db) = TestDb::create().await else { return };
+    let reg = seeds();
+    sync_registry(&db.pool, &reg).await.expect("registry sync");
+
+    // ---- the sending side: a call and the no-op baseline beside it ----------
+    let msg = |n: u32| serde_json::json!({"V4": [[[{"Transact": {"call": {"encoded": [n]}}}]]]});
+    let dest = serde_json::json!({"V4": [{"parents": 1, "interior":
+        {"X1": [[{"Parachain": [2034]}]]}}]});
+    let call = |input: &str, summary: &str, messages: serde_json::Value, baseline: Option<&str>| {
+        SimRecord {
+            chain_id: "polkadot-asset-hub".into(),
+            at_block_hash: "0xaa".into(),
+            input_hash: input.into(),
+            at_height: 19_000_000,
+            tier: sim::TIER_DRY_RUN.into(),
+            call_hash: format!("0xcall{input}"),
+            call_summary: Some(summary.into()),
+            origin_spec: "root".into(),
+            origin_json: serde_json::json!({"resolved": "system:Root"}),
+            xcm_version: 4,
+            status: "executed".into(),
+            dispatch_ok: Some(true),
+            dispatch_error: None,
+            emitted_events: serde_json::json!([]),
+            event_count: 0,
+            local_xcm: None,
+            forwarded_xcms: serde_json::json!([{"destination": dest, "messages": messages}]),
+            effects: serde_json::json!({"Ok": []}),
+            note: None,
+            spec_version: 2_003_002,
+            api_version: 2,
+            metadata_version: 15,
+            sim_version: 2,
+            raw_location: format!("raw/polkadot-asset-hub/sim/aa/{input}/x.response.scale"),
+            baseline_input_hash: baseline.map(str::to_string),
+        }
+    };
+    // The baseline is its own baseline — a no-op differenced against itself is
+    // the empty set, which is what a call that queues nothing sent.
+    insert_simulation(
+        &db.pool,
+        &call("0xba", "system.remark", serde_json::json!([msg(1)]), Some("0xba")),
+    )
+    .await
+    .expect("baseline insert");
+    insert_simulation(
+        &db.pool,
+        &call(
+            "0x01",
+            "xcmpallet.send",
+            serde_json::json!([msg(1), msg(9)]),
+            Some("0xba"),
+        ),
+    )
+    .await
+    .expect("subject insert");
+
+    // The link resolves through the ORDINARY read: a baseline is not a special
+    // kind of row, which is exactly why running it through the same path was
+    // worth doing.
+    let sims = api::pg::PgSimIndex::new(db.pool.clone());
+    let subject = sims
+        .simulation_at("polkadot-asset-hub", "0xaa", "0x01", "dry_run")
+        .await
+        .unwrap()
+        .expect("subject");
+    let baseline_hash = subject.baseline_input_hash.clone().expect("link recorded");
+    let baseline = sims
+        .simulation_at("polkadot-asset-hub", "0xaa", &baseline_hash, "dry_run")
+        .await
+        .unwrap()
+        .expect("baseline row");
+    let attribution = sim::attribute_forwarded(&subject.forwarded_xcms, &baseline.forwarded_xcms);
+    assert_eq!(attribution.total_messages, 2);
+    assert_eq!(attribution.ambient_messages, 1);
+    assert_eq!(
+        attribution.attributed_messages, 1,
+        "the difference survives a round trip through JSONB — which it only does if both \
+         sides render identically, and they do because the same decoder produced both"
+    );
+    assert_eq!(attribution.destinations[0].messages[0].message_index, 1);
+
+    // ---- the receiving side -------------------------------------------------
+    let arrival = |chain: &str, input: &str, status: &str, source: Option<(u32, u32)>| {
+        XcmSimRecord {
+            chain_id: chain.into(),
+            at_block_hash: "0xdd".into(),
+            input_hash: input.into(),
+            at_height: 13_663_124,
+            tier: sim::TIER_DRY_RUN.into(),
+            program_hash: format!("0xprog{input}"),
+            program: msg(9),
+            program_summary: Some("Transact".into()),
+            origin_location: serde_json::json!({"V4": [{"parents": 1, "interior":
+                {"X1": [[{"Parachain": [1000]}]]}}]}),
+            origin_ref: "para:1000".into(),
+            status: status.into(),
+            weight_used: (status != "not_started")
+                .then(|| serde_json::json!({"ref_time": 1_000, "proof_size": 2_000})),
+            xcm_error: (status != "complete")
+                .then(|| serde_json::json!({"index": 0, "error": {"Barrier": []}})),
+            emitted_events: serde_json::json!([
+                {"name": "balances.Minted", "data": {"amount": "36893488147419103232"}}
+            ]),
+            event_count: 1,
+            forwarded_xcms: serde_json::json!([]),
+            baseline_input_hash: Some("0xempty".into()),
+            effects: serde_json::json!({"Ok": []}),
+            note: None,
+            source_chain_id: source.map(|_| "polkadot-asset-hub".to_string()),
+            source_at_block_hash: source.map(|_| "0xaa".to_string()),
+            source_input_hash: source.map(|_| "0x01".to_string()),
+            source_forwarded_index: source.map(|(d, _)| d),
+            source_message_index: source.map(|(_, m)| m),
+            spec_version: 435,
+            api_version: 2,
+            metadata_version: 15,
+            sim_version: 2,
+            raw_location: format!("raw/{chain}/sim/dd/{input}/DryRunApi_dry_run_xcm.response.scale"),
+        }
+    };
+
+    insert_xcm_simulation(&db.pool, &arrival("hydration", "0x04", "not_started", Some((0, 1))))
+        .await
+        .expect("leg insert");
+    // Immutable per (state, input), exactly like a call: a second, different
+    // answer is refused silently and the first stands.
+    let mut contradiction = arrival("hydration", "0x04", "complete", Some((0, 1)));
+    contradiction.note = Some("rewritten".into());
+    insert_xcm_simulation(&db.pool, &contradiction)
+        .await
+        .expect("no-op, not an error");
+    let back = xcm_simulation_at(&db.pool, "hydration", "0xdd", "0x04", "dry_run")
+        .await
+        .unwrap()
+        .expect("row");
+    assert_eq!(back.status, "not_started", "an observation is never rewritten");
+    assert!(back.note.is_none());
+    assert_eq!(back.origin_ref, "para:1000");
+    assert_eq!(
+        back.emitted_events[0]["data"]["amount"], "36893488147419103232",
+        "a u128 amount survives JSONB as a decimal string on this table too"
+    );
+    assert_eq!(back.source_message_index, Some(1));
+    assert_eq!(back.source_forwarded_index, Some(0));
+    // THE SAME-TYPED COLUMNS, read back explicitly. The insert binds
+    // POSITIONALLY, so two adjacent jsonb columns or two adjacent integers can
+    // be transposed by an edit that looks like a formatting change and by
+    // nothing else — and only a round trip that names them catches it.
+    assert_eq!(back.program, msg(9), "program is not origin_location or effects");
+    assert!(
+        back.weight_used.is_none(),
+        "nothing ran, so no weight — and weight_used is not xcm_error"
+    );
+    assert_eq!(back.xcm_error.expect("a rejection names its reason")["error"],
+        serde_json::json!({"Barrier": []}));
+    assert_eq!(back.origin_location["V4"][0]["parents"], 1);
+    assert_eq!(
+        back.baseline_input_hash.as_deref(),
+        Some("0xempty"),
+        "the arrival's own baseline link round-trips too — it is a key on this table \
+         exactly as it is on the sending one"
+    );
+    // Lineage is the RECEIVER's. Asserted AGAINST the sending row rather than
+    // against a constant, because "435 is not 2003002" is only a claim about
+    // these two rows if both numbers are in the comparison.
+    assert_eq!(subject.spec_version, 2_003_002);
+    assert_eq!(
+        back.spec_version, 435,
+        "a leg carries the chain it was previewed on, not the chain that queued it"
+    );
+
+    // A second leg, and one preview with NO source at all — a program someone
+    // pasted by hand, which must never be mistaken for a leg of a journey.
+    insert_xcm_simulation(&db.pool, &arrival("hydration", "0x06", "complete", Some((0, 0))))
+        .await
+        .expect("second leg");
+    insert_xcm_simulation(&db.pool, &arrival("hydration", "0x07", "complete", None))
+        .await
+        .expect("hand-supplied preview");
+
+    let xcm_sims = api::pg::PgXcmSimIndex::new(db.pool.clone());
+    let legs = xcm_sims
+        .legs("polkadot-asset-hub", "0x01", 10)
+        .await
+        .expect("legs");
+    assert_eq!(legs.len(), 2, "the hand-supplied preview is not a leg of anything");
+    assert_eq!(
+        (legs[0].source_message_index, legs[1].source_message_index),
+        (Some(0), Some(1)),
+        "legs come back in the SENDER's list order — they are a sequence it produced, and \
+         'newest first' would shuffle a journey's own legs"
+    );
+    // The other side of the nullable pair: a program that COMPLETED reports a
+    // weight and no error, where the rejected one reported neither.
+    assert_eq!(legs[0].status, "complete");
+    assert_eq!(legs[0].weight_used.as_ref().expect("it ran")["ref_time"], 1_000);
+    assert!(legs[0].xcm_error.is_none());
+
+    // By program hash, and never borrowed from another chain's runtime.
+    assert_eq!(
+        xcm_sims
+            .xcm_simulations("hydration", "0xprog0x04", 10)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(xcm_sims
+        .xcm_simulations("polkadot-asset-hub", "0xprog0x04", 10)
+        .await
+        .unwrap()
+        .is_empty());
+
+    // The store trait the orchestration drives reads the same rows.
+    let store = PgXcmSimStore::new(db.pool.clone());
+    assert!(store
+        .get("hydration", "0xdd", "0x04", "dry_run")
+        .await
+        .unwrap()
+        .is_some());
+    assert!(store
+        .get("hydration", "0xdd", "0x04", "fork")
+        .await
+        .unwrap()
+        .is_none(),
+        "the tier is part of the key here too — a Tier 1 answer must not serve a Tier 2 ask"
+    );
 
     db.drop_db().await;
 }

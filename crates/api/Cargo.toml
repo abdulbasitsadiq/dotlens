@@ -11,6 +11,12 @@ pg = ["dep:sqlx"]
 [dependencies]
 canonical.workspace = true
 registry.workspace = true
+# For `sim::attribute_forwarded` and the simulation vocabulary. The API could
+# re-implement the difference in thirty lines, and that is exactly why it does
+# not: two implementations of "which of these messages is this call's doing"
+# could disagree, and a reader disagreeing with the runner about attribution is
+# worse than either being wrong alone.
+sim.workspace = true
 axum.workspace = true
 serde.workspace = true
 serde_json.workspace = true
