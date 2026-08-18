@@ -84,9 +84,12 @@ pub struct XcmLink {
     /// anything, and the id the receiving chain will almost always report.
     pub topic: String,
     pub topic_event_index: u32,
-    /// hrmp | ump. A pair is never established across transports.
+    /// hrmp | ump — taken from the WIRE event, which names the immediate hop.
+    /// A pair is normally established WITHIN one transport; the exception is
+    /// `remote_destination`, where the destination names another consensus
+    /// system and so cannot agree or disagree about the local hop at all.
     pub transport: String,
-    /// unique_in_block | interleaved
+    /// unique_in_block | interleaved | remote_destination
     pub rule: String,
     /// high | medium
     pub confidence: String,

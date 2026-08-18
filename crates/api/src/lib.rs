@@ -413,7 +413,9 @@ pub struct XcmMessageRow {
     pub event_index: u32,
     /// sent | received | local
     pub side: String,
-    /// hrmp | ump | dmp | local | unknown
+    /// hrmp | ump | dmp | local | remote | unknown. `remote` means the
+    /// destination names another consensus system (a bridged message), where
+    /// the FINAL destination and the first hop's transport are different things.
     pub transport: String,
     pub message_id: Option<String>,
     /// topic | wire_hash | ambiguous | none — see `xcm_not_covered()`.
@@ -457,7 +459,7 @@ pub struct XcmLinkRow {
     pub topic: String,
     /// hrmp | ump — never dmp, which has no sender-side hash event to pair.
     pub transport: String,
-    /// unique_in_block | interleaved
+    /// unique_in_block | interleaved | remote_destination
     pub rule: String,
     /// high | medium
     pub confidence: String,
@@ -633,12 +635,15 @@ pub fn xcm_journey_not_covered() -> Vec<&'static str> {
          wire_hash<->topic aliases the correlator recorded WITHIN one block. Nothing else is \
          inferred. Two legs whose ids differ and that share no recorded link are two journeys \
          here, and saying so is the point",
-        "the wire_hash<->topic link is only recorded where the block makes it unambiguous — one \
-         queued send and one `Sent` of that transport, or n of each strictly alternating. A \
-         block with 2 queued sends and 1 `Sent` records NO link, so a wire hash from that block \
-         reaches only its own half. `aliases` in this response is every link found while \
-         expanding, with the rule and evidence each rests on — a superset of those used \
-         when `alias_limit_reached` is true",
+        "the wire_hash<->topic link is only recorded where the block makes it unambiguous, by \
+         one of three rules: one queued send and one `Sent` OF THAT TRANSPORT \
+         (`unique_in_block`), n of each strictly alternating (`interleaved`), or — where the \
+         `Sent` is addressed to ANOTHER CONSENSUS SYSTEM and so cannot agree about the local \
+         transport at all — the queued send IMMEDIATELY BEFORE it in the block's send sequence \
+         (`remote_destination`). A block with 2 queued sends and 1 `Sent` records NO link, so a \
+         wire hash from that block reaches only its own half. `aliases` in this response is \
+         every link found while expanding, with the rule and evidence each rests on — a \
+         superset of those used when `alias_limit_reached` is true",
         "there is NO hop rule (an inbound message linked to a forwarded outbound send in the \
          same block), and its window of applicability may be empty: from staging-xcm-executor \
          20.0.0 the topic PROPAGATES across a hop so equality already stitches it, and below \
@@ -656,12 +661,55 @@ pub fn xcm_journey_not_covered() -> Vec<&'static str> {
          mapped yields an alias whose ends have no steps, which reads the same as a chain we \
          do not index. `xcm-correlate` chases the same decode frontier `xcm-range` does, so \
          in practice they run neck and neck",
+        "a leg addressed to ANOTHER CONSENSUS SYSTEM (a Snowbridge export, a bridged transfer) \
+         stops here, and `leaves_consensus` says so rather than letting it read as an \
+         in-flight or dropped message. What happens after the bridge needs the bridge tracer \
+         (ARCHITECTURE §10: Snowbridge and ISMP lifecycles), which is not this module. The \
+         wire hash still pairs with its topic — the queue pallet knows the first hop even \
+         when the destination is Ethereum — PROVIDED the queued send is the one immediately \
+         before it in the block; a `Sent` with another send between it and the nearest queued \
+         one still records nothing",
+        "a `remote:<consensus>` counterparty is NOT COMPARABLE against a registry that knows \
+         only this network, so `checks.counterparty_mirror` reports those pairs as unknown. \
+         That is the price of never rendering a foreign chain's para id as one of ours, which \
+         is what rows written before XCM_MAPPER_VERSION 2 did",
         "steps are ordered by BLOCK TIMESTAMP, which is the only ordering two chains share; \
          `core.blocks.timestamp` is nullable, and a step without one falls back to chain and \
          height, which are not comparable across chains. `checks.time_order` says which case \
          this journey is in",
     ]);
     v
+}
+
+/// Reduce an observed counterparty to a form comparable with
+/// [`xcm_counterparty_name`], given the network the observing chain is in.
+///
+/// `None` means NOT COMPARABLE, which the mirror check reports as `unknown` and
+/// never as a contradiction. Since XCM_MAPPER_VERSION 2 a bridged destination
+/// reads `remote:kusama/para:1000` rather than `para:1000` — deliberately, so a
+/// foreign chain is never rendered as one of ours. The cost of that correctness
+/// fix is exactly here: `remote:<other network>` cannot be checked against a
+/// registry that only knows this one, and saying "unknown" is the whole point.
+/// A location that names THIS network absolutely AND carries a para id
+/// (`remote:polkadot/para:2034`) is comparable, and resolving it is why this
+/// takes the network at all; a bare `remote:polkadot` has nothing to compare and
+/// stays unknown.
+fn comparable_counterparty<'a>(observed: &'a str, network: &str) -> Option<&'a str> {
+    let Some(rest) = observed.strip_prefix("remote:") else {
+        return Some(observed);
+    };
+    match rest.split_once('/') {
+        Some((consensus, tail)) if consensus == network => Some(tail),
+        _ => None,
+    }
+}
+
+/// Does this counterparty name a consensus system other than `network`?
+fn is_foreign_consensus(observed: &str, network: &str) -> bool {
+    observed
+        .strip_prefix("remote:")
+        .map(|rest| rest.split('/').next().unwrap_or("") != network)
+        .unwrap_or(false)
 }
 
 /// How chain `from` names chain `to` in an XCM counterparty, from REGISTRY DATA
@@ -4482,6 +4530,13 @@ async fn get_xcm_message(
         Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     };
     let sides: Vec<&str> = rows.iter().map(|r| r.side.as_str()).collect();
+    // "one chain … and another" is a CLAIM, and on live data it can be false:
+    // Asset Hub #19407624 received a message over HRMP and forwarded it onward
+    // to Ethereum in the same block, with the topic propagating across the hop,
+    // so both halves of that id sit on ONE chain. Verified Phase 3 slice 4.
+    let one_chain = rows
+        .iter()
+        .all(|r| rows.first().is_some_and(|f| f.chain_id == r.chain_id));
     let reads_as = match (
         sides.contains(&"sent"),
         sides.contains(&"received"),
@@ -4490,13 +4545,20 @@ async fn get_xcm_message(
         (_, _, true) => "no chain we index has seen this id — which is not the same as the \
                          message not existing, since a journey through an unindexed chain \
                          leaves no row here",
+        (true, true, _) if one_chain => {
+            "both halves are on record ON ONE CHAIN, which is what a HOP looks like: this \
+             chain processed the id and then sent it on under the same id, because the topic \
+             propagates across a hop. One message passing through, not a round trip — see \
+             coverage.not_covered"
+        }
         (true, true, _) => "both halves are on record: one chain reported sending this id and \
                             another reported processing it. That is strong evidence of one \
                             message and is still not an assertion — see coverage.not_covered",
         (true, false, _) => "only the SENDING half is on record. That can mean the message is \
                              still in flight, that the receiving chain is not indexed here, or \
-                             that it was dropped in transit — the three are indistinguishable \
-                             from this side",
+                             that it was dropped in transit — indistinguishable from this side \
+                             UNLESS the row's counterparty names another consensus system, in \
+                             which case the journey endpoint says so outright",
         (false, true, _) => "only the RECEIVING half is on record. The sending chain is either \
                              not indexed here or does not emit a sender event for forwarded \
                              messages",
@@ -4608,19 +4670,97 @@ async fn get_xcm_journey(
         _ => "observations_only",
     };
 
+    // Did any leg address a consensus system OTHER than its own chain's? A
+    // Snowbridge export does; a Location that names this network absolutely
+    // (`remote:polkadot/para:2034`) does NOT, which is why the chain's own
+    // network has to be resolved rather than the `remote:` prefix trusted.
+    let remote_destinations: Vec<String> = {
+        let mut seen: Vec<String> = Vec::new();
+        for r in &rows {
+            let (Some(cp), Some(chain)) = (
+                r.counterparty.as_deref(),
+                state.registry.chain(&r.chain_id),
+            ) else {
+                continue;
+            };
+            if is_foreign_consensus(cp, &chain.network) && !seen.contains(&cp.to_string()) {
+                // the WHOLE counterparty, because `remote:kusama/para:1000` and
+                // `remote:kusama/para:2000` are different destinations and
+                // collapsing them to the consensus would drop the para id
+                seen.push(cp.to_string());
+            }
+        }
+        seen
+    };
+    let leaves_consensus = !remote_destinations.is_empty();
+    // "dotlens does not index it" is DERIVED, not assumed. It is true of every
+    // remote destination today because one network is registered — and the day a
+    // Kusama seed lands it stops being true, at which point a hard-coded
+    // sentence would claim a journey is unfollowable while its receiving half
+    // sits in the same database.
+    let remote_is_indexed = remote_destinations.iter().all(|d| {
+        let consensus = d
+            .strip_prefix("remote:")
+            .unwrap_or(d.as_str())
+            .split('/')
+            .next()
+            .unwrap_or("");
+        state.registry.chains().any(|c| c.network == consensus)
+    });
+
+    // WHERE A REMOTE LEG GOES, phrased once because more than one shape can
+    // carry one. DERIVED from the registry, never assumed — see
+    // `remote_is_indexed`.
+    let remote_reach = if remote_is_indexed {
+        "a consensus system this chain is not part of — its own half is indexed here but \
+         nothing ties the two id spaces together"
+    } else {
+        "which dotlens does not index at all"
+    };
+
     let reads_as = match shape {
         "unseen" => "no chain we index has seen this id, on either side. That is not the same \
                      as the message not existing: a journey through a chain we do not map \
                      leaves no row here"
             .to_string(),
+        // A bridged leg's `send_only` is EXPECTED, not a gap, and conflating the
+        // two would be the honest-coverage doctrine failing on the one case
+        // where the answer is knowable.
+        "send_only" if leaves_consensus => format!(
+            "the sending half is on record and the journey STOPS HERE ON PURPOSE: this message \
+             is addressed to {}, {}. That is a boundary, not a missing row — following it \
+             needs the bridge tracer (ARCHITECTURE §10), which reads Snowbridge and ISMP \
+             lifecycles rather than XCM ids",
+            remote_destinations.join(", "),
+            remote_reach
+        ),
+        // A JOURNEY CAN BOTH BE STITCHED AND STILL LEAVE, and live data says so
+        // rather than theory: Asset Hub #19407624 — the block this slice was
+        // written for — is a RELAY HOP (Hydration sent it, Asset Hub received it
+        // over HRMP and forwarded it on to Ethereum with the topic propagating
+        // across the hop), so its shape is `send_and_receive`. Keying the
+        // boundary sentence on `send_only` alone left the only bridged journey
+        // this index actually holds reading as a complete story in prose while
+        // `leaves_consensus` said otherwise one field away.
         "send_and_receive" => format!(
             "one message, stitched across {} chain(s): {} sending observation(s) and {} \
              receiving one(s) carrying the same id. The stitch is id equality plus {} recorded \
-             alias link(s) — see checks and aliases for what corroborates it",
+             alias link(s) — see checks and aliases for what corroborates it{}",
             distinct_chains(&rows),
             sends.len(),
             receives.len(),
-            links.len()
+            links.len(),
+            if leaves_consensus {
+                format!(
+                    ". The journey then STOPS ON PURPOSE: its onward leg is addressed to {}, \
+                     {} — a boundary rather than a missing row, and following it needs the \
+                     bridge tracer (ARCHITECTURE §10) rather than XCM ids",
+                    remote_destinations.join(", "),
+                    remote_reach
+                )
+            } else {
+                String::new()
+            }
         ),
         "send_only" => "only the SENDING half is on record. The message may still be in flight, \
                         the receiving chain may not be indexed here, or it may have been \
@@ -4677,11 +4817,26 @@ async fn get_xcm_journey(
             };
             let expect_sender_says = xcm_counterparty_name(from, to);
             let expect_receiver_says = xcm_counterparty_name(to, from);
+            // A counterparty naming another consensus is NOT COMPARABLE against
+            // a registry that only knows this one — reported as unknown, never
+            // as a contradiction. Getting this wrong would turn slice 4's
+            // correctness fix into a check that fails on the very messages it
+            // was written to describe.
+            let said_sender = s
+                .counterparty
+                .as_deref()
+                .and_then(|c| comparable_counterparty(c, &from.network))
+                .map(str::to_string);
+            let said_receiver = r
+                .counterparty
+                .as_deref()
+                .and_then(|c| comparable_counterparty(c, &to.network))
+                .map(str::to_string);
             let verdict = match (
                 &expect_sender_says,
-                &s.counterparty,
+                &said_sender,
                 &expect_receiver_says,
-                &r.counterparty,
+                &said_receiver,
             ) {
                 (Some(es), Some(gs), Some(er), Some(gr)) if es == gs && er == gr => "corroborated",
                 (Some(es), Some(gs), _, _) if es != gs => "contradicted",
@@ -4784,6 +4939,12 @@ async fn get_xcm_journey(
         "alias_limit_reached": truncated,
         "aliases": links,
         "chains": distinct_chains(&rows),
+        // Whether any leg addressed a consensus system dotlens does not index.
+        // A `send_only` that leaves the ecosystem is a BOUNDARY, and a consumer
+        // that cannot tell it from an in-flight message would read every
+        // Snowbridge export as a dropped one.
+        "leaves_consensus": leaves_consensus,
+        "remote_destinations": remote_destinations,
         "steps": steps,
         "outcome": outcome,
         "checks": {
@@ -6204,7 +6365,7 @@ pub(crate) mod tests {
             error: None,
             weight_used: None,
             runtime_version: 2_003_002,
-            mapper_version: 1,
+            mapper_version: 2,
             // The receive is AFTER the send in wall-clock. Two chains' heights
             // are not comparable, so this is the only thing that orders a
             // journey — and the only thing that can CONTRADICT one.
@@ -6233,6 +6394,94 @@ pub(crate) mod tests {
             timestamp: Some("2026-08-17T08:00:00Z".parse().unwrap()),
             ..xcm_row("polkadot-asset-hub", 19_000_100, "sent", "wire_hash")
         });
+        // A SNOWBRIDGE EXPORT (Phase 3, slice 4), in the shape of live Asset Hub
+        // #19407624 — the single refusal in 181 live sends before the
+        // correlator learned to pair across a transport disagreement. The queue
+        // pallet says hrmp (the hop to Bridge Hub); the destination says
+        // Ethereum, which is no local transport at all.
+        xcm.insert(XcmMessageRow {
+            event_index: 6,
+            message_id: Some(format!("0x{}", "b1".repeat(32))),
+            counterparty: None,
+            timestamp: Some("2026-08-17T07:00:00Z".parse().unwrap()),
+            ..xcm_row("polkadot-asset-hub", 19_000_050, "sent", "wire_hash")
+        });
+        xcm.insert(XcmMessageRow {
+            event_index: 7,
+            message_id: Some(format!("0x{}", "b2".repeat(32))),
+            transport: "remote".into(),
+            counterparty: Some("remote:ethereum:1".into()),
+            timestamp: Some("2026-08-17T07:00:00Z".parse().unwrap()),
+            ..xcm_row("polkadot-asset-hub", 19_000_050, "sent", "topic")
+        });
+        // …AND THE SHAPE LIVE DATA ACTUALLY PRODUCED, which is not that one.
+        // Asset Hub #19407624 is a RELAY HOP: Hydration sent the message, Asset
+        // Hub received it over HRMP, and its executor forwarded it onward to
+        // Ethereum — with the TOPIC PROPAGATING across the hop, so the receive
+        // and the onward send carry the SAME id and the journey's shape is
+        // `send_and_receive`. The forwarded leg's program is empty (`[[]]`),
+        // which is what `forwarded` keys on. A boundary sentence keyed only on
+        // `send_only` never fired on the one bridged journey the index held.
+        xcm.insert(XcmMessageRow {
+            event_index: 6,
+            message_id: Some(format!("0x{}", "c1".repeat(32))),
+            counterparty: None,
+            timestamp: Some("2026-08-17T06:00:00Z".parse().unwrap()),
+            ..xcm_row("polkadot-asset-hub", 19_000_040, "sent", "wire_hash")
+        });
+        xcm.insert(XcmMessageRow {
+            event_index: 7,
+            message_id: Some(format!("0x{}", "c2".repeat(32))),
+            transport: "remote".into(),
+            counterparty: Some("remote:ethereum:1".into()),
+            forwarded: true,
+            timestamp: Some("2026-08-17T06:00:00Z".parse().unwrap()),
+            ..xcm_row("polkadot-asset-hub", 19_000_040, "sent", "topic")
+        });
+        xcm.insert(XcmMessageRow {
+            event_index: 10,
+            // THE SAME id as the onward send: the topic crossed the hop.
+            message_id: Some(format!("0x{}", "c2".repeat(32))),
+            counterparty: Some("para:2034".into()),
+            timestamp: Some("2026-08-17T06:00:00Z".parse().unwrap()),
+            ..xcm_row("polkadot-asset-hub", 19_000_040, "received", "ambiguous")
+        });
+        xcm.insert_link(XcmLinkRow {
+            chain_id: "polkadot-asset-hub".into(),
+            block_height: 19_000_040,
+            wire_event_index: 6,
+            topic_event_index: 7,
+            wire_hash: format!("0x{}", "c1".repeat(32)),
+            topic: format!("0x{}", "c2".repeat(32)),
+            transport: "hrmp".into(),
+            rule: "remote_destination".into(),
+            confidence: "medium".into(),
+            evidence: serde_json::json!({
+                "event_gap": 1, "topic_transport": "remote", "remote_topics": 1,
+                "block_sends": {"wire": 1, "topic": 1}
+            }),
+            runtime_version: 2_003_002,
+            correlator_version: 2,
+        });
+        xcm.insert_link(XcmLinkRow {
+            chain_id: "polkadot-asset-hub".into(),
+            block_height: 19_000_050,
+            wire_event_index: 6,
+            topic_event_index: 7,
+            wire_hash: format!("0x{}", "b1".repeat(32)),
+            topic: format!("0x{}", "b2".repeat(32)),
+            // FROM THE WIRE SIDE — the destination named another consensus and
+            // cannot say how this chain queued the message.
+            transport: "hrmp".into(),
+            rule: "remote_destination".into(),
+            confidence: "medium".into(),
+            evidence: serde_json::json!({
+                "transport_candidates": 1, "ordinal": 0, "event_gap": 1,
+                "topic_transport": "remote", "block_sends": {"wire": 1, "topic": 1}
+            }),
+            runtime_version: 2_003_002,
+            correlator_version: 2,
+        });
         xcm.insert_link(XcmLinkRow {
             chain_id: "polkadot-asset-hub".into(),
             block_height: 19_000_900,
@@ -6248,7 +6497,7 @@ pub(crate) mod tests {
                 "block_sends": {"wire": 1, "topic": 1}
             }),
             runtime_version: 2_003_002,
-            correlator_version: 1,
+            correlator_version: 2,
         });
 
         // governance stitched across the migration: ref 1500 submitted +
@@ -7206,7 +7455,7 @@ pub(crate) mod tests {
         // Per-chain listing: newest first, and an unknown chain 404s.
         let (_, ah) = get_json(&app, "/v1/xcm/polkadot-asset-hub/messages").await;
         let rows = ah["messages"].as_array().unwrap();
-        assert_eq!(rows.len(), 3);
+        assert_eq!(rows.len(), 8);
         assert_eq!(rows[0]["block_height"], 19_000_900);
         assert_eq!(rows[0]["event_index"], 3, "newest block first, then event order");
         assert_eq!(rows[2]["block_height"], 19_000_100);
@@ -7318,6 +7567,104 @@ pub(crate) mod tests {
                 .any(|g| g.as_str().unwrap().contains("/v1/xcm/journeys/{id} is the endpoint")),
             "the journey endpoint's not_covered must not defer to the journey endpoint"
         );
+        // A purely local journey must NOT claim it left the ecosystem.
+        assert_eq!(j["leaves_consensus"], false);
+        assert!(j["remote_destinations"].as_array().unwrap().is_empty());
+    }
+
+    /// A BRIDGED SEND (Phase 3, slice 4): the wire hash and the topic still pair
+    /// — across a transport disagreement that is structural rather than a defect
+    /// — and the journey then STOPS at the consensus boundary and says so,
+    /// instead of reading like a message that was dropped in flight.
+    #[tokio::test]
+    async fn a_journey_that_leaves_the_ecosystem_says_so_rather_than_looking_dropped() {
+        let app = router(test_state().await);
+        let wire = format!("0x{}", "b1".repeat(32));
+
+        let (status, j) = get_json(&app, &format!("/v1/xcm/journeys/{wire}")).await;
+        assert_eq!(status, StatusCode::OK);
+        // The pair holds, and takes its transport from the WIRE event: the
+        // destination named Ethereum and cannot say how this chain queued it.
+        let aliases = j["aliases"].as_array().unwrap();
+        assert_eq!(aliases.len(), 1);
+        assert_eq!(aliases[0]["rule"], "remote_destination");
+        assert_eq!(aliases[0]["confidence"], "medium");
+        assert_eq!(aliases[0]["transport"], "hrmp");
+        assert_eq!(aliases[0]["correlator_version"], 2);
+        assert_eq!(j["steps"].as_array().unwrap().len(), 2, "two ids, one message");
+
+        // THE POINT: `send_only` here is a BOUNDARY, and the payload separates
+        // it from the three-way "in flight / unindexed / dropped" it would
+        // otherwise read as.
+        assert_eq!(j["shape"], "send_only");
+        assert_eq!(j["leaves_consensus"], true);
+        assert_eq!(
+            j["remote_destinations"][0], "remote:ethereum:1",
+            "the whole destination, so two chains in one foreign consensus stay distinct"
+        );
+        let reads_as = j["reads_as"].as_str().unwrap();
+        assert!(reads_as.contains("STOPS HERE ON PURPOSE"), "{reads_as}");
+        assert!(reads_as.contains("bridge tracer"), "{reads_as}");
+
+        // No receiving half, so nothing to mirror — and crucially a foreign
+        // counterparty produces no CONTRADICTION anywhere.
+        assert_eq!(j["checks"]["counterparty_mirror"]["status"], "unknown");
+        assert!(j["checks"]["counterparty_mirror"]["pairs"].as_array().unwrap().is_empty());
+        assert!(j["coverage"]["not_covered"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|g| g.as_str().unwrap().contains("ANOTHER CONSENSUS SYSTEM")));
+    }
+
+    /// THE SHAPE LIVE DATA ACTUALLY PRODUCED (verified, Phase 3 slice 4): Asset
+    /// Hub #19407624 is not a lone bridged send, it is a RELAY HOP — Hydration
+    /// sent it, Asset Hub received it over HRMP and forwarded it to Ethereum,
+    /// and the topic PROPAGATED across the hop, so plain id equality already
+    /// stitches the receive to the onward send and the shape is
+    /// `send_and_receive`. The boundary must still be stated: a journey can be
+    /// fully stitched AND still leave the ecosystem, and keying the sentence on
+    /// `send_only` alone left this one reading as a complete story.
+    #[tokio::test]
+    async fn a_stitched_journey_that_still_leaves_the_ecosystem_says_both() {
+        let app = router(test_state().await);
+        let wire = format!("0x{}", "c1".repeat(32));
+
+        let (status, j) = get_json(&app, &format!("/v1/xcm/journeys/{wire}")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(j["shape"], "send_and_receive", "the topic crossed the hop, so this stitches");
+        assert_eq!(j["steps"].as_array().unwrap().len(), 3);
+        assert_eq!(j["leaves_consensus"], true);
+        assert_eq!(j["remote_destinations"][0], "remote:ethereum:1");
+
+        let reads_as = j["reads_as"].as_str().unwrap();
+        assert!(reads_as.contains("stitched across"), "{reads_as}");
+        assert!(
+            reads_as.contains("STOPS ON PURPOSE") && reads_as.contains("bridge tracer"),
+            "a stitched journey that leaves consensus must still say so: {reads_as}"
+        );
+
+        // Same chain on both sides, so there is no mirror to check — and a
+        // foreign counterparty must never produce a CONTRADICTION.
+        assert_eq!(j["checks"]["counterparty_mirror"]["status"], "unknown");
+        // One id on two SIDES of one chain is a hop, not a collision.
+        assert_eq!(j["checks"]["id_uniqueness"]["status"], "ok");
+
+        // AND THE OBSERVATIONS ENDPOINT MUST NOT CLAIM TWO CHAINS FOR IT. Its
+        // both-halves sentence read "one chain reported sending this id and
+        // another reported processing it" — false on a hop, where both halves
+        // sit on the same chain.
+        let topic = format!("0x{}", "c2".repeat(32));
+        let (_, m) = get_json(&app, &format!("/v1/xcm/messages/{topic}")).await;
+        assert_eq!(m["observations"].as_array().unwrap().len(), 2);
+        let hop = m["reads_as"].as_str().unwrap();
+        assert!(hop.contains("ON ONE CHAIN") && hop.contains("HOP"), "{hop}");
+
+        // …while a genuine two-chain journey still says what it always said.
+        let two = format!("0x{}", "ee".repeat(32));
+        let (_, m2) = get_json(&app, &format!("/v1/xcm/messages/{two}")).await;
+        let across = m2["reads_as"].as_str().unwrap();
+        assert!(across.contains("one chain reported sending this id and another"), "{across}");
     }
 
     #[tokio::test]

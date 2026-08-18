@@ -58,7 +58,9 @@ impl_module_error!(XcmWorkerError);
 pub struct XcmFact {
     /// sent | received | local
     pub side: String,
-    /// hrmp | ump | dmp | local | unknown
+    /// hrmp | ump | dmp | local | remote | unknown — `remote` is a
+    /// destination in ANOTHER consensus system, where the queue pallet that
+    /// carried the first hop and the destination disagree by construction.
     pub transport: String,
     /// 0x-hex, 32 bytes. None only where the event genuinely carries no id.
     pub message_id: Option<String>,
@@ -66,7 +68,9 @@ pub struct XcmFact {
     /// kinds are not interchangeable and `messageQueue` does not say which of
     /// them it is reporting.
     pub id_kind: String,
-    /// para:<id> | parent | here | None
+    /// para:<id> | parent | here | remote:<consensus>[/para:<id>] | None. The
+    /// `remote:` prefix is what keeps a FOREIGN chain's para id from being
+    /// rendered as one of ours (XCM_MAPPER_VERSION 2).
     pub counterparty: Option<String>,
     pub origin_location: Option<serde_json::Value>,
     pub destination: Option<serde_json::Value>,

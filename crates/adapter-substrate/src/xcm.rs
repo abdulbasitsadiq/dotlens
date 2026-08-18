@@ -42,13 +42,36 @@
 //!     gap: weight-starved XCMP enqueueing drops whole batches with a
 //!     `defensive!` log and no event on either side.
 //!
+//! **XCM_MAPPER_VERSION 2 (Phase 3, slice 4)** — the destination classifier
+//! learned that a Location can address ANOTHER CONSENSUS SYSTEM. Slice 3
+//! measured the cost of it not knowing: over 20,681 blocks the correlator paired
+//! 180 of 181 queued sends, and the single refusal was a Snowbridge export where
+//! the queue pallet said `hrmp` (the immediate hop, to Bridge Hub) and the
+//! `Sent` destination said Ethereum — no local transport at all, so the two
+//! sides "disagreed" and the pair was refused. That is systematic rather than
+//! unlucky: EVERY message addressed beyond the immediate neighbour refuses for
+//! the same reason. Two changes, both here:
+//!   * `transport` gains **`remote`** — "addressed to a named consensus system",
+//!     which is a positive fact and not the ignorance `unknown` records.
+//!   * `counterparty` gains the **`remote:<network>`** prefix, and this half is
+//!     a plain CORRECTNESS fix: a destination like `{parents: 2,
+//!     X2[GlobalConsensus(Kusama), Parachain(1000)]}` contains a `Parachain`
+//!     junction, so the old walk reported `para:1000` — which in this index
+//!     names POLKADOT's Asset Hub. A foreign chain rendered as one of ours reads
+//!     like a fact and joins like a fact.
+//! Version-1 rows are coarser on `transport` and, for any bridged destination
+//! carrying a `Parachain` junction, WRONG on `counterparty` — it named one of
+//! our own chains. Re-mapping those is not cosmetic, and a re-run does not do it
+//! by itself: `xcm.messages` is insert-ignore, so it needs `delete from
+//! xcm.messages where mapper_version < 2` first (migration 0017 has the recipe).
+//!
 //! XCM_MAPPER_VERSION is lineage: bump on any rule change; rows rebuild from raw.
 
 use crate::gov::{field, json_h256_hex};
 use canonical::CanonicalEvent;
 use ingest::xcm::{XcmFact, XcmMapper};
 
-pub const XCM_MAPPER_VERSION: u32 = 1;
+pub const XCM_MAPPER_VERSION: u32 = 2;
 
 pub struct SubstrateXcmMapper;
 
@@ -470,16 +493,36 @@ fn origin_counterparty(origin: &serde_json::Value) -> Option<String> {
     }
 }
 
-/// A destination Location says where, not how — but the parent count settles it:
-/// `parents: 1` with no junction is the relay (UMP), `parents: 1` plus a
+/// A destination Location says where, not how — but the parent count settles
+/// it: `parents: 1` with no junction is the relay (UMP), `parents: 1` plus a
 /// `Parachain` is a sibling (HRMP), and `parents: 0` plus a `Parachain` is a
 /// CHILD, i.e. the relay addressing a parachain (DMP). Anything else stays
 /// honest at "unknown" rather than guessing a transport.
+///
+/// A `GlobalConsensus` junction WINS OVER ALL OF THAT, and getting that
+/// precedence wrong was the one systematic blind spot slice 3 measured. A
+/// Snowbridge export from Asset Hub is addressed to
+/// `{parents: 2, X1[GlobalConsensus(Ethereum{chain_id: 1})]}` — no local
+/// transport at all — while the router that carries its first hop is XCMP, to
+/// Bridge Hub. So the destination and the queue pallet DISAGREE by construction:
+/// **a wire event's transport is the IMMEDIATE HOP; a `Sent`'s destination is
+/// the FINAL one**, and on a bridged message they are different chains. The
+/// honest label for the destination side is therefore `remote` — "addressed to a
+/// named consensus system" — and the wire event stays the authority on how the
+/// first hop actually left.
+///
+/// NOTE `remote` does NOT mean "not ours": a Location may address a chain in
+/// this very network absolutely, as
+/// `{parents: 2, X2[GlobalConsensus(Polkadot), Parachain(2034)]}`. Telling those
+/// apart needs to know which chain emitted the event, which this mapper
+/// deliberately does not — so it records the consensus by name and lets the read
+/// side, which knows the chain, resolve it.
 fn transport_for_destination(dest: &serde_json::Value) -> &'static str {
+    if global_consensus(dest).is_some() {
+        return "remote";
+    }
     let parents = field(dest, "parents", 0).and_then(|v| v.as_u64());
-    let has_para = location_counterparty(dest)
-        .map(|c| c.starts_with("para:"))
-        .unwrap_or(false);
+    let has_para = find_parachain(dest).is_some();
     match (parents, has_para) {
         (Some(1), false) => "ump",
         (Some(1), true) => "hrmp",
@@ -490,13 +533,95 @@ fn transport_for_destination(dest: &serde_json::Value) -> &'static str {
     }
 }
 
-/// "para:2034" | "parent" | None, from a Location.
+/// "para:2034" | "parent" | "remote:ethereum:1" | "remote:kusama/para:1000" |
+/// None, from a Location.
+///
+/// THE `remote:` PREFIX IS A CORRECTNESS FIX, not decoration. A bridged
+/// destination like `{parents: 2, X2[GlobalConsensus(Kusama), Parachain(1000)]}`
+/// contains a `Parachain` junction, and the walk below finds it wherever it
+/// sits — so before this, that destination reported `para:1000`, which in this
+/// index means POLKADOT's Asset Hub. A foreign chain rendered as one of ours is
+/// the worst kind of wrong: it reads as a fact, joins like a fact, and would
+/// have made the journey endpoint's counterparty mirror contradict itself the
+/// day Kusama is registered.
 fn location_counterparty(dest: &serde_json::Value) -> Option<String> {
+    if let Some(network) = global_consensus(dest) {
+        // The para id is kept, but only INSIDE the consensus that owns it.
+        return Some(match find_parachain(dest) {
+            Some(id) => format!("remote:{network}/para:{id}"),
+            None => format!("remote:{network}"),
+        });
+    }
     if let Some(id) = find_parachain(dest) {
         return Some(format!("para:{id}"));
     }
     let parents = field(dest, "parents", 0).and_then(|v| v.as_u64());
     (parents == Some(1)).then(|| "parent".to_string())
+}
+
+/// The `GlobalConsensus` junction's network, rendered as a short stable token —
+/// `polkadot`, `kusama`, `ethereum:1`, `bygenesis:0x…`.
+///
+/// SEARCHED BY THE KEY `GlobalConsensus`, never by network NAME, and that is
+/// load-bearing: `AccountId32`, `AccountIndex64` and `AccountKey20` each carry
+/// their own `network: Option<NetworkId>` field, so a perfectly local
+/// destination such as `{parents: 1, X2[Parachain(2034), AccountKey20 {network:
+/// Some(Ethereum), key}]}` mentions Ethereum without crossing any consensus
+/// boundary. Matching on the network name would call that message bridged.
+/// (Verified against staging-xcm 24.0.0 `v4/junction.rs` and `v5/junction.rs`.)
+fn global_consensus(v: &serde_json::Value) -> Option<String> {
+    fn find<'a>(v: &'a serde_json::Value) -> Option<&'a serde_json::Value> {
+        match v {
+            serde_json::Value::Object(map) => {
+                for (k, val) in map {
+                    if k == "GlobalConsensus" {
+                        return Some(val);
+                    }
+                    if let Some(found) = find(val) {
+                        return Some(found);
+                    }
+                }
+                None
+            }
+            serde_json::Value::Array(items) => items.iter().find_map(find),
+            _ => None,
+        }
+    }
+    // `GlobalConsensus(NetworkId)` is a NEWTYPE variant, so the decoder renders
+    // the NetworkId one array layer in. Peel only a single-element array, which
+    // a NetworkId (always an object) can never itself be.
+    let inner = find(v)?;
+    let network = match inner.as_array().map(|a| a.as_slice()) {
+        Some([only]) => only,
+        _ => inner,
+    };
+    Some(network_token(network))
+}
+
+/// One `NetworkId` → a short token. Unit variants render as `{"Kusama": []}`,
+/// `Ethereum` as `{"Ethereum": {"chain_id": 1}}`, `ByGenesis` as a 32-byte
+/// array. v4 additionally has Westend/Rococo/Wococo, which v5 folded into
+/// `ByGenesis` — so the variant NAME is the only thing stable across versions
+/// and it is what this reads, lower-cased, with the discriminant appended where
+/// one exists. `ByFork` is the exception and is left as the bare token: no live
+/// network uses it, and inventing a rendering for a shape nobody emits would be
+/// a guess in a function whose whole job is not to make any.
+fn network_token(network: &serde_json::Value) -> String {
+    let Some(name) = variant_name(network) else {
+        return "unknown".into();
+    };
+    let lower = name.to_ascii_lowercase();
+    match name {
+        "Ethereum" => match first_number(network) {
+            Some(chain_id) => format!("ethereum:{chain_id}"),
+            None => lower,
+        },
+        "ByGenesis" => match json_h256_hex(network) {
+            Some(hash) => format!("bygenesis:{hash}"),
+            None => lower,
+        },
+        _ => lower,
+    }
 }
 
 /// Walk a decoded Location for a `Parachain` junction, whatever the version
@@ -775,5 +900,108 @@ mod tests {
         let err = facts_for_event(&ev("polkadotxcm.SomethingNew", json!({}))).unwrap_err();
         assert!(err.contains("unknown XCM event"), "{err}");
         assert!(facts_for_event(&ev("messagequeue.Whatever", json!({}))).is_err());
+    }
+
+    /// `Sent` with a destination, in the decoder's real shapes.
+    fn sent_to(destination: serde_json::Value) -> XcmFact {
+        one(
+            "polkadotxcm.Sent",
+            json!({
+                "origin": {"parents": 0, "interior": {"Here": []}},
+                "destination": destination,
+                "message": [[{"WithdrawAsset": []}]],
+                "message_id": bytes32(0xee),
+            }),
+        )
+    }
+
+    /// THE SLICE-3 BLIND SPOT (Phase 3, slice 4): a Snowbridge export is
+    /// addressed to Ethereum, which is no local transport at all, while the
+    /// router that carries its first hop is XCMP. Before this the destination
+    /// side said `unknown`, the wire event said `hrmp`, and the correlator
+    /// refused the pair — systematically, for every message addressed beyond the
+    /// immediate neighbour.
+    #[test]
+    fn a_destination_in_another_consensus_is_remote_and_names_the_network() {
+        let f = sent_to(json!({
+            "parents": 2,
+            "interior": {"X1": [[{"GlobalConsensus": [{"Ethereum": {"chain_id": 1}}]}]]},
+        }));
+        assert_eq!(f.transport, "remote");
+        assert_eq!(f.counterparty.as_deref(), Some("remote:ethereum:1"));
+
+        // Unit NetworkId variants render as an empty array, never as a bare
+        // string — the shape rule slice 9 pinned on `pays_fee`.
+        let f = sent_to(json!({
+            "parents": 2,
+            "interior": {"X1": [[{"GlobalConsensus": [{"Kusama": []}]}]]},
+        }));
+        assert_eq!(f.transport, "remote");
+        assert_eq!(f.counterparty.as_deref(), Some("remote:kusama"));
+    }
+
+    /// THE CORRECTNESS HALF, and it is the one that would have read like a
+    /// fact: a bridged destination CONTAINS a `Parachain` junction, so the
+    /// unqualified walk reported `para:1000` — which in this index names
+    /// POLKADOT's Asset Hub, not Kusama's.
+    #[test]
+    fn a_foreign_parachain_is_never_rendered_as_one_of_ours() {
+        let f = sent_to(json!({
+            "parents": 2,
+            "interior": {"X2": [[
+                {"GlobalConsensus": [{"Kusama": []}]},
+                {"Parachain": [1000]},
+            ]]},
+        }));
+        assert_eq!(f.counterparty.as_deref(), Some("remote:kusama/para:1000"));
+        assert_ne!(f.counterparty.as_deref(), Some("para:1000"));
+        assert_eq!(f.transport, "remote");
+    }
+
+    /// THE TRAP: `AccountId32`, `AccountIndex64` and `AccountKey20` each carry
+    /// their own `network: Option<NetworkId>`, so a perfectly local sibling
+    /// destination can MENTION Ethereum without crossing anything. Matching on
+    /// the network name rather than on the `GlobalConsensus` KEY would call this
+    /// message bridged and stop pairing it.
+    #[test]
+    fn a_network_named_inside_an_account_junction_is_not_a_consensus_boundary() {
+        let f = sent_to(json!({
+            "parents": 1,
+            "interior": {"X2": [[
+                {"Parachain": [2034]},
+                {"AccountKey20": {
+                    "network": {"Some": [{"Ethereum": {"chain_id": 1}}]},
+                    "key": vec![0u8; 20],
+                }},
+            ]]},
+        }));
+        assert_eq!(f.transport, "hrmp", "a sibling that mentions Ethereum is still a sibling");
+        assert_eq!(f.counterparty.as_deref(), Some("para:2034"));
+    }
+
+    /// The three local transports are unchanged by the new precedence — the
+    /// regression this slice must not cause.
+    #[test]
+    fn local_destinations_are_classified_exactly_as_before() {
+        for (dest, transport, counterparty) in [
+            (json!({"parents": 1, "interior": {"Here": []}}), "ump", Some("parent")),
+            (
+                json!({"parents": 1, "interior": {"X1": [[{"Parachain": [2034]}]]}}),
+                "hrmp",
+                Some("para:2034"),
+            ),
+            (
+                json!({"parents": 0, "interior": {"X1": [[{"Parachain": [1005]}]]}}),
+                "dmp",
+                Some("para:1005"),
+            ),
+            // parents >= 2 with no GlobalConsensus names nothing we can read:
+            // ignorance stays `unknown`, which is a different claim from `remote`
+            (json!({"parents": 2, "interior": {"Here": []}}), "unknown", None),
+        ] {
+            let f = sent_to(dest);
+            assert_eq!(f.transport, transport);
+            assert_eq!(f.counterparty.as_deref(), counterparty);
+        }
     }
 }

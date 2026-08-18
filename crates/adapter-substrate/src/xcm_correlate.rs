@@ -32,16 +32,23 @@
 //! event's. A candidate pair in the other order is not a pair; it is two
 //! messages missing a partner each, and it is refused.
 //!
+//! **XCM_CORRELATOR_VERSION 2 (Phase 3, slice 4)** adds one rule,
+//! `remote_destination`, and it exists because slice 3's drill produced a
+//! number: 180 of 181 queued sends paired across 20,681 blocks, and the single
+//! refusal was not an unlucky block but a whole CLASS — every message addressed
+//! beyond the immediate neighbour. See `pair_remote` for the mechanism.
+//!
 //! XCM_CORRELATOR_VERSION is lineage: bump on any rule change and re-run
-//! `xcm-correlate` over the ranges (migration 0016 has the delete that a
-//! NARROWED rule additionally needs).
+//! `xcm-correlate` over the ranges. This bump WIDENS the rule, so the
+//! delete-then-insert sink converges on a plain re-run; migration 0016 has the
+//! extra delete a NARROWED rule would need.
 
 use crate::xcm::facts_for_event;
 use canonical::CanonicalEvent;
 use ingest::module::BlockMapError;
 use ingest::xcm_correlate::{XcmCorrelator, XcmLink};
 
-pub const XCM_CORRELATOR_VERSION: u32 = 1;
+pub const XCM_CORRELATOR_VERSION: u32 = 2;
 
 pub struct SubstrateXcmCorrelator;
 
@@ -62,13 +69,16 @@ struct Candidate {
     transport: String,
 }
 
-/// The only transports a pair can exist in.
+/// The transports a pair can be established WITHIN — i.e. where the destination
+/// and the queue pallet are talking about the same hop and can agree.
 ///
 /// DMP is absent on purpose and it is not an oversight: the relay's
 /// `ChildParachainRouter` computes a hash and drops it without an event, and
 /// `parachains_dmp` deposits nothing at all, so a downward send has no wire row
 /// to pair with. `unknown` is absent because a destination we could not read is
-/// a destination we will not pair on.
+/// a destination we will not pair on. `remote` is absent because agreement is
+/// the wrong test for it — see `pair_remote`, which pairs ACROSS the
+/// disagreement instead.
 const PAIRABLE: [&str; 2] = ["hrmp", "ump"];
 
 /// One block's XCM events → its id aliases.
@@ -123,15 +133,118 @@ pub fn links_for_block(
     let block_sends = serde_json::json!({ "wire": wires.len(), "topic": topics.len() });
 
     let mut out = Vec::new();
+    // BRIDGED SENDS FIRST, and the order is load-bearing. A `remote` topic
+    // belongs to no transport group, so leaving it in place would make its
+    // group's counts unequal and refuse the OTHER, perfectly clean pair in the
+    // same block — one Snowbridge export would poison every ordinary send
+    // beside it. Resolving it first removes both ends from the count.
+    let mut consumed: Vec<u32> = Vec::new();
+    pair_remote(&wires, &topics, &block_sends, &mut consumed, &mut out);
     for transport in PAIRABLE {
-        let w: Vec<&Candidate> = wires.iter().filter(|c| c.transport == transport).collect();
-        let t: Vec<&Candidate> = topics.iter().filter(|c| c.transport == transport).collect();
+        let w: Vec<&Candidate> = wires
+            .iter()
+            .filter(|c| c.transport == transport && !consumed.contains(&c.event_index))
+            .collect();
+        let t: Vec<&Candidate> = topics
+            .iter()
+            .filter(|c| c.transport == transport && !consumed.contains(&c.event_index))
+            .collect();
         pair(transport, &w, &t, &block_sends, &mut out);
     }
     // Deterministic output: the sink is keyed by the wire event index, and two
     // transports could otherwise emit in an order that depends on PAIRABLE.
     out.sort_by_key(|(index, _)| *index);
     Ok(out)
+}
+
+/// THE BRIDGED CASE (XCM_CORRELATOR_VERSION 2, Phase 3 slice 4) — the one
+/// systematic refusal slice 3 measured, over 20,681 live blocks.
+///
+/// Asset Hub #19407624: `xcmpQueue.XcmpMessageSent` at event 6 (transport
+/// `hrmp`), `polkadotXcm.Sent` at event 7 addressed to
+/// `{parents: 2, X1[GlobalConsensus(Ethereum{chain_id: 1})]}`. One wire send,
+/// one topic send, adjacent, in order — a textbook `unique_in_block` shape,
+/// refused for one reason only: the two sides reported different transports.
+///
+/// **They disagree BY CONSTRUCTION and neither is wrong.** A wire event's
+/// transport comes from WHICH PALLET QUEUED IT — the immediate hop, here XCMP to
+/// Bridge Hub. A `Sent`'s comes from the FINAL destination, which is Ethereum
+/// and is no local transport at all. So every message addressed beyond the
+/// immediate neighbour refused, which makes this a blind spot rather than an
+/// unlucky block: on Asset Hub it is every Snowbridge export.
+///
+/// The fix is to stop treating the destination as a transport CLAIM. The wire
+/// event is the authority on how the first hop left; a `remote` destination
+/// cannot corroborate that and — this is the point — cannot contradict it
+/// either. `unknown` is deliberately NOT paired on: `remote` is the positive
+/// fact "addressed to a named consensus system", while `unknown` is ignorance
+/// about the destination, and pairing on ignorance is the guess this module
+/// exists to refuse.
+///
+/// **THIS RULE PAIRS BY ADJACENCY, not by counting**, and that is a deliberate
+/// difference from `pair`. A `remote` topic belongs to no transport group, so
+/// there is nothing to count it against — but the mechanism still says exactly
+/// where its wire event is: `send_xcm` delivers (the router's event) and its
+/// caller deposits `Sent` immediately after, so the topic's own wire event is
+/// the candidate IMMEDIATELY BEFORE it in the block's send sequence. Anything
+/// else there — another topic, or a wire already claimed by a bridged pair —
+/// means the shape is not what the mechanism produces, and the block records
+/// nothing.
+///
+/// `pair` is left counting rather than converted to adjacency because it is the
+/// rule that measured 99.4% on 20,681 live blocks; changing a proven rule needs
+/// its own measurement, not a refactor.
+fn pair_remote(
+    wires: &[Candidate],
+    topics: &[Candidate],
+    block_sends: &serde_json::Value,
+    consumed: &mut Vec<u32>,
+    out: &mut Vec<(u32, XcmLink)>,
+) {
+    let remote: Vec<&Candidate> = topics.iter().filter(|c| c.transport == "remote").collect();
+    if remote.is_empty() {
+        return;
+    }
+    // Every send candidate in this block, in event order. One event yields at
+    // most one fact, so an event index identifies a candidate uniquely.
+    let mut sequence: Vec<&Candidate> = wires.iter().chain(topics.iter()).collect();
+    sequence.sort_by_key(|c| c.event_index);
+
+    for t in remote {
+        let Some(position) = sequence.iter().position(|c| c.event_index == t.event_index) else {
+            continue;
+        };
+        let Some(previous) = position.checked_sub(1).map(|p| sequence[p]) else {
+            continue; // nothing before it: no wire event to belong to
+        };
+        let is_wire = wires.iter().any(|w| w.event_index == previous.event_index);
+        if !is_wire || consumed.contains(&previous.event_index) || previous.id == t.id {
+            continue;
+        }
+        consumed.push(previous.event_index);
+        consumed.push(t.event_index);
+        out.push((
+            previous.event_index,
+            XcmLink {
+                wire_hash: previous.id.clone(),
+                topic: t.id.clone(),
+                topic_event_index: t.event_index,
+                // FROM THE WIRE SIDE, always. The destination named another
+                // consensus; the transport is how this chain actually queued it.
+                transport: previous.transport.clone(),
+                rule: "remote_destination".into(),
+                confidence: "medium".into(),
+                evidence: serde_json::json!({
+                    // Not derivable from the row: how crowded the block was, and
+                    // how many bridged sends it held.
+                    "block_sends": block_sends,
+                    "remote_topics": topics.iter().filter(|c| c.transport == "remote").count(),
+                    "event_gap": t.event_index - previous.event_index,
+                    "topic_transport": "remote",
+                }),
+            },
+        ));
+    }
 }
 
 /// The rule itself, for one transport's candidates.
@@ -423,6 +536,125 @@ mod tests {
         assert_eq!(err.event_index, 1);
         assert_eq!(err.event, "polkadotxcm.SomethingNewIn2027");
         assert!(err.reason.contains("unknown XCM event"));
+    }
+
+    /// `polkadotXcm.Sent` to another consensus system — a Snowbridge export.
+    fn sent_remote(index: u32, byte: u8) -> CanonicalEvent {
+        ev(
+            index,
+            "polkadotxcm.Sent",
+            serde_json::json!({
+                "origin": {"parents": 0, "interior": {"Here": []}},
+                "destination": {
+                    "parents": 2,
+                    "interior": {"X1": [[{"GlobalConsensus": [{"Ethereum": {"chain_id": 1}}]}]]},
+                },
+                "message": [[{"WithdrawAsset": []}]],
+                "message_id": vec![byte; 32],
+            }),
+        )
+    }
+
+    /// THE SLICE-4 CASE, in the exact shape of live Asset Hub #19407624: the
+    /// only refusal in 181 live sends, and a whole class rather than one block.
+    /// The queue pallet says `hrmp` (the hop to Bridge Hub), the destination
+    /// says Ethereum, and the link takes its transport from the WIRE side —
+    /// which is the one that actually knows how the message left.
+    #[test]
+    fn a_bridged_send_pairs_across_the_transport_disagreement() {
+        let links = links_for_block(&[wire_hrmp(6, 0x73), sent_remote(7, 0x16)]).unwrap();
+        assert_eq!(links.len(), 1, "before slice 4 this refused and the wire hash dead-ended");
+        let (wire_index, link) = &links[0];
+        assert_eq!(*wire_index, 6);
+        assert_eq!(link.transport, "hrmp", "from the wire event, never the destination");
+        assert_eq!(link.rule, "remote_destination");
+        assert_eq!(link.confidence, "medium");
+        assert_eq!(link.evidence["topic_transport"], "remote");
+        assert_eq!(link.evidence["event_gap"], 1);
+        assert_eq!(link.evidence["remote_topics"], 1);
+    }
+
+    /// THE REVIEW FINDING, and it is why this rule pairs by ADJACENCY rather
+    /// than by counting: a bridged send does not belong to any transport group,
+    /// so counting it into one made its group unequal and refused the ORDINARY
+    /// send beside it as well. One Snowbridge export would have poisoned every
+    /// clean pair in its block — a narrower version of the very class this slice
+    /// exists to close.
+    #[test]
+    fn a_bridged_send_beside_an_ordinary_one_no_longer_poisons_it() {
+        let links = links_for_block(&[
+            wire_hrmp(0, 0x11),
+            sent_hrmp(1, 0xaa, 2034),
+            wire_hrmp(6, 0x73),
+            sent_remote(7, 0x16),
+        ])
+        .unwrap();
+        assert_eq!(links.len(), 2, "both sends pair: {links:?}");
+        assert_eq!(links[0].1.rule, "unique_in_block", "the ordinary send is untouched");
+        assert_eq!(links[0].1.topic, id(0xaa));
+        assert_eq!(links[1].1.rule, "remote_destination");
+        assert_eq!(links[1].1.topic, id(0x16));
+        // …and the bridged pass ran FIRST, so the ordinary pair's transport
+        // group counted 1:1 rather than 2:1.
+        assert_eq!(links[0].1.evidence["block_sends"]["wire"], 2);
+    }
+
+    /// The ordering constraint holds across the bridge too — the mechanism does
+    /// not care where the message was addressed.
+    #[test]
+    fn a_bridged_topic_before_its_wire_event_is_still_refused() {
+        assert!(links_for_block(&[sent_remote(0, 0x16), wire_hrmp(1, 0x73)])
+            .unwrap()
+            .is_empty());
+    }
+
+    /// A destination we could not READ is ignorance, not a positive fact, so it
+    /// never pairs on its own — but it does not BLOCK a bridged pair either,
+    /// because adjacency resolves what counting could not: the wire event
+    /// immediately before the bridged topic is the one that queued it, whatever
+    /// else the block holds.
+    #[test]
+    fn an_unreadable_destination_never_pairs_but_does_not_block_adjacency() {
+        let unreadable = ev(
+            8,
+            "polkadotxcm.Sent",
+            serde_json::json!({
+                "origin": {"parents": 0, "interior": {"Here": []}},
+                "destination": {"parents": 2, "interior": {"Here": []}},
+                "message": [[{"WithdrawAsset": []}]],
+                "message_id": vec![0xaau8; 32],
+            }),
+        );
+        // alone: nothing to pair with, and no pairing invented
+        assert!(links_for_block(&[wire_hrmp(6, 0x73), unreadable.clone()]).unwrap().is_empty());
+        // after a bridged send: the wire belongs to the candidate immediately
+        // after it, and the unreadable one is simply a `Sent` with no wire event
+        let links =
+            links_for_block(&[wire_hrmp(6, 0x73), sent_remote(7, 0x16), unreadable.clone()])
+                .unwrap();
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].1.topic, id(0x16));
+        // BEFORE it, though, the unreadable send is what sits next to the wire —
+        // so the bridged topic has no adjacent wire and nothing is recorded.
+        let mut earlier = unreadable;
+        earlier.index = 7;
+        assert!(links_for_block(&[wire_hrmp(6, 0x73), earlier, sent_remote(8, 0x16)])
+            .unwrap()
+            .is_empty());
+    }
+
+    /// A bridged topic does not reach past an intervening send to claim a wire.
+    #[test]
+    fn a_bridged_topic_never_reaches_past_another_send_for_its_wire() {
+        let links = links_for_block(&[
+            wire_hrmp(0, 0x11),
+            sent_hrmp(1, 0xaa, 2034),
+            sent_remote(2, 0x16),
+        ])
+        .unwrap();
+        assert_eq!(links.len(), 1, "the local pair holds; the bridged one has no wire left");
+        assert_eq!(links[0].1.rule, "unique_in_block");
+        assert_eq!(links[0].1.topic, id(0xaa));
     }
 
     #[test]

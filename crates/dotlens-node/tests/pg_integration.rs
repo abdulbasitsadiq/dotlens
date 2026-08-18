@@ -2801,7 +2801,7 @@ async fn xcm_links_pair_the_two_sender_ids_and_a_journey_reads_from_either() {
         assert_eq!(found[0].rule, "unique_in_block");
         assert_eq!(found[0].confidence, "high");
         assert_eq!(found[0].evidence["event_gap"], 1);
-        assert_eq!(found[0].correlator_version, 1);
+        assert_eq!(found[0].correlator_version, 2);
         assert_eq!(found[0].runtime_version, 2_003_002, "lineage: which runtime, which rule");
         assert_eq!(found[0].evidence["block_sends"]["wire"], 1);
         assert_eq!((found[0].wire_event_index, found[0].topic_event_index), (0, 1));
