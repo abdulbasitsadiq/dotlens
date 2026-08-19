@@ -241,7 +241,15 @@ impl FrameDecoder {
         })
     }
 
-    fn decode_events(&self, bytes: &[u8]) -> Result<Vec<CanonicalEvent>, FrameDecodeError> {
+    /// Decode a `System.Events` blob on its own.
+    ///
+    /// Made public in slice 8 so Tier 2 can read the events of a block a FORK
+    /// built through the same decoder every indexed block goes through — which
+    /// is what makes a simulated `balances.Transfer` and an indexed one the same
+    /// kind of object, comparable field by field rather than across two
+    /// vocabularies. A second events walk living in the fork module would have
+    /// been the same duplication this project has had to unpick four times.
+    pub fn decode_events(&self, bytes: &[u8]) -> Result<Vec<CanonicalEvent>, FrameDecodeError> {
         let Some(ty_id) = self.events_type_id else {
             return Err(FrameDecodeError::Events(
                 "System.Events storage entry not found in metadata".into(),

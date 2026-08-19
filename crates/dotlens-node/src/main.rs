@@ -52,10 +52,15 @@
 //!   dotlens-node whitelist-range <chain> <from> <to>   # map whitelist events
 //!   dotlens-node xcm-range <chain> <from> <to>         # map XCM message facts
 //!   dotlens-node xcm-correlate <chain> <from> <to>     # pair the two ids of one message
+//!   dotlens-node coretime-range <chain> <from> <to>    # map core occupancy from relay events
+//!   dotlens-node sync-core-config <chain> [height]     # read + DATE the num_cores denominator
+//!   dotlens-node broker-range <chain> <from> <to>      # map coretime ENTITLEMENT from broker events
+//!   dotlens-node sync-broker-config <chain> [height]   # read + DATE the entitlement denominator
 //!
 //! Per-module followers are opt-in flags: LIVE_INGEST, DECODE_FOLLOW,
 //! BALANCES_FOLLOW, GOV_FOLLOW, VOTES_FOLLOW, TREASURY_FOLLOW, BOUNTIES_FOLLOW,
-//! WHITELIST_FOLLOW, XCM_FOLLOW, XCM_CORRELATE_FOLLOW, TIP_FOLLOW (all `=1`).
+//! WHITELIST_FOLLOW, XCM_FOLLOW, XCM_CORRELATE_FOLLOW, CORETIME_FOLLOW,
+//! TIP_FOLLOW (all `=1`).
 //! XCM_FOLLOW and XCM_CORRELATE_FOLLOW are separate on purpose: they write
 //! different tables under different versions, and re-deriving links after a
 //! correlation-rule change must not touch a single observation row.
@@ -93,6 +98,7 @@ struct Backends {
     sim: Arc<dyn api::SimIndex>,
     xcm_sim: Arc<dyn api::XcmSimIndex>,
     xcm: Arc<dyn api::XcmIndex>,
+    coretime: Arc<dyn api::CoretimeIndex>,
     runtime_versions: Arc<dyn RuntimeVersionSink>,
     /// Kept for label sync/verify (they need direct SQL, not a trait).
     #[cfg(feature = "pg")]
@@ -114,6 +120,7 @@ fn memory_backends() -> Backends {
         sim: Arc::new(api::MemorySimIndex::new()),
         xcm_sim: Arc::new(api::MemoryXcmSimIndex::new()),
         xcm: Arc::new(api::MemoryXcmIndex::new()),
+        coretime: Arc::new(api::MemoryCoretimeIndex::new()),
         runtime_versions: Arc::new(NoopRuntimeVersionSink),
         #[cfg(feature = "pg")]
         pool: None,
@@ -149,6 +156,10 @@ enum Command {
     WhitelistRange { chain: String, from: u64, to: u64 },
     XcmRange { chain: String, from: u64, to: u64 },
     XcmCorrelate { chain: String, from: u64, to: u64 },
+    CoretimeRange { chain: String, from: u64, to: u64 },
+    SyncCoreConfig { chain: String, height: Option<u64> },
+    BrokerRange { chain: String, from: u64, to: u64 },
+    SyncBrokerConfig { chain: String, height: Option<u64> },
     SyncBountyAccounts,
     AnchorVoting { chain: String, account: String, track: u32, height: Option<u64> },
     SyncTracks,
@@ -162,6 +173,7 @@ enum Command {
         call_hex: String,
         origin: String,
         height: Option<u64>,
+        opts: SimOptions,
     },
     SimulateReferendum {
         chain: String,
@@ -169,7 +181,10 @@ enum Command {
         referendum_id: i64,
         origin: String,
         height: Option<u64>,
+        opts: SimOptions,
     },
+    /// The read side of the Tier 2 queue.
+    SimJobs { chain: String, status: Option<String> },
     SimulateXcm {
         chain: String,
         origin_location: String,
@@ -184,8 +199,109 @@ enum Command {
     },
 }
 
+/// The flags both `simulate-call` and `simulate-referendum` take.
+///
+/// THEY ARE FLAGS ON THE EXISTING COMMANDS RATHER THAN A NEW `simulate-fork`,
+/// and that is deliberate: a separate command would have needed its own copy of
+/// `run_simulate_referendum`'s preimage lookup and hash check, and two copies of
+/// "where do a referendum's bytes come from" is the duplication this project has
+/// had to unpick in four separate slices. The tier is the thing that varies, so
+/// the tier is the argument. Every shipped invocation keeps working unchanged,
+/// because the default is still `dry_run`.
+#[derive(Debug, Clone, Default)]
+struct SimOptions {
+    /// "dry_run" (default) | "fork".
+    tier: Option<String>,
+    /// Storage overrides, as written. See `adapter_substrate::fork::OverrideSpec`.
+    override_specs: Vec<String>,
+    /// Enqueue and return the job id instead of running it here.
+    queue: bool,
+    /// Who signs the extrinsic the fork applies. Required on the fork tier when
+    /// the origin is privileged — see `sim::ForkRequest::signer`.
+    signer: Option<String>,
+}
+
+/// Pull `--tier`, `--set`, `--overrides` and `--queue` out of the argument list,
+/// leaving the positional arguments contiguous so the existing index-based
+/// parsing is untouched.
+fn take_sim_flags(args: &mut Vec<String>) -> Result<SimOptions> {
+    let mut opts = SimOptions::default();
+    let mut i = 0;
+    while i < args.len() {
+        let take_value = |args: &Vec<String>, i: usize, flag: &str| -> Result<String> {
+            args.get(i + 1)
+                .cloned()
+                .with_context(|| format!("{flag} needs a value"))
+        };
+        match args[i].as_str() {
+            "--tier" => {
+                opts.tier = Some(take_value(args, i, "--tier")?);
+                args.drain(i..i + 2);
+            }
+            "--set" => {
+                opts.override_specs.push(take_value(args, i, "--set")?);
+                args.drain(i..i + 2);
+            }
+            "--overrides" => {
+                // A FILE, because a storage value is JSON and shell quoting is
+                // where a counterfactual quietly becomes a different one. One
+                // spec per line; blank lines and `#` comments ignored.
+                let path = take_value(args, i, "--overrides")?;
+                let text = std::fs::read_to_string(&path)
+                    .with_context(|| format!("reading overrides from {path}"))?;
+                for line in text.lines() {
+                    let line = line.trim();
+                    if line.is_empty() || line.starts_with('#') {
+                        continue;
+                    }
+                    opts.override_specs.push(line.to_string());
+                }
+                args.drain(i..i + 2);
+            }
+            "--signer" => {
+                opts.signer = Some(take_value(args, i, "--signer")?);
+                args.drain(i..i + 2);
+            }
+            "--queue" => {
+                opts.queue = true;
+                args.remove(i);
+            }
+            _ => i += 1,
+        }
+    }
+    // AN OVERRIDE ON TIER 1 IS AN ERROR, NOT A NO-OP. `dry_run_call` executes
+    // against the chain's real state and cannot be told otherwise, so silently
+    // ignoring `--set` would answer a different question than the one asked and
+    // look exactly like an answer to the one that was.
+    let tier = opts.tier.as_deref().unwrap_or(sim::TIER_DRY_RUN);
+    anyhow::ensure!(
+        opts.override_specs.is_empty() || tier == sim::TIER_FORK,
+        "--set/--overrides inject storage, which only the fork tier can do — Tier 1 dry-runs \
+         against the chain's real state and cannot be told otherwise. Add --tier fork, or drop \
+         the overrides; they will not be silently ignored"
+    );
+    anyhow::ensure!(
+        !opts.queue || tier == sim::TIER_FORK,
+        "--queue enqueues a job for the fork worker; the dry-run tier is one round trip and has \
+         no queue"
+    );
+    anyhow::ensure!(
+        matches!(tier, "dry_run" | "fork"),
+        "--tier must be dry_run or fork, not '{tier}'"
+    );
+    Ok(opts)
+}
+
 fn parse_args() -> Result<Command> {
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    let mut args: Vec<String> = std::env::args().skip(1).collect();
+    // ONLY the simulate commands take these flags. Stripping them globally would
+    // silently re-index every other command's positional arguments, so a typo in
+    // `backfill` would shift a height rather than fail.
+    let opts = match args.first().map(String::as_str) {
+        Some("simulate-call") | Some("simulate-referendum") => take_sim_flags(&mut args)?,
+        _ => SimOptions::default(),
+    };
+    let args = args;
     let range = |usage: &'static str| -> Result<(String, u64, u64)> {
         let chain = args.get(1).context(usage)?.clone();
         let from: u64 = args.get(2).context(usage)?.parse().context(usage)?;
@@ -261,6 +377,33 @@ fn parse_args() -> Result<Command> {
                 range("usage: dotlens-node xcm-correlate <chain> <from> <to>")?;
             Ok(Command::XcmCorrelate { chain, from, to })
         }
+        Some("coretime-range") => {
+            let (chain, from, to) =
+                range("usage: dotlens-node coretime-range <chain> <from> <to>")?;
+            Ok(Command::CoretimeRange { chain, from, to })
+        }
+        Some("sync-core-config") => {
+            let usage = "usage: dotlens-node sync-core-config <chain> [height]";
+            let chain = args.get(1).context(usage)?.clone();
+            let height = match args.get(2) {
+                Some(h) => Some(h.parse::<u64>().context(usage)?),
+                None => None,
+            };
+            Ok(Command::SyncCoreConfig { chain, height })
+        }
+        Some("broker-range") => {
+            let (chain, from, to) = range("usage: dotlens-node broker-range <chain> <from> <to>")?;
+            Ok(Command::BrokerRange { chain, from, to })
+        }
+        Some("sync-broker-config") => {
+            let usage = "usage: dotlens-node sync-broker-config <chain> [height]";
+            let chain = args.get(1).context(usage)?.clone();
+            let height = match args.get(2) {
+                Some(h) => Some(h.parse::<u64>().context(usage)?),
+                None => None,
+            };
+            Ok(Command::SyncBrokerConfig { chain, height })
+        }
         Some("sync-bounty-accounts") => Ok(Command::SyncBountyAccounts),
         Some("anchor-voting") => {
             let usage = "usage: dotlens-node anchor-voting <chain> <account> <track> [height]";
@@ -325,7 +468,7 @@ fn parse_args() -> Result<Command> {
                 Some(h) => Some(h.parse::<u64>().context(usage)?),
                 None => None,
             };
-            Ok(Command::SimulateCall { chain, call_hex, origin, height })
+            Ok(Command::SimulateCall { chain, call_hex, origin, height, opts })
         }
         Some("simulate-referendum") => {
             let usage =
@@ -339,7 +482,7 @@ fn parse_args() -> Result<Command> {
                 Some(h) => Some(h.parse::<u64>().context(usage)?),
                 None => None,
             };
-            Ok(Command::SimulateReferendum { chain, class, referendum_id, origin, height })
+            Ok(Command::SimulateReferendum { chain, class, referendum_id, origin, height, opts })
         }
         Some("simulate-xcm") => {
             let usage =
@@ -372,6 +515,11 @@ fn parse_args() -> Result<Command> {
                 None => None,
             };
             Ok(Command::SimulateForwarded { chain, at_block_hash, input_hash, height })
+        }
+        Some("sim-jobs") => {
+            let usage = "usage: dotlens-node sim-jobs <chain> [status]";
+            let chain = args.get(1).context(usage)?.clone();
+            Ok(Command::SimJobs { chain, status: args.get(2).cloned() })
         }
         Some("anchor-balance") => {
             let usage = "usage: dotlens-node anchor-balance <chain> <account> <height>";
@@ -451,6 +599,7 @@ async fn main() -> Result<()> {
             sim: Arc::new(api::pg::PgSimIndex::new(pool.clone())),
             xcm_sim: Arc::new(api::pg::PgXcmSimIndex::new(pool.clone())),
             xcm: Arc::new(api::pg::PgXcmIndex::new(pool.clone())),
+            coretime: Arc::new(api::pg::PgCoretimeIndex::new(pool.clone())),
             runtime_versions: Arc::new(PgRuntimeVersionSink::new(pool.clone())),
             pool: Some(pool),
             persistent: true,
@@ -563,6 +712,26 @@ async fn main() -> Result<()> {
         );
         return run_xcm_correlate(&registry, &backends, chain, *from, *to).await;
     }
+    if let Command::CoretimeRange { chain, from, to } = &command {
+        anyhow::ensure!(
+            backends.persistent,
+            "coretime-range requires DATABASE_URL (canonical events + occupancy facts must persist)"
+        );
+        return run_coretime_range(&registry, &backends, chain, *from, *to).await;
+    }
+    if let Command::SyncCoreConfig { chain, height } = &command {
+        return run_sync_core_config(&registry, &backends, raw.as_ref(), chain, *height).await;
+    }
+    if let Command::BrokerRange { chain, from, to } = &command {
+        anyhow::ensure!(
+            backends.persistent,
+            "broker-range requires DATABASE_URL (canonical events + entitlement facts must persist)"
+        );
+        return run_broker_range(&registry, &backends, chain, *from, *to).await;
+    }
+    if let Command::SyncBrokerConfig { chain, height } = &command {
+        return run_sync_broker_config(&registry, &backends, raw.as_ref(), chain, *height).await;
+    }
     if matches!(command, Command::SyncBountyAccounts) {
         #[cfg(feature = "pg")]
         if let Some(pool) = &backends.pool {
@@ -620,18 +789,25 @@ async fn main() -> Result<()> {
     if let Command::DecodePreimages { chain, height } = &command {
         return run_decode_preimages(&registry, &backends, raw.as_ref(), chain, *height).await;
     }
-    if let Command::SimulateCall { chain, call_hex, origin, height } = &command {
+    if let Command::SimulateCall { chain, call_hex, origin, height, opts } = &command {
         let bytes = decode_scale_hex(call_hex, "call")?;
         return run_simulate(
-            &registry, &backends, raw.as_ref(), chain, bytes, origin, *height, None,
+            &registry, &backends, raw.as_ref(), chain, bytes, origin, *height, None, opts,
         )
         .await;
     }
-    if let Command::SimulateReferendum { chain, class, referendum_id, origin, height } = &command {
+    if let Command::SimulateReferendum {
+        chain, class, referendum_id, origin, height, opts,
+    } = &command
+    {
         return run_simulate_referendum(
             &registry, &backends, raw.as_ref(), chain, class, *referendum_id, origin, *height,
+            opts,
         )
         .await;
+    }
+    if let Command::SimJobs { chain, status } = &command {
+        return run_sim_jobs(&backends, chain, status.as_deref()).await;
     }
     if let Command::SimulateXcm { chain, origin_location, program_hex, height } = &command {
         let bytes = decode_scale_hex(program_hex, "program")?;
@@ -731,6 +907,9 @@ async fn main() -> Result<()> {
     spawn_whitelist_followers(&registry, &backends);
     spawn_xcm_followers(&registry, &backends);
     spawn_xcm_correlate_followers(&registry, &backends);
+    spawn_coretime_followers(&registry, &backends);
+    spawn_broker_followers(&registry, &backends);
+    spawn_fork_job_worker(&registry, &backends, &raw);
     spawn_tip_followers(&registry, &backends, &raw);
 
     // -- API ------------------------------------------------------------------
@@ -747,6 +926,7 @@ async fn main() -> Result<()> {
         sim: backends.sim.clone(),
         xcm_sim: backends.xcm_sim.clone(),
         xcm: backends.xcm.clone(),
+        coretime: backends.coretime.clone(),
         // family-encoded address parsing is adapter-owned (Invariant 4); with
         // more families this becomes registry-driven dispatch
         parse_account: Arc::new(|s| {
@@ -1792,6 +1972,119 @@ fn spawn_xcm_followers(registry: &Arc<Registry>, backends: &Arc<Backends>) {
     }
 }
 
+/// Core occupancy followers, gated on the `coretime` module — which ONLY the
+/// relay declares, and deliberately so.
+///
+/// `paraInclusion` is a relay pallet: it names both the para id and the core
+/// index, so which core produced a block is a relay fact and a parachain that
+/// declared this module would start a follower that maps nothing forever. A
+/// registry test asserts the gate holds in that direction (any chain declaring
+/// `coretime` must be a relay), because a MISSING declaration is the failure
+/// this project has paid for before — the follower silently never starts, and an
+/// empty occupancy table is indistinguishable from a network where no core did
+/// any work.
+fn spawn_coretime_followers(registry: &Arc<Registry>, backends: &Arc<Backends>) {
+    if !env_flag("CORETIME_FOLLOW") {
+        tracing::info!("coretime follower disabled (set CORETIME_FOLLOW=1 to enable)");
+        return;
+    }
+    if !backends.persistent {
+        tracing::warn!("CORETIME_FOLLOW=1 but no DATABASE_URL — refusing to map into memory");
+        return;
+    }
+    #[cfg(feature = "pg")]
+    {
+        use adapter_substrate::coretime::SubstrateOccupancyMapper;
+
+        let poll = std::time::Duration::from_secs(
+            env_or("POLL_INTERVAL_SECS", "6").parse().unwrap_or(6),
+        );
+        for chain in registry.chains() {
+            if !chain.has_module("coretime") {
+                continue;
+            }
+            if chain.family != registry::ChainFamily::Substrate {
+                tracing::debug!(chain = %chain.id, "no coretime mapper for this family — skipped");
+                continue;
+            }
+            let Some(pool) = backends.pool.clone() else { continue };
+            let chain_id = chain.id.clone();
+            let backends = backends.clone();
+            tokio::spawn(async move {
+                tracing::info!(chain = %chain_id, "coretime follower started");
+                let source = dotlens_node::balances_pg::PgEventSource::new(pool.clone());
+                let sink = dotlens_node::coretime_pg::PgOccupancySink::new(pool);
+                let deps = ingest::coretime::CoretimeDeps {
+                    checkpoints: backends.checkpoints.as_ref(),
+                    source: &source,
+                    sink: &sink,
+                };
+                ingest::coretime::coretime_follow(
+                    &chain_id,
+                    &SubstrateOccupancyMapper,
+                    &deps,
+                    poll,
+                )
+                .await;
+            });
+        }
+    }
+}
+
+/// Broker entitlement followers.
+///
+/// Gated on the `broker` module, which exactly one chain in the registry
+/// declares — and it is found by ASKING THE REGISTRY, never by naming 1005.
+/// Adding a second network's coretime chain is then a seed file and nothing
+/// else, which is the whole of Invariant 2 on this surface.
+///
+/// The gate matters more than usual here because the failure is silent in the
+/// most convincing way: a follower that never starts leaves an empty
+/// `broker_events`, and an empty entitlement table reads exactly like a network
+/// where nobody bought a core — which is a claim about the market rather than
+/// about our coverage.
+fn spawn_broker_followers(registry: &Arc<Registry>, backends: &Arc<Backends>) {
+    if !env_flag("BROKER_FOLLOW") {
+        tracing::info!("broker follower disabled (set BROKER_FOLLOW=1 to enable)");
+        return;
+    }
+    if !backends.persistent {
+        tracing::warn!("BROKER_FOLLOW=1 but no DATABASE_URL — refusing to map into memory");
+        return;
+    }
+    #[cfg(feature = "pg")]
+    {
+        use adapter_substrate::broker::SubstrateBrokerMapper;
+
+        let poll = std::time::Duration::from_secs(
+            env_or("POLL_INTERVAL_SECS", "6").parse().unwrap_or(6),
+        );
+        for chain in registry.chains() {
+            if !chain.has_module("broker") {
+                continue;
+            }
+            if chain.family != registry::ChainFamily::Substrate {
+                tracing::debug!(chain = %chain.id, "no broker mapper for this family — skipped");
+                continue;
+            }
+            let Some(pool) = backends.pool.clone() else { continue };
+            let chain_id = chain.id.clone();
+            let backends = backends.clone();
+            tokio::spawn(async move {
+                tracing::info!(chain = %chain_id, "broker follower started");
+                let source = dotlens_node::balances_pg::PgEventSource::new(pool.clone());
+                let sink = dotlens_node::broker_pg::PgBrokerSink::new(pool);
+                let deps = ingest::broker::BrokerDeps {
+                    checkpoints: backends.checkpoints.as_ref(),
+                    source: &source,
+                    sink: &sink,
+                };
+                ingest::broker::broker_follow(&chain_id, &SubstrateBrokerMapper, &deps, poll).await;
+            });
+        }
+    }
+}
+
 /// XCM correlation followers. Same gate as the `xcm` module — a chain whose
 /// messages we do not record has nothing to correlate — and its own env flag,
 /// because the two workers write different tables under different versions and
@@ -1932,6 +2225,355 @@ async fn run_xcm_range(
 #[cfg(not(feature = "pg"))]
 async fn run_xcm_range(_: &Registry, _: &Backends, _: &str, _: u64, _: u64) -> Result<()> {
     anyhow::bail!("xcm-range requires the `pg` feature")
+}
+
+/// Map core occupancy over a decoded relay range.
+///
+/// NO BACKFILL IS NEEDED FOR THIS, which is the cheapest fact in the slice:
+/// occupancy is a question about parachains answered entirely by relay events,
+/// and Phase 1 already put the relay blocks in the raw store. The prep pass
+/// decoded 1,542 of them across six runtimes with no RPC at all.
+#[cfg(feature = "pg")]
+async fn run_coretime_range(
+    registry: &Registry,
+    backends: &Backends,
+    chain: &str,
+    from: u64,
+    to: u64,
+) -> Result<()> {
+    use adapter_substrate::coretime::SubstrateOccupancyMapper;
+
+    let cfg = registry
+        .chain(chain)
+        .with_context(|| format!("unknown chain: {chain}"))?;
+    anyhow::ensure!(
+        cfg.family == registry::ChainFamily::Substrate,
+        "no coretime mapper for family {:?}",
+        cfg.family
+    );
+    // A LOUD REFUSAL RATHER THAN AN EMPTY RUN. Mapping a chain that does not
+    // declare the module would report "mapped N blocks" and write nothing, which
+    // is the exact shape of the silent gap the follower gate exists to prevent.
+    anyhow::ensure!(
+        cfg.has_module("coretime"),
+        "{chain} does not declare the `coretime` module. Occupancy is read from `paraInclusion`, \
+         a RELAY pallet, so a parachain has no candidate events to map and this run would report \
+         success while writing nothing"
+    );
+    let pool = backends
+        .pool
+        .as_ref()
+        .context("coretime-range requires DATABASE_URL")?;
+    let source = dotlens_node::balances_pg::PgEventSource::new(pool.clone());
+    let sink = dotlens_node::coretime_pg::PgOccupancySink::new(pool.clone());
+    let deps = ingest::coretime::CoretimeDeps {
+        checkpoints: backends.checkpoints.as_ref(),
+        source: &source,
+        sink: &sink,
+    };
+    let n = ingest::coretime::coretime_range(&cfg.id, &SubstrateOccupancyMapper, &deps, from, to)
+        .await
+        .with_context(|| format!("coretime-range {chain} {from}..={to}"))?;
+    tracing::info!(chain, from, to, mapped = n, "coretime-range complete");
+    println!("coretime-range {chain} {from}..={to}: mapped {n} blocks");
+    Ok(())
+}
+
+#[cfg(not(feature = "pg"))]
+async fn run_coretime_range(_: &Registry, _: &Backends, _: &str, _: u64, _: u64) -> Result<()> {
+    anyhow::bail!("coretime-range requires the `pg` feature")
+}
+
+/// Read `Configuration.ActiveConfig` at one block and record `num_cores` with
+/// the height it was read at.
+///
+/// THIS IS THE DENOMINATOR AND IT HAS ITS OWN COMMAND FOR A REASON. `num_cores`
+/// is host configuration that moves at SESSION boundaries; the prep read it at
+/// exactly one block (#32614536 → 100) and named a stale denominator as a live
+/// risk. Making it a periodic reading rather than a constant is what lets every
+/// ratio the API serves say which reading it divided by — and lets a reader see
+/// when two readings inside one window disagree.
+#[cfg(all(feature = "pg", feature = "live"))]
+async fn run_sync_core_config(
+    registry: &Registry,
+    backends: &Backends,
+    raw: &dyn RawStore,
+    chain: &str,
+    height: Option<u64>,
+) -> Result<()> {
+    use adapter_substrate::{coretime as ac, source::SubstrateSource};
+    use ingest::live::ChainSource;
+
+    let pool = backends
+        .pool
+        .as_ref()
+        .context("sync-core-config requires DATABASE_URL")?;
+    let cfg = registry
+        .chain(chain)
+        .with_context(|| format!("unknown chain: {chain}"))?;
+    anyhow::ensure!(
+        cfg.has_module("coretime"),
+        "{chain} does not declare the `coretime` module — the scheduler's core count is relay \
+         host configuration and a parachain has none"
+    );
+    let source = SubstrateSource::new(&cfg.id, cfg.endpoints.rpc.clone())
+        .map_err(|e| anyhow::anyhow!(e))?;
+    let height = match height {
+        Some(h) => h,
+        None => source.finalized_height().await.map_err(|e| anyhow::anyhow!(e))?,
+    };
+    let hash = source.block_hash(height).await.map_err(|e| anyhow::anyhow!(e))?;
+    let spec = source
+        .runtime_version_at(hash)
+        .await
+        .map_err(|e| anyhow::anyhow!(e))?;
+
+    // Archived blob if we have it, else fetch AND archive — same rule as
+    // `anchor-balance`, so the reading stays re-derivable from the raw store.
+    let meta_key = raw_store::keys::metadata(&cfg.id, spec);
+    let metadata = match raw.get(&meta_key) {
+        Ok(blob) => blob,
+        Err(raw_store::RawStoreError::NotFound(_)) => {
+            let blob = source.metadata_at(height).await.map_err(|e| anyhow::anyhow!(e))?;
+            raw.put(&meta_key, &blob, "sync-core-config")?;
+            tracing::info!(chain = %cfg.id, spec, "metadata archived while reading core config");
+            blob
+        }
+        Err(e) => return Err(e.into()),
+    };
+
+    let key = ac::active_config_key();
+    let bytes = source
+        .storage_at(&key, hash)
+        .await
+        .map_err(|e| anyhow::anyhow!(e))?
+        // ABSENT IS AN ERROR HERE, unlike an absent account balance. An account
+        // that does not exist holds zero and that is a fact; a runtime with no
+        // active host configuration is not a runtime, so an empty read means the
+        // key or the entry name is wrong and recording "0 cores" would make
+        // every ratio silently infinite.
+        .with_context(|| {
+            format!(
+                "{}.{} is absent from state at #{height} — the entry name or the key derivation \
+                 is wrong, and a missing host configuration is not a chain with no cores",
+                ac::CONFIG_PALLET,
+                ac::ACTIVE_CONFIG_ENTRY
+            )
+        })?;
+    let view = ac::decode_active_config(&metadata, &bytes).map_err(|e| anyhow::anyhow!(e))?;
+    dotlens_node::coretime_pg::insert_core_config(
+        pool,
+        &cfg.id,
+        height,
+        view.num_cores,
+        &view.scheduler_params,
+        spec,
+    )
+    .await?;
+    println!(
+        "core config {chain} @#{height} (spec {spec}): num_cores={}",
+        view.num_cores
+    );
+    println!(
+        "  this reading DATES the denominator. num_cores moves at session boundaries, so a \
+         ratio computed against it is only as current as #{height} — /v1/coretime/{chain}/occupancy \
+         names which reading it used."
+    );
+    Ok(())
+}
+
+#[cfg(not(all(feature = "pg", feature = "live")))]
+async fn run_sync_core_config(
+    _: &Registry,
+    _: &Backends,
+    _: &dyn RawStore,
+    _: &str,
+    _: Option<u64>,
+) -> Result<()> {
+    anyhow::bail!("sync-core-config requires the `pg` and `live` features")
+}
+
+/// Map `Broker.*` events into entitlement facts and the seam.
+#[cfg(feature = "pg")]
+async fn run_broker_range(
+    registry: &Registry,
+    backends: &Backends,
+    chain: &str,
+    from: u64,
+    to: u64,
+) -> Result<()> {
+    use adapter_substrate::broker::SubstrateBrokerMapper;
+
+    let cfg = registry
+        .chain(chain)
+        .with_context(|| format!("unknown chain: {chain}"))?;
+    anyhow::ensure!(
+        cfg.family == registry::ChainFamily::Substrate,
+        "no broker mapper for chain family {:?}",
+        cfg.family
+    );
+    // A LOUD REFUSAL RATHER THAN AN EMPTY RUN — the mirror of coretime-range's,
+    // and the failure it prevents is the more misleading of the two. Running this
+    // against the RELAY would report "mapped N blocks" and write nothing, because
+    // `pallet-broker` lives on the Coretime chain and the relay has no `Broker`
+    // events at all. An empty entitlement table beside a full occupancy table
+    // reads as "everything that ran was unpaid for", which is the most
+    // interesting possible wrong answer.
+    anyhow::ensure!(
+        cfg.has_module("broker"),
+        "{chain} does not declare the `broker` module. Entitlement is read from `pallet-broker`, \
+         which lives on the CORETIME chain — the relay carries the occupancy half (coretime-range) \
+         and no broker events whatsoever, so this run would report success while writing nothing"
+    );
+    let pool = backends
+        .pool
+        .as_ref()
+        .context("broker-range requires DATABASE_URL")?;
+    let source = dotlens_node::balances_pg::PgEventSource::new(pool.clone());
+    let sink = dotlens_node::broker_pg::PgBrokerSink::new(pool.clone());
+    let deps = ingest::broker::BrokerDeps {
+        checkpoints: backends.checkpoints.as_ref(),
+        source: &source,
+        sink: &sink,
+    };
+    let n = ingest::broker::broker_range(&cfg.id, &SubstrateBrokerMapper, &deps, from, to)
+        .await
+        .with_context(|| format!("broker-range {chain} {from}..={to}"))?;
+    tracing::info!(chain, from, to, mapped = n, "broker-range complete");
+    println!("broker-range {chain} {from}..={to}: mapped {n} blocks");
+    Ok(())
+}
+
+#[cfg(not(feature = "pg"))]
+async fn run_broker_range(_: &Registry, _: &Backends, _: &str, _: u64, _: u64) -> Result<()> {
+    anyhow::bail!("broker-range requires the `pg` feature")
+}
+
+/// Read `Broker.Status` + `Broker.Configuration` at one block and record
+/// `core_count` with the height it was read at.
+///
+/// THE ENTITLEMENT DENOMINATOR, and its own command for the same reason
+/// `sync-core-config` is: it MOVES. But it earns the command twice over, because
+/// it is also the cross-check that makes the join believable — it read 100 on the
+/// Coretime chain at the same time the RELAY's `num_cores` read 100. Two chains,
+/// two storage items, one number, and if they ever disagree one of the two halves
+/// is being counted against the wrong denominator.
+#[cfg(all(feature = "pg", feature = "live"))]
+async fn run_sync_broker_config(
+    registry: &Registry,
+    backends: &Backends,
+    raw: &dyn RawStore,
+    chain: &str,
+    height: Option<u64>,
+) -> Result<()> {
+    use adapter_substrate::{broker as ab, source::SubstrateSource};
+    use ingest::live::ChainSource;
+
+    let pool = backends
+        .pool
+        .as_ref()
+        .context("sync-broker-config requires DATABASE_URL")?;
+    let cfg = registry
+        .chain(chain)
+        .with_context(|| format!("unknown chain: {chain}"))?;
+    anyhow::ensure!(
+        cfg.has_module("broker"),
+        "{chain} does not declare the `broker` module — `Broker.Status` is the coretime market's \
+         own state and no other chain has one"
+    );
+    let source = SubstrateSource::new(&cfg.id, cfg.endpoints.rpc.clone())
+        .map_err(|e| anyhow::anyhow!(e))?;
+    let height = match height {
+        Some(h) => h,
+        None => source.finalized_height().await.map_err(|e| anyhow::anyhow!(e))?,
+    };
+    let hash = source.block_hash(height).await.map_err(|e| anyhow::anyhow!(e))?;
+    let spec = source
+        .runtime_version_at(hash)
+        .await
+        .map_err(|e| anyhow::anyhow!(e))?;
+
+    // Archived blob if we have it, else fetch AND archive — same rule as
+    // `sync-core-config` and `anchor-balance`, so the reading stays re-derivable
+    // from the raw store without a chain.
+    let meta_key = raw_store::keys::metadata(&cfg.id, spec);
+    let metadata = match raw.get(&meta_key) {
+        Ok(blob) => blob,
+        Err(raw_store::RawStoreError::NotFound(_)) => {
+            let blob = source.metadata_at(height).await.map_err(|e| anyhow::anyhow!(e))?;
+            raw.put(&meta_key, &blob, "sync-broker-config")?;
+            tracing::info!(chain = %cfg.id, spec, "metadata archived while reading broker config");
+            blob
+        }
+        Err(e) => return Err(e.into()),
+    };
+
+    // BOTH READS ARE REQUIRED AND AN ABSENCE IS AN ERROR. A chain running
+    // `pallet-broker` with no `Status` has not started sales, but it also cannot
+    // be distinguished from a wrong key derivation — and recording "0 cores"
+    // would make every entitlement ratio silently infinite, which is the same
+    // failure `sync-core-config` refuses one file over.
+    let status_bytes = source
+        .storage_at(&ab::status_key(), hash)
+        .await
+        .map_err(|e| anyhow::anyhow!(e))?
+        .with_context(|| {
+            format!(
+                "{}.{} is absent from state at #{height} — either sales have never started on \
+                 this chain or the key derivation is wrong, and those must not be recorded as the \
+                 same thing",
+                ab::BROKER_STORAGE_PALLET,
+                ab::STATUS_ENTRY
+            )
+        })?;
+    let configuration_bytes = source
+        .storage_at(&ab::configuration_key(), hash)
+        .await
+        .map_err(|e| anyhow::anyhow!(e))?
+        .with_context(|| {
+            format!(
+                "{}.{} is absent from state at #{height} — the sale geometry a price curve is \
+                 evaluated against has no other source, and a reading not taken cannot be taken \
+                 later",
+                ab::BROKER_STORAGE_PALLET,
+                ab::CONFIGURATION_ENTRY
+            )
+        })?;
+
+    let view = ab::decode_broker_config(&metadata, &status_bytes, &configuration_bytes)
+        .map_err(|e| anyhow::anyhow!(e))?;
+    dotlens_node::broker_pg::insert_broker_config(
+        pool,
+        &cfg.id,
+        height,
+        view.core_count,
+        &view.status,
+        &view.configuration,
+        spec,
+    )
+    .await?;
+    println!(
+        "broker config {chain} @#{height} (spec {spec}): core_count={}",
+        view.core_count
+    );
+    println!(
+        "  this reading DATES the entitlement denominator, and it is also the CROSS-CHECK: \
+         compare it against the relay's own num_cores at a nearby height (sync-core-config). Two \
+         chains agreeing on one number is what makes the entitlement-vs-occupancy delta a \
+         comparison rather than two unrelated ratios."
+    );
+    Ok(())
+}
+
+#[cfg(not(all(feature = "pg", feature = "live")))]
+async fn run_sync_broker_config(
+    _: &Registry,
+    _: &Backends,
+    _: &dyn RawStore,
+    _: &str,
+    _: Option<u64>,
+) -> Result<()> {
+    anyhow::bail!("sync-broker-config requires the `pg` and `live` features")
 }
 
 #[cfg(feature = "pg")]
@@ -2293,6 +2935,13 @@ fn parse_h256(s: &str) -> Result<[u8; 32]> {
 /// where the prefix is not part of the key. Lower-cased for the same reason
 /// `normalize_call_hash` is: `0X…` is what `to_uppercase()` produces and it must
 /// not 404.
+///
+/// GATED TO MATCH ITS ONLY CALLER (slice 5 carry-in). `run_simulate_forwarded`
+/// is `#[cfg(all(feature = "pg", feature = "live"))]` and this was not, so
+/// `cargo check --workspace --no-default-features` warned it was never used —
+/// a warning that is invisible under `--all-features`, which is exactly the
+/// build-matrix blind spot slice 9's review found twice.
+#[cfg(all(feature = "pg", feature = "live"))]
 fn prefixed(hash: &str) -> String {
     let t = hash.trim().to_ascii_lowercase();
     let body = t.strip_prefix("0x").unwrap_or(&t);
@@ -2325,10 +2974,18 @@ async fn run_simulate(
     origin_spec: &str,
     height: Option<u64>,
     referendum: Option<(String, i64)>,
+    opts: &SimOptions,
 ) -> Result<()> {
     use adapter_substrate::source::SubstrateSource;
     use dotlens_node::sim_pg::PgSimStore;
     use dotlens_node::sim_run::SubstrateDryRunner;
+
+    if opts.tier.as_deref() == Some(sim::TIER_FORK) {
+        return run_simulate_fork(
+            registry, backends, raw, chain, call_bytes, origin_spec, height, referendum, opts,
+        )
+        .await;
+    }
 
     let pool = backends.pool.as_ref().context("simulate requires DATABASE_URL")?;
     let cfg = registry
@@ -2368,7 +3025,9 @@ async fn run_simulate(
         "simulate {chain} at #{} (spec {}, DryRunApi v{}){}",
         r.at_height,
         r.spec_version,
-        r.api_version,
+        r.api_version
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "-".into()),
         if run.cached { " [recorded earlier]" } else { "" }
     );
     println!(
@@ -2385,7 +3044,12 @@ async fn run_simulate(
     for ev in r.emitted_events.as_array().into_iter().flatten() {
         println!("    - {}", ev["name"].as_str().unwrap_or("?"));
     }
-    let forwarded = r.forwarded_xcms.as_array().map(Vec::len).unwrap_or(0);
+    let forwarded = r
+        .forwarded_xcms
+        .as_ref()
+        .and_then(|f| f.as_array())
+        .map(Vec::len)
+        .unwrap_or(0);
     println!("  xcm      local {} · forwarded to {} destination(s)",
         if r.local_xcm.is_some() { "yes" } else { "none" },
         forwarded
@@ -2412,6 +3076,7 @@ async fn run_simulate_referendum(
     referendum_id: i64,
     origin_spec: &str,
     height: Option<u64>,
+    opts: &SimOptions,
 ) -> Result<()> {
     use adapter_substrate::calls;
 
@@ -2478,8 +3143,364 @@ async fn run_simulate_referendum(
         origin_spec,
         height,
         Some((class.to_string(), referendum_id)),
+        opts,
     )
     .await
+}
+
+
+/// simulate-call/-referendum `--tier fork`: one Tier 2 run.
+///
+/// IT ALWAYS CREATES A JOB ROW, and then runs it through the SAME
+/// `sim::run_job` the worker calls. `--queue` stops after the row. There is
+/// deliberately no synchronous path beside the queued one: two implementations
+/// of "run a Tier 2 simulation" that can disagree about what a Tier 2 answer is
+/// is the defect class this project has found in four separate slices, and the
+/// queue is a TRIGGER rather than a second engine.
+#[cfg(all(feature = "pg", feature = "live"))]
+#[allow(clippy::too_many_arguments)]
+async fn run_simulate_fork(
+    registry: &Registry,
+    backends: &Backends,
+    raw: &dyn RawStore,
+    chain: &str,
+    call_bytes: Vec<u8>,
+    origin_spec: &str,
+    height: Option<u64>,
+    referendum: Option<(String, i64)>,
+    opts: &SimOptions,
+) -> Result<()> {
+    use dotlens_node::sim_pg::{PgJobStore, PgSimStore};
+    use sim::JobStore;
+
+    let pool = backends
+        .pool
+        .as_ref()
+        .context("a fork simulation requires DATABASE_URL")?;
+    let cfg = registry
+        .chain(chain)
+        .with_context(|| format!("unknown chain: {chain}"))?;
+    // Parsed HERE and not in the worker: turning `signed:13UVJ…` into 32 bytes
+    // is adapter knowledge, and a job whose origin cannot be parsed should be
+    // refused by whoever wrote it rather than discovered by a worker an hour
+    // later.
+    sim::OriginSpec::parse(origin_spec, |s| {
+        adapter_substrate::accounts::parse_account(s).map_err(|e| e.to_string())
+    })
+    .map_err(|e| anyhow::anyhow!(e))?;
+
+    let jobs = PgJobStore::new(pool.clone());
+    let call_hash = format!(
+        "0x{}",
+        hex::encode(adapter_substrate::calls::blake2_256(&call_bytes))
+    );
+    let id = jobs
+        .enqueue(&sim::NewSimJob {
+            chain_id: cfg.id.clone(),
+            tier: sim::TIER_FORK.to_string(),
+            at_height: height,
+            call: call_bytes,
+            call_hash: call_hash.clone(),
+            origin_spec: origin_spec.to_string(),
+            override_specs: opts.override_specs.clone(),
+            signer: match &opts.signer {
+                None => None,
+                Some(s) => Some(
+                    adapter_substrate::accounts::parse_account(s)
+                        .map_err(|e| anyhow::anyhow!("--signer {s}: {e}"))?,
+                ),
+            },
+            requested_by: Some("cli".into()),
+            note: referendum
+                .as_ref()
+                .map(|(class, id)| format!("referendum {chain}/{class}/{id}")),
+            max_attempts: 1,
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!(e))?;
+
+    if opts.queue {
+        println!("queued fork job {id} on {chain} ({call_hash})");
+        println!("  run it with FORK_JOBS=1, or without --queue to run it here");
+        return Ok(());
+    }
+
+    // Claimed BY ID, so a worker and this command cannot both take one job — and,
+    // more importantly, so this command cannot take somebody ELSE's. `claim`
+    // otherwise returns the oldest queued job, and taking one only to bail would
+    // have spent its single attempt and held a lease on it.
+    let job = jobs
+        .claim("cli", fork_lease_secs(), fork_max_concurrent(), Some(id))
+        .await
+        .map_err(|e| anyhow::anyhow!(e))?
+        .with_context(|| {
+            format!(
+                "job {id} could not be claimed: the concurrency cap ({}) is full, so it stays \
+                 queued and a worker will take it. A fork run is a Node process and a WASM \
+                 execution; the cap is what keeps that bounded",
+                fork_max_concurrent()
+            )
+        })?;
+
+    let store = PgSimStore::new(pool.clone());
+    let run = run_one_fork_job(registry, backends, raw, &jobs, &store, &job).await?;
+    let r = &run.record;
+
+    if let Some((class, id)) = &referendum {
+        println!("referendum {chain}/{class}/{id}");
+    }
+    println!(
+        "fork {chain} at #{} (spec {}, metadata v{}){}",
+        r.at_height,
+        r.spec_version,
+        r.metadata_version,
+        if run.cached { " [recorded earlier]" } else { "" }
+    );
+    println!(
+        "  call     {} ({})",
+        r.call_summary.as_deref().unwrap_or("?"),
+        r.call_hash
+    );
+    println!("  origin   {} → {}", r.origin_spec, r.origin_json["resolved"]);
+    if let Some(overrides) = r.overrides.as_ref().and_then(|o| o.as_array()) {
+        println!(
+            "  COUNTERFACTUAL — {} storage key(s) injected; this is NOT what the chain did",
+            overrides.len()
+        );
+        for o in overrides {
+            println!(
+                "    {} \n      was {}\n      now {}",
+                o["resolved"].as_str().unwrap_or("?"),
+                o["before"].as_str().unwrap_or("(absent)"),
+                o["value"].as_str().unwrap_or("(deleted)")
+            );
+        }
+    }
+    println!("  status   {}", r.status);
+    if let Some(e) = &r.dispatch_error {
+        println!("  error    {e}");
+    }
+    if let Some(n) = &r.note {
+        println!("  note     {n}");
+    }
+    println!("  events   {}", r.event_count);
+    for ev in r.emitted_events.as_array().into_iter().flatten() {
+        println!("    - {}", ev["name"].as_str().unwrap_or("?"));
+    }
+    println!(
+        "  diff     {} ({} entr{})",
+        r.diff_status.as_deref().unwrap_or("?"),
+        r.storage_diff_count.unwrap_or(0),
+        if r.storage_diff_count == Some(1) { "y" } else { "ies" }
+    );
+    for e in r.storage_diff.as_ref().and_then(|d| d.as_array()).into_iter().flatten() {
+        println!(
+            "    {} [{}]{}",
+            e["readable"].as_str().unwrap_or("?"),
+            e["change"].as_str().unwrap_or("?"),
+            if e["from_override"].as_bool() == Some(true) {
+                "  (its BEFORE is our injected value, not the chain's)"
+            } else {
+                ""
+            }
+        );
+    }
+    println!(
+        "  built    {} — A FORK'S BLOCK: no canonical chain has this hash",
+        r.built_block_hash.as_deref().unwrap_or("?")
+    );
+    println!(
+        "  harness  {}",
+        r.harness
+            .as_ref()
+            .and_then(|h| h.get("version"))
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "unknown version".into())
+    );
+    println!("  evidence {}", r.raw_location);
+    Ok(())
+}
+
+#[cfg(all(feature = "pg", feature = "live"))]
+fn fork_max_concurrent() -> u32 {
+    env_or("SIM_FORK_MAX_CONCURRENT", "1").parse().unwrap_or(1)
+}
+
+#[cfg(all(feature = "pg", feature = "live"))]
+fn fork_lease_secs() -> u32 {
+    env_or("SIM_FORK_LEASE_SECS", "900").parse().unwrap_or(900)
+}
+
+/// Run one claimed job. THE one place a Tier 2 run happens, whether the trigger
+/// was a CLI invocation or the worker loop.
+#[cfg(all(feature = "pg", feature = "live"))]
+async fn run_one_fork_job(
+    registry: &Registry,
+    backends: &Backends,
+    raw: &dyn RawStore,
+    jobs: &dotlens_node::sim_pg::PgJobStore,
+    store: &dotlens_node::sim_pg::PgSimStore,
+    job: &sim::SimJob,
+) -> Result<sim::SimRun> {
+    use adapter_substrate::source::SubstrateSource;
+    use dotlens_node::fork_run::{ForkConfig, SubstrateForkRunner};
+
+    let cfg = registry
+        .chain(&job.chain_id)
+        .with_context(|| format!("unknown chain: {}", job.chain_id))?;
+    let endpoint = cfg
+        .endpoints
+        .rpc
+        .first()
+        .cloned()
+        .with_context(|| format!("chain {} has no rpc endpoint to fork from", job.chain_id))?;
+    let origin = sim::OriginSpec::parse(&job.origin_spec, |s| {
+        adapter_substrate::accounts::parse_account(s).map_err(|e| e.to_string())
+    })
+    .map_err(|e| anyhow::anyhow!(e))?;
+
+    let source = SubstrateSource::new(&cfg.id, cfg.endpoints.rpc.clone())
+        .map_err(|e| anyhow::anyhow!(e))?;
+    let runner = SubstrateForkRunner::new(
+        &cfg.id,
+        &source,
+        endpoint,
+        raw,
+        cfg.ss58_prefix.unwrap_or(0),
+        ForkConfig::from_env(),
+    );
+    sim::run_job(
+        &runner,
+        store,
+        jobs,
+        raw,
+        backends.receipts.as_ref(),
+        job,
+        origin,
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!(e))
+}
+
+/// sim-jobs: the read side of the queue, from the shell.
+#[cfg(feature = "pg")]
+async fn run_sim_jobs(backends: &Backends, chain: &str, status: Option<&str>) -> Result<()> {
+    let pool = backends
+        .pool
+        .as_ref()
+        .context("sim-jobs requires DATABASE_URL")?;
+    let jobs = dotlens_node::sim_pg::list_jobs(pool, chain, status, 50).await?;
+    if jobs.is_empty() {
+        println!("no simulation jobs on {chain}{}", match status {
+            Some(s) => format!(" with status '{s}'"),
+            None => String::new(),
+        });
+        return Ok(());
+    }
+    for j in &jobs {
+        println!(
+            "{:>6}  {:<9} {:<8} {} {}{}",
+            j.id,
+            j.status,
+            j.tier,
+            j.call_hash,
+            j.origin_spec,
+            if j.override_specs.is_empty() {
+                String::new()
+            } else {
+                format!("  [{} override(s) — COUNTERFACTUAL]", j.override_specs.len())
+            }
+        );
+        if let Some(e) = &j.error {
+            println!("        error: {e}");
+        }
+        if let (Some(h), Some(i)) = (&j.result_at_block_hash, &j.result_input_hash) {
+            println!("        result: /v1/sim/{chain}/calls/{} ({h} {i})", j.call_hash);
+        }
+    }
+    Ok(())
+}
+
+/// FORK_JOBS=1: drain the Tier 2 queue.
+///
+/// The loop is deliberately dumb — claim, run, repeat — because everything that
+/// could go wrong is already a property of the row: the cap is enforced at claim
+/// time inside one transaction, the lease makes a crashed worker's job
+/// reclaimable, and `max_attempts` decides whether a failure is retried. A
+/// worker that made those decisions itself would be a second policy beside the
+/// one in the table.
+#[cfg(all(feature = "pg", feature = "live"))]
+fn spawn_fork_job_worker(registry: &Arc<Registry>, backends: &Arc<Backends>, raw: &Arc<dyn RawStore>) {
+    if !env_flag("FORK_JOBS") {
+        tracing::info!("fork job worker disabled (set FORK_JOBS=1 to enable)");
+        return;
+    }
+    let Some(pool) = backends.pool.clone() else {
+        tracing::warn!("FORK_JOBS=1 but no DATABASE_URL — the queue lives in Postgres");
+        return;
+    };
+    let registry = registry.clone();
+    let backends = backends.clone();
+    let raw = raw.clone();
+    let poll = env_or("POLL_INTERVAL_SECS", "6").parse::<u64>().unwrap_or(6);
+    let worker = format!(
+        "{}#{}",
+        hostname_or("node"),
+        std::process::id()
+    );
+    tokio::spawn(async move {
+        use dotlens_node::sim_pg::{PgJobStore, PgSimStore};
+        use sim::JobStore;
+        let jobs = PgJobStore::new(pool.clone());
+        let store = PgSimStore::new(pool);
+        loop {
+            let claimed = jobs
+                .claim(&worker, fork_lease_secs(), fork_max_concurrent(), None)
+                .await;
+            match claimed {
+                Ok(Some(job)) => {
+                    tracing::info!(job = job.id, chain = %job.chain_id, "fork job claimed");
+                    // A failed run has ALREADY been recorded against the row by
+                    // `sim::run_job`; the worker logs it and carries on rather
+                    // than dying, because one bad request must not stop a queue.
+                    if let Err(e) =
+                        run_one_fork_job(&registry, &backends, raw.as_ref(), &jobs, &store, &job)
+                            .await
+                    {
+                        // `sim::run_job` records its own failures — but everything
+                        // BEFORE it (unknown chain, no rpc endpoint, an origin that
+                        // does not parse) happens in `run_one_fork_job` and would
+                        // otherwise leave the row `running` until its lease expired.
+                        // A setup failure is deterministic, so it is REFUSED.
+                        let _ = jobs.fail(job.id, &e.to_string(), true).await;
+                        tracing::warn!(job = job.id, error = %e, "fork job did not produce a result");
+                    }
+                }
+                Ok(None) => tokio::time::sleep(std::time::Duration::from_secs(poll)).await,
+                Err(e) => {
+                    tracing::warn!(error = %e, "fork job claim failed");
+                    tokio::time::sleep(std::time::Duration::from_secs(poll)).await;
+                }
+            }
+        }
+    });
+}
+
+#[cfg(not(all(feature = "pg", feature = "live")))]
+fn spawn_fork_job_worker(_registry: &Arc<Registry>, _backends: &Arc<Backends>, _raw: &Arc<dyn RawStore>) {
+    if env_flag("FORK_JOBS") {
+        tracing::warn!("built without `pg`+`live` — FORK_JOBS is IGNORED");
+    }
+}
+
+#[cfg(not(feature = "pg"))]
+async fn run_sim_jobs(_backends: &Backends, _chain: &str, _status: Option<&str>) -> Result<()> {
+    anyhow::bail!("built without `pg`: the simulation queue lives in Postgres")
+}
+
+#[cfg(all(feature = "pg", feature = "live"))]
+fn hostname_or(default: &str) -> String {
+    std::env::var("HOSTNAME").unwrap_or_else(|_| default.to_string())
 }
 
 /// simulate-xcm: one Tier 1 preview of an arriving PROGRAM (Phase 3, slice 5).
@@ -2630,7 +3651,19 @@ async fn run_simulate_forwarded(
     .await?
     .with_context(|| format!("the recorded baseline {baseline_hash} is missing"))?;
 
-    let attribution = sim::attribute_forwarded(&subject.forwarded_xcms, &baseline.forwarded_xcms);
+    // Both are dry_run rows by construction here (this command follows a
+    // `dry_run_call`'s forwarded list), so a missing list is a contradiction and
+    // is refused rather than defaulted to empty — an empty baseline would
+    // attribute every ambient message to the run.
+    let subject_forwarded = subject
+        .forwarded_xcms
+        .as_ref()
+        .context("this simulation has no forwarded_xcms — only the dry_run tier produces one")?;
+    let baseline_forwarded = baseline
+        .forwarded_xcms
+        .as_ref()
+        .context("this simulation's baseline has no forwarded_xcms")?;
+    let attribution = sim::attribute_forwarded(subject_forwarded, baseline_forwarded);
     println!(
         "forwarded from {} at #{} ({}): {} message(s) total, {} already in flight, \
          {} attributable to this call",
@@ -2724,7 +3757,7 @@ async fn run_simulate_forwarded(
 #[allow(clippy::too_many_arguments)]
 async fn run_simulate(
     _: &Registry, _: &Backends, _: &dyn RawStore, _: &str, _: Vec<u8>, _: &str, _: Option<u64>,
-    _: Option<(String, i64)>,
+    _: Option<(String, i64)>, _: &SimOptions,
 ) -> Result<()> {
     anyhow::bail!("simulate-call requires the `pg` and `live` features")
 }
@@ -2749,7 +3782,7 @@ async fn run_simulate_forwarded(
 #[allow(clippy::too_many_arguments)]
 async fn run_simulate_referendum(
     _: &Registry, _: &Backends, _: &dyn RawStore, _: &str, _: &str, _: i64, _: &str,
-    _: Option<u64>,
+    _: Option<u64>, _: &SimOptions,
 ) -> Result<()> {
     anyhow::bail!("simulate-referendum requires the `pg` and `live` features")
 }
@@ -2926,8 +3959,7 @@ async fn run_sync_assets(
         .with_context(|| format!("unknown chain: {chain}"))?;
     let source = SubstrateSource::new(&cfg.id, cfg.endpoints.rpc.clone())
         .map_err(|e| anyhow::anyhow!(e))?;
-    let report =
-        dotlens_node::assets_pg::sync_assets(pool, raw, &source, &cfg.id, height).await?;
+    let report = dotlens_node::assets_pg::sync_assets(pool, raw, &source, cfg, height).await?;
     println!(
         "asset sync {chain} @#{} (spec {}): {} assets {:?}{}{}",
         report.height,
@@ -2948,6 +3980,30 @@ async fn run_sync_assets(
             format!(" — {} undecodable id(s)", report.undecodable_ids)
         }
     );
+    // The three numbers 0019 added, printed unconditionally rather than only
+    // when non-zero: the gap between `absolutized` and `total` is the population
+    // a cross-chain consolidation cannot add up, and a line that disappears when
+    // it is healthy is a line nobody learns to read.
+    println!(
+        "  identity: {} of {} assets carry an absolute (observer-free) name",
+        report.absolutized,
+        report.total()
+    );
+    if report.native_alias_skipped > 0 {
+        println!(
+            "  {} registry entr(y/ies) name the chain's NATIVE token — folded onto \
+             the `native` row rather than given a second key",
+            report.native_alias_skipped
+        );
+    }
+    if report.erc20_unanchorable > 0 {
+        println!(
+            "  {} asset(s) are Erc20: registered, named and located, and NOT \
+             anchorable — their balances live in pallet_evm storage, which is \
+             outside this slice (see core.assets.asset_type)",
+            report.erc20_unanchorable
+        );
+    }
     Ok(())
 }
 
@@ -2983,7 +4039,7 @@ async fn run_treasury_holdings(
     let source = SubstrateSource::new(&cfg.id, cfg.endpoints.rpc.clone())
         .map_err(|e| anyhow::anyhow!(e))?;
     let report =
-        dotlens_node::assets_pg::snapshot_holdings(pool, raw, &source, &cfg.id, height).await?;
+        dotlens_node::assets_pg::snapshot_holdings(pool, raw, &source, cfg, height).await?;
     println!(
         "holdings {chain} @#{} (spec {}): {} accounts × assets = {} probes, \
          {} non-zero{}",
@@ -3001,6 +4057,14 @@ async fn run_treasury_holdings(
             )
         }
     );
+    if report.skipped_unanchorable > 0 {
+        println!(
+            "  {} asset(s) NOT PROBED: their balances are not in a pallet this \
+             sweep reads (Erc20 — pallet_evm storage). Not probed is not zero, \
+             and this line is the difference",
+            report.skipped_unanchorable
+        );
+    }
     if report.accounts == 0 {
         println!(
             "note: no treasury accounts registered on {chain} — run \

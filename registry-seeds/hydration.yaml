@@ -12,6 +12,12 @@ family: substrate
 relay: polkadot
 para_id: 2034
 network: polkadot
+# WHOSE TOKEN this chain's pallet_balances holds (Phase 3 slice 6). `own` = this
+# chain ISSUES its native currency, so the token's absolute XCM name is the
+# chain's own path. Not derivable from `para_id`: Hydration and Asset Hub are
+# both parachains and their native currencies are different assets.
+native_token: own
+
 
 # NOT 63, which is what the ss58-registry still says and what every older doc
 # repeats. The runtime constant `System.SS58Prefix` is 0 as of commit 0f3ecb255
@@ -78,6 +84,15 @@ capabilities:
   extrinsics: true
   events: true
   runtime_metadata: true
+  # NOT pallet-assets. `instances` is the vocabulary a reader compares against
+  # `core.assets.representation_kind`, and Hydration's is the ORML pair:
+  # `AssetRegistry` (identity, symbols, decimals, XCM locations) + `orml_tokens`
+  # (the balances themselves). Declarative — `sync-assets` still finds both
+  # pallets by the SHAPE of their storage, never by this list or by a chain id,
+  # so a chain that renames a pallet keeps working and this entry can never
+  # silently become the authority.
+  assets:
+    instances: [orml]
   xcm:
     min_version: 3
   # Its OWN OpenGov — `referenda = 37`, `conviction_voting = 36`,
@@ -93,11 +108,16 @@ modules:
   - extrinsics
   - events
   - xcm
+  # ON SINCE PHASE 3 SLICE 6 — the orml mapper. See the block below for what
+  # that does and does not now cover. (The `capabilities.assets` entry above is
+  # DECLARATIVE and drives nothing: `sync-assets` finds the ORML pallets by the
+  # shape of their storage, so this module list is the only thing here that
+  # changes behaviour — it is what starts the balances follower.)
+  - balances
 
 # ---------------------------------------------------------------------------
-# WHY `balances` IS NOT IN THAT LIST, and it is the most important thing on this
-# page. Money lives in THREE places on Hydration and our balances mapper reads
-# only the first:
+# WHY `balances` WAS NOT IN THAT LIST UNTIL NOW, and what turning it on does and
+# does not buy. Money lives in THREE places on Hydration:
 #   pallet_balances (7)  — HDX ONLY (asset id 0), `AccountStore = System`, so
 #                          our existing System.Account anchor decoder does work.
 #   orml_tokens    (77)  — EVERYTHING else: DOT, USDT, USDC, vDOT, LRNA,
@@ -106,19 +126,34 @@ modules:
 #   pallet_evm     (90)  — aTokens (aDOT). The money market is an AAVE V3 FORK
 #                          IN THE EVM, not a pallet; `pallet_liquidation` (76)
 #                          is only the Substrate-side liquidator.
-# Enabling `balances` here would index HDX and report the Polkadot treasury's
-# position on this chain as nothing — the same shape of silent hole as the
-# ≈$592k stablecoin gap measured in Phase 2 slice 6, one chain over. The
-# orml-tokens arm is its own slice; until it lands, saying nothing is honest and
-# saying HDX-only would not be.
 #
-# ONE TRAP FOR THAT FUTURE SLICE, recorded now: Hydration runs a FORK of
-# orml-currencies (`pallet_currencies = 79`) specifically because "the latest
-# versions of the orml-currencies pallet don't emit events" (their comment). So
-# one movement may surface as BOTH a `currencies.*` event and an underlying
-# `tokens.*`/`balances.*` event — the double-count shape that `DustLost` +
-# `BurnedDebt` produced in slice 6. Verify the overlap on live data before
-# mapping both.
+# Until slice 6 our mapper read only the first, so enabling `balances` would have
+# indexed HDX and reported the Polkadot treasury's largest position on this chain
+# as nothing — the same shape of silent hole as the ≈$592k stablecoin gap
+# measured in Phase 2 slice 6, one chain over and larger. Saying nothing was
+# honest; saying HDX-only would not have been.
+#
+# `adapter_substrate::orml` now covers the SECOND, so the module is on. THE
+# THIRD IS STILL NOT COVERED, and that is a stated boundary rather than an
+# oversight: an Erc20 asset's balance lives in `pallet_evm` STORAGE, so it has
+# nothing to anchor against, and a pure event mapper cannot even tell an Erc20
+# asset from a Token one (`asset_type` lives in registry state). `sync-assets`
+# records `core.assets.asset_type`, so those thirteen assets are registered,
+# named, located and VISIBLY unanchorable — which is the honest half-answer, and
+# the reason the treasury consolidator is not closed by this slice alone.
+#
+# THE ORML-CURRENCIES TRAP, recorded here as a warning and now MEASURED rather
+# than feared: Hydration runs a FORK of orml-currencies (`pallet_currencies =
+# 79`) specifically because "the latest versions of the orml-currencies pallet
+# don't emit events" (their comment). It is a WRAPPER, so one movement surfaces
+# BOTH as a `currencies.*` event and as the underlying `tokens.*`/`balances.*`
+# one — the double-count shape `DustLost` + `BurnedDebt` produced in slice 6.
+# Over 2,000 blocks: `currencies.Transferred` 1275 = 458 mirrored by
+# `tokens.Transfer` + 378 mirrored by `balances.Transfer` + 439 mirrored by
+# nothing — and those 439 ROWS span exactly 13 ASSET IDS, every one of them
+# Erc20. Mapping both vocabularies would double-count 1,225 movements; mapping
+# the wrapper INSTEAD would miss 45% of token transfers. The mapper takes
+# `tokens.*` and maps all four `currencies.*` variants to ∅.
 #
 # XCM-relevant pallets, for the mapper: polkadotXcm 107, cumulusXcm 109,
 # xcmpQueue 111, messageQueue 114 (index 113 retired — was DmpQueue), ormlXcm

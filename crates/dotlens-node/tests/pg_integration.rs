@@ -923,11 +923,18 @@ async fn balances_worker_maps_deltas_and_survives_the_boundary_filter() {
     assert_eq!(post.len(), 1);
     assert_eq!(post[0].delta, "-160000000");
 
-    // anchors: insert + read back (frozen None → null; insert-ignore on rerun)
+    // anchors: insert + read back (insert-ignore on rerun).
+    //
+    // `frozen` IS NON-NULL HERE ON PURPOSE (slice 7). It has been written since
+    // Phase 1 and read by nothing until the consolidation endpoint surfaced it,
+    // so its column was never proven to round-trip — and slice 7 widened two
+    // hand-maintained sqlx tuples to carry it, where an off-by-one maps the
+    // wrong column SILENTLY. The value is the real one slice 6 measured on a
+    // live Hydration anchor.
     let ab = adapter_substrate::balances::AccountBalances {
         free: 500_000_000_000,
         reserved: 5_000_000_000,
-        frozen: None,
+        frozen: Some(3_387_116_328_755_630_044),
     };
     for _ in 0..2 {
         dotlens_node::balances_pg::insert_anchor(
@@ -942,6 +949,15 @@ async fn balances_worker_maps_deltas_and_survives_the_boundary_filter() {
     assert_eq!(anchors[0].total, "505000000000");
     assert_eq!(anchors[0].free, "500000000000");
     assert!(anchors[0].note.is_none());
+    // the widened tuple maps the right column — and `total` is deliberately NOT
+    // reduced by it (an anchor's total is free + reserved; frozen is a lock on
+    // `free`, not a separate pot)
+    assert_eq!(
+        anchors[0].frozen.as_deref(),
+        Some("3387116328755630044"),
+        "frozen must survive the read path it was never exercised on"
+    );
+    assert_eq!(anchors[0].total, "505000000000");
 
     db.drop_db().await;
 }
@@ -1950,7 +1966,11 @@ async fn asset_balances_share_the_balances_tables_and_holdings_join_their_assets
         "the 2^65 asset amount survived as NUMERIC"
     );
     assert_eq!(by_asset["assets:1984"].2, "transfer_out");
-    assert_eq!(by_asset["assets:1984"].3, 2, "MAPPER_VERSION bumped to 2");
+    assert_eq!(
+        by_asset["assets:1984"].3 as u32,
+        adapter_substrate::balances::MAPPER_VERSION,
+        "an asset delta carries the balances mapper's own version as lineage"
+    );
     assert_eq!(by_asset["native"].1, "-160000000", "native mapping untouched");
     let foreign = rows
         .iter()
@@ -1975,6 +1995,10 @@ async fn asset_balances_share_the_balances_tables_and_holdings_join_their_assets
     // ---- 2. the asset registry, including the constructed XCM name ------
     let usdt_location = aa::local_asset_location(50, 1984);
     let usdt_key = aa::canonical_location(&usdt_location).expect("canonical");
+    let ah_path = adapter_substrate::orml::chain_path("polkadot", Some(1000));
+    let usdt_absolute =
+        adapter_substrate::orml::absolutize(&ah_path, &usdt_location).expect("absolutizes");
+    let usdt_absolute_key = usdt_absolute.to_string();
     // the asset id EXACTLY as it sits inside the storage key
     let usdt_id_bytes = 1984u32.to_le_bytes();
     dotlens_node::assets_pg::upsert_asset(
@@ -1985,6 +2009,11 @@ async fn asset_balances_share_the_balances_tables_and_holdings_join_their_assets
         Some("1984"),
         Some(&usdt_location),
         Some(&usdt_key),
+        // the observer-free name Asset Hub gives its own asset 1984 (0019) —
+        // the same string Hydration's row for the same asset must produce
+        Some(&usdt_absolute),
+        Some(&usdt_absolute_key),
+        None,
         Some(&usdt_id_bytes[..]),
         &aa::AssetMeta {
             name: Some("Tether USD".into()),
@@ -2011,6 +2040,9 @@ async fn asset_balances_share_the_balances_tables_and_holdings_join_their_assets
         "assets:1984",
         "trust_backed",
         Some("1984"),
+        None,
+        None,
+        None,
         None,
         None,
         None,
@@ -2893,7 +2925,7 @@ async fn simulation_results_are_immutable_per_state_and_read_back_newest_first()
         call_summary: Some("multiassetbounties.fund_bounty".into()),
         origin_spec: "Origins:MediumSpender".into(),
         origin_json: serde_json::json!({"resolved": "Origins:MediumSpender"}),
-        xcm_version: 4,
+        xcm_version: Some(4),
         status: status.into(),
         // NULL for api_error, and the distinction is the point: "the call
         // failed" and "we never got to try" are different facts, and 0014 says
@@ -2908,11 +2940,11 @@ async fn simulation_results_are_immutable_per_state_and_read_back_newest_first()
         ]),
         event_count: 1,
         local_xcm: None,
-        forwarded_xcms: serde_json::json!([]),
+        forwarded_xcms: Some(serde_json::json!([])),
         effects: serde_json::json!({"Ok": [{"emitted_events": []}]}),
         note: None,
         spec_version: 2_003_002,
-        api_version: 2,
+        api_version: Some(2),
         metadata_version: 15,
         sim_version: 1,
         raw_location: format!(
@@ -2923,6 +2955,16 @@ async fn simulation_results_are_immutable_per_state_and_read_back_newest_first()
         // this. `a_previewed_arrival_is_its_own_row_and_the_baseline_link_is_a_key`
         // is where the link is exercised.
         baseline_input_hash: None,
+        overrides: None,
+        override_hash: None,
+        storage_diff: None,
+        storage_diff_count: None,
+        diff_status: None,
+        built_block_hash: None,
+        harness: None,
+        // dry_run: no scheduler, so no route and no anchor.
+        dispatch_route: None,
+        agenda_anchor: None,
     };
 
     let first = record("0xaa", "0x01", 19_000_000, "dispatch_failed");
@@ -2962,6 +3004,17 @@ async fn simulation_results_are_immutable_per_state_and_read_back_newest_first()
     // Tier 1 row and report it as cached.
     let mut fork = record("0xaa", "0x01", 19_000_000, "executed");
     fork.tier = "fork".into();
+    // A fork row must name its route — `simulation_results_fork_names_its_route`
+    // enforces it, because the coverage list served with the row is selected
+    // from this column.
+    fork.dispatch_route = Some(sim::ROUTE_SCHEDULED.into());
+    // …and it must say what its diff covers, for the same reason one column
+    // over: `simulation_results_fork_names_its_diff_scope` (0023) makes "NULL
+    // means this is not a fork row" a guarantee rather than a convention, so a
+    // fork row with no diff scope is a shape production cannot produce — the
+    // runner always records one of the five. `extrinsic_only` is what the live
+    // scheduled route writes, and on THIS route it does not cover the call.
+    fork.diff_status = Some(sim::DIFF_STATUS_EXTRINSIC_ONLY.into());
     insert_simulation(&db.pool, &fork)
         .await
         .expect("a different tier is a different row");
@@ -3044,6 +3097,192 @@ async fn simulation_results_are_immutable_per_state_and_read_back_newest_first()
     db.drop_db().await;
 }
 
+/// A FORK ROW READ BACK THROUGH BOTH READERS, with every column a fork row
+/// leaves NULL actually NULL (Phase 3, slice 10).
+///
+/// THIS IS THE TEST SLICE 8 NEEDED AND SLICE 9 PROMISED. Slice 8's verification
+/// found `forwarded_xcms: Some(r.try_get(…)?)` in `PgSimIndex`'s row reader —
+/// migration 0021 made that column nullable and every fork row leaves it NULL,
+/// and `try_get::<Value, _>` on a NULL is a decode ERROR. So reading ANY fork row
+/// through the API would have failed, on the one surface the tier exists to
+/// serve, and it was caught only because the same change had to compile. Nothing
+/// tested it. The test above inserts a fork row with `forwarded_xcms: Some([])`
+/// inherited from a dry-run fixture, so it does not exercise the NULL at all.
+///
+/// The four nullable columns are asserted TOGETHER because they fail the same
+/// way: a bare `try_get` on any of them is a runtime error no compiler sees, and
+/// each one is null on a fork row for its own reason.
+#[tokio::test]
+async fn a_fork_row_round_trips_through_both_readers_with_its_null_columns_null() {
+    use api::SimIndex as _;
+    use dotlens_node::sim_pg::{insert_simulation, simulation_at};
+    use sim::SimRecord;
+
+    let Some(db) = TestDb::create().await else { return };
+    let reg = seeds();
+    sync_registry(&db.pool, &reg).await.expect("registry sync");
+
+    let call_hash = format!("0x{}", "f0".repeat(32));
+    let row = SimRecord {
+        chain_id: "polkadot-asset-hub".into(),
+        at_block_hash: format!("0x{}", "8e".repeat(32)),
+        input_hash: format!("0x{}", "f1".repeat(32)),
+        at_height: 19_368_576,
+        tier: sim::TIER_FORK.into(),
+        call_hash: call_hash.clone(),
+        call_summary: Some("multiassetbounties.fund_bounty".into()),
+        origin_spec: "Origins:MediumSpender".into(),
+        origin_json: serde_json::json!({"resolved": "Origins:MediumSpender"}),
+        // NULL #1 and #2: this tier calls no runtime API, so there is no
+        // DryRunApi version and no `result_xcms_version`. Read as 0 they would
+        // put "DryRunApi v0" on a row that asked nothing.
+        xcm_version: None,
+        api_version: None,
+        status: "executed".into(),
+        dispatch_ok: Some(true),
+        dispatch_error: None,
+        emitted_events: serde_json::json!([
+            {"name": "assets.Transferred", "data": {"amount": "83760000000"}}
+        ]),
+        event_count: 1,
+        local_xcm: None,
+        // NULL #3 — THE ONE THAT BROKE. A fork run produces no forwarded list.
+        forwarded_xcms: None,
+        effects: serde_json::json!({"diff_method": "dev_dryRun"}),
+        note: None,
+        spec_version: 2_003_002,
+        metadata_version: 15,
+        sim_version: 2,
+        raw_location: "raw/polkadot-asset-hub/sim/8e/f1/chopsticks_fork.response.json".into(),
+        // NULL #4: a fork run has no forwarded list, so nothing to difference.
+        baseline_input_hash: None,
+        overrides: None,
+        override_hash: None,
+        storage_diff: Some(serde_json::json!([{"key": "0x26aa394e", "change": "changed"}])),
+        storage_diff_count: Some(1),
+        diff_status: Some(sim::DIFF_STATUS_EXTRINSIC_ONLY.into()),
+        // NULL #5: no block is built on the live route.
+        built_block_hash: None,
+        harness: Some(serde_json::json!({"tool": "chopsticks", "version": "1.5.1"})),
+        dispatch_route: Some(sim::ROUTE_SCHEDULED.into()),
+        agenda_anchor: Some(serde_json::json!({
+            "provider": "relay", "at_parent": 32_519_445u64, "written_at": 32_519_445u64,
+        })),
+    };
+    insert_simulation(&db.pool, &row).await.expect("insert a fork row");
+
+    // ---- READER 1: the runner's cache path. A failure here means a second run
+    // at one state cannot find its own answer and re-runs a fork.
+    let back = simulation_at(
+        &db.pool,
+        "polkadot-asset-hub",
+        &row.at_block_hash,
+        &row.input_hash,
+        sim::TIER_FORK,
+    )
+    .await
+    .expect("the fork row reads back")
+    .expect("it is there");
+    assert!(back.forwarded_xcms.is_none(), "NULL stays None, never Some(null)");
+    assert!(back.xcm_version.is_none());
+    assert!(back.api_version.is_none());
+    assert!(back.built_block_hash.is_none());
+    assert!(back.baseline_input_hash.is_none());
+    assert_eq!(back.diff_status.as_deref(), Some(sim::DIFF_STATUS_EXTRINSIC_ONLY));
+    assert_eq!(back.dispatch_route.as_deref(), Some(sim::ROUTE_SCHEDULED));
+    assert_eq!(back.agenda_anchor.as_ref().unwrap()["provider"], "relay");
+    assert_eq!(back.sim_version, 2, "lineage survives the round trip");
+
+    // ---- READER 2: the API's, which is where the defect actually lived.
+    let index = api::pg::PgSimIndex::new(db.pool.clone());
+    let served = index
+        .simulations("polkadot-asset-hub", &call_hash, 10)
+        .await
+        .expect("a fork row is READABLE through the surface this tier exists to serve");
+    assert_eq!(served.len(), 1);
+    let s = &served[0];
+    assert!(s.forwarded_xcms.is_none());
+    assert!(s.xcm_version.is_none());
+    assert!(s.api_version.is_none());
+    assert!(s.built_block_hash.is_none());
+    assert_eq!(s.storage_diff_count, Some(1));
+    assert_eq!(s.diff_status.as_deref(), Some(sim::DIFF_STATUS_EXTRINSIC_ONLY));
+
+    // …and through the single-row lookup, which is a SECOND hand-maintained
+    // column list. Two `select`s that name the same columns are a transposition
+    // waiting for a column of the same type to be added.
+    let one = index
+        .simulation_at(
+            "polkadot-asset-hub",
+            &row.at_block_hash,
+            &row.input_hash,
+            sim::TIER_FORK,
+        )
+        .await
+        .expect("point lookup")
+        .expect("it is there");
+    assert!(one.forwarded_xcms.is_none());
+    assert_eq!(one.dispatch_route.as_deref(), Some(sim::ROUTE_SCHEDULED));
+
+    // ---- THE VOCABULARY IS AN INTEGRITY GUARANTEE, proven in BOTH directions.
+    // 0023's CHECK is what stops a typo'd status being accepted silently and then
+    // read as "no diff" — a blank column beside a status claiming it was read.
+    let bad = sqlx::query(
+        "update sim.simulation_results set diff_status = 'partial' where tier = 'fork'",
+    )
+    .execute(&db.pool)
+    .await;
+    assert!(
+        bad.is_err(),
+        "a status outside the five-value vocabulary must be REJECTED by the database"
+    );
+    for ok in sim::DIFF_STATUSES {
+        sqlx::query("update sim.simulation_results set diff_status = $1 where tier = 'fork'")
+            .bind(ok)
+            .execute(&db.pool)
+            .await
+            .unwrap_or_else(|e| panic!("'{ok}' is in the vocabulary and must be accepted: {e}"));
+    }
+    // AND NULL IS REFUSED ON A FORK ROW, which is what makes 0023's "NULL means
+    // this is not a fork row" a guarantee rather than a sentence above a
+    // constraint that permits the opposite. Without this the API had to invent a
+    // value for a NULL, and the only available invention — "unavailable" — is a
+    // POSITIVE claim about a run nobody made it of.
+    let nulled = sqlx::query(
+        "update sim.simulation_results set diff_status = null where tier = 'fork'",
+    )
+    .execute(&db.pool)
+    .await;
+    assert!(
+        nulled.is_err(),
+        "a fork row must name what its diff covers — see \
+         simulation_results_fork_names_its_diff_scope"
+    );
+    // …while a NON-fork row is exactly where NULL belongs, which proves the
+    // constraint is scoped to the TIER rather than to the column. Built through
+    // the same writer as everything else, so the column list cannot drift from
+    // the one production uses.
+    let dry = SimRecord {
+        input_hash: format!("0x{}", "dd".repeat(32)),
+        tier: sim::TIER_DRY_RUN.into(),
+        xcm_version: Some(4),
+        api_version: Some(2),
+        diff_status: None,
+        storage_diff: None,
+        storage_diff_count: None,
+        dispatch_route: None,
+        agenda_anchor: None,
+        harness: None,
+        forwarded_xcms: Some(serde_json::json!([])),
+        ..row.clone()
+    };
+    insert_simulation(&db.pool, &dry)
+        .await
+        .expect("a dry_run row carries no diff_status at all, and NULL is what that means");
+
+    db.drop_db().await;
+}
+
 /// The receiving side gets its own table, and the baseline link is a KEY into
 /// the sending side's (Phase 3, slice 5).
 ///
@@ -3080,22 +3319,32 @@ async fn a_previewed_arrival_is_its_own_row_and_the_baseline_link_is_a_key() {
             call_summary: Some(summary.into()),
             origin_spec: "root".into(),
             origin_json: serde_json::json!({"resolved": "system:Root"}),
-            xcm_version: 4,
+            xcm_version: Some(4),
             status: "executed".into(),
             dispatch_ok: Some(true),
             dispatch_error: None,
             emitted_events: serde_json::json!([]),
             event_count: 0,
             local_xcm: None,
-            forwarded_xcms: serde_json::json!([{"destination": dest, "messages": messages}]),
+            forwarded_xcms: Some(serde_json::json!([{"destination": dest, "messages": messages}])),
             effects: serde_json::json!({"Ok": []}),
             note: None,
             spec_version: 2_003_002,
-            api_version: 2,
+            api_version: Some(2),
             metadata_version: 15,
             sim_version: 2,
             raw_location: format!("raw/polkadot-asset-hub/sim/aa/{input}/x.response.scale"),
             baseline_input_hash: baseline.map(str::to_string),
+            overrides: None,
+            override_hash: None,
+            storage_diff: None,
+            storage_diff_count: None,
+            diff_status: None,
+            built_block_hash: None,
+            harness: None,
+            // dry_run: no scheduler, so no route and no anchor.
+            dispatch_route: None,
+            agenda_anchor: None,
         }
     };
     // The baseline is its own baseline — a no-op differenced against itself is
@@ -3133,7 +3382,10 @@ async fn a_previewed_arrival_is_its_own_row_and_the_baseline_link_is_a_key() {
         .await
         .unwrap()
         .expect("baseline row");
-    let attribution = sim::attribute_forwarded(&subject.forwarded_xcms, &baseline.forwarded_xcms);
+    let attribution = sim::attribute_forwarded(
+        subject.forwarded_xcms.as_ref().expect("a dry_run row has a forwarded list"),
+        baseline.forwarded_xcms.as_ref().expect("a dry_run baseline has one too"),
+    );
     assert_eq!(attribution.total_messages, 2);
     assert_eq!(attribution.ambient_messages, 1);
     assert_eq!(
@@ -3288,6 +3540,756 @@ async fn a_previewed_arrival_is_its_own_row_and_the_baseline_link_is_a_key() {
         .unwrap()
         .is_none(),
         "the tier is part of the key here too — a Tier 1 answer must not serve a Tier 2 ask"
+    );
+
+    db.drop_db().await;
+}
+
+/// PHASE 3, SLICE 6 — the Hydration money mapper, end to end through Postgres.
+///
+/// FOUR THINGS THIS PROVES THAT A UNIT TEST CANNOT, each of which is a place a
+/// silent zero could have hidden:
+///
+///   1. An orml delta lands in `balances.balance_changes` on a `tokens:<id>`
+///      key, in the SAME table as a native and a pallet-assets one, routed to
+///      the right partition — the claim that "asset balances are not a new kind
+///      of fact" holding for a THIRD vocabulary.
+///   2. An orml ANCHOR keeps its reserved half. Migration 0010's asset writer
+///      records `reserved = 0` by design; routing an orml holding through it
+///      would drop a real reserved position silently, so the anchor is written
+///      through the NATIVE writer and this asserts the split survives the round
+///      trip.
+///   3. **ONE ASSET, TWO CHAINS, ONE `absolute_key`** — the identity claim the
+///      whole slice rests on. Asset Hub's `assets:1984` and Hydration's
+///      `tokens:10` are the same USDT, they carry DIFFERENT `location_key`s
+///      because a Location is relative to its observer, and a `group by
+///      absolute_key` finds them as one thing. The negative half is asserted
+///      first: without it, this test would pass on two rows that were never
+///      distinguishable.
+///   4. The native-alias rule: HDX exists as registry asset 0 AND as the
+///      pallet_balances token, and there is exactly ONE row for it.
+#[tokio::test]
+async fn orml_balances_share_the_tables_and_one_asset_resolves_across_two_chains() {
+    let Some(db) = TestDb::create().await else {
+        return;
+    };
+    use adapter_substrate::assets as aa;
+    use adapter_substrate::orml;
+
+    let reg = seeds();
+    sync_registry(&db.pool, &reg).await.expect("registry sync");
+
+    // Hydration must be registered by the SEEDS, not by this test — if the seed
+    // ever stops loading, this assertion is where we find out rather than in a
+    // silently empty result set below.
+    let hydration = reg.chain("hydration").expect("hydration is a registered chain");
+    assert_eq!(hydration.para_id, Some(2034));
+    assert!(
+        hydration.has_module("balances"),
+        "the orml mapper is why this module is on; with it off the worker never \
+         starts and every number below would be zero for the wrong reason"
+    );
+
+    // ---- 1. the two observers' spellings of ONE asset --------------------
+    let ah_path = orml::chain_path("polkadot", Some(1000));
+    let hydra_path = orml::chain_path("polkadot", Some(2034));
+
+    // Asset Hub names its own asset 1984 with no parents at all
+    let ah_usdt = aa::local_asset_location(50, 1984);
+    // Hydration's AssetRegistry stores the same asset one hop away, in the
+    // decoder's real shape (newtype-wrapped junctions, nested X3)
+    let hydra_usdt = serde_json::json!({
+        "parents": 1,
+        "interior": {"X3": [[
+            {"Parachain": [1000]}, {"PalletInstance": [50]}, {"GeneralIndex": [1984]}
+        ]]}
+    });
+
+    let ah_location_key = aa::canonical_location(&ah_usdt).expect("canonical");
+    let hydra_location_key = aa::canonical_location(&hydra_usdt).expect("canonical");
+    assert_ne!(
+        ah_location_key, hydra_location_key,
+        "THE NEGATIVE HALF: version-stripping cannot reconcile two observers' \
+         frames. If these are ever equal, the assertion below proves nothing."
+    );
+
+    let ah_absolute = orml::absolutize(&ah_path, &ah_usdt).expect("absolutizes");
+    let hydra_absolute = orml::absolutize(&hydra_path, &hydra_usdt).expect("absolutizes");
+
+    dotlens_node::assets_pg::upsert_asset(
+        &db.pool,
+        "polkadot-asset-hub",
+        "assets:1984",
+        "trust_backed",
+        Some("1984"),
+        Some(&ah_usdt),
+        Some(&ah_location_key),
+        Some(&ah_absolute),
+        Some(&ah_absolute.to_string()),
+        None,
+        Some(&1984u32.to_le_bytes()[..]),
+        &aa::AssetMeta {
+            name: Some("Tether USD".into()),
+            symbol: Some("USDT".into()),
+            decimals: Some(6),
+        },
+        &Default::default(),
+        Some(2_003_002),
+        Some(500),
+        "test",
+    )
+    .await
+    .expect("ah usdt");
+
+    dotlens_node::assets_pg::upsert_asset(
+        &db.pool,
+        "hydration",
+        "tokens:10",
+        "orml",
+        Some("10"),
+        Some(&hydra_usdt),
+        Some(&hydra_location_key),
+        Some(&hydra_absolute),
+        Some(&hydra_absolute.to_string()),
+        Some("Token"),
+        Some(&10u32.to_le_bytes()[..]),
+        &aa::AssetMeta {
+            name: Some("Tether USD".into()),
+            symbol: Some("USDT".into()),
+            decimals: Some(6),
+        },
+        &Default::default(),
+        Some(435),
+        Some(13_653_999),
+        "test",
+    )
+    .await
+    .expect("hydration usdt");
+
+    // THE JOIN. Two chains, two representations, one asset — found by grouping
+    // on a column, which is why 0019 adds no table.
+    // fetch_ALL, not fetch_one: `fetch_one` returns the first row of a
+    // multi-row result rather than erroring, so a second cross-chain group
+    // would be silently ignored by an assertion claiming there is exactly one.
+    let groups: Vec<(i64, String)> = sqlx::query_as(
+        "select count(distinct chain_id), absolute_key from core.assets \
+         where absolute_key is not null group by absolute_key \
+         having count(distinct chain_id) > 1",
+    )
+    .fetch_all(&db.pool)
+    .await
+    .expect("cross-chain groups");
+    assert_eq!(groups.len(), 1, "exactly one asset spans two chains here");
+    let (chains, key) = groups.into_iter().next().unwrap();
+    assert_eq!(chains, 2);
+    assert_eq!(
+        key,
+        r#"[{"GlobalConsensus":{"Polkadot":[]}},{"Parachain":1000},{"PalletInstance":50},{"GeneralIndex":1984}]"#
+    );
+
+    // an Erc20 asset is registered, named and located — and VISIBLY
+    // unanchorable, which is this slice's scope boundary living in the data
+    dotlens_node::assets_pg::upsert_asset(
+        &db.pool,
+        "hydration",
+        "tokens:1001",
+        "orml",
+        Some("1001"),
+        None,
+        None,
+        None,
+        None,
+        Some("Erc20"),
+        Some(&1001u32.to_le_bytes()[..]),
+        &aa::AssetMeta { name: Some("aDOT".into()), symbol: Some("aDOT".into()), decimals: Some(10) },
+        &Default::default(),
+        Some(435),
+        Some(13_653_999),
+        "test",
+    )
+    .await
+    .expect("adot");
+    let (erc20,): (i64,) =
+        sqlx::query_as("select count(*) from core.assets where asset_type = 'Erc20'")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!(erc20, 1, "the money market is registered, not hidden");
+
+    // ---- 2. HDX: one row, not two ---------------------------------------
+    // The registry calls it asset 0 and pallet_balances calls it the native
+    // token. `sync-assets` folds the registry's richer metadata ONTO the native
+    // row; the mapper refuses a `tokens:0` event. Both halves of that rule mean
+    // the same thing here: exactly one row for HDX.
+    let holder_bytes_for_guard = adapter_substrate::accounts::sibling_sovereign(1000);
+    let native_hdx = serde_json::json!({"parents": 0, "interior": []});
+    let hdx_absolute = orml::absolutize(&hydra_path, &native_hdx).expect("a chain is its own name");
+    dotlens_node::assets_pg::upsert_asset(
+        &db.pool,
+        "hydration",
+        "native",
+        "native",
+        None,
+        Some(&native_hdx),
+        Some(&native_hdx.to_string()),
+        Some(&hdx_absolute),
+        Some(&hdx_absolute.to_string()),
+        Some("Token"),
+        None,
+        &aa::AssetMeta { name: Some("HDX".into()), symbol: Some("HDX".into()), decimals: Some(12) },
+        &Default::default(),
+        Some(435),
+        Some(13_653_999),
+        "test",
+    )
+    .await
+    .expect("hdx");
+    let (hdx_rows,): (i64,) = sqlx::query_as(
+        "select count(*) from core.assets where chain_id = 'hydration' \
+         and (asset_key = 'native' or asset_key = 'tokens:0')",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(hdx_rows, 1, "HDX is one asset, however many pallets name it");
+    // AND THE ASSERTION CAN FAIL, which it could not while nothing in this test
+    // ever wrote `tokens:0`: the mapper is what forbids that key, so assert the
+    // mapper — a `tokens.Deposited` on currency 0 must HALT rather than produce
+    // a delta that a sink would then happily insert.
+    let native_event = canonical::CanonicalEvent {
+        index: 0,
+        transaction_index: None,
+        name: "tokens.Deposited".into(),
+        data: serde_json::json!({
+            "currency_id": 0, "who": [[holder_bytes_for_guard.to_vec()]], "amount": 1
+        }),
+    };
+    assert!(
+        adapter_substrate::orml::deltas_for_orml_event(&native_event).is_err(),
+        "the second HDX row is prevented by a refusal, not by nobody trying"
+    );
+    assert_eq!(
+        hdx_absolute.to_string(),
+        r#"[{"GlobalConsensus":{"Polkadot":[]}},{"Parachain":2034}]"#,
+        "a native token has no AssetLocations entry, and absolutizes to its \
+         own chain — which is how it gets a name at all"
+    );
+
+    // ---- 3. deltas: three vocabularies, one table ------------------------
+    let holder = adapter_substrate::accounts::sibling_sovereign(1000);
+    let peer = adapter_substrate::accounts::para_sovereign(2034);
+    let sink = dotlens_node::balances_pg::PgDeltaSink::new(db.pool.clone());
+    let d = |account: &[u8; 32], asset: &str, magnitude: u128, negative: bool| {
+        ingest::balances::BalanceDelta {
+            account: account.to_vec(),
+            magnitude,
+            negative,
+            reason: if negative { "transfer_out".into() } else { "transfer_in".into() },
+            counterparty: None,
+            asset: asset.to_string(),
+        }
+    };
+    // the >u64 magnitude an 18-decimal orml asset really produces (4.5% of live
+    // events), so the NUMERIC path is exercised rather than assumed
+    let big: u128 = 36_893_488_147_419_103_232;
+    ingest::balances::DeltaSink::write(
+        &sink,
+        "hydration",
+        13_653_000,
+        435,
+        adapter_substrate::balances::MAPPER_VERSION,
+        &[
+            (0, d(&holder, "tokens:10", 20_895_000_000, true)),
+            (1, d(&peer, "tokens:10", 20_895_000_000, false)),
+            (2, d(&holder, "tokens:222", big, false)),
+            (3, d(&holder, "native", 1_000, false)),
+        ],
+    )
+    .await
+    .expect("orml deltas land");
+
+    let rows: Vec<(String, String, bool)> = sqlx::query_as(
+        "select asset, delta::text, delta < 0 from balances.balance_changes \
+         where chain_id = 'hydration' order by event_index",
+    )
+    .fetch_all(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(rows.len(), 4);
+    assert_eq!(rows[0].0, "tokens:10");
+    assert!(rows[0].2, "the out leg is negative");
+    assert_eq!(rows[2].1, big.to_string(), "an 18-decimal magnitude survives");
+    assert_eq!(rows[3].0, "native", "HDX still goes through pallet_balances");
+
+    // the mapper version on every row is the bumped one, so a future rebuild
+    // can tell orml-covered ranges from pre-orml ones
+    // the VALUE, not merely that there is one of them — `count(distinct …)` on
+    // rows written by one constant cannot fail, and this slice's whole claim
+    // about lineage is that the number MOVED
+    let (version,): (i32,) = sqlx::query_as(
+        "select distinct mapper_version from balances.balance_changes \
+         where chain_id = 'hydration'",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .expect("exactly one mapper_version on these rows");
+    assert_eq!(
+        version, adapter_substrate::balances::MAPPER_VERSION as i32,
+        "orml rows must carry the bumped version, or a rebuild cannot tell \
+         orml-covered ranges from pre-orml ones"
+    );
+
+    // partition routing exact, and the default partition EMPTY
+    let (routed,): (i64,) =
+        sqlx::query_as("select count(*) from balances.balance_changes_p_hydration")
+            .fetch_one(&db.pool)
+            .await
+            .expect("hydration has its own partition");
+    assert_eq!(routed, 4);
+    let (defaulted,): (i64,) =
+        sqlx::query_as("select count(*) from balances.balance_changes_default")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!(defaulted, 0);
+
+    // replay is a no-op (insert-ignore), same as every other module
+    ingest::balances::DeltaSink::write(
+        &sink,
+        "hydration",
+        13_653_000,
+        435,
+        adapter_substrate::balances::MAPPER_VERSION,
+        &[(0, d(&holder, "tokens:10", 20_895_000_000, true))],
+    )
+    .await
+    .expect("replay");
+    let (after,): (i64,) =
+        sqlx::query_as("select count(*) from balances.balance_changes where chain_id = 'hydration'")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!(after, 4, "replay must not duplicate");
+
+    // ---- 4. the anchor keeps its reserved half ---------------------------
+    // THE ROUTING DECISION 0019 ARGUES FOR, asserted: an orml holding has a
+    // free/reserved split, so it takes the NATIVE writer. Through
+    // `insert_asset_anchor` the 700 below would be silently zero.
+    let holding = orml::OrmlHolding { free: 5_000, reserved: 700, frozen: Some(100) };
+    dotlens_node::balances_pg::insert_anchor(
+        &db.pool,
+        "hydration",
+        &holder[..],
+        "tokens:10",
+        13_652_999,
+        &holding.as_account_balances(),
+        Some(435),
+        "test",
+        None,
+    )
+    .await
+    .expect("orml anchor");
+    let (free, reserved, total, status): (String, String, String, Option<String>) =
+        sqlx::query_as(
+            "select free::text, reserved::text, total::text, status \
+             from balances.balance_anchors where chain_id = 'hydration' \
+             and asset = 'tokens:10'",
+        )
+        .fetch_one(&db.pool)
+        .await
+        .expect("the orml anchor row");
+    assert_eq!(free, "5000");
+    assert_eq!(
+        reserved, "700",
+        "an orml position's reserved half must survive — the pallet-assets \
+         anchor writer would have made this 0"
+    );
+    assert_eq!(total, "5700");
+    assert_eq!(
+        status, None,
+        "orml has no per-account asset status; a plausible default would be a lie"
+    );
+
+    db.drop_db().await;
+}
+
+/// Core occupancy end to end (Phase 3, slice 11): candidate events become
+/// occupancy rows, a relay parent HASH becomes a HEIGHT, the measured
+/// one-candidate-per-core invariant is enforced by the database, and the
+/// endpoint serves TWO ratios that are not the same number.
+///
+/// THE DECISIVE HALF IS THE RELAY-PARENT RESOLUTION, because it is the one thing
+/// a pure mapper structurally cannot do and therefore the one thing only this
+/// test covers. Async backing puts the parent 2-6 blocks back (measured: min 2,
+/// avg 3.261, max 6, never 0 or 1), so inside a contiguously indexed window it
+/// resolves and at every window EDGE it cannot — and a NULL there must read
+/// "outside our data", never "lag zero". Both cases are asserted here, in the
+/// same block, so one cannot pass by the other's luck.
+#[tokio::test]
+async fn occupancy_resolves_its_relay_parents_and_serves_two_ratios_that_differ() {
+    use adapter_substrate::coretime::SubstrateOccupancyMapper;
+    use api::CoretimeIndex as _;
+    use canonical::{CanonicalBlock, CanonicalEvent, Lineage};
+
+    let Some(db) = TestDb::create().await else { return };
+    let reg = seeds();
+    sync_registry(&db.pool, &reg).await.expect("registry sync");
+
+    // A block hash as 32 bytes, so a relay_parent in the decoded shape
+    // (`[[32 bytes]]` — H256 is a newtype over [u8;32], the layer this project
+    // has met seven times) hexes to exactly the hash `core.blocks` carries.
+    let hash_bytes = |h: u64| {
+        let mut b = [0u8; 32];
+        b[24..].copy_from_slice(&h.to_be_bytes());
+        b
+    };
+    let parent_json = |h: u64| serde_json::json!([hash_bytes(h).to_vec()]);
+
+    let candidate = |index: u32, variant: &str, core: u32, para: u32, parent: u64| {
+        let mut fields = vec![
+            serde_json::json!({
+                "descriptor": {
+                    "para_id": [para],
+                    "relay_parent": parent_json(parent),
+                    "pov_hash": [vec![(core + 1) as u8; 32]],
+                },
+                "commitments_hash": [vec![0u8; 32]]
+            }),
+            // head_data — present in the event and deliberately never stored
+            serde_json::json!([1u8, 2, 3, 4]),
+            serde_json::json!([core]),
+        ];
+        if variant != "CandidateTimedOut" {
+            fields.push(serde_json::json!([13]));
+        }
+        CanonicalEvent {
+            index,
+            transaction_index: None,
+            name: format!("parainclusion.{variant}"),
+            data: serde_json::Value::Array(fields),
+        }
+    };
+
+    let block = |height: u64, events: Vec<CanonicalEvent>| CanonicalBlock {
+        chain_id: "polkadot".into(),
+        height,
+        hash: format!("0x{height:064x}"),
+        parent_hash: format!("0x{:064x}", height - 1),
+        timestamp: Some("2026-08-19T00:00:00Z".parse().unwrap()),
+        finalized: true,
+        lineage: Lineage {
+            runtime_version: 2_003_002,
+            decoder_version: 2,
+            raw_location: format!("raw/polkadot/test/{height}"),
+        },
+        transactions: vec![],
+        events,
+    };
+
+    let blocks = api::pg::PgBlockIndex::new(db.pool.clone());
+    for h in [500u64, 501, 502] {
+        api::BlockIndex::insert(&blocks, block(h, vec![]))
+            .await
+            .expect("insert empty relay block");
+    }
+    api::BlockIndex::insert(
+        &blocks,
+        block(
+            503,
+            vec![
+                // parent #500 IS indexed — lag 3, the modal value in the sample
+                candidate(0, "CandidateIncluded", 0, 2004, 500),
+                // parent #497 is NOT indexed: a window edge, and the reason
+                // relay_parent_height is nullable for a reason that is not
+                // "we did not look"
+                candidate(1, "CandidateIncluded", 5, 2034, 497),
+                // A BACKING ON THE SAME CORE IN THE SAME BLOCK. This is the
+                // shape the partial unique index is scoped for: at high
+                // occupancy a core finishes one candidate and starts the next in
+                // one block, so uniqueness applies to inclusions ONLY.
+                candidate(2, "CandidateBacked", 0, 2004, 500),
+                // the one named-field variant in this pallet — a deliberate ∅,
+                // and the reason shape is decided per VARIANT, never per pallet
+                CanonicalEvent {
+                    index: 3,
+                    transaction_index: None,
+                    name: "parainclusion.UpwardMessagesReceived".into(),
+                    data: serde_json::json!({ "from": [1005], "count": 1 }),
+                },
+            ],
+        ),
+    )
+    .await
+    .expect("insert block 503");
+    api::BlockIndex::insert(
+        &blocks,
+        block(504, vec![candidate(0, "CandidateIncluded", 0, 2004, 501)]),
+    )
+    .await
+    .expect("insert block 504");
+
+    let source = dotlens_node::balances_pg::PgEventSource::new(db.pool.clone());
+    let sink = dotlens_node::coretime_pg::PgOccupancySink::new(db.pool.clone());
+    let checkpoints = ingest::pg::PgCheckpointStore::new(db.pool.clone());
+    let deps = ingest::coretime::CoretimeDeps {
+        checkpoints: &checkpoints,
+        source: &source,
+        sink: &sink,
+    };
+    ingest::coretime::coretime_range("polkadot", &SubstrateOccupancyMapper, &deps, 500, 504)
+        .await
+        .expect("map occupancy");
+
+    // 3 inclusions + 1 backing; UpwardMessagesReceived produced nothing.
+    let (rows,): (i64,) = sqlx::query_as("select count(*) from coretime.core_occupancy")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(rows, 4);
+    for (part, want) in [
+        ("coretime.core_occupancy_p_polkadot", 4),
+        ("coretime.core_occupancy_default", 0),
+    ] {
+        let (n,): (i64,) = sqlx::query_as(&format!("select count(*) from {part}"))
+            .fetch_one(&db.pool)
+            .await
+            .unwrap_or_else(|e| panic!("counting {part}: {e}"));
+        assert_eq!(n, want, "{part} — a chain must land in its own partition");
+    }
+
+    // THE DECISIVE CHECK, both directions, in one block.
+    let parents: Vec<(i32, Option<i64>, Option<String>)> = sqlx::query_as(
+        "select core_index, relay_parent_height, relay_parent_hash \
+         from coretime.core_occupancy \
+         where block_height = 503 and kind = 'included' order by core_index",
+    )
+    .fetch_all(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(parents.len(), 2);
+    assert_eq!(
+        (parents[0].0, parents[0].1),
+        (0, Some(500)),
+        "a relay parent inside the indexed window resolves to its height — lag 3"
+    );
+    assert_eq!(
+        parents[1].1, None,
+        "#497 is outside the window: NULL means 'the parent is not in our data', and a lag of \
+         zero would be a different and impossible claim"
+    );
+    assert_eq!(
+        parents[1].2,
+        Some(format!("0x{:064x}", 497)),
+        "the HASH survives even when the height cannot be resolved — a row that threw it away \
+         could never be improved by a wider backfill"
+    );
+
+    // group_index is present on the four-field variants and would be NULL on
+    // CandidateTimedOut, which carries three. No live instance of that exists
+    // anywhere on Polkadot, which is why the mapper checks its arity separately.
+    let (group,): (Option<i32>,) = sqlx::query_as(
+        "select group_index from coretime.core_occupancy \
+         where block_height = 503 and event_index = 0",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(group, Some(13));
+
+    // The checkpoint proves MODULE_CORETIME is this module's own key. Share
+    // another module's and two workers corrupt one checkpoint while every other
+    // assertion here still passes; `ingest::coretime` ships no worker tests, so
+    // this is the only thing that pins it.
+    let cp = ingest::CheckpointStore::get(&checkpoints, "polkadot", ingest::coretime::MODULE_CORETIME)
+        .await
+        .expect("checkpoint read")
+        .expect("the coretime worker advanced its own checkpoint");
+    assert_eq!(cp.last_height, 504);
+    assert_eq!(cp.module, ingest::coretime::MODULE_CORETIME);
+
+    // Append-only: re-running a range is a no-op. This also proves the insert's
+    // PK arbiter reaches the DO NOTHING path before the partial unique index
+    // objects to the identical row — which is exactly what the next assertion
+    // shows it does NOT do for a genuinely different row.
+    ingest::coretime::coretime_range("polkadot", &SubstrateOccupancyMapper, &deps, 500, 504)
+        .await
+        .expect("replay");
+    let (again,): (i64,) = sqlx::query_as("select count(*) from coretime.core_occupancy")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(again, 4, "re-running a range must not duplicate facts");
+
+    // AND THE UNRESOLVED PARENT IS FILLABLE, which is what makes the NULL an
+    // honest "outside our data" rather than "outside our data WHEN WE FIRST
+    // LOOKED". Index #497 — the wider backfill — and re-run: the edge resolves
+    // and the height that was already known does not move. A `do nothing` sink
+    // would leave the first NULL forever and the column's meaning would drift
+    // with the window without anything saying so.
+    api::BlockIndex::insert(&blocks, block(497, vec![]))
+        .await
+        .expect("the backfill widens");
+    ingest::coretime::coretime_range("polkadot", &SubstrateOccupancyMapper, &deps, 500, 504)
+        .await
+        .expect("re-run after the wider backfill");
+    let filled: Vec<(i32, Option<i64>)> = sqlx::query_as(
+        "select core_index, relay_parent_height from coretime.core_occupancy \
+         where block_height = 503 and kind = 'included' order by core_index",
+    )
+    .fetch_all(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        filled,
+        vec![(0, Some(500)), (5, Some(497))],
+        "the edge resolved on the second pass and the resolved height did not move"
+    );
+    let (still,): (i64,) = sqlx::query_as("select count(*) from coretime.core_occupancy")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(still, 4, "a monotone fill updates in place; it never adds a row");
+
+    // THE MEASURED INVARIANT, ENFORCED AND NAMED. Zero collisions across 51,998
+    // included candidates, so a second inclusion on one core in one block does
+    // not mean "a duplicate to skip" — it means our reading of the runtime's
+    // core assignment is wrong, and a ratio computed from it would double-count
+    // a core. It must stop ingestion rather than be absorbed.
+    let clash = ingest::coretime::OccupancyRow {
+        kind: "included".into(),
+        core_index: 0,
+        para_id: 2004,
+        group_index: Some(13),
+        relay_parent_hash: None,
+        pov_hash: None,
+    };
+    let err = ingest::coretime::OccupancySink::write(
+        &sink,
+        "polkadot",
+        503,
+        2_003_002,
+        1,
+        &[(9, clash)],
+    )
+    .await
+    .expect_err("a second inclusion on core 0 at #503 must be refused");
+    assert!(err.contains("TWO INCLUDED CANDIDATES ON CORE 0"), "{err}");
+    // ...while a BACKING at the same coordinates is accepted, because the
+    // uniqueness is scoped to inclusions and a core legitimately carries both in
+    // one block.
+    let backing = ingest::coretime::OccupancyRow {
+        kind: "backed".into(),
+        core_index: 0,
+        para_id: 2004,
+        group_index: Some(13),
+        relay_parent_hash: None,
+        pov_hash: None,
+    };
+    ingest::coretime::OccupancySink::write(&sink, "polkadot", 503, 2_003_002, 1, &[(10, backing)])
+        .await
+        .expect("a backing on a core that also had an inclusion is not a collision");
+
+    // ---- the denominator, and the two ratios it divides -------------------
+    //
+    // TWO READINGS THAT DISAGREE, on purpose: `num_cores` is host configuration
+    // that moves at session boundaries, and a window containing two readings is
+    // a window where one ratio is an average of two different questions.
+    dotlens_node::coretime_pg::insert_core_config(
+        &db.pool,
+        "polkadot",
+        502,
+        2,
+        &serde_json::json!({ "num_cores": 2, "lookahead": 5 }),
+        2_003_002,
+    )
+    .await
+    .expect("earlier reading");
+    dotlens_node::coretime_pg::insert_core_config(
+        &db.pool,
+        "polkadot",
+        504,
+        4,
+        &serde_json::json!({ "num_cores": 4, "lookahead": 5 }),
+        2_003_002,
+    )
+    .await
+    .expect("the reading the window ran under");
+
+    let index = api::pg::PgCoretimeIndex::new(db.pool.clone());
+    let cores = index.occupancy_by_core("polkadot", 500, 504).await.unwrap();
+    assert_eq!(cores.len(), 2, "cores 0 and 5 produced; the backing on core 0 is not a core used");
+    assert_eq!((cores[0].core_index, cores[0].included_blocks), (0, 2));
+    assert_eq!(cores[0].paras, vec![2004]);
+    assert_eq!((cores[1].core_index, cores[1].included_blocks), (5, 1));
+
+    let kinds = index.kind_counts("polkadot", 500, 504).await.unwrap();
+    assert_eq!(
+        kinds,
+        vec![("backed".to_string(), 2), ("included".to_string(), 3)],
+        "backed rows are IN the table and OUT of the ratios"
+    );
+
+    let cov = index.window_coverage("polkadot", 500, 504).await.unwrap();
+    assert_eq!(
+        cov.blocks_indexed, 5,
+        "the slot-fill denominator is what we INDEXED, not the width somebody asked for"
+    );
+    assert_eq!(
+        cov.heights_with_occupancy, 2,
+        "three of the five blocks are empty — the gap is how a reader sees an unmapped range \
+         without being told"
+    );
+
+    let chosen = index
+        .core_config_at_or_before("polkadot", 504)
+        .await
+        .unwrap()
+        .expect("a reading at or before the window's end");
+    assert_eq!((chosen.block_height, chosen.num_cores), (504, 4));
+    assert_eq!(
+        index.num_cores_in_window("polkadot", 500, 504).await.unwrap(),
+        vec![2, 4],
+        "two readings that disagree: the denominator MOVED inside the window and a single ratio \
+         across it averages two different questions"
+    );
+
+    // LINEAGE, which Invariant 3 requires of the aggregate as much as of the
+    // rows: one entry, so every count above was produced by ONE rule set. Two
+    // entries would mean the window was mapped under two and the ratios are an
+    // average of two different definitions of occupancy.
+    let lineage = index.occupancy_lineage("polkadot", 500, 504).await.unwrap();
+    assert_eq!(lineage, vec![(2_003_002u64, 1u32, 5u64)], "one runtime, one mapper, five rows");
+
+    // AND THE STALE DETECTOR SPANS EVERY KIND. `max_core_index` must see core 5
+    // whether it arrived as an inclusion or a backing — a detector that read
+    // only the rows the ratios count would claim to look at "the data" while
+    // skipping rows the same response reports under `by_kind`.
+    assert_eq!(
+        index.max_core_index("polkadot", 500, 504).await.unwrap(),
+        Some(5)
+    );
+
+    // The two ratios, computed the way the endpoint computes them — and they
+    // are not the same number, which is the entire product claim:
+    //   cores touched  = 2 of 4 declared = 50.0%
+    //   slots filled   = 3 of (5 blocks x 4 cores) = 15.0%
+    let touched = cores.len() as f64 / chosen.num_cores as f64;
+    let filled = 3.0 / (cov.blocks_indexed * chosen.num_cores as u64) as f64;
+    assert!((touched - 0.50).abs() < 1e-9, "{touched}");
+    assert!((filled - 0.15).abs() < 1e-9, "{filled}");
+    assert!(touched > filled, "even the cores that are used sit idle");
+
+    // AND THE STALE-DENOMINATOR DETECTOR FIRES ON REAL ROWS. Core 5 carried work
+    // while the reading declares 4 cores exist — a contradiction that can only
+    // mean the reading predates a core count that grew, which is the live risk
+    // 0024 names and the reason `num_cores` is a dated table rather than a
+    // constant.
+    let max_core = cores.iter().map(|c| c.core_index).max().unwrap();
+    assert!(
+        max_core >= chosen.num_cores,
+        "core {max_core} against a declared {} — the endpoint reports this as \
+         `stale_suspected` rather than clamping it away",
+        chosen.num_cores
     );
 
     db.drop_db().await;

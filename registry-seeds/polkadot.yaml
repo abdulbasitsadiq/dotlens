@@ -5,6 +5,12 @@ family: substrate
 relay: null            # it IS a relay
 para_id: null
 network: polkadot
+# WHOSE TOKEN this chain's pallet_balances holds (Phase 3 slice 6). `own` = this
+# chain ISSUES its native currency, so the token's absolute XCM name is the
+# chain's own path. Not derivable from `para_id`: Hydration and Asset Hub are
+# both parachains and their native currencies are different assets.
+native_token: own
+
 ss58_prefix: 0
 
 # Short names the search grammar's `on <chain>` suffix accepts. DATA, so a
@@ -45,3 +51,10 @@ modules:
                            # UMP message (messageQueue, origin Ump(Para(id))) and SENDS
                            # every DMP one. Without this the xcm follower never starts
                            # here and half of every journey is invisible.
+  - coretime               # OCCUPANCY only, and it lives HERE rather than on the
+                           # Coretime chain: `paraInclusion` names both the para id
+                           # and the core index, so which core actually produced a
+                           # block is a RELAY fact. The Coretime chain (1005) owns
+                           # the ENTITLEMENT half — regions, renewals, sales — and is
+                           # not registered yet; the product is the delta between
+                           # them, and this is the term nobody else has.

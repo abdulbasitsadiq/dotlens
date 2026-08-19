@@ -391,7 +391,11 @@ pub fn infer_shape(s: &str) -> Shape {
 /// the first would silently re-point every un-prefixed query at Kusama the day
 /// Kusama is registered, which is a behaviour change nobody would have asked
 /// for and nothing would have caught.
-fn known_networks(registry: &Registry) -> Vec<String> {
+/// PUB(CRATE) since slice 7: `get_treasury_consolidated` refuses an unknown
+/// network, and two implementations of "which networks exist" that could
+/// disagree is the defect class this crate already avoided once by depending on
+/// `sim` rather than re-deriving its set arithmetic.
+pub(crate) fn known_networks(registry: &Registry) -> Vec<String> {
     let mut seen: Vec<String> = Vec::new();
     for c in registry.chains() {
         if !seen.iter().any(|n| n == &c.network) {

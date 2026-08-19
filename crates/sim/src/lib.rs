@@ -402,18 +402,27 @@ pub struct SimRecord {
     pub call_summary: Option<String>,
     pub origin_spec: String,
     pub origin_json: serde_json::Value,
-    pub xcm_version: u32,
+    /// `result_xcms_version` — an argument of `dry_run_call`. `None` on a fork
+    /// row, which calls no runtime API and therefore has no such version;
+    /// writing 0 would read as XCM v0, a real version and a wrong answer.
+    pub xcm_version: Option<u32>,
     pub status: String,
     pub dispatch_ok: Option<bool>,
     pub dispatch_error: Option<serde_json::Value>,
     pub emitted_events: serde_json::Value,
     pub event_count: u32,
     pub local_xcm: Option<serde_json::Value>,
-    pub forwarded_xcms: serde_json::Value,
+    /// `None` = this tier does not produce a forwarded list. An empty array
+    /// would read as "this call queues no messages", which is a claim about the
+    /// CALL where the truth is a fact about the TIER.
+    pub forwarded_xcms: Option<serde_json::Value>,
     pub effects: serde_json::Value,
     pub note: Option<String>,
     pub spec_version: u32,
-    pub api_version: u32,
+    /// The DryRunApi version that answered. `None` on a fork row — no runtime
+    /// API was called, and recording the version the runtime happens to declare
+    /// would invite a reader to believe it was used.
+    pub api_version: Option<u32>,
     pub metadata_version: u32,
     pub sim_version: u32,
     pub raw_location: String,
@@ -422,6 +431,33 @@ pub struct SimRecord {
     /// was recorded, so `forwarded_xcms` means "messages present" and never
     /// "this call would send these".
     pub baseline_input_hash: Option<String>,
+
+    // ---------------------------------------------------- Tier 2 (slice 8)
+    // All `None` on a dry_run row. See migration 0021.
+    /// The resolved override set. `None` = NOT A COUNTERFACTUAL; an empty array
+    /// would be indistinguishable from a counterfactual that injects nothing,
+    /// and every rendering of this row turns on the difference.
+    pub overrides: Option<serde_json::Value>,
+    /// blake2b-256 over the canonical override encoding, folded into
+    /// `input_hash`. Kept beside the set so the fold is verifiable without
+    /// re-deriving the whole request — and so a database CHECK can insist that a
+    /// counterfactual is never recorded without it.
+    pub override_hash: Option<String>,
+    pub storage_diff: Option<serde_json::Value>,
+    pub storage_diff_count: Option<u32>,
+    /// decoded | extrinsic_only | undecodable | unavailable | refused — see
+    /// [`DIFF_STATUSES`]. Not a boolean: "we did not look" and
+    /// "nothing changed" must never be the same value.
+    pub diff_status: Option<String>,
+    /// The hash of a block that exists ONLY ON THE FORK.
+    pub built_block_hash: Option<String>,
+    /// Which engine spoke, and what it mocks.
+    pub harness: Option<serde_json::Value>,
+    /// scheduled | dry_run_extrinsic — see [`PreparedFork::dispatch_route`].
+    pub dispatch_route: Option<String>,
+    /// The agenda anchor decision and its evidence. The column that turns an
+    /// unexplained `not_dispatched` into a readable one.
+    pub agenda_anchor: Option<serde_json::Value>,
 }
 
 impl SimRecord {
@@ -450,22 +486,31 @@ impl SimRecord {
             call_summary: prepared.call_summary.clone(),
             origin_spec: prepared.origin_spec.clone(),
             origin_json: prepared.origin_json.clone(),
-            xcm_version: prepared.xcm_version,
+            xcm_version: Some(prepared.xcm_version),
             status: outcome.status.as_str().to_string(),
             dispatch_ok: outcome.dispatch_ok,
             dispatch_error: outcome.dispatch_error.clone(),
             emitted_events,
             event_count: outcome.events.len() as u32,
             local_xcm: outcome.local_xcm.clone(),
-            forwarded_xcms: serde_json::Value::Array(outcome.forwarded_xcms.clone()),
+            forwarded_xcms: Some(serde_json::Value::Array(outcome.forwarded_xcms.clone())),
             effects: outcome.effects.clone(),
             note: outcome.note.clone(),
             spec_version: prepared.spec_version,
-            api_version: prepared.api_version,
+            api_version: Some(prepared.api_version),
             metadata_version: prepared.metadata_version,
             sim_version,
             raw_location,
             baseline_input_hash,
+            overrides: None,
+            override_hash: None,
+            storage_diff: None,
+            storage_diff_count: None,
+            diff_status: None,
+            built_block_hash: None,
+            harness: None,
+            dispatch_route: None,
+            agenda_anchor: None,
         })
     }
 }
@@ -1170,6 +1215,545 @@ pub fn attribute_forwarded(
         attributed_messages,
         ambient_messages,
         total_messages,
+    }
+}
+
+// ============================================================================
+// TIER 2 — THE FORK (Phase 3, slice 8)
+// ============================================================================
+//
+// The same ordering as Tier 1 — prepare → cache → archive request → dispatch →
+// archive response → interpret → record — over a subject that is asked
+// differently and answered differently.
+//
+// THREE THINGS ARE DELIBERATELY ABSENT, and each absence is a decision:
+//
+//   * NO BASELINE. Tier 1 needs one because `forwarded_xcms` is a property of
+//     the STATE and not of the call, so a no-op run is the only way to tell the
+//     two apart. This tier produces no forwarded list at all (it calls no runtime
+//     API), so there is nothing to difference and a baseline here would be a
+//     second expensive run answering a question nobody asked.
+//   * NO SECOND ORCHESTRATION FOR THE QUEUE. `run_fork_simulation` is what the
+//     job worker calls and it is also what the CLI calls; the queue is a trigger,
+//     not a second path. Two implementations of "run a Tier 2 simulation" that
+//     could diverge is exactly the defect class this project keeps finding.
+//   * NO GENERALISATION OF THE THREE ORCHESTRATIONS. `ingest::module` was
+//     extracted after FIVE hand-copies had proved identical. There are three
+//     here, they differ in their subject, their answer and (for this one) their
+//     absence of a baseline, and what they genuinely share is already factored
+//     into [`SimArtifacts`].
+
+/// The tier tag written to `sim.simulation_results.tier` for a fork run.
+pub const TIER_FORK: &str = "fork";
+
+// ============================================================================
+// WHAT A STORAGE DIFF COVERS — the vocabulary, and the two rules that read it
+// ============================================================================
+//
+// THIS LIVES IN `sim` AND NOT IN THE ADAPTER, and the reason is the same one
+// that made `api` depend on this crate in slice 5. Both the RUNNER (which
+// decides what to record) and the READER (which decides how to render it) have
+// to answer "does this diff cover the call", and two implementations of that
+// question that could disagree is the defect class this project keeps finding —
+// `shared_decimals` in slice 7 was the last one. The adapter owns the part that
+// is genuinely protocol: mapping a particular harness's answer onto this
+// vocabulary (`adapter_substrate::fork::diff_scope_from_answer`). What a status
+// MEANS is tier vocabulary, and tier vocabulary is this crate's, beside
+// [`TIER_FORK`].
+
+/// Every phase of the block was returned and read.
+pub const DIFF_STATUS_DECODED: &str = "decoded";
+/// The bytes were read and decoded and cover the `apply_extrinsic` phase ONLY —
+/// block initialization and the inherents are not in them.
+///
+/// The ordinary case on the live Tier 2 route, measured 2026-08-18 from the
+/// harness's own source. See `adapter_substrate::fork::DIFF_METHOD_DRY_RUN` for
+/// where it comes from and [`diff_covers_subject`] for when it matters.
+pub const DIFF_STATUS_EXTRINSIC_ONLY: &str = "extrinsic_only";
+/// A diff came back in a shape that version could not read. The bytes are
+/// archived; nothing is guessed.
+pub const DIFF_STATUS_UNDECODABLE: &str = "undecodable";
+/// This build of the harness exposes no diff method at all.
+pub const DIFF_STATUS_UNAVAILABLE: &str = "unavailable";
+/// It HAS a diff method and it failed on this block.
+pub const DIFF_STATUS_REFUSED: &str = "refused";
+
+/// The whole vocabulary, in the order migration 0023's CHECK lists it.
+pub const DIFF_STATUSES: [&str; 5] = [
+    DIFF_STATUS_DECODED,
+    DIFF_STATUS_EXTRINSIC_ONLY,
+    DIFF_STATUS_UNDECODABLE,
+    DIFF_STATUS_UNAVAILABLE,
+    DIFF_STATUS_REFUSED,
+];
+
+/// Is there a diff to record at all?
+///
+/// GATED ON THE PRESENT VALUES, NOT ON `!= "unavailable"`. Slice 8 wrote this
+/// rule as a literal `== "decoded"` at its one call site, and adding a fifth
+/// value to the vocabulary would then have made every diff on the live route
+/// fall through to NULL — a column that silently stops being written, beside a
+/// status claiming the bytes were read. So it is a function with a test, and a
+/// sixth value has to be classified here or the test fails.
+pub fn diff_is_present(status: &str) -> bool {
+    matches!(status, DIFF_STATUS_DECODED | DIFF_STATUS_EXTRINSIC_ONLY)
+}
+
+/// Does the diff cover the thing that was SIMULATED?
+///
+/// NOT THE SAME QUESTION AS [`diff_is_present`], and on the scheduled route the
+/// two answers differ — which is the defect slice 10 exists for. A privileged
+/// call is dispatched by `pallet_scheduler` in `on_initialize`, and
+/// `extrinsic_only` is precisely the scope that omits it, so a scheduled row's
+/// diff describes the NO-OP VEHICLE and nothing else. Reading it as "this call
+/// changed twelve keys" is the most confidently wrong thing this tier can serve.
+///
+/// ON THE EXTRINSIC ROUTE THE SAME BYTES ARE COMPLETE, and that is worth saying
+/// rather than carrying the limitation onto a route where it is not one: the
+/// subject IS the extrinsic, so its whole effect is in the phase the diff covers.
+/// A whole-block diff there would be strictly WORSE for attribution — it would
+/// mix in every pallet's `on_initialize` bookkeeping, which the call did not do.
+///
+/// THE ROUTE IS A PARAMETER RATHER THAN A COLUMN OF ITS OWN for the reason
+/// migration 0023 states: "does the diff cover the subject" is a function of two
+/// facts the row already carries, and a stored third copy would be the derived
+/// column this project has refused four times.
+pub fn diff_covers_subject(status: &str, route: &str) -> bool {
+    match status {
+        DIFF_STATUS_DECODED => true,
+        DIFF_STATUS_EXTRINSIC_ONLY => route == ROUTE_DRY_RUN_EXTRINSIC,
+        _ => false,
+    }
+}
+
+/// `dispatch_route` — the call went through `pallet_scheduler`'s agenda, because
+/// no RPC can express a privileged origin.
+pub const ROUTE_SCHEDULED: &str = "scheduled";
+/// `dispatch_route` — the call was applied as an extrinsic, which a `signed:`
+/// origin simply is.
+pub const ROUTE_DRY_RUN_EXTRINSIC: &str = "dry_run_extrinsic";
+
+/// One resolved storage override, as it is stored on the result row.
+///
+/// EVERYTHING IS HEX AND JSON, so this type is protocol-free: the resolution
+/// happened in `adapter_substrate::fork` against a runtime's own metadata, and
+/// what arrives here is bytes and a rendering.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ForkOverride {
+    /// The spec exactly as the caller wrote it.
+    pub spec: String,
+    /// What it resolved to — `Assets.Account(1337, 0x…)`.
+    pub resolved: String,
+    pub key: String,
+    /// The value INJECTED. `None` = this override deletes the key.
+    pub value: Option<String>,
+    /// The value the REAL chain held at this block, read over ordinary RPC from
+    /// the real endpoint before anything was forked.
+    ///
+    /// THIS IS THE FIELD THAT MAKES THE FABRICATION LEGIBLE. Without it a
+    /// counterfactual row and a faithful one look alike; with it, the row itself
+    /// says "the chain held X here and the fork was told Y". `None` means the key
+    /// did not exist on the real chain — i.e. this override CREATED it, which is
+    /// a stronger fabrication than changing a number and reads as one.
+    pub before: Option<String>,
+    /// `before`/`value` decoded against the item's declared type, where they
+    /// could be. A rendering, never the authority — the hex is.
+    pub decoded_before: Option<serde_json::Value>,
+    pub decoded_after: Option<serde_json::Value>,
+}
+
+/// One Tier 2 ask.
+#[derive(Debug, Clone)]
+pub struct ForkRequest {
+    pub chain_id: String,
+    pub at_height: Option<u64>,
+    /// SCALE-encoded `RuntimeCall`.
+    pub call: Vec<u8>,
+    pub origin: OriginSpec,
+    pub origin_spec: String,
+    /// Override specs AS WRITTEN. Resolved during `prepare_fork`, because
+    /// resolving them needs the runtime's metadata AND a read of the real chain,
+    /// both of which are only available once the state is pinned.
+    pub override_specs: Vec<String>,
+    /// Who signs the extrinsic the fork actually applies.
+    ///
+    /// ON THE SCHEDULED ROUTE THIS IS NOT THE ORIGIN. The call is dispatched by
+    /// `pallet_scheduler` under whatever privileged origin was asked for; the
+    /// extrinsic is a no-op whose only job is to make the block execute, and this
+    /// account pays its fee. It therefore has to be one that CAN — which is why
+    /// it is a required argument rather than a derived throwaway: funding an
+    /// invented account means encoding an `AccountInfo` whose field names have
+    /// changed across pallet-balances versions, and guessing that shape wrong
+    /// produces a fork that refuses to apply anything for a reason that looks
+    /// like the call. Auto-funding it is a later slice; naming a funded account
+    /// is one flag.
+    ///
+    /// On the extrinsic route it is the origin's own account, so the two coincide.
+    pub signer: [u8; 32],
+}
+
+#[derive(Debug, Clone)]
+pub struct PreparedFork {
+    pub chain_id: String,
+    pub at_height: u64,
+    pub at_block_hash: String,
+    pub spec_version: u32,
+    pub metadata_version: u32,
+    pub tier: String,
+    pub method: String,
+    /// blake2b-256 over the canonical fork request encoding — the domain tag,
+    /// the origin bytes, the call bytes and the resolved override set. See
+    /// `adapter_substrate::fork::fork_input_bytes`.
+    pub input_hash: String,
+    /// blake2b-256 over the override set alone. `None` when there are none.
+    pub override_hash: Option<String>,
+    pub overrides: Vec<ForkOverride>,
+    pub call_hash: String,
+    pub call_summary: Option<String>,
+    pub origin_spec: String,
+    pub origin_json: serde_json::Value,
+    /// The canonical request bytes, archived before anything is run — so a run
+    /// that dies mid-flight still leaves what was asked on record. It carries
+    /// the origin AND the call, which is why neither is a second field here:
+    /// two copies of the call in one struct is one copy that can go stale, and
+    /// the hash was taken over these bytes.
+    pub request: Vec<u8>,
+    /// scheduled | dry_run_extrinsic. Decided by the ORIGIN: a privileged origin
+    /// has to go through the scheduler because no RPC can express one, while a
+    /// `signed:` origin is just an extrinsic. The two model different things —
+    /// only the second runs transaction extensions — so the coverage list served
+    /// with the row is chosen from this.
+    pub dispatch_route: String,
+    /// Which block-number line the scheduler counts on, and the evidence that
+    /// decided it. `None` on the extrinsic route, which involves no agenda.
+    pub agenda_anchor: Option<serde_json::Value>,
+    /// The account the vehicle extrinsic is signed as. It pays the fee, so it has
+    /// to be one that can.
+    pub signer: [u8; 32],
+}
+
+/// What the fork did.
+#[derive(Debug, Clone)]
+pub struct ForkOutcome {
+    /// executed | dispatch_failed | not_dispatched.
+    pub status: String,
+    pub dispatch_ok: Option<bool>,
+    pub dispatch_error: Option<serde_json::Value>,
+    pub events: Vec<SimEvent>,
+    /// The whole harness result, schema-on-read — the built block's header, the
+    /// extrinsic count, the runtime logs, the raw diff sizes. The part no future
+    /// question has to re-run a fork to answer.
+    pub effects: serde_json::Value,
+    pub storage_diff: Option<serde_json::Value>,
+    pub storage_diff_count: Option<u32>,
+    pub diff_status: String,
+    pub built_block_hash: Option<String>,
+    pub harness: serde_json::Value,
+    pub note: Option<String>,
+}
+
+impl SimRecord {
+    /// A fork row. Same table, same key shape, `tier = 'fork'`.
+    pub fn from_fork(
+        prepared: &PreparedFork,
+        outcome: &ForkOutcome,
+        sim_version: u32,
+        raw_location: String,
+    ) -> Result<Self, SimError> {
+        // Serialized before it is counted, and loudly, for the reason
+        // `SimRecord::new` states: `event_count: 2` beside `emitted_events: []`
+        // is a row that contradicts itself.
+        let emitted_events = serde_json::to_value(&outcome.events)
+            .map_err(|e| SimError::Encode(format!("serializing simulated events: {e}")))?;
+        // An empty override set is NOT a counterfactual, and the two must not be
+        // recorded alike — the migration's CHECK enforces the pairing, and this
+        // is where the pairing is decided.
+        let overrides = if prepared.overrides.is_empty() {
+            None
+        } else {
+            Some(serde_json::to_value(&prepared.overrides).map_err(|e| {
+                SimError::Encode(format!("serializing storage overrides: {e}"))
+            })?)
+        };
+        Ok(Self {
+            chain_id: prepared.chain_id.clone(),
+            at_block_hash: prepared.at_block_hash.clone(),
+            input_hash: prepared.input_hash.clone(),
+            at_height: prepared.at_height,
+            tier: prepared.tier.clone(),
+            call_hash: prepared.call_hash.clone(),
+            call_summary: prepared.call_summary.clone(),
+            origin_spec: prepared.origin_spec.clone(),
+            origin_json: prepared.origin_json.clone(),
+            xcm_version: None,
+            status: outcome.status.clone(),
+            dispatch_ok: outcome.dispatch_ok,
+            dispatch_error: outcome.dispatch_error.clone(),
+            emitted_events,
+            event_count: outcome.events.len() as u32,
+            local_xcm: None,
+            forwarded_xcms: None,
+            effects: outcome.effects.clone(),
+            note: outcome.note.clone(),
+            spec_version: prepared.spec_version,
+            api_version: None,
+            metadata_version: prepared.metadata_version,
+            sim_version,
+            raw_location,
+            baseline_input_hash: None,
+            overrides,
+            override_hash: prepared.override_hash.clone(),
+            storage_diff: outcome.storage_diff.clone(),
+            storage_diff_count: outcome.storage_diff_count,
+            diff_status: Some(outcome.diff_status.clone()),
+            built_block_hash: outcome.built_block_hash.clone(),
+            harness: Some(outcome.harness.clone()),
+            dispatch_route: Some(prepared.dispatch_route.clone()),
+            agenda_anchor: prepared.agenda_anchor.clone(),
+        })
+    }
+}
+
+#[async_trait]
+pub trait ForkRunner: Send + Sync {
+    /// Pin the state, resolve the overrides against the runtime's metadata, read
+    /// what the REAL chain holds at each overridden key, and build the canonical
+    /// request. Nothing is forked here.
+    async fn prepare_fork(&self, req: &ForkRequest) -> Result<PreparedFork, SimError>;
+    /// Start the harness, inject, build a block, read the answer back. Returns
+    /// the RAW harness output, archived before it is interpreted.
+    async fn dispatch_fork(&self, prepared: &PreparedFork) -> Result<Vec<u8>, SimError>;
+    /// Pure: harness output → outcome. Failure is loud and writes no row.
+    fn interpret_fork(
+        &self,
+        prepared: &PreparedFork,
+        response: &[u8],
+    ) -> Result<ForkOutcome, SimError>;
+    fn sim_version(&self) -> u32;
+}
+
+/// prepare → cache → archive request → dispatch → archive response → interpret
+/// → record.
+pub async fn run_fork_simulation(
+    runner: &dyn ForkRunner,
+    store: &dyn SimStore,
+    raw: &dyn raw_store::RawStore,
+    receipts: &dyn ingest::ReceiptSink,
+    req: &ForkRequest,
+) -> Result<SimRun, SimError> {
+    let prepared = runner.prepare_fork(req).await?;
+
+    if let Some(hit) = store
+        .get(
+            &prepared.chain_id,
+            &prepared.at_block_hash,
+            &prepared.input_hash,
+            &prepared.tier,
+        )
+        .await?
+    {
+        // The harness version is NOT part of the key (migration 0021 says why),
+        // so a cache hit can have been produced by a different chopsticks than
+        // the one installed now. The row records which; this line makes it
+        // visible without anyone having to go and look.
+        tracing::info!(
+            chain = %prepared.chain_id, height = prepared.at_height,
+            input = %prepared.input_hash, tier = %prepared.tier,
+            recorded_harness = %hit.harness.as_ref()
+                .and_then(|h| h.get("version"))
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "unknown".into()),
+            "fork simulation already recorded for this tier, state, input and override set — \
+             not re-running"
+        );
+        return Ok(SimRun {
+            record: hit,
+            cached: true,
+        });
+    }
+
+    let artifacts = SimArtifacts::new(
+        raw,
+        receipts,
+        &prepared.chain_id,
+        &prepared.at_block_hash,
+        &prepared.input_hash,
+        &prepared.method,
+    );
+    artifacts.put_params(&prepared.request).await?;
+    let response = runner.dispatch_fork(&prepared).await?;
+    let response_key = artifacts.put_response(&response).await?;
+
+    let outcome = runner.interpret_fork(&prepared, &response)?;
+    let record = SimRecord::from_fork(&prepared, &outcome, runner.sim_version(), response_key)?;
+    store.put(&record).await?;
+    Ok(SimRun {
+        record,
+        cached: false,
+    })
+}
+
+// ---------------------------------------------------------------- the queue
+
+pub const JOB_QUEUED: &str = "queued";
+pub const JOB_RUNNING: &str = "running";
+pub const JOB_DONE: &str = "done";
+pub const JOB_FAILED: &str = "failed";
+pub const JOB_REFUSED: &str = "refused";
+
+/// A request to run a simulation, before anybody has run it.
+#[derive(Debug, Clone)]
+pub struct NewSimJob {
+    pub chain_id: String,
+    pub tier: String,
+    pub at_height: Option<u64>,
+    pub call: Vec<u8>,
+    pub call_hash: String,
+    pub origin_spec: String,
+    pub override_specs: Vec<String>,
+    pub requested_by: Option<String>,
+    pub note: Option<String>,
+    pub max_attempts: u32,
+    pub signer: Option<[u8; 32]>,
+}
+
+#[derive(Debug, Clone)]
+pub struct SimJob {
+    pub id: i64,
+    pub chain_id: String,
+    pub tier: String,
+    pub at_height: Option<u64>,
+    pub call: Vec<u8>,
+    pub call_hash: String,
+    pub origin_spec: String,
+    pub override_specs: Vec<String>,
+    pub requested_by: Option<String>,
+    pub note: Option<String>,
+    pub status: String,
+    pub attempts: u32,
+    pub max_attempts: u32,
+    pub signer: Option<[u8; 32]>,
+    pub error: Option<String>,
+    pub result_at_block_hash: Option<String>,
+    pub result_input_hash: Option<String>,
+}
+
+#[async_trait]
+pub trait JobStore: Send + Sync {
+    async fn enqueue(&self, job: &NewSimJob) -> Result<i64, SimError>;
+    /// Take the oldest queued job, if the concurrency cap allows one more.
+    ///
+    /// `max_concurrent` is enforced by the STORE and not by the caller, because
+    /// the cap has to hold across processes: two workers on one box, or a worker
+    /// beside a CLI run, must not both decide there is room. The Pg
+    /// implementation serialises claims on an advisory lock for exactly that
+    /// reason — `for update skip locked` alone does not make a COUNT and a CLAIM
+    /// atomic against a concurrent uncommitted claim.
+    /// `only` restricts the claim to ONE job id. Without it the CLI's inline
+    /// run would take whatever the oldest queued job happens to be, flip it to
+    /// running, spend its single attempt and hold a lease on it — wedging a
+    /// bystander job on the way to reporting that it could not run its own.
+    async fn claim(
+        &self,
+        worker: &str,
+        lease_secs: u32,
+        max_concurrent: u32,
+        only: Option<i64>,
+    ) -> Result<Option<SimJob>, SimError>;
+    async fn complete(
+        &self,
+        id: i64,
+        at_block_hash: &str,
+        input_hash: &str,
+    ) -> Result<(), SimError>;
+    /// `refused` marks a DETERMINISTIC failure — bad call bytes, an origin this
+    /// runtime does not have, a chain with no fork endpoint. It is a separate
+    /// terminal state from `failed` because retrying it is guaranteed to spend a
+    /// Node process on an answer that cannot change.
+    async fn fail(&self, id: i64, error: &str, refused: bool) -> Result<(), SimError>;
+    async fn get(&self, id: i64) -> Result<Option<SimJob>, SimError>;
+}
+
+/// Run ONE job to a terminal state.
+///
+/// THIS IS THE ONLY PLACE A TIER 2 RUN HAPPENS. `simulate-call --tier fork`
+/// creates a job row and calls this; `FORK_JOBS=1` claims a job row and calls
+/// this. One implementation, two triggers — the alternative (a synchronous path
+/// beside a queued one) is two codepaths that can disagree about what a Tier 2
+/// answer is, which is the defect this project has found in four separate
+/// slices.
+///
+/// A [`SimError::Encode`] is REFUSED rather than failed: it means the request
+/// itself cannot be built on this runtime, and no number of retries changes that.
+///
+/// THE ORIGIN ARRIVES ALREADY PARSED, and that is not an inconvenience: turning
+/// `signed:13UVJ…` into 32 bytes is protocol knowledge this crate does not have
+/// (the same reason `OriginSpec::parse` takes an injected parser), and a worker
+/// loop must not be the place that discovers it. The caller parses it, and a job
+/// whose origin does not parse is refused before it ever gets here.
+pub async fn run_job(
+    runner: &dyn ForkRunner,
+    store: &dyn SimStore,
+    jobs: &dyn JobStore,
+    raw: &dyn raw_store::RawStore,
+    receipts: &dyn ingest::ReceiptSink,
+    job: &SimJob,
+    origin: OriginSpec,
+) -> Result<SimRun, SimError> {
+    if job.tier != TIER_FORK {
+        let msg = format!(
+            "job {} asks for tier '{}' and this worker runs '{}' — refusing rather than running \
+             a different tier than was asked for",
+            job.id, job.tier, TIER_FORK
+        );
+        jobs.fail(job.id, &msg, true).await?;
+        return Err(SimError::Encode(msg));
+    }
+    // THE SIGNER IS RESOLVED HERE, ONCE, and a scheduled run without one is
+    // REFUSED rather than defaulted: the vehicle extrinsic needs an account that
+    // can pay for it, and an invented one produces a fork that declines to apply
+    // anything for a reason that reads like the call being bad.
+    let signer = match (&origin, job.signer) {
+        (OriginSpec::Signed(who), _) => *who,
+        (_, Some(s)) => s,
+        (_, None) => {
+            let msg = format!(
+                "job {} dispatches through the scheduler, which needs a funded account to sign \
+                 the no-op extrinsic that makes the block execute — pass --signer <account>. It \
+                 is NOT the dispatch origin ({}), it only pays the fee",
+                job.id, job.origin_spec
+            );
+            jobs.fail(job.id, &msg, true).await?;
+            return Err(SimError::Encode(msg));
+        }
+    };
+    let req = ForkRequest {
+        chain_id: job.chain_id.clone(),
+        at_height: job.at_height,
+        call: job.call.clone(),
+        origin,
+        origin_spec: job.origin_spec.clone(),
+        override_specs: job.override_specs.clone(),
+        signer,
+    };
+    match run_fork_simulation(runner, store, raw, receipts, &req).await {
+        Ok(run) => {
+            jobs.complete(
+                job.id,
+                &run.record.at_block_hash,
+                &run.record.input_hash,
+            )
+            .await?;
+            Ok(run)
+        }
+        Err(e) => {
+            // Encode = the request cannot be built on this runtime at all.
+            // Everything else may be transient (an endpoint, a busy box, a
+            // harness that failed to start), so it stays retryable.
+            let refused = matches!(e, SimError::Encode(_) | SimError::Unsupported { .. });
+            jobs.fail(job.id, &e.to_string(), refused).await?;
+            Err(e)
+        }
     }
 }
 
@@ -1911,5 +2495,58 @@ mod tests {
         assert_eq!(a.attributed_messages, 0);
         assert_eq!(a.total_messages, 0);
         assert!(a.destinations.is_empty());
+    }
+
+    #[test]
+    fn the_diff_gate_lists_every_present_value_so_a_new_one_cannot_blank_the_column() {
+        // THE REGRESSION THIS PINS: slice 8's gate was `== "decoded"`, so adding
+        // `extrinsic_only` to the vocabulary would have made every diff on the
+        // live route fall through to NULL — a column that silently stops being
+        // written, beside a status saying it was read.
+        assert!(diff_is_present(DIFF_STATUS_DECODED));
+        assert!(diff_is_present(DIFF_STATUS_EXTRINSIC_ONLY));
+        assert!(!diff_is_present(DIFF_STATUS_UNDECODABLE));
+        assert!(!diff_is_present(DIFF_STATUS_UNAVAILABLE));
+        assert!(!diff_is_present(DIFF_STATUS_REFUSED));
+        // Every value in the vocabulary is CLASSIFIED. A sixth added without a
+        // decision here fails this rather than defaulting to "no diff".
+        assert_eq!(
+            // `into_iter()` rather than `iter()`: the array yields `&'static str`
+            // in one step, where `iter()` would hand the closure a `&&&str` and
+            // lean on transitive deref coercion at the call site.
+            DIFF_STATUSES.into_iter().filter(|s| diff_is_present(s)).count(),
+            2,
+            "exactly two of the five statuses carry bytes; update this test AND the gate together"
+        );
+    }
+
+    #[test]
+    fn the_same_bytes_cover_the_call_on_one_route_and_not_on_the_other() {
+        // THE MEASURED DEFECT, as a property. On the scheduled route the call is
+        // dispatched in `on_initialize`, which is exactly the phase an
+        // `extrinsic_only` diff omits — so the diff describes the no-op vehicle.
+        assert!(
+            !diff_covers_subject(DIFF_STATUS_EXTRINSIC_ONLY, ROUTE_SCHEDULED),
+            "a scheduled dispatch runs in on_initialize and is not in an apply_extrinsic diff"
+        );
+        // On the extrinsic route the subject IS the extrinsic, so the same bytes
+        // are complete — and this is not a lucky exception, it is why the status
+        // is about SCOPE and the coverage sentence is chosen by ROUTE.
+        assert!(diff_covers_subject(DIFF_STATUS_EXTRINSIC_ONLY, ROUTE_DRY_RUN_EXTRINSIC));
+
+        // A whole-block diff covers the call on either route.
+        assert!(diff_covers_subject(DIFF_STATUS_DECODED, ROUTE_SCHEDULED));
+        assert!(diff_covers_subject(DIFF_STATUS_DECODED, ROUTE_DRY_RUN_EXTRINSIC));
+
+        // No bytes, no coverage — on either route, and never confused with
+        // "nothing changed".
+        for s in [
+            DIFF_STATUS_UNDECODABLE,
+            DIFF_STATUS_UNAVAILABLE,
+            DIFF_STATUS_REFUSED,
+        ] {
+            assert!(!diff_covers_subject(s, ROUTE_SCHEDULED));
+            assert!(!diff_covers_subject(s, ROUTE_DRY_RUN_EXTRINSIC));
+        }
     }
 }

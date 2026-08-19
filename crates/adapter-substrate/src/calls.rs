@@ -83,7 +83,13 @@ pub fn decode_call_with(
 /// The runtime's outer `RuntimeCall` type id + the type registry.
 /// v15/v16 declare it directly (`extrinsic.call_ty`); v14 only exposes the
 /// UncheckedExtrinsic type, whose `Call` type parameter is the call type.
-fn runtime_call_type(
+///
+/// Made `pub(crate)` in slice 9 so `fork::noop_call_bytes` can reach it. Tier 2
+/// needs the RuntimeCall enum WITHOUT the runtime declaring DryRunApi — the
+/// property that lets a fork run on a chain a dry run cannot — so it cannot go
+/// through `DryRunContext`, which resolves the same type from the API's own
+/// parameter declaration.
+pub(crate) fn runtime_call_type(
     prefixed: &RuntimeMetadataPrefixed,
 ) -> Result<(u32, scale_info::PortableRegistry), String> {
     match &prefixed.1 {

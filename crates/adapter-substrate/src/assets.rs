@@ -216,15 +216,24 @@ fn is_mapped_assets_pallet(pallet: &str) -> bool {
 
 // ------------------------------------------------------------------ the mapper
 
-/// pallet-assets event → per-account deltas. Returns ∅ for every event that is
-/// not a mapped assets pallet's; errors LOUDLY for a mapped pallet's unknown
-/// or malformed event.
+/// pallet-assets event → per-account deltas. Errors LOUDLY for a mapped
+/// pallet's unknown or malformed event.
+///
+/// Everything else is HANDED TO `crate::orml`, not returned as ∅ — so a
+/// `tokens.*` or `currencies.*` event can halt from here too. ∅ is what comes
+/// back for an event that belongs to no money pallet either of them owns.
 pub fn deltas_for_assets_event(event: &CanonicalEvent) -> Result<Vec<BalanceDelta>, String> {
     let Some((pallet, variant)) = split_event_name(&event.name) else {
         return Ok(vec![]);
     };
     if !is_mapped_assets_pallet(pallet) {
-        return Ok(vec![]);
+        // The ORML family is the same fact in a third vocabulary, so it goes
+        // through the same worker, the same tables and the same loud-halt
+        // discipline. Delegated rather than inlined for the reason this module
+        // is itself delegated to from `balances`: the rules there are long, they
+        // are pinned by their own tests, and one mapper file per pallet family
+        // is what keeps a field-name assumption from leaking between them.
+        return crate::orml::deltas_for_orml_event(event);
     }
     let data = &event.data;
     let ctx = |what: &str| format!("{}: {what} (data: {data})", event.name);

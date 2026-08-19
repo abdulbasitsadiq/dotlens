@@ -37,6 +37,19 @@ pub struct AssetSyncReport {
     /// is the only acceptable number; anything else means the key layout is
     /// not what metadata says it is.
     pub undecodable_ids: usize,
+    /// Assets that got an observer-free `absolute_key` (0019). Reported because
+    /// the gap between this and `total()` is the population a cross-chain
+    /// consolidation cannot yet add up, and that number should be looked at
+    /// rather than assumed to be zero.
+    pub absolutized: usize,
+    /// Registry entries skipped because they name the chain's NATIVE token,
+    /// which already has a `native` row. COUNTED, never silent: "we folded it
+    /// in" and "there was nothing there" must not be the same number.
+    pub native_alias_skipped: usize,
+    /// Assets whose registry declares them Erc20 — registered, named and
+    /// located here, and NOT anchorable by this slice because their balance
+    /// lives in `pallet_evm` storage. The scope boundary, as a number.
+    pub erc20_unanchorable: usize,
 }
 
 impl AssetSyncReport {
@@ -57,6 +70,14 @@ pub async fn upsert_asset(
     local_id: Option<&str>,
     xcm_location: Option<&serde_json::Value>,
     location_key: Option<&str>,
+    // `absolute_*` is the observer-free name (0019), coalesced like its relative
+    // sibling: a later read that could not absolutize must not erase one that
+    // could. `asset_type` is the asset's own declared type where its registry
+    // has one (Token, Erc20, …) — NULL for pallet-assets, which has no such
+    // concept. (Plain `//`: rustc rejects `///` on a function parameter.)
+    absolute_location: Option<&serde_json::Value>,
+    absolute_key: Option<&str>,
+    asset_type: Option<&str>,
     raw_key_bytes: Option<&[u8]>,
     meta: &adapter_substrate::assets::AssetMeta,
     details: &adapter_substrate::assets::AssetDetailsView,
@@ -67,15 +88,20 @@ pub async fn upsert_asset(
     sqlx::query(
         "insert into core.assets \
              (chain_id, asset_key, representation_kind, local_id, xcm_location, \
-              location_key, raw_key_bytes, symbol, name, decimals, supply, \
+              location_key, absolute_location, absolute_key, asset_type, \
+              raw_key_bytes, symbol, name, decimals, supply, \
               min_balance, is_sufficient, accounts, status, spec_version, \
               observed_height, source) \
-         values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11::numeric,$12::numeric,$13,$14,$15,$16,$17,$18) \
+         values ($1,$2,$3,$4,$5,$6,$19,$20,$21,$7,$8,$9,$10,$11::numeric,$12::numeric,$13,$14,$15,$16,$17,$18) \
          on conflict (chain_id, asset_key) do update set \
              representation_kind = excluded.representation_kind, \
              local_id = coalesce(excluded.local_id, core.assets.local_id), \
              xcm_location = coalesce(excluded.xcm_location, core.assets.xcm_location), \
              location_key = coalesce(excluded.location_key, core.assets.location_key), \
+             absolute_location = coalesce(excluded.absolute_location, \
+                                          core.assets.absolute_location), \
+             absolute_key = coalesce(excluded.absolute_key, core.assets.absolute_key), \
+             asset_type = coalesce(excluded.asset_type, core.assets.asset_type), \
              raw_key_bytes = coalesce(excluded.raw_key_bytes, core.assets.raw_key_bytes), \
              symbol = case when excluded.observed_height is not null \
                             and excluded.observed_height >= \
@@ -139,6 +165,11 @@ pub async fn upsert_asset(
     .bind(spec_version.map(|s| s as i64))
     .bind(observed_height.map(|h| h as i64))
     .bind(source)
+    // $19..$21 — appended rather than inserted mid-list so every existing
+    // placeholder keeps its number and no bind silently shifts by one
+    .bind(absolute_location)
+    .bind(absolute_key)
+    .bind(asset_type)
     .execute(pool)
     .await
     .with_context(|| format!("upserting asset {chain_id}/{asset_key}"))?;
@@ -158,12 +189,27 @@ pub struct AssetRow {
     pub symbol: Option<String>,
     pub decimals: Option<i32>,
     pub status: Option<String>,
+    /// The registry's own declared type (Token, Erc20, …). SELECTED, not
+    /// decorative: without it the holdings sweep cannot tell an asset whose
+    /// balance is in `pallet_evm` storage from one it simply does not hold, and
+    /// would write a zero anchor for the money market — the exact conflation of
+    /// "we did not look" with "there is nothing there" that `skipped_no_key`
+    /// exists to prevent one struct below.
+    pub asset_type: Option<String>,
 }
 
 pub async fn assets_for_chain(pool: &PgPool, chain_id: &str) -> Result<Vec<AssetRow>> {
-    let rows: Vec<(String, String, Option<Vec<u8>>, Option<String>, Option<i32>, Option<String>)> =
-        sqlx::query_as(
-            "select asset_key, representation_kind, raw_key_bytes, symbol, decimals, status \
+    let rows: Vec<(
+        String,
+        String,
+        Option<Vec<u8>>,
+        Option<String>,
+        Option<i32>,
+        Option<String>,
+        Option<String>,
+    )> = sqlx::query_as(
+            "select asset_key, representation_kind, raw_key_bytes, symbol, decimals, \
+                    status, asset_type \
              from core.assets where chain_id = $1 order by asset_key",
         )
         .bind(chain_id)
@@ -173,13 +219,22 @@ pub async fn assets_for_chain(pool: &PgPool, chain_id: &str) -> Result<Vec<Asset
     Ok(rows
         .into_iter()
         .map(
-            |(asset_key, representation_kind, raw_key_bytes, symbol, decimals, status)| AssetRow {
+            |(
                 asset_key,
                 representation_kind,
                 raw_key_bytes,
                 symbol,
                 decimals,
                 status,
+                asset_type,
+            )| AssetRow {
+                asset_key,
+                representation_kind,
+                raw_key_bytes,
+                symbol,
+                decimals,
+                status,
+                asset_type,
             },
         )
         .collect())
@@ -248,11 +303,19 @@ pub async fn sync_assets(
     pool: &PgPool,
     raw: &dyn raw_store::RawStore,
     source: &adapter_substrate::source::SubstrateSource,
-    chain_id: &str,
+    cfg: &registry::ChainConfig,
     height: Option<u64>,
 ) -> Result<AssetSyncReport> {
     use adapter_substrate::assets as aa;
+    use adapter_substrate::orml;
     use ingest::live::ChainSource;
+
+    // TAKES THE WHOLE ChainConfig RATHER THAN AN ID, since 0019: absolutizing a
+    // Location needs the OBSERVER'S OWN PATH, which is `network` + `para_id` —
+    // registry data, so no chain is named in code and a chain registered later
+    // absolutizes with no edit here (Invariant 2).
+    let chain_id = cfg.id.as_str();
+    let observer_path = orml::chain_path(&cfg.network, cfg.para_id);
 
     let height = match height {
         Some(h) => h,
@@ -291,7 +354,39 @@ pub async fn sync_assets(
             Default::default()
         }
     };
+    // `xcm_location` keeps the SELF-RELATIVE name it has always had — "this
+    // chain's own currency, whatever that turns out to be" — which is what
+    // `metadata_free_asset_key` resolves against and must not change.
     let native_location = serde_json::json!({"parents": 0, "interior": []});
+
+    // THE ABSOLUTE NAME IS A DIFFERENT QUESTION, and a reviewer caught that
+    // answering it from `{parents: 0, Here}` is WRONG on every system
+    // parachain. "This chain's native currency" and "this chain as a location"
+    // coincide only when the chain ISSUES its own token: Hydration issues HDX,
+    // so HDX absolutizes to `[GC(Polkadot), Parachain(2034)]` — but Asset Hub
+    // issues nothing, its native token is the RELAY's DOT, and absolutizing
+    // `{parents: 0, Here}` there would produce a key naming the PARACHAIN. AH's
+    // DOT would then join nothing, and the position that split off would be the
+    // treasury's 24.3M DOT, which is the largest number the consolidator exists
+    // to add up.
+    //
+    // `para_id` cannot answer it (Hydration and Asset Hub are both parachains)
+    // and no runtime constant states it, so it is REGISTRY DATA. **Absent means
+    // unknown, and unknown means NULL** — a wrong absolute name is worse than
+    // none, and NULL is already 0019's documented "not absolutizable".
+    let native_token_location = cfg.native_token.map(|k| k.location());
+    if native_token_location.is_none() {
+        tracing::warn!(chain = %chain_id,
+            "seed declares no `native_token` — this chain's native currency gets \
+             NO absolute name, so it cannot be recognised as the same asset on \
+             any other chain");
+    }
+    let native_absolute = native_token_location
+        .as_ref()
+        .and_then(|l| orml::absolutize(&observer_path, l));
+    let native_absolute_key = native_token_location
+        .as_ref()
+        .and_then(|l| orml::absolute_key(&observer_path, l));
     upsert_asset(
         pool,
         chain_id,
@@ -300,6 +395,9 @@ pub async fn sync_assets(
         None,
         Some(&native_location),
         Some(&native_location.to_string()),
+        native_absolute.as_ref(),
+        native_absolute_key.as_deref(),
+        None,
         None,
         &native_meta,
         &Default::default(),
@@ -309,6 +407,9 @@ pub async fn sync_assets(
     )
     .await?;
     report.per_instance.push(("native".into(), 1));
+    if native_absolute.is_some() {
+        report.absolutized += 1;
+    }
 
     for pallet in &pallets {
         if pallet.representation == aa::Representation::Unmapped {
@@ -417,6 +518,23 @@ pub async fn sync_assets(
                 // already-normalized value agrees today and would drift the
                 // day normalization changes
                 let location_key = location.as_ref().and_then(aa::canonical_location);
+                // and the observer-free name, from the SAME location — which is
+                // what lets this row and Hydration's row for the same asset be
+                // recognised as one thing (0019)
+                // through `orml::absolute_key`, which 0019 names as this
+                // column's producer — `.to_string()` on an already-normalized
+                // value agrees today and would drift the day the rendering
+                // changes, which is verbatim the argument made for
+                // `canonical_location` ten lines above
+                let absolute = location
+                    .as_ref()
+                    .and_then(|l| orml::absolutize(&observer_path, l));
+                let absolute_key = location
+                    .as_ref()
+                    .and_then(|l| orml::absolute_key(&observer_path, l));
+                if absolute.is_some() {
+                    report.absolutized += 1;
+                }
                 upsert_asset(
                     pool,
                     chain_id,
@@ -425,6 +543,9 @@ pub async fn sync_assets(
                     local_id.as_deref(),
                     location.as_ref(),
                     location_key.as_deref(),
+                    absolute.as_ref(),
+                    absolute_key.as_deref(),
+                    None, // pallet-assets has no asset_type concept
                     Some(id),
                     &meta,
                     &details,
@@ -438,7 +559,275 @@ pub async fn sync_assets(
         }
         report.per_instance.push((pallet.key_prefix.clone(), count));
     }
+
+    sync_orml_registry(
+        pool,
+        source,
+        &metadata,
+        chain_id,
+        &observer_path,
+        hash,
+        spec,
+        height,
+        &mut report,
+    )
+    .await?;
     Ok(report)
+}
+
+/// The ORML arm of the asset sync: `AssetRegistry.Assets` for identity and
+/// `AssetRegistry.AssetLocations` for the XCM name, joined by asset id.
+///
+/// A no-op on a chain with no AssetRegistry-shaped pallet, which is every chain
+/// dotlens indexed before Phase 3 slice 6 — the pallet is found by the SHAPE of
+/// its storage (`Assets` + `AssetLocations`), so this needs no chain id and no
+/// capability flag to decide whether to run.
+///
+/// THE KEY TRICK IS THE ONE SLICE 6 ALREADY BUILT, reused verbatim and it pays
+/// off twice here: both AssetRegistry maps are `Blake2_128Concat`, so the asset
+/// id falls straight out of a key's tail with no re-hashing — AND the same
+/// 16-byte hash prefix can be reused against the `AssetLocations` prefix, so the
+/// second map is read without hashing anything a second time.
+#[cfg(feature = "live")]
+#[allow(clippy::too_many_arguments)]
+async fn sync_orml_registry(
+    pool: &PgPool,
+    source: &adapter_substrate::source::SubstrateSource,
+    metadata: &[u8],
+    chain_id: &str,
+    observer_path: &[serde_json::Value],
+    hash: adapter_substrate::source::BlockHash,
+    spec: u32,
+    height: u64,
+    report: &mut AssetSyncReport,
+) -> Result<()> {
+    use adapter_substrate::assets as aa;
+    use adapter_substrate::orml;
+
+    let pallets = orml::orml_pallets_from_metadata(metadata)
+        .map_err(|e| anyhow::anyhow!("{chain_id}: {e}"))?;
+    let Some(reg) = pallets.registry else {
+        return Ok(());
+    };
+
+    // THE GUESS, CHECKED. `orml::ORML_NATIVE_CURRENCY_ID` is a constant in a
+    // PURE mapper that has no metadata to read, and this is the one place that
+    // can afford to verify it. A runtime whose own declaration disagrees would
+    // make the mapper refuse the wrong asset and double-count the right one, so
+    // the sync REFUSES rather than proceeding with a mapper it knows is wrong.
+    let declared = orml::native_currency_id_from_metadata(metadata)
+        .map_err(|e| anyhow::anyhow!("{chain_id}: {e}"))?;
+    match declared {
+        Some(n) if n != orml::ORML_NATIVE_CURRENCY_ID => anyhow::bail!(
+            "{chain_id} declares its native currency id as {n}, but the orml \
+             mapper's guard is {} — mapping this chain would record its native \
+             token twice under `{}:{}` while refusing an asset that is not \
+             native. Fix ORML_NATIVE_CURRENCY_ID (and its measurement) before \
+             indexing this chain",
+            orml::ORML_NATIVE_CURRENCY_ID,
+            orml::TOKENS_KEY_PREFIX,
+            orml::ORML_NATIVE_CURRENCY_ID
+        ),
+        // The runtime declares neither `GetNativeCurrencyId` nor
+        // `NativeAssetId`. We do NOT then assume 0 — the whole point of the
+        // check is to stop assuming — but nor is an unverified guard a reason
+        // to refuse a chain: it is a reason to say so loudly, once, where an
+        // operator will see it.
+        None => tracing::warn!(
+            chain = %chain_id,
+            "runtime declares no native-currency-id constant — the orml \
+             mapper's `tokens:{}` guard is UNVERIFIED on this chain",
+            orml::ORML_NATIVE_CURRENCY_ID
+        ),
+        Some(_) => {}
+    }
+
+    let asset_entry = aa::storage_entry_info(metadata, &reg.storage_prefix, "Assets")
+        .map_err(|e| anyhow::anyhow!("{chain_id}/{}: {e}", reg.name))?;
+    let loc_entry = aa::storage_entry_info(metadata, &reg.storage_prefix, "AssetLocations")
+        .map_err(|e| anyhow::anyhow!("{chain_id}/{}: {e}", reg.name))?;
+
+    // 1. enumerate every registered asset id, straight out of the storage keys
+    let prefix = aa::map_prefix(&reg.storage_prefix, "Assets");
+    let mut ids: Vec<Vec<u8>> = Vec::new();
+    let mut start: Option<Vec<u8>> = None;
+    loop {
+        let page = source
+            .storage_keys_paged(&prefix, PAGE, start.as_deref(), hash)
+            .await
+            .map_err(|e| anyhow::anyhow!(e))?;
+        let short = page.len() < PAGE as usize;
+        start = page.last().cloned();
+        for key in &page {
+            match aa::asset_id_bytes_from_key(key, &asset_entry.hashers) {
+                Ok(bytes) => ids.push(bytes),
+                Err(e) => {
+                    tracing::warn!(chain = %chain_id, pallet = %reg.name, error = %e,
+                        "AssetRegistry key not decomposable — asset skipped");
+                    report.undecodable_ids += 1;
+                }
+            }
+        }
+        if short {
+            break;
+        }
+    }
+
+    // 2. read AssetDetails + AssetNativeLocation for all of them, batched
+    let mut count = 0usize;
+    for chunk in ids.chunks(PAGE as usize / 2) {
+        let mut keys: Vec<Vec<u8>> = Vec::with_capacity(chunk.len() * 2);
+        for id in chunk {
+            keys.push(
+                aa::asset_map_key(&reg.storage_prefix, "Assets", &asset_entry.hashers, id)
+                    .map_err(|e| anyhow::anyhow!(e))?,
+            );
+            keys.push(
+                aa::asset_map_key(
+                    &reg.storage_prefix,
+                    "AssetLocations",
+                    &loc_entry.hashers,
+                    id,
+                )
+                .map_err(|e| anyhow::anyhow!(e))?,
+            );
+        }
+        let values: std::collections::HashMap<Vec<u8>, Vec<u8>> = source
+            .storage_batch_at(&keys, hash)
+            .await
+            .map_err(|e| anyhow::anyhow!(e))?
+            .into_iter()
+            .filter_map(|(k, v)| v.map(|v| (k, v)))
+            .collect();
+
+        for (i, id) in chunk.iter().enumerate() {
+            let Some(details_bytes) = values.get(&keys[i * 2]) else {
+                // the key was listed a moment ago at this same block hash;
+                // absent now cannot happen, and an empty default would invent
+                // an asset with no name rather than report the impossibility
+                anyhow::bail!(
+                    "{chain_id}/{}: asset id {} was enumerated but has no value \
+                     at the same block hash",
+                    reg.name,
+                    hex::encode(id)
+                );
+            };
+            let asset = orml::decode_registry_asset(&asset_entry, details_bytes)
+                .map_err(|e| anyhow::anyhow!("{chain_id}/{}: {e}", reg.name))?;
+
+            let id_json = aa::decode_asset_id_with(&asset_entry, id)
+                .map_err(|e| anyhow::anyhow!("{chain_id}/{}: {e}", reg.name))?;
+            // through the mapper's OWN reader, so the sync and the mapper can
+            // never disagree about what number a currency id is
+            let Some(local_id) = orml::currency_id_from_json(&id_json) else {
+                report.undecodable_ids += 1;
+                continue;
+            };
+
+            // THE NATIVE ALIAS. On an orml chain the chain's own token is ALSO a
+            // registry entry (HDX is asset 0), and giving it a `tokens:0` row
+            // beside the `native` one would be the same money twice under two
+            // keys — the mapper refuses the event side for exactly this reason.
+            // Its METADATA is better than `system_properties`' though (a name,
+            // an existential deposit), so it is folded ONTO the native row
+            // rather than thrown away.
+            if local_id == orml::ORML_NATIVE_CURRENCY_ID {
+                report.native_alias_skipped += 1;
+                // **`observed_height` IS DELIBERATELY None HERE, and that is the
+                // whole design of this write.** With a height, every
+                // `case when excluded.observed_height >= …` arm in
+                // `upsert_asset` would take `excluded` — and `name`, `symbol`
+                // and `decimals` are all `Option` on a registry asset and
+                // genuinely absent on real ones, so this would ERASE the symbol
+                // and decimals `system_properties` just supplied, and flip
+                // `source` from `chain-properties` to `sync-assets` on a row
+                // whose values did not come from here. With None, the guard
+                // fails and only the plainly-coalesced columns move — which is
+                // exactly the one fact this write has that the native read did
+                // not: `asset_type`.
+                upsert_asset(
+                    pool,
+                    chain_id,
+                    "native",
+                    "native",
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    asset.asset_type.as_deref(),
+                    None,
+                    &Default::default(),
+                    &Default::default(),
+                    Some(spec),
+                    None,
+                    "sync-assets",
+                )
+                .await?;
+                continue;
+            }
+
+            let asset_key = orml::asset_key_for_currency(local_id);
+
+            // A MISSING LOCATION IS A FACT, NOT A GAP — see `decode_asset_location`.
+            let location = match values.get(&keys[i * 2 + 1]) {
+                Some(bytes) => Some(
+                    orml::decode_asset_location(&loc_entry, bytes)
+                        .map_err(|e| anyhow::anyhow!("{chain_id}/{}: {e}", reg.name))?,
+                ),
+                None => None,
+            };
+            let location_key = location.as_ref().and_then(aa::canonical_location);
+            let absolute = location
+                .as_ref()
+                .and_then(|l| orml::absolutize(observer_path, l));
+            // through the named producer, not `.to_string()` — see the identical
+            // note on the pallet-assets arm
+            let absolute_key = location
+                .as_ref()
+                .and_then(|l| orml::absolute_key(observer_path, l));
+            if absolute.is_some() {
+                report.absolutized += 1;
+            }
+            if asset.asset_type.as_deref() == Some("Erc20") {
+                report.erc20_unanchorable += 1;
+            }
+
+            upsert_asset(
+                pool,
+                chain_id,
+                &asset_key,
+                // dotlens vocabulary for "an orml-tokens balance", parallel to
+                // trust_backed/pool/foreign — NOT one of those, because the
+                // storage, the key order and the free/reserved split all differ
+                "orml",
+                Some(&local_id.to_string()),
+                location.as_ref(),
+                location_key.as_deref(),
+                absolute.as_ref(),
+                absolute_key.as_deref(),
+                asset.asset_type.as_deref(),
+                Some(id),
+                &aa::AssetMeta {
+                    name: asset.name.clone(),
+                    symbol: asset.symbol.clone(),
+                    decimals: asset.decimals,
+                },
+                &aa::AssetDetailsView {
+                    min_balance: asset.existential_deposit,
+                    is_sufficient: asset.is_sufficient,
+                    ..Default::default()
+                },
+                Some(spec),
+                Some(height),
+                "sync-assets",
+            )
+            .await?;
+            count += 1;
+        }
+    }
+    report.per_instance.push((orml::TOKENS_KEY_PREFIX.into(), count));
+    Ok(())
 }
 
 /// Archived metadata for `spec`, fetched AND archived if we do not have it —
@@ -482,9 +871,20 @@ pub struct HoldingsReport {
     /// as holdings.
     pub non_zero: usize,
     /// Assets registered but unreadable because no `sync-assets` has ever seen
-    /// their storage key. Counted, because "we did not look" and "there is
-    /// nothing there" must never be the same number.
+    /// their storage key, OR because no indexed pallet owns their key prefix.
+    /// Counted, because "we did not look" and "there is nothing there" must
+    /// never be the same number.
     pub skipped_no_key: usize,
+    /// Assets this sweep DELIBERATELY did not probe because their balance is not
+    /// in any pallet it can read — today, the `Erc20` assets of an ORML chain's
+    /// registry, whose balances live in `pallet_evm` storage.
+    ///
+    /// **THIS COUNTER IS THE FIX FOR A REAL DEFECT, not bookkeeping.** Probing
+    /// them anyway returns nothing, and nothing was recorded as a ZERO anchor
+    /// noted `absent` — so the treasury's ~5.7M DOT money-market position would
+    /// have appeared in the data as a confident zero. A skipped probe that says
+    /// so is the honest answer; an anchor of 0 is a wrong one.
+    pub skipped_unanchorable: usize,
 }
 
 /// Anchor every registered treasury account against every registered asset on
@@ -503,11 +903,13 @@ pub async fn snapshot_holdings(
     pool: &PgPool,
     raw: &dyn raw_store::RawStore,
     source: &adapter_substrate::source::SubstrateSource,
-    chain_id: &str,
+    cfg: &registry::ChainConfig,
     height: Option<u64>,
 ) -> Result<HoldingsReport> {
-    use adapter_substrate::{accounts as acct, assets as aa, balances as ab};
+    use adapter_substrate::{accounts as acct, assets as aa, balances as ab, orml};
     use ingest::live::ChainSource;
+
+    let chain_id = cfg.id.as_str();
 
     let height = match height {
         Some(h) => h,
@@ -538,6 +940,21 @@ pub async fn snapshot_holdings(
             .map_err(|e| anyhow::anyhow!("{chain_id}/{}: {e}", p.name))?;
         account_entries.insert(p.storage_prefix.clone(), entry);
     }
+    // The ORML side, resolved once for the same reason — and it is a SEPARATE
+    // entry because the map is `Accounts` (plural) with the key halves in the
+    // opposite order and a value carrying a free/reserved split. Nothing about
+    // it can share a code path with pallet-assets without one of the two being
+    // silently wrong.
+    let orml_pallets = orml::orml_pallets_from_metadata(&metadata)
+        .map_err(|e| anyhow::anyhow!("{chain_id}: {e}"))?;
+    let orml_entry = match &orml_pallets.tokens {
+        Some(t) => Some((
+            t.storage_prefix.clone(),
+            aa::storage_entry_info(&metadata, &t.storage_prefix, "Accounts")
+                .map_err(|e| anyhow::anyhow!("{chain_id}/{}: {e}", t.name))?,
+        )),
+        None => None,
+    };
 
     let mut report = HoldingsReport {
         chain_id: chain_id.to_string(),
@@ -549,10 +966,22 @@ pub async fn snapshot_holdings(
 
     // build the whole key list first: (account, asset) → key, plus one native
     // System.Account key per account
+    /// WHICH READER decodes the value that comes back, and therefore which
+    /// anchor writer records it. Three kinds rather than an `Option<prefix>`,
+    /// because the third one is not a variation on the second: an orml holding
+    /// has a free/reserved split and takes the NATIVE anchor writer, while a
+    /// pallet-assets holding has one number and takes the asset one (0010's
+    /// column mapping). Collapsing them would write `reserved = 0` over a real
+    /// reserved position — the exact silent-loss shape this slice exists to end.
+    enum Reader {
+        Native,
+        PalletAssets(String),
+        Orml(String),
+    }
     struct Probe {
         account: Vec<u8>,
         asset_key: String,
-        storage_prefix: Option<String>, // None = native
+        reader: Reader,
     }
     let mut probes: Vec<Probe> = Vec::new();
     let mut keys: Vec<Vec<u8>> = Vec::new();
@@ -565,7 +994,7 @@ pub async fn snapshot_holdings(
         probes.push(Probe {
             account: a.account_id.clone(),
             asset_key: "native".into(),
-            storage_prefix: None,
+            reader: Reader::Native,
         });
         // A LEGACY BOUNTY ACCOUNT IS PROBED FOR THE NATIVE ASSET ONLY.
         // pallet-bounties and pallet-child-bounties are native-token-only by
@@ -588,10 +1017,62 @@ pub async fn snapshot_holdings(
             if asset.asset_key == "native" {
                 continue;
             }
+            // AN ASSET WHOSE BALANCE IS NOT IN A PALLET WE READ IS SKIPPED,
+            // LOUDLY-BY-COUNT, RATHER THAN PROBED AND ANCHORED AT ZERO. An
+            // `Erc20` registry asset's balance is in `pallet_evm` storage; the
+            // orml `Accounts` probe for it returns nothing, and nothing was
+            // being written as a zero anchor noted `absent` — which would put
+            // the treasury's money-market position into the data as a confident
+            // zero. Keyed on the asset's OWN declared type, so it needs no chain
+            // id and no list.
+            if asset.asset_type.as_deref() == Some("Erc20") {
+                report.skipped_unanchorable += 1;
+                continue;
+            }
             let Some(raw_id) = asset.raw_key_bytes.as_ref() else {
                 report.skipped_no_key += 1;
                 continue;
             };
+
+            // THE ORML ARM, tried first because its key prefix (`tokens:`) is
+            // this adapter's own word and cannot collide with a pallet-assets
+            // instance's, which is taken from the runtime's pallet name.
+            if let Some((prefix, entry)) = orml_entry.as_ref() {
+                if asset
+                    .asset_key
+                    .starts_with(&format!("{}:", adapter_substrate::orml::TOKENS_KEY_PREFIX))
+                {
+                    let key =
+                        orml::accounts_key(prefix, &entry.hashers, &account32, raw_id)
+                            .map_err(|e| anyhow::anyhow!(e))?;
+                    // THE ORDER CHECK, run once per key and free: lift the two
+                    // halves back out and require the account half to be the
+                    // account we put in. orml keys `(account, currency)` where
+                    // pallet-assets keys `(asset, account)`, and building it the
+                    // wrong way round yields a well-formed key that matches
+                    // nothing — which reads exactly like an empty account, i.e.
+                    // like an entire chain's treasury position being zero.
+                    match orml::accounts_key_parts(&key, &entry.hashers) {
+                        Ok((back, _)) if back == account32 => {}
+                        Ok((back, _)) => anyhow::bail!(
+                            "{chain_id}: orml Accounts key does not round-trip — \
+                             built for {} but lifts {}; the key halves are in \
+                             the wrong order and every holding would read zero",
+                            hex::encode(account32),
+                            hex::encode(back)
+                        ),
+                        Err(e) => anyhow::bail!("{chain_id}: orml Accounts key: {e}"),
+                    }
+                    keys.push(key);
+                    probes.push(Probe {
+                        account: a.account_id.clone(),
+                        asset_key: asset.asset_key.clone(),
+                        reader: Reader::Orml(prefix.clone()),
+                    });
+                    continue;
+                }
+            }
+
             // which instance owns this key prefix — from metadata, so a
             // renamed pallet is caught here rather than mis-read
             let Some(pallet) = pallets
@@ -609,13 +1090,13 @@ pub async fn snapshot_holdings(
             probes.push(Probe {
                 account: a.account_id.clone(),
                 asset_key: asset.asset_key.clone(),
-                storage_prefix: Some(pallet.storage_prefix.clone()),
+                reader: Reader::PalletAssets(pallet.storage_prefix.clone()),
             });
         }
     }
     report.assets_probed = probes
         .iter()
-        .filter(|p| p.storage_prefix.is_some())
+        .filter(|p| !matches!(p.reader, Reader::Native))
         .count();
 
     // read them in batches, then decode and anchor
@@ -633,8 +1114,8 @@ pub async fn snapshot_holdings(
 
     for (i, probe) in probes.iter().enumerate() {
         let value = values.get(&keys[i]).cloned().flatten();
-        match &probe.storage_prefix {
-            None => {
+        match &probe.reader {
+            Reader::Native => {
                 let (balances, note) = match value {
                     Some(bytes) => (
                         ab::decode_account_info(&metadata, &bytes)
@@ -662,7 +1143,7 @@ pub async fn snapshot_holdings(
                 )
                 .await?;
             }
-            Some(prefix) => {
+            Reader::PalletAssets(prefix) => {
                 let (holding, note) = match value {
                     Some(bytes) => (
                         aa::decode_asset_account_with(&account_entries[prefix], &bytes)
@@ -685,6 +1166,51 @@ pub async fn snapshot_holdings(
                     height,
                     holding.balance,
                     holding.status.as_deref(),
+                    Some(spec),
+                    "treasury-holdings",
+                    note,
+                )
+                .await?;
+            }
+            // THE NATIVE WRITER, on an ASSET key — which looks like a mistake
+            // and is the correction. `orml_tokens::AccountData { free, reserved,
+            // frozen }` is the pallet-balances shape, so an orml position can
+            // have a real reserved half; `insert_asset_anchor` writes
+            // `reserved = 0` by design (0010: a pallet-assets account genuinely
+            // has one number) and would drop it silently. `status` stays NULL,
+            // as it does for native anchors: orml has no per-account asset
+            // status, and a plausible default is how a schema starts lying.
+            Reader::Orml(prefix) => {
+                let entry = &orml_entry
+                    .as_ref()
+                    .expect("an Orml probe implies an orml entry")
+                    .1;
+                debug_assert_eq!(
+                    prefix,
+                    &orml_entry.as_ref().expect("checked above").0,
+                    "one orml tokens pallet per chain"
+                );
+                let (holding, note) = match value {
+                    Some(bytes) => (
+                        orml::decode_orml_account(entry, &bytes)
+                            .map_err(|e| anyhow::anyhow!(e))?,
+                        None,
+                    ),
+                    None => (
+                        orml::OrmlHolding { free: 0, reserved: 0, frozen: None },
+                        Some("absent"),
+                    ),
+                };
+                if holding.total() > 0 {
+                    report.non_zero += 1;
+                }
+                crate::balances_pg::insert_anchor(
+                    pool,
+                    chain_id,
+                    &probe.account,
+                    &probe.asset_key,
+                    height,
+                    &holding.as_account_balances(),
                     Some(spec),
                     "treasury-holdings",
                     note,
@@ -758,6 +1284,26 @@ pub async fn sync_treasury_accounts(
                         Vec::new()
                     }
                 };
+                // A CHAIN HAVING A TREASURY PALLET DOES NOT MAKE ITS TREASURY
+                // OURS — and this guard is what Phase 3 slice 6 had to add
+                // before registering the first chain with its own governance.
+                // Hydration runs `pallet_treasury` with the SAME PalletId as
+                // the relay (`py/trsry`), so without it that pot is derived,
+                // stamped `network = polkadot`, and served on
+                // `/v1/treasury/polkadot/holdings` as Polkadot treasury money.
+                // A wrong number, not a missing one — and the worst kind,
+                // because it reads like a fact and sums like a fact.
+                //
+                // The predicate is registry data end to end (residency for a
+                // registered treasury instance's domain), so no chain is named
+                // here, and registering Hydration's OWN treasury later is a seed
+                // edit rather than a code change.
+                if !registry.carries_treasury_for_network(&chain.id, &chain.network) {
+                    tracing::debug!(chain = %chain.id, network = %chain.network,
+                        "no treasury residency on this network — pot derivation \
+                         skipped (this chain's own treasury is not ours)");
+                    continue;
+                }
                 for pc in pallet_ids {
                     // the SAME pallet → instance vocabulary the treasury
                     // mapper uses, so the account list and the spend list can

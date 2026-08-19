@@ -16,6 +16,14 @@ family: substrate
 relay: polkadot
 para_id: 1004
 network: polkadot
+# WHOSE TOKEN this chain's pallet_balances holds (Phase 3 slice 6). `relay` =
+# this chain issues NOTHING; its native currency is the relay's DOT, whose
+# absolute XCM name is [GlobalConsensus(Polkadot)] and NOT this parachain.
+# Absolutizing `{parents: 0, Here}` here would name the PARACHAIN, so this
+# chain's DOT would join nothing — and on Asset Hub that is the treasury's
+# 24.3M DOT splitting off on its own.
+native_token: relay
+
 ss58_prefix: 0
 
 # Short names the search grammar's `on <chain>` suffix accepts. DATA, so a

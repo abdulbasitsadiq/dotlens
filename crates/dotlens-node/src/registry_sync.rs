@@ -128,6 +128,15 @@ pub async fn sync_registry(pool: &PgPool, registry: &Registry) -> Result<()> {
             ("treasury", "bounty_events"),
             ("xcm", "messages"),
             ("xcm", "message_links"),
+            ("coretime", "core_occupancy"),
+            // The entitlement half (0025). Both are partitioned by chain like
+            // every other domain fact table, and both must be listed here or the
+            // Coretime chain's rows land in the DEFAULT partition on the very
+            // first `broker-range` — which still QUERIES correctly through the
+            // parent, but is not what the migration's partition-per-chain claim
+            // says, and is not repairable without moving rows.
+            ("coretime", "broker_events"),
+            ("coretime", "core_assignments"),
         ] {
             let part = format!("{schema}.{table}_p_{}", c.id.replace('-', "_"));
             let ddl = format!(

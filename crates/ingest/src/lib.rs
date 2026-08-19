@@ -15,6 +15,8 @@ pub mod tip;
 pub mod treasury;
 pub mod votes;
 pub mod whitelist;
+pub mod broker;
+pub mod coretime;
 pub mod xcm;
 pub mod xcm_correlate;
 

@@ -42,6 +42,12 @@ pub mod bounties;
 /// Pure — no I/O.
 pub mod assets;
 
+/// ORML money semantics: orml-tokens event→delta mapping (through the SAME
+/// balances tables, on a `tokens:<id>` key), the AssetRegistry state reads that
+/// give those ids names and locations, and the ABSOLUTE-location normalizer
+/// that makes one asset's two observers agree. Pure — no I/O.
+pub mod orml;
+
 /// Governance semantics: referenda event→timeline mapping + track definitions
 /// decoded from runtime metadata. Pure — no I/O.
 pub mod gov;
@@ -267,3 +273,24 @@ mod tests {
         assert!(decode_block(b"not json", "loc").is_err());
     }
 }
+
+/// Tier 2 simulation, pure half (Phase 3, slice 8): the storage a fork must be
+/// given so it will dispatch a call under a chosen origin, the raw keys and
+/// values a counterfactual injects, and a raw storage diff read back against the
+/// runtime's own metadata.
+pub mod fork;
+
+/// The `dev_*` JSON-RPC vocabulary of a running chopsticks fork (Phase 3,
+/// slice 8). Live-gated: it is a client, and a client needs a transport.
+#[cfg(feature = "live")]
+pub mod chopsticks;
+/// Coretime ENTITLEMENT, read from `pallet-broker` on the Coretime chain (Phase
+/// 3, slice 13) — who bought, renewed, split or pooled what, and the
+/// `CoreAssigned` seam that joins it to occupancy on a relay-block number line
+/// the chain states itself.
+pub mod broker;
+
+/// Core OCCUPANCY, read from the relay's own candidate-inclusion events (Phase
+/// 3, slice 11) — the usage half of coretime, and the half no marketplace can
+/// show. Entitlement is `broker` above, and the product is the delta.
+pub mod coretime;

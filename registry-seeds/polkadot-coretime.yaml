@@ -1,0 +1,142 @@
+# Polkadot Coretime (1005) — home of `pallet-broker`, the ENTITLEMENT half.
+#
+# THE THIRD PLUG-AND-PLAY TEST, and the first one where the chain being
+# registered is the SUBJECT of a slice rather than a bystander. Collectives and
+# People (Phase 2 slice 4) proved a chain can be added with zero adapter code;
+# Hydration (Phase 3 slice 2) proved it for a non-system parachain. This one adds
+# a chain AND a mapper in the same slice, so the claim to check is narrower and
+# sharper: registering it must require no adapter code, and everything new must
+# live in `adapter_substrate::broker`.
+#
+# EVERY FIELD BELOW WAS READ FROM THE CHAIN in slice 13's prep pass, not from a
+# blog post or a registry. The two that would have been wrong if guessed are
+# `native_token` and `ss58_prefix`, and both are called out where they sit.
+id: polkadot-coretime
+name: Polkadot Coretime
+family: substrate
+relay: polkadot
+para_id: 1005
+network: polkadot
+
+# WHOSE TOKEN this chain's pallet_balances holds.
+#
+# `relay` — Coretime ISSUES NOTHING. `system_properties` returns
+# `{ss58Format: 0, tokenDecimals: 10, tokenSymbol: DOT}`, i.e. exactly Asset
+# Hub's case, and getting this wrong is what slice 6's blocker was: absolutizing
+# `{parents: 0, Here}` from here would name the PARACHAIN, so this chain's DOT
+# would join nothing and would sit alone instead of adding to the relay's.
+#
+# It matters more than usual on this chain, because coretime is BOUGHT in DOT
+# that was teleported here — so the money on 1005 is the same DOT the treasury
+# and every sale price is denominated in.
+native_token: relay
+
+# VERIFIED 2026-08-19 by reading `System.SS58Prefix` at a real block: 0x0000 = 0
+# at spec 2003002. Read from the chain rather than from the ss58-registry, which
+# slice 6 measured as stale for Hydration by a whole prefix (0, not 63).
+ss58_prefix: 0
+
+# Short names the search grammar's `on <chain>` suffix accepts. DATA, so
+# api::search needs no edit.
+aliases:
+  - ct
+  - coretime
+  - broker
+
+lifecycle:
+  - status: live
+    from: "2024-09-05T03:36:18Z"   # VERIFIED 2026-08-19: `Timestamp.Now` at
+                                   # block #1 = 1725507378000 ms, byte-identical
+                                   # on two independent archive endpoints.
+                                   # Genesis block 0 carries no timestamp, so
+                                   # block #1 is the earliest instant this chain
+                                   # can attest — the same rule Collectives and
+                                   # People were corrected to in slice 4, where
+                                   # secondary sources were wrong by 10 days and
+                                   # 7 weeks respectively.
+
+endpoints:
+  rpc:
+    # PROBED FOR ARCHIVE DEPTH, NOT LIVENESS (Phase 1 slice 6's lesson). Both of
+    # these serve state at block #1 and return the identical genesis timestamp,
+    # so the whole history is reachable today.
+    - wss://polkadot-coretime-rpc.polkadot.io
+    - wss://coretime-polkadot-rpc.n.dwellir.com
+    # DELIBERATELY NOT SEEDED, and named so nobody adds them back from a stale
+    # apps-config: `polkadot-coretime.api.onfinality.io/public`,
+    # `sys.ibp.network/coretime-polkadot` and `rpc.ibp.network/coretime-polkadot`
+    # all fail to RESOLVE (NXDOMAIN) as of 2026-08-19. A dead hostname in this
+    # list is what cost three backfill workers in the Phase 1 endurance drill.
+
+capabilities:
+  blocks: true
+  extrinsics: true
+  events: true
+  runtime_metadata: true
+  # Declared for the reader that will ask "which chain in this network sells
+  # coretime" without naming one. NOTHING READS IT YET — the broker follower and
+  # both CLI commands gate on the `broker` MODULE below, and the delta reader is
+  # not in this slice. Kept rather than dropped because a capability is a
+  # statement about the chain rather than an index that costs writes, but it is
+  # an unearned field on the same rule and should gain its reader next.
+  #
+  # NOTE the word collides with `ingest::coretime::MODULE_CORETIME`, which is the
+  # RELAY's occupancy module. Different namespaces, so nothing breaks — but a
+  # query joining on the bare string will not tell them apart.
+  coretime: true
+  xcm:
+    min_version: 2
+
+modules:
+  - blocks
+  - extrinsics
+  - events
+  - accounts
+  # Money here is plain DOT in `pallet_balances` (see `native_token` above), and
+  # the shipped mapper covers pallet-balances' 30 declared variants at this spec
+  # and HALTS LOUDLY on a 31st — unlike Hydration, whose seed leaves `balances`
+  # off precisely because money lives in three places there and enabling it would
+  # have reported a partial as a total.
+  #
+  # STATED HONESTLY: the prep pass read this chain's `Broker` pallet, not its
+  # full pallet list, so "pallet_balances is the only money vocabulary here" is
+  # INFERRED from it being a fellowship system parachain at the same spec as
+  # Asset Hub. The loud halt is what makes that inference safe to act on.
+  - balances
+  # The SENDING half of every core assignment, and only that. MEASURED: each of
+  # the 97 `Broker.CoreAssigned` at the sale boundary is paired with a
+  # `parachainsystem.UpwardMessageSent`, so the outbound leg is real and the
+  # shipped mapper records it.
+  #
+  # WHETHER IT STITCHES IS UNMEASURED, and the seed must not imply otherwise. The
+  # relay's `coretime.CoreAssigned` is a pallet event, NOT the XCM arriving half;
+  # the arriving half would be a relay `messagequeue.Processed` whose id matches,
+  # and slice 2 established that id is the TOPIC where one exists and the wire
+  # hash otherwise, with `id_kind = 'ambiguous'`. No correlation was attempted in
+  # the prep pass. So this enables a half-journey we can see, not a journey we
+  # have joined.
+  - xcm
+  # NEW in Phase 3 slice 13. `pallet-broker`: sales, regions, renewals,
+  # reservations, leases and the CoreAssigned seam.
+  #
+  # THE NAME IS `broker`, NOT `coretime`, AND THAT IS DELIBERATE.
+  # `ingest::coretime::MODULE_CORETIME = "coretime"` is already taken by slice
+  # 11's RELAY occupancy worker. Checkpoints key on (chain_id, module) so there
+  # would be no literal collision — that worker runs on `polkadot` and this one
+  # on `polkadot-coretime` — but two different rule sets under one module name is
+  # exactly what `xcm` vs `xcm_correlate` was split to avoid, and the two
+  # `mapper_version` columns would be indistinguishable in a query.
+  - broker
+
+# NO DOMAIN-RESIDENCY ENTRY, and the absence is a decision rather than an
+# oversight. Residency exists for domains that MIGRATED between chains
+# (governance, balances, treasury, identity). The coretime MARKET has lived on
+# 1005 since this chain's genesis; the lease-era entitlement it replaced was
+# relay `slots`/`auctions`, and `Broker.Leases` is measured EMPTY, so there is no
+# window to encode today.
+#
+# When the delta reader lands it should resolve BOTH sides from the registry —
+# the relay for occupancy, whichever chain declares the entitlement side for
+# `pallet-broker` — so that no chain id ever appears in code. That is the shape
+# to build to; it is not the shape anything has today, because there is no delta
+# reader yet.

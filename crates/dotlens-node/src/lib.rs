@@ -48,6 +48,16 @@ pub mod xcm_pg;
 #[cfg(feature = "pg")]
 pub mod xcm_links_pg;
 
+/// Broker ENTITLEMENT facts, the seam, and the entitlement denominator (Phase 3,
+/// slice 13) — append-only, two tables in one transaction.
+#[cfg(feature = "pg")]
+pub mod broker_pg;
+
+/// Core occupancy facts and the `num_cores` denominator (Phase 3, slice 11) —
+/// append-only, plus the one place a relay parent HASH becomes a HEIGHT.
+#[cfg(feature = "pg")]
+pub mod coretime_pg;
+
 /// Tier 1 simulation results (Phase 3, slice 1) — immutable observations.
 #[cfg(feature = "pg")]
 pub mod sim_pg;
@@ -55,6 +65,12 @@ pub mod sim_pg;
 /// The live `sim::DryRunner`: RPC + raw store + the pure adapter half.
 #[cfg(feature = "live")]
 pub mod sim_run;
+
+/// The live `sim::ForkRunner` (Phase 3, slice 8): a chopsticks subprocess, its
+/// port, its lifetime, and the six RPC calls that turn "run this call under this
+/// origin at this block" into a block somebody can read.
+#[cfg(feature = "live")]
+pub mod fork_run;
 
 /// Deterministic contiguous chunking for concurrent backfill: same inputs →
 /// same chunks → per-chunk checkpoints (`raw_backfill:{a}-{b}`) resume exactly

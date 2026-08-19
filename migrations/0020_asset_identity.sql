@@ -1,0 +1,90 @@
+-- 0020_asset_identity: the index 0019 deliberately withheld, arriving WITH its
+-- reader (Phase 3, slice 7 — cross-chain consolidation).
+--
+-- 0019 added `core.assets.absolute_key` and then argued its own index out:
+--
+--     "NO INDEX ON `absolute_key` YET, on purpose … every read this slice ships
+--      fetches ALL of one chain's assets through the PK prefix and matches in
+--      Rust. The query that WOULD earn this index is 'every representation of
+--      one asset across every chain', which is the cross-chain consolidation
+--      surface — it does not exist yet, and it should arrive WITH its index."
+--
+-- That query now exists (`AssetIndex::representations`, serving
+-- `/v1/assets/identity`), so the index arrives with it. This is the same
+-- discipline that deferred `assets_symbol_idx` from 0010 to 0013, and the
+-- opposite of what 0013 had to fix: `core.blocks.hash` and
+-- `core.transactions.hash` shipped with no index at all and sequential-scanned
+-- every partition, invisible at 200 blocks and ruinous at 52M.
+--
+-- WHICH QUERY EARNS IT, precisely, because the distinction is easy to get wrong
+-- and the wrong answer adds write amplification for nothing:
+--
+--   * The CONSOLIDATION grouping does NOT earn it. It reads one chain's assets
+--     through the PK PREFIX (`where chain_id = $1`) — a few hundred to ~1,400
+--     rows per contributing chain — and groups them in Rust. That is a real
+--     per-request cost and it is stated here rather than glossed as a point
+--     lookup, but it is an existing access path that this index would not
+--     improve: an index on `absolute_key` cannot serve a query that does not
+--     filter on it.
+--   * The REVERSE lookup does. "Given this absolute name, which representations
+--     exist?" has no other path into the table and would scan every row on every
+--     chain. That is `/v1/assets/identity`, and it is also what a future
+--     asset-detail page and the search resolver's asset arm will use.
+--
+-- PARTIAL, on the column's own distribution rather than by habit: `absolute_key`
+-- is NULL for a large and legitimate share of rows — 756 of Hydration's 1,437
+-- registered assets have no absolute name, because XYK shares (730), StableSwap
+-- shares and Bonds are chain-local constructs with no XCM location at all. Those
+-- rows can never satisfy an equality lookup on this column, so indexing them
+-- would be paying on every write for entries no query can ever read.
+-- (752 of those 756 are XYK 730 + StableSwap 17 + Bond 5; the rest, and the 26
+-- Erc20 assets, are NULL for their own reasons. The point is the SHARE, not the
+-- decomposition.)
+-- TWO THINGS THIS INDEX DOES NOT PROMISE, recorded so they are not rediscovered:
+--   (a) The partial predicate is usable only because Postgres can PROVE
+--       `absolute_key = $1` implies `absolute_key IS NOT NULL` — which it can,
+--       since text equality is strict, and it holds for a bound parameter and
+--       not merely a constant.
+--       WHAT LOSES THAT PROOF IS WRAPPING THE COLUMN, not the shape of the
+--       right-hand side. Measured at verification (Pg 16, bound parameters, not
+--       literals): `absolute_key = any($1)` STILL uses this index — a strict
+--       operator inside a ScalarArrayOpExpr is null-rejecting too, so the proof
+--       survives — while `lower(absolute_key) = $1` falls to a Seq Scan. An
+--       earlier draft of this comment named `= any($1)` as a way to lose the
+--       index; that was wrong, and it is corrected here rather than left for
+--       someone to size a query rewrite from. The rule that IS true: keep the
+--       indexed column bare on the left. `PgAssetIndex::representations` does,
+--       and its own doc comment states it correctly ("no `lower()`, no cast").
+--   (b) It provides the FILTER only, never the ordering: the reader sorts by
+--       `chain_id collate "C"`, so there is always a sort on top. Trivial at
+--       this cardinality; not something to build a paging strategy on.
+create index assets_absolute_key_idx
+    on core.assets (absolute_key)
+    where absolute_key is not null;
+
+-- ---------------------------------------------------------------- no new table
+--
+-- **AND STILL NO `treasury.consolidated_position`, for the fifth time.** The
+-- consolidated view this slice ships is computed per request from
+-- `balances.balance_anchors` + `balances.balance_changes` + `core.assets`, all
+-- three of which already carry lineage. Materialising the answer would create a
+-- fourth copy of a derivable number, and it would be the copy WITHOUT lineage —
+-- verbatim the argument that killed `treasury.consolidated_position` in 0010,
+-- `graph.cross_chain_operations` in P3 slice 3, the stored forwarded-attribution
+-- in P3 slice 5, and a `logical_assets` join table in 0019.
+--
+-- The rule this project keeps re-deriving: materialise when a LISTING surface
+-- needs it (a per-request recursive walk is fine for one subject and wrong for a
+-- page of them), not when a detail view does. A treasury has one consolidated
+-- position, not a page of them.
+--
+-- ------------------------------------------------------------------- still no
+--
+-- NO PRICES, NO TOTALS IN A COMMON UNIT. 0010 refused `usd_est` on the grounds
+-- that "quantities here are exact and self-provenanced; a price is neither, and
+-- a price column with no stated source, timestamp and method is how a treasury
+-- dashboard starts lying quietly". Consolidation makes that refusal MORE
+-- important rather than less: adding DOT to USDT requires a price, and the whole
+-- point of this surface is that every number on it can be re-derived by the
+-- reader. The endpoint sums each logical asset in its OWN units and says, in
+-- `coverage.valuation`, that it will not do more.

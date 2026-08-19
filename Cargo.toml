@@ -27,7 +27,7 @@ anyhow = "1"
 hex = "0.4"
 blake2 = "0.10"
 chrono = { version = "0.4", features = ["serde"] }
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "net", "time", "sync"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "net", "time", "sync", "process", "io-util"] }
 subxt = "0.50"
 # pure decode stack (no network): versions may need bumping at first compile
 frame-metadata = { version = "23", features = ["current", "decode"] }

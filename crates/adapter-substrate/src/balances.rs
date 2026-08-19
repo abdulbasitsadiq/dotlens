@@ -54,7 +54,21 @@ use scale_value::{Composite, Value, ValueDef};
 /// they are missing every USDT and USDC movement in their range. A rebuild is
 /// `balances-range` over the range again, and the version column is what tells
 /// you which ranges still need it.
-pub const MAPPER_VERSION: u32 = 2;
+///
+/// 2 → 3 (Phase 3, slice 6): the same argument, one vocabulary further out —
+/// this mapper now also carries the ORML pallets (`crate::orml`), so a range
+/// mapped at v2 on an orml chain is missing every DOT, USDT and vDOT movement
+/// in it.
+///
+/// AND THE BUMP COSTS NOTHING ON THIS DATA, which is worth stating rather than
+/// leaving for somebody to work out: no v2 row anywhere is missing orml
+/// coverage, because `balances` was never an enabled module on the only orml
+/// chain in the registry — Hydration's seed deliberately left it off, on the
+/// grounds that saying nothing was honest and saying HDX-only would not have
+/// been. So every existing v2 row was written on a chain with no orml pallets, where a
+/// v2 row and a v3 row are byte-identical. There is no rebuild to schedule; the
+/// version moves because the RULE SET moved, and lineage records rule sets.
+pub const MAPPER_VERSION: u32 = 3;
 
 pub struct SubstrateDeltaMapper;
 
@@ -210,7 +224,10 @@ pub fn deltas_for_event(event: &CanonicalEvent) -> Result<Vec<BalanceDelta>, Str
         // they go through the same worker, the same tables and the same
         // loud-halt discipline — just a different vocabulary. Delegated
         // rather than inlined because the rules there are long and are
-        // pinned by their own tests (crate::assets).
+        // pinned by their own tests (crate::assets), which in turn hands
+        // anything it does not own to `crate::orml` (the third vocabulary:
+        // orml-tokens, on a `tokens:<id>` key). Three pallet families, one
+        // chain of pure functions, one set of tables.
         _ => return crate::assets::deltas_for_assets_event(event),
     })
 }

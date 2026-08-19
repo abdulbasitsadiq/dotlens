@@ -93,6 +93,31 @@ pub struct AccountSeed {
     pub note: Option<String>,
 }
 
+/// Two values, deliberately, rather than a free-form XCM location: this is the
+/// only distinction that exists, and a two-variant enum cannot be typo'd into
+/// something plausible-looking the way a hand-written `{parents: …}` can.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NativeToken {
+    /// The chain issues its own token (every relay; Hydration's HDX).
+    Own,
+    /// The chain's native currency is its RELAY's token (every system
+    /// parachain: DOT on Asset Hub, Collectives and People).
+    Relay,
+}
+
+impl NativeToken {
+    /// This token's location AS THIS CHAIN SEES IT — the input the absolute-name
+    /// normalizer needs. `Own` is the chain itself; `Relay` is one hop up.
+    pub fn location(&self) -> serde_json::Value {
+        let parents = match self {
+            NativeToken::Own => 0,
+            NativeToken::Relay => 1,
+        };
+        serde_json::json!({ "parents": parents, "interior": [] })
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChainConfig {
     pub id: String,
@@ -105,6 +130,27 @@ pub struct ChainConfig {
     pub network: String,
     #[serde(default)]
     pub ss58_prefix: Option<u16>,
+    /// WHOSE TOKEN this chain's `pallet_balances` holds — and it is registry
+    /// data because it is not derivable from anything else here.
+    ///
+    /// "A chain's native currency" and "the chain as a location" are different
+    /// things that coincide only when the chain ISSUES its own token. Hydration
+    /// issues HDX, so its native token's absolute name is
+    /// `[GC(Polkadot), Parachain(2034)]`. **Asset Hub issues nothing: its native
+    /// token is the relay's DOT**, whose absolute name is `[GC(Polkadot)]` — and
+    /// a reviewer caught that absolutizing `{parents: 0, Here}` from Asset Hub
+    /// gives `[GC(Polkadot), Parachain(1000)]`, i.e. a key naming the PARACHAIN,
+    /// which joins nothing. The position it would have split off is the
+    /// treasury's 24.3M DOT, which is the largest number the consolidator
+    /// exists to add up.
+    ///
+    /// `para_id` cannot answer it (Hydration and Asset Hub are both
+    /// parachains), and no runtime constant states it, so it is seeded.
+    /// **ABSENT MEANS UNKNOWN, NOT `Own`** — a parachain seed that forgets this
+    /// gets a NULL absolute name for its native token, which is the honest
+    /// answer and is exactly what a wrong default would have hidden.
+    #[serde(default)]
+    pub native_token: Option<NativeToken>,
     #[serde(default)]
     pub lifecycle: Vec<LifecycleEvent>,
     #[serde(default)]
@@ -425,6 +471,43 @@ impl Registry {
         &self.treasury_instances
     }
 
+    /// Does this chain carry (or has it ever carried) a treasury instance THIS
+    /// NETWORK considers its own?
+    ///
+    /// **THIS EXISTS BECAUSE A CHAIN HAVING A TREASURY PALLET DOES NOT MAKE ITS
+    /// TREASURY OURS.** `sync_treasury_accounts` derives a pot from any
+    /// PalletId whose pallet maps to a treasury instance, and stamps it with
+    /// `network = chain.network` — which was harmless while every registered
+    /// chain's treasury WAS the network's, and stops being harmless the moment
+    /// a chain with its own governance is registered. Hydration runs
+    /// `pallet_treasury` with PalletId `py/trsry`, exactly like the relay, so
+    /// without this guard **Hydration's own treasury pot appears on
+    /// `/v1/treasury/polkadot/holdings` as Polkadot treasury money** — a wrong
+    /// number rather than a missing one, and the worst kind, because it reads
+    /// like a fact and sums like a fact.
+    ///
+    /// The predicate is registry data end to end: a chain is a treasury chain
+    /// for its network if any residency window for a REGISTERED treasury
+    /// instance's domain names it. So the relay and Asset Hub qualify through
+    /// the `treasury` domain, Collectives through `fellowship_treasury` and
+    /// `ambassador_treasury`, and Hydration through nothing — with no chain id
+    /// written down anywhere (Invariant 2). Registering Hydration's OWN treasury
+    /// later is a seed edit: give it an instance and a domain.
+    ///
+    /// Windows are not time-filtered: a pot that WAS the network's treasury is
+    /// still treasury history, which is the same rule `active` follows.
+    pub fn carries_treasury_for_network(&self, chain_id: &str, network: &str) -> bool {
+        let domains: Vec<&str> = self
+            .treasury_instances
+            .iter()
+            .map(|t| t.domain.as_str())
+            .chain(std::iter::once(DEFAULT_TREASURY_DOMAIN))
+            .collect();
+        self.residency.iter().any(|r| {
+            r.chain == chain_id && r.network == network && domains.contains(&r.domain.as_str())
+        })
+    }
+
     /// Residency domain carrying a treasury instance; unregistered instances
     /// fall back to the main treasury domain.
     pub fn domain_for_treasury_instance(&self, instance: &str) -> &str {
@@ -524,10 +607,17 @@ mod tests {
         assert_eq!(h.ss58_prefix, Some(0));
         assert!(h.endpoints.rpc.iter().all(|e| e.starts_with("wss://")));
         assert!(h.has_module("xcm"), "the xcm follower is gated on this");
-        // `balances` is DELIBERATELY off: pallet-balances holds HDX only, and
-        // every other asset lives in orml-tokens or in EVM storage, so enabling
-        // it would report the treasury's position here as nothing.
-        assert!(!h.has_module("balances"));
+        // `balances` was DELIBERATELY off until Phase 3 slice 6, because
+        // pallet-balances holds HDX only and every other asset lives in
+        // orml-tokens or in EVM storage — enabling it would have reported the
+        // treasury's position here as nothing. `adapter_substrate::orml` covers
+        // the orml half, so it is on; the EVM half is still uncovered and is
+        // recorded as `core.assets.asset_type = 'Erc20'` rather than implied.
+        assert!(
+            h.has_module("balances"),
+            "the orml mapper is why this is on; with it off the follower never \
+             starts and every Hydration balance is zero for the wrong reason"
+        );
         // It runs its own OpenGov, whose pallet names collide with Polkadot's —
         // enabling the module before the class is scoped would merge two id
         // spaces.
@@ -555,6 +645,40 @@ mod tests {
                 Some("hydration"),
                 "a chain brings its own aliases; api::search needs no edit"
             );
+        }
+    }
+
+    #[test]
+    fn coretime_occupancy_is_declared_by_the_relay_and_only_by_relays() {
+        let reg = Registry::load_from_dir(&seeds_dir()).unwrap();
+
+        // THE POSITIVE HALF IS THE ONE THAT BITES. A missing module means the
+        // follower silently never starts — slice 3's finding — and an empty
+        // `coretime.core_occupancy` is indistinguishable from a network where no
+        // core did any work. The relay is the ONLY source of candidate events,
+        // so if this assertion fails the whole module is dark and nothing else
+        // says so.
+        assert!(
+            reg.chain("polkadot").expect("polkadot").has_module("coretime"),
+            "the relay must declare `coretime`: `paraInclusion` is a relay pallet and it is the \
+             only place core occupancy is reported"
+        );
+
+        // And the negative half, stated as the PROPERTY rather than as a list of
+        // today's parachains — so registering Kusama (which would declare it,
+        // and should) does not restage this test, while a parachain picking the
+        // module up does. A parachain follower would map nothing forever.
+        for chain in reg.chains() {
+            if chain.has_module("coretime") {
+                assert!(
+                    chain.relay.is_none(),
+                    "{} declares `coretime` but is a parachain of {:?}: occupancy is answered by \
+                     the RELAY, and a parachain follower would run against a chain that emits no \
+                     candidate events at all",
+                    chain.id,
+                    chain.relay
+                );
+            }
         }
     }
 
@@ -605,6 +729,56 @@ mod tests {
                 c.domain
             );
         }
+    }
+
+    /// THE TWO FACTS PHASE 3 SLICE 6 MOVED INTO THE REGISTRY, both because a
+    /// reviewer proved they were not derivable from what was already there.
+    #[test]
+    fn whose_token_and_whose_treasury_are_registry_data() {
+        let reg = Registry::load_from_dir(&seeds_dir()).unwrap();
+
+        // (1) WHOSE TOKEN. `para_id` cannot answer this — Hydration and Asset
+        // Hub are both parachains and their native currencies are different
+        // assets. Absolutizing `{parents:0, Here}` from Asset Hub would name the
+        // PARACHAIN, so AH's DOT would join nothing and the treasury's largest
+        // position would split off on its own.
+        assert_eq!(reg.chain("polkadot").unwrap().native_token, Some(NativeToken::Own));
+        assert_eq!(reg.chain("hydration").unwrap().native_token, Some(NativeToken::Own));
+        for parachain in [
+            "polkadot-asset-hub",
+            "polkadot-collectives",
+            "polkadot-people",
+        ] {
+            assert_eq!(
+                reg.chain(parachain).unwrap().native_token,
+                Some(NativeToken::Relay),
+                "{parachain}'s native currency is the relay's DOT, not a token \
+                 of its own"
+            );
+        }
+        // and the locations those two answers produce differ by exactly one hop
+        assert_eq!(NativeToken::Own.location()["parents"], 0);
+        assert_eq!(NativeToken::Relay.location()["parents"], 1);
+
+        // (2) WHOSE TREASURY. Hydration runs `pallet_treasury` with the SAME
+        // PalletId as the relay (`py/trsry`), so a pot derived from metadata
+        // alone would be stamped `network = polkadot` and served as Polkadot
+        // treasury money. Residency is what says otherwise, and it says it
+        // without naming a chain in any of the code that asks.
+        assert!(reg.carries_treasury_for_network("polkadot", "polkadot"));
+        assert!(reg.carries_treasury_for_network("polkadot-asset-hub", "polkadot"));
+        assert!(
+            reg.carries_treasury_for_network("polkadot-collectives", "polkadot"),
+            "the Fellowship and Ambassador instances live here"
+        );
+        assert!(
+            !reg.carries_treasury_for_network("hydration", "polkadot"),
+            "Hydration's treasury is HYDRATION's — a chain having a treasury \
+             pallet does not make its treasury ours"
+        );
+        // an unregistered network answers no for every chain, rather than
+        // falling back to something plausible
+        assert!(!reg.carries_treasury_for_network("polkadot", "kusama"));
     }
 
     #[test]

@@ -483,13 +483,36 @@ impl DryRunContext {
         &self,
         origin: &OriginSpec,
     ) -> Result<(Vec<u8>, serde_json::Value), String> {
+        encode_origin_for(&self.types, self.origin_ty, origin)
+    }
+}
+
+/// Resolve an origin expression against a runtime's own `OriginCaller` enum.
+///
+/// SPLIT OUT OF `DryRunContext` IN SLICE 8, and the reason is worth stating:
+/// Tier 2 encodes an origin too, into `pallet_scheduler`'s `Scheduled.origin`,
+/// and that field's TYPE ID comes from the scheduler's agenda rather than from
+/// `dry_run_call`'s first parameter. Two implementations of "resolve
+/// `<Pallet>:<Variant>` to bytes" that could disagree is the defect class this
+/// project keeps finding (`api` depending on `sim` for `attribute_forwarded` was
+/// the same call), so the type id became a parameter instead.
+///
+/// The consequence is a real one and not incidental: Tier 2 no longer needs the
+/// runtime to declare `DryRunApi` at all. A chain that cannot be dry-run can
+/// still be forked.
+pub fn encode_origin_for(
+    types: &PortableRegistry,
+    origin_ty: u32,
+    origin: &OriginSpec,
+) -> Result<(Vec<u8>, serde_json::Value), String> {
+    {
         let (pallet, variant, account) = match origin {
             OriginSpec::Variant { pallet, variant } => (pallet.as_str(), variant.as_str(), None),
             // `signed:…` is `system:Signed(who)` — the one origin with a field.
             OriginSpec::Signed(who) => ("system", "Signed", Some(who)),
         };
 
-        let outer = self.variants_of(self.origin_ty, "the runtime's OriginCaller")?;
+        let outer = variants_in(types, origin_ty, "the runtime's OriginCaller")?;
         let outer_variant = find_variant(outer, pallet).ok_or_else(|| {
             format!(
                 "no origin '{pallet}' in this runtime; it has: {}",
@@ -505,7 +528,7 @@ impl DryRunContext {
                 ))
             }
         };
-        let inner = self.variants_of(inner_ty, &format!("origin '{}'", outer_variant.name))?;
+        let inner = variants_in(types, inner_ty, &format!("origin '{}'", outer_variant.name))?;
         let inner_variant = find_variant(inner, variant).ok_or_else(|| {
             format!(
                 "no variant '{variant}' in origin '{}'; it has: {}",
@@ -526,7 +549,7 @@ impl DryRunContext {
             }
             (Some(who), 1) => {
                 let field_ty = inner_variant.fields[0].ty.id;
-                if !self.is_32_byte_account(field_ty) {
+                if !is_32_byte_account_in(types, field_ty) {
                     return Err(format!(
                         "'{}:{}' does not take a 32-byte account id on this chain (an \
                          AccountId20 chain, most likely) — not expressible today",
@@ -555,7 +578,9 @@ impl DryRunContext {
         });
         Ok((bytes, json))
     }
+}
 
+impl DryRunContext {
     // ------------------------------------------------------ the baseline call
 
     /// The SCALE bytes of `system.remark()` with an empty payload — the no-op
@@ -1297,14 +1322,7 @@ impl DryRunContext {
         ty_id: u32,
         what: &str,
     ) -> Result<&'a [scale_info::Variant<scale_info::form::PortableForm>], String> {
-        let ty = self
-            .types
-            .resolve(ty_id)
-            .ok_or_else(|| format!("{what}: type {ty_id} is not in the registry"))?;
-        match &ty.type_def {
-            TypeDef::Variant(v) => Ok(&v.variants),
-            _ => Err(format!("{what}: type {ty_id} is not an enum")),
-        }
+        variants_in(&self.types, ty_id, what)
     }
 
     fn is_u32(&self, ty_id: u32) -> bool {
@@ -1313,31 +1331,46 @@ impl DryRunContext {
             Some(TypeDef::Primitive(TypeDefPrimitive::U32))
         )
     }
+}
 
-    /// Is this type an `AccountId32`? Walks single-field newtypes down to the
-    /// array, so `AccountId32(pub [u8; 32])` and a bare `[u8; 32]` both pass and
-    /// an AccountId20 chain fails honestly instead of being sent 32 bytes.
-    fn is_32_byte_account(&self, ty_id: u32) -> bool {
-        let mut id = ty_id;
-        for _ in 0..4 {
-            let Some(ty) = self.types.resolve(id) else {
-                return false;
-            };
-            match &ty.type_def {
-                TypeDef::Array(a) => {
-                    return a.len == 32
-                        && matches!(
-                            self.types.resolve(a.type_param.id).map(|t| &t.type_def),
-                            Some(TypeDef::Primitive(TypeDefPrimitive::U8))
-                        )
-                }
-                TypeDef::Composite(c) if c.fields.len() == 1 => id = c.fields[0].ty.id,
-                TypeDef::Tuple(t) if t.fields.len() == 1 => id = t.fields[0].id,
-                _ => return false,
-            }
-        }
-        false
+/// The variants of an enum type, or a message naming what was expected.
+/// Free-standing so `fork.rs` can reach the origin encoder without a
+/// `DryRunContext` (which requires the runtime to declare `DryRunApi`).
+fn variants_in<'a>(
+    types: &'a PortableRegistry,
+    ty_id: u32,
+    what: &str,
+) -> Result<&'a [scale_info::Variant<scale_info::form::PortableForm>], String> {
+    let ty = types
+        .resolve(ty_id)
+        .ok_or_else(|| format!("{what}: type {ty_id} is not in the registry"))?;
+    match &ty.type_def {
+        TypeDef::Variant(v) => Ok(&v.variants),
+        _ => Err(format!("{what}: type {ty_id} is not an enum")),
     }
+}
+
+/// Is this type an `AccountId32`? Walks single-field newtypes down to the array.
+fn is_32_byte_account_in(types: &PortableRegistry, ty_id: u32) -> bool {
+    let mut id = ty_id;
+    for _ in 0..4 {
+        let Some(ty) = types.resolve(id) else {
+            return false;
+        };
+        match &ty.type_def {
+            TypeDef::Array(a) => {
+                return a.len == 32
+                    && matches!(
+                        types.resolve(a.type_param.id).map(|t| &t.type_def),
+                        Some(TypeDef::Primitive(TypeDefPrimitive::U8))
+                    )
+            }
+            TypeDef::Composite(c) if c.fields.len() == 1 => id = c.fields[0].ty.id,
+            TypeDef::Tuple(t) if t.fields.len() == 1 => id = t.fields[0].id,
+            _ => return false,
+        }
+    }
+    false
 }
 
 // ------------------------------------------------------------------- helpers

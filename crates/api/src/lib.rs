@@ -194,6 +194,10 @@ pub struct BalanceAnchorRow {
     pub free: String,
     pub reserved: String,
     pub total: String,
+    /// Sum of frozen locks where the runtime exposes them. Informational —
+    /// total is free + reserved and does NOT subtract this. Null means the
+    /// runtime did not tell us, which is different from zero.
+    pub frozen: Option<String>,
     pub spec_version: Option<u64>,
     pub source: String,
     pub note: Option<String>,
@@ -371,6 +375,7 @@ impl BalanceIndex for MemoryBalanceIndex {
                 anchor_source: anchor.as_ref().map(|a| a.source.clone()),
                 anchor_note: anchor.as_ref().and_then(|a| a.note.clone()),
                 anchor_status: anchor.as_ref().and_then(|a| a.status.clone()),
+                anchor_frozen: anchor.as_ref().and_then(|a| a.frozen.clone()),
                 delta_sum: delta_sum.to_string(),
                 delta_count: relevant.len() as u64,
                 last_delta_height: relevant.iter().map(|c| c.height).max(),
@@ -403,6 +408,29 @@ pub struct AssetRow {
     #[serde(skip_serializing)]
     pub location_key: Option<String>,
     pub xcm_location: Option<serde_json::Value>,
+    /// The OBSERVER-FREE name (migration 0019) — what makes this row and another
+    /// chain's row for the same asset recognisable as one thing.
+    ///
+    /// `location_key` cannot do it and never could: a Location is relative to
+    /// its observer, so Hydration spells USDT `{parents:1, X3[Parachain(1000),
+    /// PalletInstance(50), GeneralIndex(1984)]}` and Asset Hub spells the same
+    /// asset `{parents:0, X2[PalletInstance(50), GeneralIndex(1984)]}`.
+    /// Version-stripping makes the SPELLINGS agree and cannot make the FRAMES
+    /// agree. Verified on live data: those two rows carry **2 distinct
+    /// `location_key`s and 1 distinct `absolute_key`**.
+    ///
+    /// NULL is common and is not a fault — 756 of Hydration's 1,437 registered
+    /// assets have no absolute name, because XYK shares, StableSwap shares and
+    /// Bonds are chain-local constructs with no XCM location at all. A null here
+    /// means "cannot be named across chains", which is why the consolidation
+    /// endpoint counts them rather than dropping them.
+    pub absolute_key: Option<String>,
+    pub absolute_location: Option<serde_json::Value>,
+    /// The asset's own declared type where its registry has one (Token, Erc20,
+    /// XYK, …). NULL for pallet-assets, which has no such concept. `Erc20` is
+    /// the one a reader must act on: those balances live in `pallet_evm`
+    /// storage, so they are named here and anchorable nowhere.
+    pub asset_type: Option<String>,
 }
 
 /// One XCM observation (`xcm.messages`) — one chain's half of one message.
@@ -681,6 +709,80 @@ pub fn xcm_journey_not_covered() -> Vec<&'static str> {
     v
 }
 
+/// What a core-occupancy answer is not.
+///
+/// THE FIRST LINE IS THE SLICE'S WHOLE PRODUCT CLAIM. There are two ratios here
+/// and they are different questions; a single `utilization` field would report
+/// one and call it the other, throwing away the only number in this response
+/// that no other tool has.
+pub fn coretime_not_covered() -> Vec<&'static str> {
+    vec![
+        "there are TWO ratios and neither of them is 'utilization'. `cores_touched_ratio` is how \
+         many declared cores produced ANYTHING; `slots_filled_ratio` is how many core-block \
+         slots were actually filled. Measured over 1,000 contiguous relay blocks they read \
+         47.0% and 34.69% — the gap IS the finding, because it says even the cores that are \
+         used sit idle. Collapsing them into one number reports one and calls it the other",
+        "the denominator is a DATED READING, not a constant. `num_cores` is host configuration \
+         that moves at session boundaries, so `denominator.read_at_height` says which reading \
+         this ratio divided by and `denominator.position` says whether it was read inside the \
+         window, before it, after it, or that there is no reading at all — in which case both \
+         ratios are null rather than computed against a guess. A ratio against a stale \
+         denominator is silently wrong, so `denominator.stale_suspected` fires when a core index \
+         at or above `num_cores` appears on ANY row in the window (inclusions, backings and \
+         time-outs alike), which can only mean the reading predates a core count that grew. \
+         `stable_across_window` is null when no reading falls INSIDE the window: nothing here \
+         can then say whether the denominator moved during it, and that is not the same as \
+         saying it held",
+        "this endpoint is the USAGE half ONLY. The entitlement half — what each core was BOUGHT \
+         or reserved to do — is `pallet-broker` on the Coretime chain and lands in \
+         coretime.broker_events / coretime.core_assignments (slice 13). The delta between what \
+         was PAID FOR and what was USED is a join across the two, and NOTHING ON THIS ENDPOINT \
+         COMPUTES IT: the ratios here divide by every declared core, entitled or not, so a low \
+         figure mixes 'nobody bought it' with 'somebody bought it and did not use it'",
+        "bulk and on-demand cannot be distinguished from relay data AT ALL, and slice 13 measured \
+         what that costs rather than leaving it as a caveat. A core used for a handful of blocks \
+         looks like an on-demand core and looks equally like a bulk core whose chain was idle, \
+         and nothing in `paraInclusion` says which — so slice 11's reading of two barely-used \
+         cores as an on-demand signal was an INFERENCE, and the entitlement half REFUTED it: both \
+         are Task-entitled bulk cores with a full mask, using 1.0% and 2.9% of what they bought. \
+         Any such reading taken from this endpoint alone is a guess of the same kind",
+        "the ratios count `included` rows ONLY. `backed` rows sit in the same table because \
+         backed-without-included is the wasted-coretime signal, and counting them here would \
+         roughly double every figure — async backing means almost every inclusion has a backing \
+         2-6 blocks earlier. `by_kind` shows what is there beside the inclusions",
+        "`timed_out` — the runtime saying outright that a core was occupied and produced \
+         nothing — has ZERO live instances: not one row in 1,542 relay blocks, and no event \
+         matching TimedOut anywhere in the events table. The second, independent signal is also \
+         empty: matching backed to included on `pov_hash` inside window INTERIORS gives 48,932 \
+         backed and 0 never included. So wasted coretime is expressible here and has never been \
+         observed, and this response must not be read as evidence that it does not happen",
+        "a block that is DECODED but not yet coretime-mapped counts in `blocks_indexed` and \
+         contributes no occupancy, which under-reports the slot-fill ratio. Compare \
+         `window.blocks_indexed` against `window.heights_with_occupancy` to see it — but read \
+         the gap carefully, because it has THREE causes and this response cannot tell them \
+         apart: the mapper's checkpoint being behind the window's end, blocks that genuinely \
+         carried no candidate events, and (at the tip) nothing at all, since `blocks_indexed` \
+         counts FINALIZED blocks only, matching the filter the mapper's own event source uses",
+        "`window.blocks_indexed` is the slot-fill denominator, NOT the requested span. A window \
+         with gaps must not be divided by its nominal width or the ratio drops with every block \
+         nobody indexed; `window.contiguous` says which case this is",
+        "core->para rotation is UNEXERCISED on live data. Every one of the 47 used cores in the \
+         prep's 1,000-block sample served exactly one para, so a `paras` list with two entries \
+         would be the first live instance of the time-ranged half of the core<->chain \
+         many-to-many. The para->cores direction is well exercised (one para held 11 cores at \
+         93.1% each), and the model rests on that half plus ECOSYSTEM's reasoning for the other",
+        "`occupancy.lineage` is the aggregate's own Invariant-3 stamp, and MORE THAN ONE ENTRY \
+         means the window was mapped under two rule sets — a `mapper_version` change is a change \
+         to which events are mapped or how a field is read, so the counts above would be an \
+         average of two different definitions of occupancy. An EMPTY list means no lineage was \
+         recorded for this window, which happens when there are no rows in it at all",
+        "occupancy is not THROUGHPUT. A filled slot says a candidate was included on that core, \
+         not how much work it carried: PoV size, weight and transaction counts are not read \
+         here, and `head_data` is deliberately not stored at all (20.0 MB across 17,763 rows in \
+         a 555-block subset, and occupancy needs none of it)",
+    ]
+}
+
 /// Reduce an observed counterparty to a form comparable with
 /// [`xcm_counterparty_name`], given the network the observing chain is in.
 ///
@@ -754,20 +856,28 @@ pub struct SimulationRow {
     pub call_summary: Option<String>,
     pub origin_spec: String,
     pub origin: serde_json::Value,
-    pub xcm_version: u32,
-    /// executed | dispatch_failed | api_error — see the migration on why
-    /// `dispatch_failed` is a result rather than an error.
+    /// `None` on a `fork` row: that tier calls no runtime API and so has no
+    /// `result_xcms_version`.
+    pub xcm_version: Option<u32>,
+    /// executed | dispatch_failed | api_error on the dry_run tier;
+    /// executed | dispatch_failed | not_dispatched on the fork tier. See the
+    /// migrations on why `dispatch_failed` is a result rather than an error, and
+    /// on why `not_dispatched` is not folded into it.
     pub status: String,
     pub dispatch_ok: Option<bool>,
     pub dispatch_error: Option<serde_json::Value>,
     pub emitted_events: serde_json::Value,
     pub event_count: u32,
     pub local_xcm: Option<serde_json::Value>,
-    pub forwarded_xcms: serde_json::Value,
+    /// `None` = this tier does not produce a forwarded list at all. Not `[]`,
+    /// which would read as "this call queues no messages" — a claim about the
+    /// call where the truth is a fact about the tier. The two are also what
+    /// decides whether `forwarded_attribution` is attached to this row.
+    pub forwarded_xcms: Option<serde_json::Value>,
     pub effects: serde_json::Value,
     pub note: Option<String>,
     pub spec_version: u64,
-    pub api_version: u32,
+    pub api_version: Option<u32>,
     pub metadata_version: u32,
     pub sim_version: u32,
     pub raw_location: String,
@@ -776,6 +886,29 @@ pub struct SimulationRow {
     /// queue. `None` = no baseline, and every reader is told so rather than left
     /// to assume the forwarded list is this call's doing.
     pub baseline_input_hash: Option<String>,
+
+    // ------------------------------------------------- Tier 2 (Phase 3, slice 8)
+    /// The storage this run INJECTED, each entry carrying what the real chain
+    /// held there. `None` = this row is not a counterfactual, and that
+    /// distinction is why it is not an empty array.
+    pub overrides: Option<serde_json::Value>,
+    pub override_hash: Option<String>,
+    pub storage_diff: Option<serde_json::Value>,
+    pub storage_diff_count: Option<u32>,
+    /// decoded | extrinsic_only | undecodable | unavailable | refused — see
+    /// `sim::DIFF_STATUSES` and migration 0023. Read BESIDE `dispatch_route`:
+    /// whether that scope reaches this row's own call is what `diff_covers`
+    /// computes, and on a scheduled fork row it does not.
+    pub diff_status: Option<String>,
+    /// A block that exists ONLY ON THE FORK. No canonical chain has it and no
+    /// explorer will find it — see `counterfactual.reads_as`.
+    pub built_block_hash: Option<String>,
+    pub harness: Option<serde_json::Value>,
+    /// scheduled | dry_run_extrinsic. A fork row must name its route, because the
+    /// two model different things and `tier_coverage` is chosen from it.
+    pub dispatch_route: Option<String>,
+    /// Which block-number line the scheduler counts on, and the evidence for it.
+    pub agenda_anchor: Option<serde_json::Value>,
 }
 
 /// One recorded `dry_run_xcm` — what a chain would do with a program that
@@ -1113,7 +1246,8 @@ pub fn sim_not_covered() -> Vec<&'static str> {
          check, no nonce, no mortality, no fee withdrawal and no length or weight limit",
         "a whitelisted-call flow needs its authorization to already exist in storage; \
          previewing one before the Fellowship has whitelisted it fails honestly rather \
-         than predicting the enacted outcome (Tier 2 sets that state up — Phase 3)",
+         than predicting the enacted outcome. Tier 2 can be TOLD that state with an explicit \
+         `--set` storage override; it does not discover or set it up on its own",
         "forwarded_xcms is not what the DESTINATION would do — that is dry_run_xcm ON THAT \
          CHAIN, and it is a separate run that somebody has to have made",
         "forwarded_xcms IS NOT ALWAYS ATTRIBUTABLE TO THE SIMULATED CALL, and a raw list on \
@@ -1136,6 +1270,155 @@ pub fn sim_not_covered() -> Vec<&'static str> {
          artifact we index. The chain does record it once, in the submitting \
          `referenda.submit` call's `proposal_origin` argument; reading that back as a \
          suggested origin is a later slice",
+    ]
+}
+
+/// What a TIER 2 (fork) answer does not model.
+///
+/// A SEPARATE LIST FROM `sim_not_covered`, AND THAT IS THE POINT. This project
+/// has four times shipped one shared `not_covered` whose first line was false on
+/// its second consumer (slice 3's journey list, slice 4's boundary sentence,
+/// slice 5's `legs`, slice 7's holdings line). Tier 1's list opens with "the call
+/// is dispatched directly" — which is not what this tier does — so the two are
+/// structurally separate and each row carries the one that is true of it, rather
+/// than a shared list being carefully worded until it is true of both.
+///
+/// The first four lines are chopsticks' own FAQ answer to "what is mocked?",
+/// quoted rather than paraphrased. The rest are this project's.
+pub fn fork_not_covered() -> Vec<&'static str> {
+    vec![
+        "THE HARNESS MOCKS FOUR THINGS AND SAYS SO ITSELF: a mocked tx pool, no real block \
+         finalization, mocked inherents, and simulated XCM channels. A diff that looks \
+         authoritative while the inherents were mocked is the failure this tier is most likely \
+         to produce, which is why the list is on the row as well as here",
+        "`built_block_hash` is NULL on every row this tier writes today, because the live route \
+         builds no block — it dry-runs one. Where an older row carries one it names a block no \
+         canonical chain has, no explorer will find, and dotlens never wrote to core.blocks, and \
+         it does NOT identify the counterfactual either: the harness builds every block with a \
+         zero state root, so a faithful run and an injected one share it",
+        "this models ENACTMENT and nothing before it — nothing here checks that a referendum \
+         passed, that its track permits the origin it was given, or that its decision period \
+         elapsed. Whether it would pass is the votes endpoint's question, not this one's",
+        "the state is the state at the forked block, NOT the state at enactment. A referendum \
+         that would enact in a week is previewed against today's balances and today's agenda",
+        "WHERE THERE IS A DIFF AT ALL, IT COVERS THE `apply_extrinsic` PHASE ONLY. The harness \
+         runs `Core_initialize_block` and the inherents and consumes each one's changes into a \
+         storage layer it does not return, so what comes back is the writes of the single \
+         extrinsic that was applied. `diff_status` says which of the five cases this row is and \
+         `diff_covers` says whether that scope reaches this row's own call. Measured 2026-08-18 \
+         from the harness's own source, after the previous version of this line claimed the only \
+         omission was System.Events and that it was not a gap",
+        "THE DIFF BELOW HAS NO System.Events ENTRY, and its absence is the reason \
+         `emitted_events` is trustworthy on a row whose diff is not. The harness's raw answer \
+         does carry that one key with the WHOLE block's events in it — `apply_extrinsic` reads \
+         the existing list and appends to it, so what it writes includes everything \
+         `on_initialize` emitted — and dotlens lifts it out into `emitted_events` and excludes \
+         it from `storage_diff`, because its 'before' is last block's events and tells a reader \
+         nothing",
+        "a diff entry names what the metadata lets it name. A key argument under a NON-CONCAT \
+         hasher (Blake2_128, Twox64, Twox128, Twox256, Blake2_256) keeps no copy of the value it \
+         hashed, so those arguments are reported as unknown rather than guessed — `args_complete` \
+         says which",
+        "`diff_status` distinguishes five things a boolean could not: `decoded` (every phase of \
+         the block was returned and read), `extrinsic_only` (the bytes were read and cover the \
+         applied extrinsic and nothing before it — the ordinary case on the live route), \
+         `undecodable` (a diff came back in a shape this version cannot read; the bytes are \
+         archived and nothing is guessed), `unavailable` (this build of the harness has no diff \
+         method at all) and `refused` (it HAS one and it failed on this block — the ordinary \
+         case for the whole-block method on a PARACHAIN, where the harness builds a block \
+         without set_validation_data and then cannot re-execute it). The events and the dispatch \
+         verdict are read before the diff is asked for and are unaffected by any of them. 'We \
+         did not look', 'nothing changed' and 'we looked at the wrong half' are never the same \
+         value",
+        "runtime CONSTANTS cannot be changed by this tier at all — the harness says so in its \
+         own FAQ, and changing one needs a replacement wasm rather than a storage override",
+        "the harness VERSION is recorded on the row and is NOT part of the cache key, so a \
+         cached answer may have been produced by a different chopsticks than the one installed \
+         now. `harness.version` says which. Unlike a Tier 1 row a fork row is not re-derivable \
+         from archived bytes alone — re-deriving it means re-running it",
+        "a spend that was approved and enacted and then FAILED AT PAYOUT is not this tier's \
+         question and is already answered without simulating anything: \
+         /v1/treasury/{network}/spends/{id} distinguishes SpendProcessed from paid and records \
+         PaymentFailed. Simulation answers 'what WOULD happen', never 'what did'",
+    ]
+}
+
+/// What a fork row does not model, CHOSEN BY ITS ROUTE.
+///
+/// The two routes differ in the one line Tier 1's list opens with. A scheduled
+/// dispatch is not an extrinsic, so no transaction extension runs; an applied
+/// extrinsic runs the whole pipeline with only the signature faked. Serving one
+/// sentence for both would be false half the time, which is the shared-list
+/// defect this project has now shipped five times — so the sentence is selected
+/// from `dispatch_route` rather than worded to cover both.
+pub fn fork_route_not_covered(route: Option<&str>) -> Vec<&'static str> {
+    let mut out = fork_not_covered();
+    match route {
+        Some(sim::ROUTE_DRY_RUN_EXTRINSIC) => {
+            out.push(
+                "this row's call was APPLIED AS AN EXTRINSIC, so unlike every other simulation \
+                 in this project the transaction extensions DID run — nonce, mortality, fee \
+                 withdrawal and weight are real. Only the SIGNATURE is faked, and the fee came \
+                 out of the signer's balance, which is why that account appears in the diff",
+            );
+            out.push(
+                "no scheduler was involved and no agenda entry was written, so this row has no \
+                 `agenda_anchor` and nothing was REPLACED in the chain's own schedule",
+            );
+            out.push(
+                "ON THIS ROUTE AN `extrinsic_only` DIFF IS COMPLETE, not a limitation: the \
+                 subject IS the applied extrinsic, so its whole effect is in the phase the diff \
+                 covers. A whole-block diff here would be worse for attribution — it would mix \
+                 in every pallet's on_initialize bookkeeping, which this call did not do",
+            );
+        }
+        _ => {
+            out.push(
+                "this row's call was DISPATCHED BY THE SCHEDULER, not by the chain: one task was \
+                 written into the agenda under the origin the caller named, at the height \
+                 `agenda_anchor` names — which on a parachain whose scheduler is relay-anchored \
+                 is on the RELAY's number line, and is the parent's value rather than the next \
+                 one, because a scheduler's `now` in `on_initialize` has not seen the block's \
+                 own inherents yet",
+            );
+            out.push(
+                "so NO TRANSACTION EXTENSION RAN: no signature, no nonce, no mortality, no fee, \
+                 no weight limit on the call itself, no tip, no priority and no pool admission. \
+                 The extrinsic in the diff is a no-op whose only job was to make the block \
+                 execute; its signer paid that fee and nothing else, and its keys are marked \
+                 `from_harness`",
+            );
+            out.push(
+                "AND THAT IS WHY AN `extrinsic_only` DIFF ON THIS ROW DOES NOT DESCRIBE ITS CALL. \
+                 The scheduler dispatches in `on_initialize`, which is exactly the phase that \
+                 scope omits, so the entries below would be the NO-OP VEHICLE's writes — its \
+                 fee, its nonce, the block's own bookkeeping. Measured: between a run that \
+                 dispatched nothing and a run that funded a bounty, the diff key set was \
+                 identical while the events grew. `diff_covers` on this row says whether that is \
+                 the case here; where it is, `emitted_events` is the complete record of what the \
+                 call did, and nothing is synthesised to fill the gap",
+            );
+        }
+    }
+    out
+}
+
+/// The limits of a COUNTERFACTUAL — shipped only by rows that have one.
+pub fn counterfactual_not_covered() -> Vec<&'static str> {
+    vec![
+        "EVERY NUMBER DOWNSTREAM OF AN OVERRIDDEN KEY IS FABRICATED. This row is not a record of \
+         anything that happened; it is what a runtime would have done had its storage held what \
+         the `overrides` below say it was told to hold",
+        "each override carries `before`, read from the REAL chain at this block before anything \
+         was forked, beside the value that was injected. A `before` of null means the key did \
+         NOT EXIST on the real chain — the override created it, which is a stronger fabrication \
+         than changing a number",
+        "an override sets ONE key and reconciles nothing around it. Raising a balance does not \
+         update the asset's total supply or its account count, and a runtime that checks those \
+         invariants may behave in ways the real chain never would",
+        "a diff entry marked `from_override: true` has this run's own INJECTED value as its \
+         `before`, not what the chain held. It is a consequence of the counterfactual and reads \
+         like history if the flag is ignored",
     ]
 }
 
@@ -1217,6 +1500,23 @@ pub trait AssetIndex: Send + Sync {
         &self,
         symbol: &str,
     ) -> Result<Vec<(String, AssetRow)>, IndexError>;
+
+    /// Every representation of ONE logical asset, across every chain, found by
+    /// its observer-free name.
+    ///
+    /// **THIS IS THE READER THAT EARNS `assets_absolute_key_idx`**, and the
+    /// distinction matters because migration 0019 deliberately withheld that
+    /// index with the note that the query earning it "does not exist yet and
+    /// should arrive WITH its index" (0013 is the precedent for what happens
+    /// otherwise). Note which query it is: the CONSOLIDATION grouping does NOT
+    /// earn it — that walks a known set of (chain, asset_key) pairs and reaches
+    /// `core.assets` through its primary key. It is this REVERSE lookup —
+    /// "given an absolute name, which representations exist" — that has no
+    /// other path and would otherwise scan.
+    async fn representations(
+        &self,
+        absolute_key: &str,
+    ) -> Result<Vec<(String, AssetRow)>, IndexError>;
 }
 
 #[derive(Default)]
@@ -1266,6 +1566,28 @@ impl AssetIndex for MemoryAssetIndex {
         out.sort_by(|(ac, ar), (bc, br)| (ac, &ar.asset_key).cmp(&(bc, &br.asset_key)));
         Ok(out)
     }
+
+    async fn representations(
+        &self,
+        absolute_key: &str,
+    ) -> Result<Vec<(String, AssetRow)>, IndexError> {
+        let map = self.assets.read().map_err(|e| IndexError(e.to_string()))?;
+        let mut out: Vec<(String, AssetRow)> = map
+            .iter()
+            .flat_map(|(chain, rows)| {
+                rows.iter()
+                    // EXACT match, never a prefix or a contains. An absolute key
+                    // is a canonical rendering, so equality is the whole
+                    // relation — and `search`'s own rule ("NEVER prefix-search
+                    // a hash") applies here for the same reason: a prefix over
+                    // this column is a range scan on an identifier.
+                    .filter(|r| r.absolute_key.as_deref() == Some(absolute_key))
+                    .map(move |r| (chain.clone(), r.clone()))
+            })
+            .collect();
+        out.sort_by(|(ac, ar), (bc, br)| (ac, &ar.asset_key).cmp(&(bc, &br.asset_key)));
+        Ok(out)
+    }
 }
 
 /// One (account, asset) position: the latest anchor at or before the query
@@ -1288,6 +1610,13 @@ pub struct HoldingRow {
     pub anchor_source: Option<String>,
     pub anchor_note: Option<String>,
     pub anchor_status: Option<String>,
+    /// The frozen (locked) portion of a NATIVE-shaped anchor, where the runtime
+    /// exposes one. Recorded since Phase 1 and read by NOTHING until now — which
+    /// was a real gap on a treasury surface, because a position that is largely
+    /// frozen is not a position that can be spent. Null for pallet-assets
+    /// anchors, which have no such column, and null where the runtime does not
+    /// expose it; never zero as a stand-in for either.
+    pub anchor_frozen: Option<String>,
     /// Sum of `balance_changes` strictly after the anchor (and within the
     /// query height, if one was given).
     pub delta_sum: String,
@@ -2250,6 +2579,311 @@ impl GovIndex for MemoryGovIndex {
     }
 }
 
+// ------------------------------------------------------------------- coretime
+
+/// One core's work over a window: how many para-blocks it produced, and for
+/// whom.
+///
+/// `included_blocks` counts `kind = 'included'` ROWS ONLY. `backed` rows sit in
+/// the same table (they are the wasted-coretime signal) and counting them here
+/// would roughly double every figure, because async backing means almost every
+/// inclusion has a backing 2–6 blocks earlier.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct CoreOccupancyRow {
+    pub core_index: u32,
+    pub included_blocks: u64,
+    /// Every para this core carried in the window, ascending.
+    ///
+    /// In the prep's 1,000-block sample every one of the 47 used cores served
+    /// exactly ONE para — core→para rotation is UNEXERCISED on live data, so a
+    /// list with two entries here would be the first live instance of the
+    /// time-ranged half of the core↔chain many-to-many, and is worth noticing
+    /// rather than averaging away.
+    pub paras: Vec<u32>,
+}
+
+/// One dated reading of the denominator.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct CoreConfigRow {
+    pub block_height: u64,
+    pub num_cores: u32,
+    pub runtime_version: u64,
+}
+
+/// How much of the requested window we actually hold.
+///
+/// BOTH NUMBERS MATTER AND THEY ANSWER DIFFERENT QUESTIONS. `blocks_indexed` is
+/// the slot-fill DENOMINATOR — a window with gaps must not be divided by its
+/// nominal span, or the ratio silently drops with every missing block.
+/// `heights_with_occupancy` is the DIAGNOSTIC: a block that is decoded but not
+/// yet coretime-mapped counts in the denominator and contributes nothing, and
+/// the gap between these two is the only way to see that from outside.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub struct WindowCoverage {
+    pub blocks_indexed: u64,
+    pub heights_with_occupancy: u64,
+}
+
+#[async_trait]
+pub trait CoretimeIndex: Send + Sync {
+    /// Per-core inclusion counts over `[from, to]`, ascending by core index.
+    async fn occupancy_by_core(
+        &self,
+        chain_id: &str,
+        from: u64,
+        to: u64,
+    ) -> Result<Vec<CoreOccupancyRow>, IndexError>;
+    /// Row counts per `kind` — so a reader can see how much `backed` and
+    /// `timed_out` sit beside the `included` rows the ratios are built from.
+    async fn kind_counts(
+        &self,
+        chain_id: &str,
+        from: u64,
+        to: u64,
+    ) -> Result<Vec<(String, u64)>, IndexError>;
+    /// How much of the window is indexed, and how much of it carries occupancy.
+    ///
+    /// Reads `core.blocks` even though it lives on the coretime index: the
+    /// slot-fill denominator is a coretime question, and answering it in the
+    /// handler by way of a second index would let the two drift apart on which
+    /// blocks "count".
+    async fn window_coverage(
+        &self,
+        chain_id: &str,
+        from: u64,
+        to: u64,
+    ) -> Result<WindowCoverage, IndexError>;
+    /// The newest reading at or before `height`.
+    async fn core_config_at_or_before(
+        &self,
+        chain_id: &str,
+        height: u64,
+    ) -> Result<Option<CoreConfigRow>, IndexError>;
+    /// The oldest reading strictly after `height` — used ONLY when nothing was
+    /// read at or before it, so a ratio can still be served while saying plainly
+    /// that its denominator was read after the window it divides.
+    async fn core_config_after(
+        &self,
+        chain_id: &str,
+        height: u64,
+    ) -> Result<Option<CoreConfigRow>, IndexError>;
+    /// The highest core index seen in the window ACROSS EVERY KIND.
+    ///
+    /// Deliberately not the max over the inclusion counts: a core that appears
+    /// only in `backed` or `timed_out` rows is still a core the runtime
+    /// scheduled work onto, and the stale-denominator detector must see it. A
+    /// detector that read only inclusions would claim to look at "the data"
+    /// while ignoring rows the same response reports in `by_kind`.
+    async fn max_core_index(
+        &self,
+        chain_id: &str,
+        from: u64,
+        to: u64,
+    ) -> Result<Option<u32>, IndexError>;
+    /// `(runtime_version, mapper_version, rows)` for the window, ascending.
+    ///
+    /// LINEAGE, WHICH INVARIANT 3 REQUIRES OF EVERY ROW AND THEREFORE OF EVERY
+    /// AGGREGATE OVER ROWS. More than one `mapper_version` here means the window
+    /// was mapped under two RULE SETS and the counts are an average of them —
+    /// which is exactly the case where a ratio is not comparable with itself,
+    /// and the one thing a bare percentage can never tell you.
+    async fn occupancy_lineage(
+        &self,
+        chain_id: &str,
+        from: u64,
+        to: u64,
+    ) -> Result<Vec<(u64, u32, u64)>, IndexError>;
+    /// Every DISTINCT `num_cores` value observed inside `[from, to]`, ascending.
+    ///
+    /// More than one means the denominator MOVED inside the window — `num_cores`
+    /// is host configuration that changes at session boundaries — and a single
+    /// ratio across it is an average of two different questions. The handler
+    /// reports it rather than picking a winner quietly.
+    async fn num_cores_in_window(
+        &self,
+        chain_id: &str,
+        from: u64,
+        to: u64,
+    ) -> Result<Vec<u32>, IndexError>;
+}
+
+#[derive(Default)]
+pub struct MemoryCoretimeIndex {
+    /// (chain, height, event_index) → (kind, core, para)
+    rows: RwLock<Vec<(String, u64, u32, String, u32, u32)>>,
+    configs: RwLock<Vec<(String, CoreConfigRow)>>,
+    /// Heights present in `core.blocks`, as far as this index is concerned.
+    indexed: RwLock<Vec<(String, u64)>>,
+}
+
+impl MemoryCoretimeIndex {
+    pub fn new() -> Self {
+        Self::default()
+    }
+    pub fn insert_row(
+        &self,
+        chain_id: &str,
+        height: u64,
+        event_index: u32,
+        kind: &str,
+        core_index: u32,
+        para_id: u32,
+    ) {
+        self.rows.write().expect("lock").push((
+            chain_id.into(),
+            height,
+            event_index,
+            kind.into(),
+            core_index,
+            para_id,
+        ));
+    }
+    pub fn insert_config(&self, chain_id: &str, row: CoreConfigRow) {
+        self.configs.write().expect("lock").push((chain_id.into(), row));
+    }
+    pub fn insert_indexed_height(&self, chain_id: &str, height: u64) {
+        self.indexed.write().expect("lock").push((chain_id.into(), height));
+    }
+}
+
+#[async_trait]
+impl CoretimeIndex for MemoryCoretimeIndex {
+    async fn occupancy_by_core(
+        &self,
+        chain_id: &str,
+        from: u64,
+        to: u64,
+    ) -> Result<Vec<CoreOccupancyRow>, IndexError> {
+        let rows = self.rows.read().map_err(|e| IndexError(e.to_string()))?;
+        let mut by_core: std::collections::BTreeMap<u32, (u64, std::collections::BTreeSet<u32>)> = std::collections::BTreeMap::new();
+        for (c, h, _, kind, core, para) in rows.iter() {
+            if c != chain_id || *h < from || *h > to || kind != "included" {
+                continue;
+            }
+            let e = by_core.entry(*core).or_insert_with(|| (0, std::collections::BTreeSet::new()));
+            e.0 += 1;
+            e.1.insert(*para);
+        }
+        Ok(by_core
+            .into_iter()
+            .map(|(core_index, (included_blocks, paras))| CoreOccupancyRow {
+                core_index,
+                included_blocks,
+                paras: paras.into_iter().collect(),
+            })
+            .collect())
+    }
+
+    async fn kind_counts(
+        &self,
+        chain_id: &str,
+        from: u64,
+        to: u64,
+    ) -> Result<Vec<(String, u64)>, IndexError> {
+        let rows = self.rows.read().map_err(|e| IndexError(e.to_string()))?;
+        let mut counts: std::collections::BTreeMap<String, u64> = std::collections::BTreeMap::new();
+        for (c, h, _, kind, _, _) in rows.iter() {
+            if c != chain_id || *h < from || *h > to {
+                continue;
+            }
+            *counts.entry(kind.clone()).or_default() += 1;
+        }
+        Ok(counts.into_iter().collect())
+    }
+
+    async fn window_coverage(
+        &self,
+        chain_id: &str,
+        from: u64,
+        to: u64,
+    ) -> Result<WindowCoverage, IndexError> {
+        let indexed = self.indexed.read().map_err(|e| IndexError(e.to_string()))?;
+        let blocks: std::collections::BTreeSet<u64> = indexed
+            .iter()
+            .filter(|(c, h)| c == chain_id && *h >= from && *h <= to)
+            .map(|(_, h)| *h)
+            .collect();
+        let rows = self.rows.read().map_err(|e| IndexError(e.to_string()))?;
+        let with_rows: std::collections::BTreeSet<u64> = rows
+            .iter()
+            .filter(|(c, h, ..)| c == chain_id && *h >= from && *h <= to)
+            .map(|(_, h, ..)| *h)
+            .collect();
+        Ok(WindowCoverage {
+            blocks_indexed: blocks.len() as u64,
+            heights_with_occupancy: with_rows.len() as u64,
+        })
+    }
+
+    async fn core_config_at_or_before(
+        &self,
+        chain_id: &str,
+        height: u64,
+    ) -> Result<Option<CoreConfigRow>, IndexError> {
+        let configs = self.configs.read().map_err(|e| IndexError(e.to_string()))?;
+        Ok(configs
+            .iter()
+            .filter(|(c, r)| c == chain_id && r.block_height <= height)
+            .max_by_key(|(_, r)| r.block_height)
+            .map(|(_, r)| r.clone()))
+    }
+
+    async fn core_config_after(
+        &self,
+        chain_id: &str,
+        height: u64,
+    ) -> Result<Option<CoreConfigRow>, IndexError> {
+        let configs = self.configs.read().map_err(|e| IndexError(e.to_string()))?;
+        Ok(configs
+            .iter()
+            .filter(|(c, r)| c == chain_id && r.block_height > height)
+            .min_by_key(|(_, r)| r.block_height)
+            .map(|(_, r)| r.clone()))
+    }
+
+    async fn max_core_index(
+        &self,
+        chain_id: &str,
+        from: u64,
+        to: u64,
+    ) -> Result<Option<u32>, IndexError> {
+        let rows = self.rows.read().map_err(|e| IndexError(e.to_string()))?;
+        Ok(rows
+            .iter()
+            .filter(|(c, h, ..)| c == chain_id && *h >= from && *h <= to)
+            .map(|(_, _, _, _, core, _)| *core)
+            .max())
+    }
+
+    async fn occupancy_lineage(
+        &self,
+        chain_id: &str,
+        from: u64,
+        to: u64,
+    ) -> Result<Vec<(u64, u32, u64)>, IndexError> {
+        // The memory index carries no per-row lineage — it exists to exercise
+        // the HANDLER, and a fabricated runtime version would be worse than an
+        // absence. The handler renders an empty list as "no lineage recorded".
+        let _ = (chain_id, from, to);
+        Ok(vec![])
+    }
+
+    async fn num_cores_in_window(
+        &self,
+        chain_id: &str,
+        from: u64,
+        to: u64,
+    ) -> Result<Vec<u32>, IndexError> {
+        let configs = self.configs.read().map_err(|e| IndexError(e.to_string()))?;
+        let set: std::collections::BTreeSet<u32> = configs
+            .iter()
+            .filter(|(c, r)| c == chain_id && r.block_height >= from && r.block_height <= to)
+            .map(|(_, r)| r.num_cores)
+            .collect();
+        Ok(set.into_iter().collect())
+    }
+}
+
 // -------------------------------------------------------------------- pg impl
 
 #[cfg(feature = "pg")]
@@ -2587,18 +3221,20 @@ pub mod pg {
             account_id: &[u8],
             asset: &str,
         ) -> Result<Vec<super::BalanceAnchorRow>, IndexError> {
+            // height, free, reserved, total, frozen, spec, source, note, status
             let rows: Vec<(
                 i64,
                 String,
                 String,
                 String,
+                Option<String>,
                 Option<i64>,
                 String,
                 Option<String>,
                 Option<String>,
             )> = sqlx::query_as(
                 "select block_height, free::text, reserved::text, total::text, \
-                            spec_version, source, note, status \
+                            frozen::text, spec_version, source, note, status \
                      from balances.balance_anchors \
                      where chain_id = $1 and account_id = $2 and asset = $3 \
                      order by block_height",
@@ -2611,12 +3247,13 @@ pub mod pg {
             .map_err(|e| IndexError(e.to_string()))?;
             Ok(rows
                 .into_iter()
-                .map(|(height, free, reserved, total, spec, source, note, status)| {
+                .map(|(height, free, reserved, total, frozen, spec, source, note, status)| {
                     super::BalanceAnchorRow {
                         height: height as u64,
                         free,
                         reserved,
                         total,
+                        frozen,
                         spec_version: spec.map(|s| s as u64),
                         source,
                         note,
@@ -2646,12 +3283,15 @@ pub mod pg {
             if accounts.is_empty() {
                 return Ok(vec![]);
             }
+            // account_id, asset, total, height, spec, source, note, status,
+            // frozen, delta_sum, delta_count, last_height
             type Row = (
                 Vec<u8>,
                 String,
                 Option<String>,
                 Option<i64>,
                 Option<i64>,
+                Option<String>,
                 Option<String>,
                 Option<String>,
                 Option<String>,
@@ -2675,7 +3315,8 @@ pub mod pg {
                       anch as ( \
                         select distinct on (p.account_id, p.asset) \
                                p.account_id, p.asset, a.total::text as total, \
-                               a.block_height, a.spec_version, a.source, a.note, a.status \
+                               a.block_height, a.spec_version, a.source, a.note, a.status, \
+                               a.frozen::text as frozen \
                           from pairs p \
                           left join balances.balance_anchors a \
                             on a.chain_id = $1 and a.account_id = p.account_id \
@@ -2685,6 +3326,7 @@ pub mod pg {
                       ) \
                  select anch.account_id, anch.asset, anch.total, anch.block_height, \
                         anch.spec_version, anch.source, anch.note, anch.status, \
+                        anch.frozen, \
                         coalesce(d.delta_sum, '0') as delta_sum, \
                         coalesce(d.delta_count, 0) as delta_count, d.last_height \
                    from anch \
@@ -2717,6 +3359,7 @@ pub mod pg {
                         source,
                         note,
                         status,
+                        frozen,
                         delta_sum,
                         delta_count,
                         last_height,
@@ -2729,6 +3372,7 @@ pub mod pg {
                         anchor_source: source,
                         anchor_note: note,
                         anchor_status: status,
+                        anchor_frozen: frozen,
                         delta_sum: delta_sum.unwrap_or_else(|| "0".into()),
                         delta_count: delta_count as u64,
                         last_delta_height: last_height.map(|h| h as u64),
@@ -2879,6 +3523,221 @@ pub mod pg {
         }
     }
 
+    /// Postgres-backed core-occupancy reads over `coretime.core_occupancy` and
+    /// `coretime.core_config`.
+    ///
+    /// EVERY QUERY HERE IS A RANGE SCAN ON AN INDEX 0024 CREATED WITH ITS
+    /// READER, and this is that reader: `core_occupancy_core_idx (chain_id,
+    /// core_index, block_height)` serves the per-core grouping, and the
+    /// `core_config` probes ride its primary key.
+    pub struct PgCoretimeIndex {
+        pool: PgPool,
+    }
+
+    impl PgCoretimeIndex {
+        pub fn new(pool: PgPool) -> Self {
+            Self { pool }
+        }
+    }
+
+    #[async_trait]
+    impl super::CoretimeIndex for PgCoretimeIndex {
+        async fn occupancy_by_core(
+            &self,
+            chain_id: &str,
+            from: u64,
+            to: u64,
+        ) -> Result<Vec<super::CoreOccupancyRow>, IndexError> {
+            // `kind = 'included'` IS THE WHOLE RATIO. `backed` rows live in the
+            // same table on purpose (backed-without-included is the
+            // wasted-coretime signal) and counting them here would roughly
+            // double every figure, because async backing puts a backing 2-6
+            // blocks before nearly every inclusion.
+            let rows: Vec<(i32, i64, Vec<i32>)> = sqlx::query_as(
+                "select core_index, count(*), array_agg(distinct para_id order by para_id) \
+                 from coretime.core_occupancy \
+                 where chain_id = $1 and block_height between $2 and $3 and kind = 'included' \
+                 group by core_index order by core_index",
+            )
+            .bind(chain_id)
+            .bind(from as i64)
+            .bind(to as i64)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| IndexError(e.to_string()))?;
+            Ok(rows
+                .into_iter()
+                .map(|(core, n, paras)| super::CoreOccupancyRow {
+                    core_index: core as u32,
+                    included_blocks: n as u64,
+                    paras: paras.into_iter().map(|p| p as u32).collect(),
+                })
+                .collect())
+        }
+
+        async fn kind_counts(
+            &self,
+            chain_id: &str,
+            from: u64,
+            to: u64,
+        ) -> Result<Vec<(String, u64)>, IndexError> {
+            let rows: Vec<(String, i64)> = sqlx::query_as(
+                "select kind, count(*) from coretime.core_occupancy \
+                 where chain_id = $1 and block_height between $2 and $3 \
+                 group by kind order by kind collate \"C\"",
+            )
+            .bind(chain_id)
+            .bind(from as i64)
+            .bind(to as i64)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| IndexError(e.to_string()))?;
+            Ok(rows.into_iter().map(|(k, n)| (k, n as u64)).collect())
+        }
+
+        async fn window_coverage(
+            &self,
+            chain_id: &str,
+            from: u64,
+            to: u64,
+        ) -> Result<super::WindowCoverage, IndexError> {
+            // TWO COUNTS, ONE ROUND TRIP. The first is the slot-fill
+            // denominator; the second is how a reader sees that the mapper is
+            // behind the block index without being told.
+            //
+            // `and finalized` MATCHES THE NUMERATOR'S OWN FILTER. The event
+            // source this module maps from reads finalized rows only, so
+            // counting unfinalized tip blocks in the denominator would add 2-3
+            // core-block slots that can never be filled by construction — a
+            // ratio that sags at the tip for a reason nobody could see.
+            let (blocks, with_rows): (i64, i64) = sqlx::query_as(
+                "select \
+                   (select count(*) from core.blocks \
+                     where chain_id = $1 and height between $2 and $3 and finalized), \
+                   (select count(distinct block_height) from coretime.core_occupancy \
+                     where chain_id = $1 and block_height between $2 and $3)",
+            )
+            .bind(chain_id)
+            .bind(from as i64)
+            .bind(to as i64)
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|e| IndexError(e.to_string()))?;
+            Ok(super::WindowCoverage {
+                blocks_indexed: blocks as u64,
+                heights_with_occupancy: with_rows as u64,
+            })
+        }
+
+        async fn core_config_at_or_before(
+            &self,
+            chain_id: &str,
+            height: u64,
+        ) -> Result<Option<super::CoreConfigRow>, IndexError> {
+            let row: Option<(i64, i32, i64)> = sqlx::query_as(
+                "select block_height, num_cores, runtime_version from coretime.core_config \
+                 where chain_id = $1 and block_height <= $2 \
+                 order by block_height desc limit 1",
+            )
+            .bind(chain_id)
+            .bind(height as i64)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| IndexError(e.to_string()))?;
+            Ok(row.map(|(h, n, rv)| super::CoreConfigRow {
+                block_height: h as u64,
+                num_cores: n as u32,
+                runtime_version: rv as u64,
+            }))
+        }
+
+        async fn core_config_after(
+            &self,
+            chain_id: &str,
+            height: u64,
+        ) -> Result<Option<super::CoreConfigRow>, IndexError> {
+            let row: Option<(i64, i32, i64)> = sqlx::query_as(
+                "select block_height, num_cores, runtime_version from coretime.core_config \
+                 where chain_id = $1 and block_height > $2 \
+                 order by block_height limit 1",
+            )
+            .bind(chain_id)
+            .bind(height as i64)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| IndexError(e.to_string()))?;
+            Ok(row.map(|(h, n, rv)| super::CoreConfigRow {
+                block_height: h as u64,
+                num_cores: n as u32,
+                runtime_version: rv as u64,
+            }))
+        }
+
+        async fn max_core_index(
+            &self,
+            chain_id: &str,
+            from: u64,
+            to: u64,
+        ) -> Result<Option<u32>, IndexError> {
+            // NO `kind` FILTER, unlike `occupancy_by_core`. See the trait.
+            let row: (Option<i32>,) = sqlx::query_as(
+                "select max(core_index) from coretime.core_occupancy \
+                 where chain_id = $1 and block_height between $2 and $3",
+            )
+            .bind(chain_id)
+            .bind(from as i64)
+            .bind(to as i64)
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|e| IndexError(e.to_string()))?;
+            Ok(row.0.map(|n| n as u32))
+        }
+
+        async fn occupancy_lineage(
+            &self,
+            chain_id: &str,
+            from: u64,
+            to: u64,
+        ) -> Result<Vec<(u64, u32, u64)>, IndexError> {
+            let rows: Vec<(i64, i32, i64)> = sqlx::query_as(
+                "select runtime_version, mapper_version, count(*) \
+                 from coretime.core_occupancy \
+                 where chain_id = $1 and block_height between $2 and $3 \
+                 group by runtime_version, mapper_version \
+                 order by runtime_version, mapper_version",
+            )
+            .bind(chain_id)
+            .bind(from as i64)
+            .bind(to as i64)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| IndexError(e.to_string()))?;
+            Ok(rows
+                .into_iter()
+                .map(|(rv, mv, n)| (rv as u64, mv as u32, n as u64))
+                .collect())
+        }
+
+        async fn num_cores_in_window(
+            &self,
+            chain_id: &str,
+            from: u64,
+            to: u64,
+        ) -> Result<Vec<u32>, IndexError> {
+            let rows: Vec<(i32,)> = sqlx::query_as(
+                "select distinct num_cores from coretime.core_config \
+                 where chain_id = $1 and block_height between $2 and $3 order by num_cores",
+            )
+            .bind(chain_id)
+            .bind(from as i64)
+            .bind(to as i64)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| IndexError(e.to_string()))?;
+            Ok(rows.into_iter().map(|(n,)| n as u32).collect())
+        }
+    }
+
     /// Postgres-backed simulation reads over `sim.simulation_results`.
     pub struct PgSimIndex {
         pool: PgPool,
@@ -2897,7 +3756,8 @@ pub mod pg {
          call_summary, origin_spec, origin_json, xcm_version, status, dispatch_ok, \
          dispatch_error, emitted_events, event_count, local_xcm, forwarded_xcms, effects, note, \
          spec_version, api_version, metadata_version, sim_version, raw_location, observed_at, \
-         baseline_input_hash";
+         baseline_input_hash, overrides, override_hash, storage_diff, storage_diff_count, \
+         diff_status, built_block_hash, harness, dispatch_route, agenda_anchor";
 
     fn sim_row(r: &sqlx::postgres::PgRow) -> Result<super::SimulationRow, IndexError> {
         use sqlx::Row as _;
@@ -2912,23 +3772,46 @@ pub mod pg {
             call_summary: r.try_get("call_summary").map_err(err)?,
             origin_spec: r.try_get("origin_spec").map_err(err)?,
             origin: r.try_get("origin_json").map_err(err)?,
-            xcm_version: r.try_get::<i32, _>("xcm_version").map_err(err)? as u32,
+            // Nullable since 0021 — read as Option, never defaulted: a NULL read
+            // as 0 would put "XCM v0" and "DryRunApi v0" on a fork row that
+            // called neither.
+            xcm_version: r
+                .try_get::<Option<i32>, _>("xcm_version")
+                .map_err(err)?
+                .map(|n| n as u32),
             status: r.try_get("status").map_err(err)?,
             dispatch_ok: r.try_get("dispatch_ok").map_err(err)?,
             dispatch_error: r.try_get("dispatch_error").map_err(err)?,
             emitted_events: r.try_get("emitted_events").map_err(err)?,
             event_count: r.try_get::<i32, _>("event_count").map_err(err)? as u32,
             local_xcm: r.try_get("local_xcm").map_err(err)?,
+            // Nullable since 0021 — a fork row HAS no forwarded list, and reading
+            // it as a bare Value makes sqlx error on the NULL. Option, never Some().
             forwarded_xcms: r.try_get("forwarded_xcms").map_err(err)?,
             effects: r.try_get("effects").map_err(err)?,
             note: r.try_get("note").map_err(err)?,
             spec_version: r.try_get::<i64, _>("spec_version").map_err(err)? as u64,
-            api_version: r.try_get::<i32, _>("api_version").map_err(err)? as u32,
+            api_version: r
+                .try_get::<Option<i32>, _>("api_version")
+                .map_err(err)?
+                .map(|n| n as u32),
             metadata_version: r.try_get::<i32, _>("metadata_version").map_err(err)? as u32,
             sim_version: r.try_get::<i32, _>("sim_version").map_err(err)? as u32,
             raw_location: r.try_get("raw_location").map_err(err)?,
             observed_at: r.try_get("observed_at").map_err(err)?,
             baseline_input_hash: r.try_get("baseline_input_hash").map_err(err)?,
+            overrides: r.try_get("overrides").map_err(err)?,
+            override_hash: r.try_get("override_hash").map_err(err)?,
+            storage_diff: r.try_get("storage_diff").map_err(err)?,
+            storage_diff_count: r
+                .try_get::<Option<i32>, _>("storage_diff_count")
+                .map_err(err)?
+                .map(|n| n as u32),
+            diff_status: r.try_get("diff_status").map_err(err)?,
+            built_block_hash: r.try_get("built_block_hash").map_err(err)?,
+            harness: r.try_get("harness").map_err(err)?,
+            dispatch_route: r.try_get("dispatch_route").map_err(err)?,
+            agenda_anchor: r.try_get("agenda_anchor").map_err(err)?,
         })
     }
 
@@ -3163,10 +4046,14 @@ pub mod pg {
                 Option<String>,
                 Option<String>,
                 Option<serde_json::Value>,
+                Option<String>,
+                Option<serde_json::Value>,
+                Option<String>,
             );
             let rows: Vec<Row> = sqlx::query_as(
                 "select chain_id, asset_key, representation_kind, symbol, name, decimals, \
-                        supply::text, status, location_key, xcm_location \
+                        supply::text, status, location_key, xcm_location, \
+                        absolute_key, absolute_location, asset_type \
                  from core.assets where lower(symbol) = lower($1) \
                  order by chain_id collate \"C\", asset_key collate \"C\"",
             )
@@ -3188,6 +4075,9 @@ pub mod pg {
                         status,
                         location_key,
                         xcm_location,
+                        absolute_key,
+                        absolute_location,
+                        asset_type,
                     )| {
                         (
                             chain_id,
@@ -3201,6 +4091,9 @@ pub mod pg {
                                 status,
                                 location_key,
                                 xcm_location,
+                                absolute_key,
+                                absolute_location,
+                                asset_type,
                             },
                         )
                     },
@@ -3219,10 +4112,14 @@ pub mod pg {
                 Option<String>,
                 Option<String>,
                 Option<serde_json::Value>,
+                Option<String>,
+                Option<serde_json::Value>,
+                Option<String>,
             );
             let rows: Vec<Row> = sqlx::query_as(
                 "select asset_key, representation_kind, symbol, name, decimals, \
-                        supply::text, status, location_key, xcm_location \
+                        supply::text, status, location_key, xcm_location, \
+                        absolute_key, absolute_location, asset_type \
                  from core.assets where chain_id = $1 order by asset_key collate \"C\"",
             )
             .bind(chain_id)
@@ -3242,6 +4139,9 @@ pub mod pg {
                         status,
                         location_key,
                         xcm_location,
+                        absolute_key,
+                        absolute_location,
+                        asset_type,
                     )| super::AssetRow {
                         asset_key,
                         representation_kind,
@@ -3252,6 +4152,84 @@ pub mod pg {
                         status,
                         location_key,
                         xcm_location,
+                        absolute_key,
+                        absolute_location,
+                        asset_type,
+                    },
+                )
+                .collect())
+        }
+
+        /// The reader migration 0020's index exists for. `absolute_key = $1` is
+        /// spelled plainly — no `lower()`, no cast — so the plain btree index is
+        /// usable; a functional index is only used when the query spells the
+        /// expression the same way, which is why `assets_by_symbol` above says
+        /// `lower(symbol)` and this does not.
+        async fn representations(
+            &self,
+            absolute_key: &str,
+        ) -> Result<Vec<(String, super::AssetRow)>, IndexError> {
+            type Row = (
+                String,
+                String,
+                String,
+                Option<String>,
+                Option<String>,
+                Option<i32>,
+                Option<String>,
+                Option<String>,
+                Option<String>,
+                Option<serde_json::Value>,
+                Option<String>,
+                Option<serde_json::Value>,
+                Option<String>,
+            );
+            let rows: Vec<Row> = sqlx::query_as(
+                "select chain_id, asset_key, representation_kind, symbol, name, decimals, \
+                        supply::text, status, location_key, xcm_location, \
+                        absolute_key, absolute_location, asset_type \
+                 from core.assets where absolute_key = $1 \
+                 order by chain_id collate \"C\", asset_key collate \"C\"",
+            )
+            .bind(absolute_key)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| IndexError(e.to_string()))?;
+            Ok(rows
+                .into_iter()
+                .map(
+                    |(
+                        chain_id,
+                        asset_key,
+                        representation_kind,
+                        symbol,
+                        name,
+                        decimals,
+                        supply,
+                        status,
+                        location_key,
+                        xcm_location,
+                        absolute_key,
+                        absolute_location,
+                        asset_type,
+                    )| {
+                        (
+                            chain_id,
+                            super::AssetRow {
+                                asset_key,
+                                representation_kind,
+                                symbol,
+                                name,
+                                decimals: decimals.map(|d| d as u32),
+                                supply,
+                                status,
+                                location_key,
+                                xcm_location,
+                                absolute_key,
+                                absolute_location,
+                                asset_type,
+                            },
+                        )
                     },
                 )
                 .collect())
@@ -4291,6 +5269,7 @@ pub struct AppState {
     pub sim: Arc<dyn SimIndex>,
     pub xcm_sim: Arc<dyn XcmSimIndex>,
     pub xcm: Arc<dyn XcmIndex>,
+    pub coretime: Arc<dyn CoretimeIndex>,
     pub parse_account: AccountParser,
 }
 
@@ -4312,6 +5291,11 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/treasury/{network}/spends/{id}", get(get_treasury_spend))
         .route("/v1/treasury/{network}/pot", get(get_treasury_pot))
         .route("/v1/treasury/{network}/holdings", get(get_treasury_holdings))
+        .route(
+            "/v1/treasury/{network}/consolidated",
+            get(get_treasury_consolidated),
+        )
+        .route("/v1/assets/identity", get(get_asset_identity))
         .route("/v1/bounties/{network}", get(list_bounties))
         .route("/v1/bounties/{network}/{id}", get(get_bounty))
         .route("/v1/assets/{chain}", get(list_assets))
@@ -4320,6 +5304,10 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/xcm/{chain}/messages", get(list_xcm_messages))
         .route("/v1/xcm/messages/{message_id}", get(get_xcm_message))
         .route("/v1/xcm/journeys/{message_id}", get(get_xcm_journey))
+        .route(
+            "/v1/coretime/{chain}/occupancy",
+            get(get_coretime_occupancy),
+        )
         .route("/v1/search", get(get_search))
         .route("/v1/domains/{network}/{domain}", get(resolve_domain))
         .with_state(state)
@@ -4941,6 +5929,35 @@ async fn get_gov_referendum(
             .then_with(|| a.tier.cmp(&b.tier))
     });
 
+    // EVERY ROW GETS THE SAME ENRICHMENT IT GETS ON /v1/sim/…, through the same
+    // function. Before slice 10 this page serialized the rows RAW: a fork row
+    // appeared here with no `tier_coverage`, no `diff_covers` and — the sharp
+    // one — a counterfactual's `overrides` with no `is_counterfactual` marker,
+    // i.e. fabricated state rendered unlabelled on a governance page.
+    let simulations: Vec<serde_json::Value> = simulations
+        .iter()
+        .map(|row| {
+            let mut value = serde_json::to_value(row).unwrap_or_else(|_| serde_json::json!({}));
+            if let Some(obj) = value.as_object_mut() {
+                enrich_simulation(row, obj);
+            }
+            value
+        })
+        .collect();
+    // A fork row on this page must not be described by the DRY-RUN list, whose
+    // second line ("the call is dispatched directly") is false of this tier on
+    // either route. Each row already carries its own in `tier_coverage`; this
+    // says so rather than letting the response-level list read as complete.
+    let has_fork = simulations
+        .iter()
+        .any(|s| s["tier"] == sim::TIER_FORK);
+    let tiers_carry_their_own = has_fork.then_some(
+        "at least one row below is a `fork` row, whose limits are different IN KIND from the \
+         dry-run tier's — not a subset. `not_covered` here describes the dry-run tier only; \
+         read each row's own `tier_coverage.not_covered`, and its `diff_covers` for whether \
+         its storage diff describes the call at all",
+    );
+
     // Three different situations that all produce an empty list, and they are
     // NOT the same claim. Saying "nobody previewed this" when we never had a
     // hash to look one up by would be asserting something we did not check.
@@ -4953,8 +5970,10 @@ async fn get_gov_referendum(
             "not_covered": sim_not_covered(),
         }),
         (Some(_), true) => serde_json::json!({
-            "recorded_only": "no Tier 1 preview has been run for this proposal; that is an \
-                              absence of simulations, not a claim about the call",
+            // NOT "no Tier 1 preview": this list is untiered, so an empty one
+            // means nobody previewed the call on ANY tier.
+            "recorded_only": "no preview of any tier has been run for this proposal; that is \
+                              an absence of simulations, not a claim about the call",
             "not_covered": sim_not_covered(),
         }),
         (Some(_), false) => serde_json::json!({
@@ -4966,12 +5985,16 @@ async fn get_gov_referendum(
             // raw `forwarded_xcms` on each row below is exactly what the
             // not_covered list warns it is, and the endpoint that differences it
             // is named rather than implied.
-            "attribution_elsewhere": "each simulation here carries its raw forwarded_xcms, \
+            "attribution_elsewhere": "each DRY-RUN simulation here carries its raw forwarded_xcms \
+                                      (a fork row has none at all), \
                                       which is NOT attributable to the call on its own. \
                                       /v1/sim/{chain}/calls/{call_hash} differences it \
                                       against the recorded no-op baseline and reports the \
                                       previewed arrivals",
             "not_covered": sim_not_covered(),
+            // Emitted only when a fork row is actually present, because a line
+            // that names a tier belongs on a response that has one.
+            "tiers_carry_their_own": tiers_carry_their_own,
         }),
     };
 
@@ -4991,6 +6014,312 @@ async fn get_gov_referendum(
 #[derive(Deserialize)]
 struct SimQuery {
     limit: Option<u64>,
+    /// dry_run | fork. 0014 deferred this knob with the note that it "ships with
+    /// Tier 2, which is also what makes it selective" — this is that slice, and
+    /// leaving it out would have made that comment the stale kind this project
+    /// keeps having to correct. Absent = both tiers, which is the useful default:
+    /// a call previewed two ways is two answers worth seeing together.
+    tier: Option<String>,
+}
+
+/// `?from=&to=` — the window an occupancy ratio is computed over. Both are
+/// required; see the handler for why there is no default.
+#[derive(Deserialize)]
+struct CoretimeQuery {
+    from: Option<u64>,
+    to: Option<u64>,
+}
+
+/// The widest window this endpoint will aggregate in one request.
+///
+/// The RESPONSE is bounded by `num_cores` however wide the window, so this is
+/// not about payload size — it is about a `group by` over a partition scan that
+/// nobody meant to ask for. The prep's own sample was 1,000 blocks.
+const CORETIME_MAX_SPAN: u64 = 250_000;
+
+/// Core occupancy over a relay window — TWO ratios, never one.
+///
+/// ---------------------------------------------------------------------------
+/// THE TWO RATIOS ARE THE PRODUCT CLAIM, AND THEY ARE NOT THE SAME NUMBER.
+///
+/// Measured over the contiguous 1,000 relay blocks 32613537-32614536:
+/// **47 of 100 declared cores produced anything (47.0%)** while only **34.69% of
+/// core-block slots were filled** (34,690 of 1,000 x 100). The gap is the
+/// finding — even the cores that are used sit idle — and a single `utilization`
+/// field would report one of those and call it the other, throwing away the only
+/// figure here that no marketplace view has.
+///
+/// So this handler serves both, each beside the two integers it was computed
+/// from, and the per-core distribution underneath: 10 cores saturated, 19 at
+/// 75-95%, 4 at 50-75%, 12 at 25-50%, 2 under 5%, and 53 producing nothing at
+/// all. That shape is the answer to "is coretime working", and an average of it
+/// is not.
+///
+/// ---------------------------------------------------------------------------
+/// AND THE DENOMINATOR CARRIES ITS OWN PROVENANCE, because it moves.
+///
+/// `num_cores` is host configuration read at a BLOCK; the prep read it at
+/// exactly one (#32614536 -> 100) and named a stale denominator as a live risk.
+/// Every ratio here names which reading it divided by, where that reading sits
+/// relative to the window, and whether the window contains readings that
+/// DISAGREE. With no reading at all the counts are still served and the ratios
+/// are `null` — refusing a ratio is this project's answer to not having a
+/// denominator, and inventing one is not.
+async fn get_coretime_occupancy(
+    State(state): State<AppState>,
+    Path(chain): Path<String>,
+    Query(q): Query<CoretimeQuery>,
+) -> Response {
+    let Some(cfg) = state.registry.chain(&chain) else {
+        return error(StatusCode::NOT_FOUND, format!("unknown chain '{chain}'"));
+    };
+    // A REGISTERED PARACHAIN IS A 404 WITH A REASON, not an empty window.
+    // `paraInclusion` is a relay pallet, so a parachain has no candidate events
+    // at all — and an empty response here would read as "this chain's cores did
+    // nothing", which is a claim about the network rather than about us.
+    if !cfg.has_module("coretime") {
+        return error(
+            StatusCode::NOT_FOUND,
+            format!(
+                "'{chain}' does not declare the `coretime` module. Core occupancy is read from \
+                 `paraInclusion`, a RELAY pallet that names both the para id and the core index, \
+                 so it is answered by the relay and not by the parachain that ran on the core"
+            ),
+        );
+    }
+    let (Some(from), Some(to)) = (q.from, q.to) else {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "both `from` and `to` are required: an occupancy ratio is only meaningful over a \
+             stated window, and defaulting to one would put a window nobody chose underneath a \
+             percentage somebody quotes"
+                .to_string(),
+        );
+    };
+    if from > to {
+        return error(StatusCode::BAD_REQUEST, "`from` must not exceed `to`".to_string());
+    }
+    // `to - from` is already non-negative, but `?to=18446744073709551615` makes
+    // `+ 1` overflow: a debug build panics inside a public GET and a release
+    // build wraps to zero, passes the limit check and binds `to as i64 == -1`.
+    let span = (to - from).saturating_add(1);
+    if span > CORETIME_MAX_SPAN {
+        return error(
+            StatusCode::BAD_REQUEST,
+            format!("window of {span} blocks exceeds the {CORETIME_MAX_SPAN}-block limit"),
+        );
+    }
+
+    let ise = |e: IndexError| error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string());
+    let cores = match state.coretime.occupancy_by_core(&chain, from, to).await {
+        Ok(c) => c,
+        Err(e) => return ise(e),
+    };
+    let kinds = match state.coretime.kind_counts(&chain, from, to).await {
+        Ok(k) => k,
+        Err(e) => return ise(e),
+    };
+    let coverage = match state.coretime.window_coverage(&chain, from, to).await {
+        Ok(c) => c,
+        Err(e) => return ise(e),
+    };
+    // The reading that DATES the ratio: the newest at or before the window's
+    // end, because that is the configuration the window ran under.
+    let at_or_before = match state.coretime.core_config_at_or_before(&chain, to).await {
+        Ok(c) => c,
+        Err(e) => return ise(e),
+    };
+    let (config, position) = match at_or_before {
+        Some(c) if c.block_height >= from => (Some(c), "inside_window"),
+        Some(c) => (Some(c), "before_window"),
+        None => match state.coretime.core_config_after(&chain, to).await {
+            Ok(Some(c)) => (Some(c), "after_window"),
+            Ok(None) => (None, "none"),
+            Err(e) => return ise(e),
+        },
+    };
+    let readings_in_window = match state.coretime.num_cores_in_window(&chain, from, to).await {
+        Ok(v) => v,
+        Err(e) => return ise(e),
+    };
+
+    // ACROSS EVERY KIND, not just the inclusions the ratios count — see below.
+    let max_core_seen = match state.coretime.max_core_index(&chain, from, to).await {
+        Ok(m) => m,
+        Err(e) => return ise(e),
+    };
+    let lineage = match state.coretime.occupancy_lineage(&chain, from, to).await {
+        Ok(l) => l,
+        Err(e) => return ise(e),
+    };
+
+    // NULL, NOT `true`, WHEN NOTHING WAS READ INSIDE THE WINDOW. "No reading
+    // fell in this window" and "the readings that did agree" are different
+    // claims, and rendering the first as the second would put a confident
+    // stability flag on exactly the case the flag exists to warn about.
+    let stable_across_window = if readings_in_window.is_empty() {
+        None
+    } else {
+        Some(readings_in_window.len() <= 1)
+    };
+
+    let included: u64 = cores.iter().map(|c| c.included_blocks).sum();
+    let cores_used = cores.len() as u64;
+    let num_cores = config.as_ref().map(|c| c.num_cores);
+
+    // A CORE INDEX AT OR ABOVE THE DENOMINATOR IS A CONTRADICTION, and it is the
+    // one detector for the stale-denominator risk 0024 names that costs nothing:
+    // the runtime scheduled work onto a core the reading says does not exist, so
+    // the reading predates a core count that grew.
+    //
+    // It reads `max_core_index`, which spans EVERY kind. A `backed` row on a
+    // core beyond the denominator is the same contradiction as an `included`
+    // one, and a detector that ignored it would claim to look at "the data"
+    // while skipping rows this very response reports in `by_kind`.
+    let stale_suspected = matches!((max_core_seen, num_cores), (Some(m), Some(n)) if m >= n);
+
+    // A WINDOW WE HOLD NO BLOCKS FOR HAS NEITHER RATIO, NO BANDS AND NO IDLE
+    // COUNT — none of them are zero, they are undefined. 0/0 is not 0, and
+    // "seven cores produced nothing" derived from having looked at nothing is a
+    // positive claim about the network made from an absence of data.
+    //
+    // `cores_touched_ratio` is gated on this too, and that is the LESS obvious
+    // half. Its denominator survives an empty window (100 cores are declared
+    // whether or not we indexed anything), so 0/100 is arithmetically defined —
+    // and factually it is "we did not look" rendered as "there is nothing
+    // there", on one of the two headline numbers. The sibling ratio nulls out
+    // to stop exactly that being quoted, and a band table of zeroes is refused
+    // three lines down for the same reason; a bare 0.0 here would be the one
+    // screenshot-able figure left saying the network sat idle.
+    let have_blocks = coverage.blocks_indexed > 0;
+
+    let slots = num_cores.map(|n| coverage.blocks_indexed * n as u64);
+    let cores_touched_ratio = num_cores
+        .filter(|n| *n > 0)
+        .filter(|_| have_blocks)
+        .map(|n| cores_used as f64 / n as f64);
+    let slots_filled_ratio = slots.filter(|s| *s > 0).map(|s| included as f64 / s as f64);
+
+    // The bands the prep measured, and the shape the endpoint exists to render.
+    // Half-open (lo, hi] throughout, so the six of them partition (0, ∞)
+    // exactly: a core sitting on a boundary lands in one band and they sum to
+    // `cores_that_produced_anything`.
+    //
+    // The WHOLE OBJECT is null without blocks to divide by, rather than every
+    // band reading zero — a fill ratio of 0/0 is undefined, and a band table
+    // full of zeroes is a distribution somebody would screenshot.
+    let bands = if have_blocks {
+        let band = |lo: f64, hi: f64| -> u64 {
+            cores
+                .iter()
+                .filter(|c| {
+                    let f = c.included_blocks as f64 / coverage.blocks_indexed as f64;
+                    f > lo && f <= hi
+                })
+                .count() as u64
+        };
+        serde_json::json!({
+            "saturated_over_95": band(0.95, f64::INFINITY),
+            "busy_75_to_95": band(0.75, 0.95),
+            "half_50_to_75": band(0.50, 0.75),
+            "light_25_to_50": band(0.25, 0.50),
+            "sparse_5_to_25": band(0.05, 0.25),
+            "barely_used_under_5": band(0.0, 0.05),
+            // num_cores - used. NULL without a denominator, and ALSO null when
+            // the denominator is contradicted by the data: subtracting a used
+            // count from a core count the rows disprove yields a number that is
+            // arithmetically coherent and factually meaningless.
+            "producing_nothing": num_cores
+                .filter(|_| !stale_suspected)
+                .map(|n| (n as u64).saturating_sub(cores_used)),
+        })
+    } else {
+        serde_json::Value::Null
+    };
+
+    let by_kind: serde_json::Map<String, serde_json::Value> = kinds
+        .iter()
+        .map(|(k, n)| (k.clone(), serde_json::json!(n)))
+        .collect();
+
+    // THREE ARMS, NOT TWO. The two-arm version said "no `num_cores` reading is
+    // on record" whenever EITHER ratio was missing — and an empty window
+    // reaches that arm with the reading right there in the payload beside it,
+    // so the sentence would have been false about a field two lines away.
+    let reads_as = match (cores_touched_ratio, slots_filled_ratio) {
+        (Some(touched), Some(filled)) => format!(
+            "{:.1}% of the {} declared cores produced something, while only {:.2}% of \
+             core-block slots were filled. THOSE ARE DIFFERENT QUESTIONS: the first says how \
+             much of the network's capacity is claimed at all, the second says how much of it \
+             did work. The gap between them is idle time inside the cores that ARE used, and \
+             it is the number no marketplace view can show.",
+            touched * 100.0,
+            num_cores.unwrap_or(0),
+            filled * 100.0
+        ),
+        _ if num_cores.is_none() => {
+            "NO RATIO IS SERVED because no `num_cores` reading is on record for this chain — \
+             run `sync-core-config`. The counts below are complete and the denominator is \
+             missing, which is not the same as a low utilization figure, and inventing a core \
+             count to divide by is exactly the kind of number this module exists not to produce."
+                .to_string()
+        }
+        _ => format!(
+            "BOTH RATIOS ARE UNDEFINED, NOT ZERO: this window holds {} indexed block(s), so \
+             there are no core-block slots to fill, {}/0 has no value, and a share of cores \
+             that produced something cannot be read off blocks we do not hold. The denominator \
+             ({} cores, read at #{}) is on record and named below; what is missing is the \
+             window. Backfill and decode the range, then run `coretime-range`.",
+            coverage.blocks_indexed,
+            included,
+            num_cores.unwrap_or(0),
+            config.as_ref().map(|c| c.block_height).unwrap_or(0)
+        ),
+    };
+
+    Json(serde_json::json!({
+        "chain": chain,
+        "window": {
+            "from": from,
+            "to": to,
+            "span": span,
+            "blocks_indexed": coverage.blocks_indexed,
+            "contiguous": coverage.blocks_indexed == span,
+            "heights_with_occupancy": coverage.heights_with_occupancy,
+        },
+        "denominator": {
+            "num_cores": num_cores,
+            "read_at_height": config.as_ref().map(|c| c.block_height),
+            "runtime_version": config.as_ref().map(|c| c.runtime_version),
+            "position": position,
+            "distinct_num_cores_in_window": readings_in_window,
+            "stable_across_window": stable_across_window,
+            "stale_suspected": stale_suspected,
+            "max_core_index_observed": max_core_seen,
+        },
+        "occupancy": {
+            "cores_that_produced_anything": cores_used,
+            "cores_touched_ratio": cores_touched_ratio,
+            "included_candidates": included,
+            "core_block_slots": slots,
+            "slots_filled_ratio": slots_filled_ratio,
+            // Invariant 3 applies to an aggregate as much as to a row: two
+            // entries here mean the window was mapped under two rule sets and
+            // the counts above are an average of them.
+            "lineage": lineage
+                .iter()
+                .map(|(rv, mv, n)| serde_json::json!({
+                    "runtime_version": rv, "mapper_version": mv, "rows": n
+                }))
+                .collect::<Vec<_>>(),
+            "reads_as": reads_as,
+        },
+        "by_kind": by_kind,
+        "bands": bands,
+        "cores": &cores,
+        "coverage": { "not_covered": coretime_not_covered() },
+    }))
+    .into_response()
 }
 
 /// Recent XCM observations on one chain.
@@ -5485,6 +6814,190 @@ fn distinct_chains(rows: &[XcmMessageRow]) -> usize {
     seen.len()
 }
 
+/// Attach to one serialized simulation everything that is TRUE OF THAT ROW
+/// rather than of the endpoint serving it: the tier's own coverage list, the
+/// anchor decision, what its storage diff covers, and whether its state was
+/// fabricated.
+///
+/// SHARED BY BOTH SURFACES THAT SERVE A SIMULATION, and that is the whole reason
+/// it is a function. It lived inline in `/v1/sim/{chain}/calls/{hash}` and the
+/// REFERENDUM page — the killer flow, the page somebody actually reads — served
+/// the same rows raw: a fork row appeared there with the Tier 1 coverage list
+/// ("the call is dispatched directly", false of this tier on either route), with
+/// its `storage_diff` and no `diff_covers` to say the entries are the vehicle's,
+/// and — worst — a COUNTERFACTUAL row rendered its `overrides` with no
+/// `is_counterfactual` marker at all. Fabricated state on a governance page,
+/// unlabelled. Two renderings of one row that could disagree is the defect class
+/// this project keeps finding; this is that class on the surface that matters
+/// most.
+///
+/// `attribution` and `legs` are deliberately NOT here: they need an async index
+/// read per row, and the endpoint that can afford one attaches them itself.
+fn enrich_simulation(row: &SimulationRow, obj: &mut serde_json::Map<String, serde_json::Value>) {
+    // EACH ROW CARRIES THE COVERAGE THAT IS TRUE OF ITS OWN TIER. A
+    // response-level `not_covered` describes the DRY-RUN tier; a fork row's
+    // limits are different in kind (see `fork_not_covered`), and wording one
+    // shared list until it is true of both is exactly how this project has
+    // shipped five false lines.
+    obj.insert(
+        "tier_coverage".into(),
+        serde_json::json!({
+            "tier": row.tier,
+            "dispatch_route": row.dispatch_route,
+            "not_covered": if row.tier == sim::TIER_FORK {
+                fork_route_not_covered(row.dispatch_route.as_deref())
+            } else {
+                sim_not_covered()
+            },
+        }),
+    );
+    // A COUNTERFACTUAL SAYS SO ON ITS OWN ROW, not only in a coverage
+    // list somebody may not read. `overrides` is NULL on a faithful run
+    // and never `[]`, so this block appears exactly when the state was
+    // fabricated.
+    // WHERE THE SCHEDULER WAS TOLD TO LOOK. Surfaced unconditionally on a
+    // scheduled row, because the single most likely wrong answer this
+    // tier can give is `not_dispatched`, and the difference between "the
+    // chain declined" and "the agenda was written on the wrong number
+    // line" is exactly this object.
+    if let Some(anchor) = &row.agenda_anchor {
+        obj.insert("agenda_anchor".into(), anchor.clone());
+    }
+    // WHAT THE DIFF IS ABOUT, BESIDE THE DIFF.
+    //
+    // On a scheduled row `storage_diff` describes the no-op vehicle
+    // extrinsic and NOT the call, because the dispatch happens in
+    // `on_initialize` and the harness returns the `apply_extrinsic`
+    // phase only. Twelve decoded entries under a heading that says
+    // "storage diff" is the most confidently wrong thing this tier can
+    // serve, so the row says what its own bytes cover rather than
+    // leaving it to a coverage list somebody may not read — the same
+    // argument that put `is_counterfactual` on the row instead of only
+    // in `not_covered`.
+    //
+    // COMPUTED, NEVER STORED: it is a function of `diff_status` and
+    // `dispatch_route`, both already on the row, and a stored third copy
+    // would be the one that can go stale.
+    if row.tier == sim::TIER_FORK {
+        // NO DEFAULTS. A row recorded before 0022/0023 may carry NULL in
+        // either column, and `unwrap_or("unavailable")` there would say
+        // "this build of the harness has no diff method at all" — a
+        // POSITIVE claim, about a run nobody made it of. That is the
+        // conflation the column exists to refuse, so an absent column is
+        // rendered absent and the row says it does not know.
+        let scope = match (row.diff_status.as_deref(), row.dispatch_route.as_deref()) {
+            (Some(status), Some(route)) => {
+                let covers = sim::diff_covers_subject(status, route);
+                serde_json::json!({
+                    "diff_status": status,
+                    "dispatch_route": route,
+                    "covers_this_call": covers,
+                    "read_instead": (!covers).then_some("emitted_events"),
+                    // MATCHED ON THE STATUS AS WELL AS THE VERDICT.
+                    // `covers == true` is reached two ways — an extrinsic
+                    // whose own phase is returned, and a whole-block diff
+                    // on either route — and one sentence for both would
+                    // tell a scheduled `decoded` row that its call "was
+                    // applied as an extrinsic", which is the second-
+                    // consumer defect this slice is otherwise fixing.
+                    "reads_as": match (status, covers) {
+                        (sim::DIFF_STATUS_DECODED, _) =>
+                            "every phase of the block was returned, `on_initialize` \
+                             included — so wherever this call ran, its writes are among \
+                             the entries in `storage_diff`",
+                        (sim::DIFF_STATUS_EXTRINSIC_ONLY, true) =>
+                            "the entries in `storage_diff` are this call's own writes: \
+                             the call was applied as an extrinsic, so the phase the \
+                             harness returns is the phase it ran in",
+                        (sim::DIFF_STATUS_EXTRINSIC_ONLY, false) =>
+                            "THE ENTRIES IN `storage_diff` ARE NOT THIS CALL'S. The call \
+                             was dispatched by the scheduler in `on_initialize`, and the \
+                             harness returns the applied extrinsic's phase only — so \
+                             what is listed is the no-op vehicle's writes. \
+                             `emitted_events` is the complete record of what the call \
+                             did, and nothing was synthesised to fill the gap",
+                        _ =>
+                            "there is no storage diff on this row at all — see \
+                             `diff_status` for whether the harness has no diff method, \
+                             declined this block, or answered in a shape this version \
+                             cannot read. None of those means the call changed nothing",
+                    },
+                })
+            }
+            (status, route) => serde_json::json!({
+                "diff_status": status,
+                "dispatch_route": route,
+                "covers_this_call": serde_json::Value::Null,
+                "read_instead": "emitted_events",
+                "reads_as": "this row does not record what its diff covers — it predates \
+                             the columns that say so. Read `emitted_events`, which every \
+                             row of this tier has always carried in full",
+            }),
+        };
+        obj.insert("diff_covers".into(), scope);
+    }
+    if let Some(overrides) = &row.overrides {
+        obj.insert(
+            "counterfactual".into(),
+            serde_json::json!({
+                "is_counterfactual": true,
+                "override_hash": row.override_hash,
+                "override_count": overrides.as_array().map(|a| a.len()).unwrap_or(0),
+                "reads_as": "THIS IS NOT WHAT THE CHAIN DID. Storage was injected before \
+                             the call ran, so every figure below is what WOULD have \
+                             happened had the chain held the values in `overrides` — each \
+                             of which carries `before`, the value the real chain actually \
+                             held at this block",
+                "not_covered": counterfactual_not_covered(),
+            }),
+        );
+    } else if row.tier == sim::TIER_FORK {
+        // SELECTED BY ROUTE, for the same reason `fork_route_not_covered`
+        // is. "What was injected is the harness's own setup — the scheduled
+        // task…the agenda slot…entries marked `from_harness`" is true of the
+        // SCHEDULED route and false of every clause on the extrinsic one:
+        // there is no scheduled task, `agenda_anchor` is NULL (so the text
+        // pointed at an absent column), and no diff entry is ever
+        // `from_harness`. One faithful-fork sentence for both routes is the
+        // shared-list defect this slice already refused one field over.
+        let reads_as = match row.dispatch_route.as_deref() {
+            Some(sim::ROUTE_SCHEDULED) => {
+                "a faithful fork: no storage was injected to CHANGE the \
+                 chain's state. What was injected is the harness's own \
+                 setup — the scheduled task that dispatches the call, and \
+                 (for a call too large to inline) its preimage and request \
+                 status. The agenda slot it went into (see `agenda_anchor` \
+                 for which height, and on which number line) is REPLACED \
+                 rather than appended to, so any task the chain really had \
+                 scheduled there did not run here; diff entries marked \
+                 `from_harness` are that setup and not effects of the call"
+            }
+            Some(sim::ROUTE_DRY_RUN_EXTRINSIC) => {
+                "a faithful fork: no storage was injected at all. The call \
+                 was applied as an ordinary extrinsic, so there is no \
+                 scheduled task, no agenda slot and no harness setup in the \
+                 diff — every entry is the call's own doing. What IS mocked \
+                 is the signature: dotlens holds no key, so the run proves \
+                 nothing about whether the signer could have authorised it"
+            }
+            // Legacy or absent: claim NEITHER route's specifics rather than
+            // defaulting to one of them, which is how a row acquires a
+            // sentence about machinery it never used.
+            _ => {
+                "a faithful fork: no storage was injected to CHANGE the \
+                 chain's state. This row does not record which route it \
+                 took, so what the harness set up on its own behalf cannot \
+                 be stated here — `storage_diff` marks any such entry \
+                 `from_harness`"
+            }
+        };
+        obj.insert(
+            "counterfactual".into(),
+            serde_json::json!({ "is_counterfactual": false, "reads_as": reads_as }),
+        );
+    }
+}
+
 /// Recorded Tier 1 simulations of one call, on one chain.
 ///
 /// CHAIN-SCOPED, not network-scoped, and unlike almost everything else here
@@ -5518,6 +7031,14 @@ async fn get_simulations(
         Ok(r) => r,
         Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     };
+    // FILTERED AFTER THE LIMIT, and said out loud rather than left to be found in
+    // an EXPLAIN: `simulation_results_call_idx` does not carry `tier`, so a
+    // tier-filtered page of N may return fewer than N. Pushing it into the index
+    // is a migration, and this reader is not yet the one that earns it.
+    let rows: Vec<SimulationRow> = match &q.tier {
+        None => rows,
+        Some(t) => rows.into_iter().filter(|r| &r.tier == t).collect(),
+    };
 
     // Each row is enriched with the two things a raw forwarded list cannot say
     // on its own: WHICH of those messages this call is responsible for, and what
@@ -5532,30 +7053,55 @@ async fn get_simulations(
     // indexes that exist. This endpoint is not the omnibox.
     let mut simulations = Vec::with_capacity(rows.len());
     for row in rows {
-        let baseline = match &row.baseline_input_hash {
+        // ATTRIBUTION IS ATTACHED ONLY TO ROWS THAT HAVE A FORWARDED LIST.
+        // A fork row does not call `dry_run_call` and produces none, and
+        // `attribution_json` would answer "no no-op was recorded at this state"
+        // — true of the data and misleading about the tier, since a fork has no
+        // baseline concept at all. A field that describes a column belongs on
+        // rows that have the column; this is the same rule that split
+        // `sim_attribution_not_covered` out in slice 5.
+        let attribution = match &row.forwarded_xcms {
             None => None,
-            Some(h) => {
-                match state
-                    .sim
-                    .simulation_at(&chain, &row.at_block_hash, h, &row.tier)
-                    .await
-                {
-                    Ok(b) => b,
-                    Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
-                }
+            Some(forwarded) => {
+                let baseline = match &row.baseline_input_hash {
+                    None => None,
+                    Some(h) => {
+                        match state
+                            .sim
+                            .simulation_at(&chain, &row.at_block_hash, h, &row.tier)
+                            .await
+                        {
+                            Ok(b) => b,
+                            Err(e) => {
+                                return error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+                            }
+                        }
+                    }
+                };
+                Some(attribution_json(
+                    row.baseline_input_hash.as_deref(),
+                    baseline.as_ref().and_then(|b| {
+                        b.forwarded_xcms
+                            .as_ref()
+                            .map(|f| (f, b.call_summary.as_deref()))
+                    }),
+                    forwarded,
+                ))
             }
         };
-        let attribution = attribution_json(
-            row.baseline_input_hash.as_deref(),
-            baseline
-                .as_ref()
-                .map(|b| (&b.forwarded_xcms, b.call_summary.as_deref())),
-            &row.forwarded_xcms,
-        );
 
-        let legs = match state.xcm_sim.legs(&chain, &row.input_hash, 25).await {
-            Ok(l) => l,
-            Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+        // `legs` DESCRIBES `forwarded_xcms` — they are the previewed arrivals of
+        // this row's own forwarded messages — so it belongs only on rows that
+        // have one, for the same reason `forwarded_attribution` does. A fork row
+        // carrying `legs: []` beside a coverage note saying "an empty list means
+        // nobody followed them" would be the FIFTH false line this project has
+        // shipped on a second consumer, in the slice that names the class.
+        let legs = match &row.forwarded_xcms {
+            None => None,
+            Some(_) => match state.xcm_sim.legs(&chain, &row.input_hash, 25).await {
+                Ok(l) => Some(l),
+                Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+            },
         };
         // NO SILENT DEFAULT HERE. `unwrap_or(json!({}))` would serve a
         // simulation with no chain, no status and no lineage, and
@@ -5566,7 +7112,7 @@ async fn get_simulations(
         // `SimRecord::new` makes about `event_count` beside an empty list).
         let (mut value, legs) = match (
             serde_json::to_value(&row),
-            serde_json::to_value(&legs),
+            serde_json::to_value(legs.unwrap_or_default()),
         ) {
             (Ok(v), Ok(l)) => (v, l),
             _ => {
@@ -5577,8 +7123,11 @@ async fn get_simulations(
             }
         };
         if let Some(obj) = value.as_object_mut() {
-            obj.insert("forwarded_attribution".into(), attribution);
-            obj.insert("legs".into(), legs);
+            if let Some(attribution) = attribution {
+                obj.insert("forwarded_attribution".into(), attribution);
+                obj.insert("legs".into(), legs);
+            }
+            enrich_simulation(&row, obj);
         }
         simulations.push(value);
     }
@@ -5602,6 +7151,10 @@ async fn get_simulations(
                                       difference for a leg's own onward messages is on \
                                       /v1/sim/{chain}/xcm/{program_hash}",
             "not_covered": sim_not_covered(),
+            "tiers_carry_their_own": "`not_covered` here describes the DRY-RUN tier. A row \
+                                      carries the list that is true of ITS tier in \
+                                      `tier_coverage.not_covered` — a fork row's limits are \
+                                      different in kind, not a subset",
             "attribution_not_covered": sim_attribution_not_covered(),
             "arrival_not_covered": xcm_sim_not_covered(),
         },
@@ -6620,9 +8173,14 @@ async fn list_assets(State(state): State<AppState>, Path(chain): Path<String>) -
         Ok(assets) => Json(serde_json::json!({
             "chain": chain,
             "count": assets.len(),
-            "note": "one row per REPRESENTATION on this chain; the identity graph \
-                     linking representations of one logical asset across chains is \
-                     not built yet (ARCHITECTURE §8, Phase 5)",
+            "note": "one row per REPRESENTATION on this chain. The FUNGIBLE half of \
+                     the identity graph now exists as data — `absolute_key` is the \
+                     observer-free name, and /v1/assets/identity?key= lists every \
+                     representation of one logical asset across every chain. What \
+                     is still Phase 5 is the NON-fungible half and the bridged \
+                     ERC-20 ↔ foreign-asset ↔ precompile links, which are not \
+                     derivable from a Location and need a real graph \
+                     (ARCHITECTURE §8)",
             "assets": assets,
         }))
         .into_response(),
@@ -6820,10 +8378,12 @@ async fn get_treasury_holdings(
                  INACTIVE and is not swept: its account is emptied and removed \
                  from pallet storage when the bounty ends. If one is ever \
                  refunded after conclusion, this endpoint will not see it",
-                "positions on chains dotlens has not registered — notably the \
-                 Hydration DCA accounts, the Omnipool POL and the money-market \
-                 position (ECOSYSTEM §6 puts treasury assets across 7+ chains); \
-                 Hydration is registered in Phase 3",
+                // DERIVED, not asserted. An earlier draft said flatly that no
+                // account on Hydration is registered — which the same response
+                // would have contradicted the moment one was, and this project
+                // has shipped a `not_covered` line that was false on its own
+                // page three times now.
+                hydration_coverage_line(&accounts),
                 "assets whose storage key has never been read by sync-assets: \
                  they are listed with a null amount, never as zero",
                 "an asset being destroyed (status 'Destroying') zeroes holder \
@@ -6841,6 +8401,604 @@ async fn get_treasury_holdings(
                  decoded against.",
     }))
     .into_response()
+}
+
+// ------------------------------------------------- cross-chain consolidation
+
+#[derive(Deserialize)]
+struct IdentityQuery {
+    /// The observer-free name, exactly as `core.assets.absolute_key` holds it.
+    key: String,
+}
+
+/// EVERY REPRESENTATION OF ONE LOGICAL ASSET, ACROSS EVERY CHAIN — PRODUCT.md
+/// gap 6, and the question no chain-shaped explorer can ask.
+///
+/// The key is an ugly string (a JSON junction array) and that is deliberate: it
+/// is the CANONICAL NAME, so a reader can re-derive it themselves from a chain's
+/// own location and the registry's path for that chain. A short opaque id would
+/// be prettier and un-checkable, which is the trade this project keeps refusing.
+///
+/// EXACT MATCH ONLY. A prefix over this column is a range scan on an identifier
+/// — the same rule the search resolver states as "NEVER prefix-search a hash",
+/// for the same reason.
+async fn get_asset_identity(
+    State(state): State<AppState>,
+    Query(q): Query<IdentityQuery>,
+) -> Response {
+    let reps = match state.assets.representations(&q.key).await {
+        Ok(r) => r,
+        Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    };
+
+    // DECIMALS ARE THE ADDABILITY TEST, and it is checked here rather than
+    // assumed. Two representations of one asset should agree on decimals — they
+    // are the same asset, moved by XCM, so one unit on either side is one unit.
+    // A disagreement means either a registry error or that the absolute name has
+    // collided two different things, and in both cases summing them would
+    // produce a number that is wrong by a power of ten.
+    let addable = shared_decimals(reps.iter().map(|(_, a)| a.decimals)).is_some();
+
+    Json(serde_json::json!({
+        "absolute_key": q.key,
+        "absolute_location": reps.first().and_then(|(_, a)| a.absolute_location.clone()),
+        "representation_count": reps.len(),
+        // deduped, like the consolidated endpoint's field of the same name —
+        // two representations on ONE chain (a foreign row and a pool row) would
+        // otherwise print that chain twice under a key its sibling dedups
+        "chains": reps.iter().map(|(c, _)| c.clone())
+            .collect::<std::collections::BTreeSet<_>>(),
+        "representations": reps
+            .iter()
+            .map(|(chain, a)| serde_json::json!({
+                "chain": chain,
+                "asset_key": a.asset_key,
+                "representation_kind": a.representation_kind,
+                "asset_type": a.asset_type,
+                "symbol": a.symbol,
+                "name": a.name,
+                "decimals": a.decimals,
+                "supply": a.supply,
+                "status": a.status,
+                // the SELF-RELATIVE name, kept beside the absolute one on
+                // purpose: these two differing is the entire finding, and a
+                // reader who only ever sees the absolute key would have to take
+                // the normalizer on trust
+                "location_key": a.location_key,
+            }))
+            .collect::<Vec<_>>(),
+        "addable": addable,
+        "reads_as": if reps.is_empty() {
+            "no asset dotlens has indexed carries this absolute name. That is not \
+             the same as the asset not existing — it may be on a chain that is \
+             not registered, or on one whose sync-assets has not run".to_string()
+        } else if reps.len() == 1 {
+            "one representation. Either this asset exists on one chain only, or \
+             the others are on chains dotlens does not index".to_string()
+        } else if addable {
+            format!(
+                "{} representations of ONE asset across {} chains, all agreeing \
+                 on decimals — so their quantities are directly addable",
+                reps.len(),
+                reps.iter().map(|(c, _)| c).collect::<std::collections::BTreeSet<_>>().len()
+            )
+        } else {
+            "these representations do NOT agree on decimals (or some are \
+             unknown), so their quantities must NOT be added. Reported as \
+             separate lines rather than summed into a wrong number".to_string()
+        },
+    }))
+    .into_response()
+}
+
+/// THE CROSS-CHAIN TREASURY POSITION — one logical asset at a time, summed
+/// across every chain that holds it, with every contributing number's provenance
+/// still attached.
+///
+/// This is what the asset-identity work in slice 6 was FOR. Before it, a
+/// treasury page could list Asset Hub's USDT and Hydration's USDT and had no
+/// honest way to say they were the same thing: their `location_key`s genuinely
+/// differ, because a Location is relative to its observer. `absolute_key` is
+/// what makes them one row here.
+///
+/// FOUR RULES, each of which is a refusal:
+///   1. **No stored table.** Computed per request from anchors + deltas +
+///      core.assets, all of which carry lineage. See 0020.
+///   2. **No prices, no cross-asset total.** Each logical asset sums in its OWN
+///      units. Adding DOT to USDT needs a price, and a price with no source,
+///      timestamp and method is how a treasury dashboard starts lying.
+///   3. **Decimals must agree or the line is not summed.** Two representations
+///      of one asset are the same asset moved by XCM, so a disagreement means a
+///      registry error or an absolute-name collision — either way, summing is
+///      wrong by a power of ten.
+///   4. **Everything that cannot be consolidated is COUNTED**, not dropped. A
+///      holding whose asset has no absolute name is real money; it appears as an
+///      unconsolidated line with the reason attached.
+async fn get_treasury_consolidated(
+    State(state): State<AppState>,
+    Path(network): Path<String>,
+) -> Response {
+    // An unknown network must NOT render as "this treasury holds nothing" —
+    // that is a claim, and a wrong one. Every other surface refuses an unknown
+    // subject (search 400s an unknown chain, the referendum endpoint 404s an
+    // unindexed id) and this is the surface where a confident empty answer would
+    // be read as a fact about the money.
+    let networks = crate::search::known_networks(&state.registry);
+    if !networks.contains(&network) {
+        return error(
+            StatusCode::NOT_FOUND,
+            format!("unknown network '{network}' — registered networks: {networks:?}"),
+        );
+    }
+    let accounts = match state.treasury.accounts(&network).await {
+        Ok(a) => a,
+        Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    };
+
+    let mut chains: Vec<String> = Vec::new();
+    for a in &accounts {
+        if !chains.contains(&a.chain_id) {
+            chains.push(a.chain_id.clone());
+        }
+    }
+
+    /// One chain's contribution to one logical asset.
+    ///
+    /// **`amount` IS AN OPTION, AND THAT IS THE FIX FOR THE WORST DEFECT THIS
+    /// SLICE COULD HAVE SHIPPED.** The first draft classified an unanchored
+    /// holding as "unconsolidated" and dropped it BEFORE grouping — so a chain
+    /// whose `treasury-holdings` sweep had not run contributed nothing, and the
+    /// position rendered a clean `total` across the remaining chains with no
+    /// hint that a leg was missing. That is not a gap, it is a wrong number that
+    /// reads like a fact and sums like a fact, and Hydration is in exactly that
+    /// state today (slice 6 verified `treasury-holdings hydration` reports 0
+    /// accounts). A leg with a known asset and an unknown balance now JOINS its
+    /// group and suppresses the group's total.
+    struct Leg {
+        chain: String,
+        asset_key: String,
+        account_label: String,
+        account_ss58: Option<String>,
+        account_role: String,
+        account_derivation: Option<String>,
+        account_source: String,
+        /// None = this pair has been seen MOVING but never read from state.
+        amount: Option<i128>,
+        decimals: Option<u32>,
+        symbol: Option<String>,
+        basis: &'static str,
+        anchor_height: Option<u64>,
+        anchor_spec_version: Option<u64>,
+        anchor_source: Option<String>,
+        frozen_at_anchor: Option<String>,
+        asset_status: Option<String>,
+        reason_unknown: Option<&'static str>,
+    }
+
+    let mut by_absolute: std::collections::BTreeMap<String, Vec<Leg>> =
+        std::collections::BTreeMap::new();
+    let mut unconsolidated: Vec<serde_json::Value> = Vec::new();
+    let mut unanchored = 0usize;
+    let mut erc20_unanchorable = 0usize;
+    let mut zero_positions = 0usize;
+    let mut account_addresses = 0usize;
+
+    for chain in &chains {
+        let mut seen: Vec<&TreasuryAccountRow> = Vec::new();
+        for a in accounts.iter().filter(|a| &a.chain_id == chain) {
+            if !seen.iter().any(|s| s.account_id == a.account_id) {
+                seen.push(a);
+            }
+        }
+        let ids: Vec<Vec<u8>> = seen.iter().map(|a| a.account_id.clone()).collect();
+        account_addresses += seen.len();
+
+        let holdings = match state.balances.holdings(chain, &ids, None).await {
+            Ok(h) => h,
+            Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+        };
+        let assets = match state.assets.assets(chain).await {
+            Ok(a) => a,
+            Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+        };
+        let by_key: HashMap<&str, &AssetRow> =
+            assets.iter().map(|a| (a.asset_key.as_str(), a)).collect();
+
+        for h in &holdings {
+            let Some(account) = seen.iter().find(|a| a.account_id == h.account_id) else {
+                continue;
+            };
+            let asset = by_key.get(h.asset.as_str());
+            let amount_str = h.amount();
+            let amount = amount_str.as_deref().and_then(|a| a.parse::<i128>().ok());
+
+            // a zero position is not news, but it is COUNTED — "we looked and
+            // there is nothing" and "we did not look" must stay distinguishable,
+            // which is the rule the holdings sweep's own output states
+            if amount == Some(0) {
+                zero_positions += 1;
+                continue;
+            }
+
+            // AN Erc20 ASSET IS UNREADABLE IN PRINCIPLE, and it is classified
+            // FIRST for two reasons a reviewer caught. (a) Its balance lives in
+            // `pallet_evm` storage, so `treasury-holdings` skips it BY DESIGN —
+            // it can never have an anchor, so a counter placed after the
+            // anchor check could never fire, and `coverage.erc20_positions`
+            // would have read 0 forever while claiming to measure the largest
+            // uncovered position dotlens knows about. (b) The generic
+            // "run treasury-holdings to anchor it" advice is guaranteed to do
+            // nothing here, and a remedy that cannot work is worse than none.
+            if asset.and_then(|a| a.asset_type.as_deref()) == Some("Erc20") {
+                erc20_unanchorable += 1;
+                unconsolidated.push(serde_json::json!({
+                    "chain": chain,
+                    "asset_key": h.asset,
+                    "absolute_key": asset.and_then(|a| a.absolute_key.clone()),
+                    "symbol": asset.and_then(|a| a.symbol.clone()),
+                    "account": account.label,
+                    "amount": null,
+                    // THE EVENT-STREAM TOTAL, which is `delta_sum` and NOT
+                    // `amount()`. `amount()` is anchor + deltas and returns None
+                    // with no anchor — and an Erc20 can never HAVE an anchor, so
+                    // reading it here made `movement_only` structurally null
+                    // forever, one field over from the counter that was a
+                    // blocker for exactly that reason. The `not_covered` line
+                    // promises "any figure shown beside one is `movement_only`,
+                    // a total from the event stream"; this is the figure that
+                    // makes the promise keepable.
+                    "movement_only": h.delta_sum,
+                    "movement_event_count": h.delta_count,
+                    "reason": "this asset is declared Erc20: its balance lives in \
+                               `pallet_evm` storage, not in any pallet dotlens \
+                               reads, so NO command will ever anchor it. Any \
+                               figure beside it is a movement total from the event \
+                               stream, never a position",
+                }));
+                continue;
+            }
+
+            // THE HOLDING WHOSE ASSET HAS NO ABSOLUTE NAME. Real money that
+            // cannot be added to anything, because nothing on another chain can
+            // be recognised as the same asset. Two very different causes, so two
+            // different reasons rather than one generic line.
+            let Some(abs) = asset.and_then(|a| a.absolute_key.clone()) else {
+                if amount.is_none() {
+                    unanchored += 1;
+                }
+                unconsolidated.push(serde_json::json!({
+                    "chain": chain,
+                    "asset_key": h.asset,
+                    "absolute_key": null,
+                    "symbol": asset.and_then(|a| a.symbol.clone()),
+                    "account": account.label,
+                    "account_derivation": account.derivation,
+                    "amount": amount.map(|a| a.to_string()),
+                    "basis": h.basis(),
+                    "provenance": {
+                        "anchor_height": h.anchor_height,
+                        "anchor_spec_version": h.anchor_spec_version,
+                        "anchor_source": h.anchor_source,
+                    },
+                    "reason": if asset.is_none() {
+                        "this asset is not in core.assets on this chain — run \
+                         sync-assets"
+                    } else {
+                        "this asset has no absolute (observer-free) name, so no \
+                         representation on another chain can be recognised as the \
+                         same asset. Usually correct and permanent: a chain-local \
+                         construct (XYK/StableSwap share, Bond) has no XCM \
+                         location at all. It can also mean the chain's seed omits \
+                         `native_token` — see coverage.chains_without_native_token"
+                    },
+                }));
+                continue;
+            };
+
+            // AND HERE IS THE ONE THAT USED TO BE DROPPED. A named asset with an
+            // unknown balance JOINS its group and suppresses the group's total,
+            // rather than quietly leaving a smaller total looking whole.
+            if amount.is_none() {
+                unanchored += 1;
+            }
+            by_absolute.entry(abs).or_default().push(Leg {
+                chain: chain.clone(),
+                asset_key: h.asset.clone(),
+                account_label: account.label.clone(),
+                account_ss58: account.ss58.clone(),
+                account_role: account.role.clone(),
+                account_derivation: account.derivation.clone(),
+                account_source: account.source.clone(),
+                amount,
+                decimals: asset.and_then(|a| a.decimals),
+                symbol: asset.and_then(|a| a.symbol.clone()),
+                basis: h.basis(),
+                anchor_height: h.anchor_height,
+                anchor_spec_version: h.anchor_spec_version,
+                anchor_source: h.anchor_source.clone(),
+                frozen_at_anchor: h.anchor_frozen.clone(),
+                asset_status: asset.and_then(|a| a.status.clone()),
+                reason_unknown: amount.is_none().then_some(
+                    "no anchor: this pair has been seen MOVING but never read \
+                     from state. Run treasury-holdings on this chain",
+                ),
+            });
+        }
+    }
+
+    // A CHAIN WHOSE SEED OMITS `native_token` gets a NULL absolute name for its
+    // native currency (0019), which means its DOT — or whatever it holds —
+    // silently fails to join anything here. That was a stated gap with nothing
+    // enforcing it; this endpoint is the first reader that would under-report
+    // because of it, so it is the one that names it.
+    // SCOPED TO EVERY REGISTERED CHAIN, not just the ones with a treasury
+    // account — a reviewer pointed out that a seed omitting `native_token` is
+    // most likely on a chain whose account is not registered YET, which is
+    // exactly when this check would have stayed empty and read as "all clear".
+    // And a chain the registry does not know at all counts as missing, not as
+    // fine: `is_none_or` is the honest polarity.
+    let chains_without_native_token: Vec<&str> = state
+        .registry
+        .chains()
+        .filter(|c| c.native_token.is_none())
+        .map(|c| c.id.as_str())
+        .collect();
+
+    let mut positions = Vec::with_capacity(by_absolute.len());
+    let mut not_addable = 0usize;
+    let mut incomplete = 0usize;
+    for (absolute_key, legs) in &by_absolute {
+        // ONE implementation of the addability rule, shared with the identity
+        // endpoint. Two implementations of "are these the same unit" that could
+        // disagree is the defect class that made `api` depend on `sim` in slice
+        // 5 rather than re-implement thirty lines of set arithmetic — and the
+        // two drafts here HAD already diverged on the empty case (`<= 1` vs
+        // `== 1`), which a reviewer caught.
+        let decimals = shared_decimals(legs.iter().map(|l| l.decimals));
+        let addable = decimals.is_some();
+        if !addable {
+            not_addable += 1;
+        }
+        // A GROUP WITH A LEG OF UNKNOWN SIZE HAS NO TOTAL. Summing the known
+        // legs would render a smaller number that looks complete, which is
+        // precisely the failure this endpoint exists to end.
+        let complete = legs.iter().all(|l| l.amount.is_some());
+        if !complete {
+            incomplete += 1;
+        }
+        let summable = addable && complete;
+        let total: i128 = legs.iter().filter_map(|l| l.amount).sum();
+        let decimals = if addable { decimals } else { None };
+        // the symbol is a LABEL, not the identity — representations may spell it
+        // differently ("USDt" vs "USDT"), so take the first and keep every
+        // spelling visible on the legs
+        let symbol = legs.iter().find_map(|l| l.symbol.clone());
+
+        positions.push(serde_json::json!({
+            "absolute_key": absolute_key,
+            "symbol": symbol,
+            "decimals": decimals,
+            // THE SUM IS OMITTED, not zeroed, when the legs disagree on units OR
+            // when any leg's size is unknown. A null total beside a populated
+            // leg list is unmistakable; a wrong number is not.
+            "total": summable.then(|| total.to_string()),
+            "display": summable
+                .then(|| decimals.and_then(|d| format_units(&total.to_string(), d)))
+                .flatten(),
+            "addable": addable,
+            "complete": complete,
+            "legs_of_unknown_size": legs.iter().filter(|l| l.amount.is_none()).count(),
+            "chains": legs.iter().map(|l| l.chain.clone())
+                .collect::<std::collections::BTreeSet<_>>(),
+            "legs": legs.iter().map(|l| serde_json::json!({
+                "chain": l.chain,
+                "asset_key": l.asset_key,
+                "symbol": l.symbol,
+                "decimals": l.decimals,
+                "amount": l.amount.map(|a| a.to_string()),
+                "display": l.amount.zip(l.decimals)
+                    .and_then(|(a, d)| format_units(&a.to_string(), d)),
+                "unknown_because": l.reason_unknown,
+                // ROADMAP criterion 2 is "every account holding network-treasury
+                // money is listed WITH its derivation", and this is the surface
+                // people will actually read — so the derivation travels with the
+                // leg rather than only on the holdings page
+                "account": l.account_label,
+                "account_ss58": l.account_ss58,
+                "account_role": l.account_role,
+                "account_derivation": l.account_derivation,
+                "account_source": l.account_source,
+                "asset_status": l.asset_status,
+                // THE LOCKED PORTION, surfaced for the first time — and named
+                // `frozen_at_anchor` rather than `frozen` on purpose. It is read
+                // from the ANCHOR while `amount` is anchor + deltas, so the two
+                // are as-of different heights; and it is NOT subtracted from any
+                // total (`balance_anchors.total` is free + reserved). A reader
+                // who saw a bare `frozen` beside `amount` would subtract it.
+                "frozen_at_anchor": l.frozen_at_anchor,
+                "basis": l.basis,
+                "provenance": {
+                    "anchor_height": l.anchor_height,
+                    "anchor_spec_version": l.anchor_spec_version,
+                    "anchor_source": l.anchor_source,
+                },
+            })).collect::<Vec<_>>(),
+            "identity": format!("/v1/assets/identity?key={}",
+                                urlencode(absolute_key)),
+        }));
+    }
+
+    // biggest first is meaningless across assets with different decimals and no
+    // prices, so order by the one thing that IS comparable: how many chains a
+    // position spans, then its name. Deterministic, and it puts the genuinely
+    // cross-chain positions — the ones this endpoint exists for — at the top.
+    positions.sort_by(|a, b| {
+        let span = |v: &serde_json::Value| v["chains"].as_array().map(|c| c.len()).unwrap_or(0);
+        span(b)
+            .cmp(&span(a))
+            .then_with(|| a["absolute_key"].as_str().cmp(&b["absolute_key"].as_str()))
+    });
+
+    let cross_chain = positions
+        .iter()
+        .filter(|p| p["chains"].as_array().map(|c| c.len()).unwrap_or(0) > 1)
+        .count();
+
+    Json(serde_json::json!({
+        "network": network,
+        "positions": positions,
+        "unconsolidated": unconsolidated,
+        "coverage": {
+            "chains": chains,
+            // ADDRESSES, not `treasury_accounts` rows: the table is keyed
+            // (chain, account, role), so an address that is both a derived pot
+            // and a registry seed has two rows and is one account. On a surface
+            // whose contract is "counted, never estimated", the row count would
+            // inflate it.
+            "accounts": account_addresses,
+            "logical_assets": by_absolute.len(),
+            "spanning_more_than_one_chain": cross_chain,
+            "not_addable_decimals_disagree": not_addable,
+            "positions_with_a_leg_of_unknown_size": incomplete,
+            "unconsolidated_positions": unconsolidated.len(),
+            "positions_without_an_anchor": unanchored,
+            "zero_positions": zero_positions,
+            "erc20_positions": erc20_unanchorable,
+            "chains_without_native_token": chains_without_native_token,
+            "valuation": "none — quantities only, each logical asset in its OWN \
+                          units. There is deliberately no cross-asset total: \
+                          adding DOT to USDT needs a price, and a price with no \
+                          source, timestamp and method is how a treasury \
+                          dashboard starts lying quietly (migration 0010's rule, \
+                          which consolidation makes more important, not less)",
+            "not_covered": consolidation_not_covered(),
+        },
+        "note": "one row per LOGICAL asset, summed across chains by its \
+                 observer-free name. Every leg keeps the block it was anchored \
+                 at, the runtime it was decoded against, and which command read \
+                 it — the sum is re-derivable from the legs, and the legs are \
+                 re-derivable from the chain.",
+    }))
+    .into_response()
+}
+
+/// The ADDABILITY RULE, in one place.
+///
+/// `Some(d)` only when every representation states its decimals AND they all
+/// state the same one — which is what makes two quantities of "the same asset"
+/// literally addable. Empty is NOT addable: a claim of addability about nothing
+/// is how `/v1/assets/identity` on an unknown key reported `"addable": true`
+/// beside `"representation_count": 0` in the first draft.
+///
+/// Shared by both readers deliberately. Two implementations of "are these the
+/// same unit" that could disagree is the defect class that made `api` depend on
+/// `sim` in slice 5 — and these two HAD already diverged (`<= 1` vs `== 1`)
+/// before a reviewer caught it.
+fn shared_decimals(decimals: impl Iterator<Item = Option<u32>>) -> Option<u32> {
+    let mut seen: Option<u32> = None;
+    let mut any = false;
+    for d in decimals {
+        any = true;
+        match (d, seen) {
+            (None, _) => return None,
+            (Some(d), None) => seen = Some(d),
+            (Some(d), Some(prev)) if d == prev => {}
+            (Some(_), Some(_)) => return None,
+        }
+    }
+    if any {
+        seen
+    } else {
+        None
+    }
+}
+
+/// Minimal percent-encoding for the one place a canonical key is put into a URL.
+/// Not a general-purpose encoder — it escapes everything outside the unreserved
+/// set, which is correct if verbose for a JSON array.
+fn urlencode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() * 3);
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
+/// The chains-we-cannot-fully-see line, DERIVED from the account list rather
+/// than written down — because what is true depends on which accounts happen to
+/// be registered, and a hard-coded sentence about that goes stale silently.
+fn hydration_coverage_line(accounts: &[TreasuryAccountRow]) -> String {
+    let derived_elsewhere = accounts
+        .iter()
+        .any(|a| a.chain_id != "polkadot" && a.derivation.is_none());
+    let mut line = String::from(
+        "positions on chains dotlens has not registered (ECOSYSTEM §6 puts treasury assets across 7+ chains). Where a chain IS registered, its money is only as visible as its ACCOUNTS: a treasury position held at a location-derived (HashedDescription) sovereign address is not derivable by dotlens, so it appears here only if a reviewed registry seed names it",
+    );
+    if derived_elsewhere {
+        line.push_str(
+            ". Some accounts above are seeded rather than derived, and carry a null `derivation` to say so",
+        );
+    }
+    line.push_str(
+        ". A money-market position is additionally unreadable in principle: those are Erc20 assets whose balances live in pallet_evm storage",
+    );
+    line
+}
+
+/// What a consolidated position does NOT include.
+///
+/// SEPARATE FROM the holdings endpoint's list on purpose, and the project has
+/// twice shipped a shared `not_covered` helper that was false on its second
+/// consumer (slices 3 and 4, then again in slice 5). The two surfaces have
+/// genuinely different gaps: holdings is per account and per chain, so
+/// "positions on unregistered chains" is its blind spot; consolidation is per
+/// logical asset, so ITS blind spot is anything that cannot be NAMED across
+/// chains — a different set, with a different fix.
+fn consolidation_not_covered() -> Vec<&'static str> {
+    vec![
+        "assets with no absolute (observer-free) name cannot be consolidated and \
+         are listed under `unconsolidated` instead of being dropped. Usually this \
+         is correct and permanent — a chain-local construct (XYK share, \
+         StableSwap share, Bond) has no XCM location at all, and on Hydration \
+         that is 756 of 1,437 registered assets",
+        "Erc20 assets are named and located here and their BALANCES are not \
+         readable at all: they live in `pallet_evm` storage, not in a pallet this \
+         indexer reads, so NO command will ever anchor one — `treasury-holdings` \
+         skips them by design and says so. `erc20_positions` counts them and they \
+         are listed under `unconsolidated` with a null amount; any figure shown \
+         beside one is `movement_only`, a total from the event stream, never a \
+         position",
+        "an account that holds treasury money but is not REGISTERED contributes \
+         nothing here and is not counted, because an unregistered account is one \
+         we do not know to look for. The known instance is the Polkadot \
+         treasury's position on Hydration, which sits at a location-derived \
+         (HashedDescription) sovereign address dotlens does not derive — an \
+         account listed for that chain came from a reviewed registry seed, not \
+         from a derivation",
+        "`frozen_at_anchor` is read from the ANCHOR while `amount` is anchor + \
+         deltas, so the two are as-of different heights; it is NOT subtracted \
+         from any leg or total (an anchor's total is free + reserved), and null \
+         means the runtime did not expose it, never zero",
+        "every number here is the ANCHOR + DELTAS reconstruction. The independent \
+         state re-read that would make it agree two ways — ROADMAP's amended \
+         Phase 3 criterion 1 — is what `treasury-holdings` does at a given \
+         height; this endpoint does not run it, so a disagreement between the \
+         two would not show up here",
+        "no price is consulted, so there is no total across assets and no USD \
+         figure. Each logical asset sums in its own units only",
+        "a sum is only as current as its least current leg: legs are anchored at \
+         DIFFERENT blocks (each chain has its own height), so a consolidated \
+         total is 'as of the anchors named on the legs', not as of one instant. \
+         Re-run treasury-holdings on every chain to tighten it",
+        "two representations that disagree on decimals are NOT summed — the \
+         position is reported with a null total and every leg intact, because \
+         summing them would be wrong by a power of ten",
+    ]
 }
 
 #[derive(Deserialize)]
@@ -6947,6 +9105,7 @@ pub(crate) mod tests {
                 free: "500".into(),
                 reserved: "0".into(),
                 total: "500".into(),
+                frozen: None,
                 spec_version: Some(2_000_006),
                 source: "test".into(),
                 note: None,
@@ -6987,7 +9146,7 @@ pub(crate) mod tests {
                 "variant_index": 33,
                 "account": null,
             }),
-            xcm_version: 4,
+            xcm_version: Some(4),
             status: "dispatch_failed".into(),
             dispatch_ok: Some(false),
             dispatch_error: Some(serde_json::json!({
@@ -7002,13 +9161,13 @@ pub(crate) mod tests {
             // TWO messages to one destination, of which ONE was already in
             // flight — the relay's shape in miniature, so the difference below
             // is a real subtraction rather than a copy.
-            forwarded_xcms: serde_json::json!([
+            forwarded_xcms: Some(serde_json::json!([
                 {"destination": sim_destination(2034), "messages": [sim_msg(1), sim_msg(9)]}
-            ]),
+            ])),
             effects: serde_json::json!({"Ok": [{"emitted_events": []}]}),
             note: None,
             spec_version: 2_003_002,
-            api_version: 2,
+            api_version: Some(2),
             metadata_version: 15,
             sim_version: 2,
             raw_location: "raw/polkadot-asset-hub/sim/cd/01/\
@@ -7016,6 +9175,17 @@ pub(crate) mod tests {
                 .into(),
             observed_at: None,
             baseline_input_hash: Some(format!("0x{}", "02".repeat(32))),
+            overrides: None,
+            override_hash: None,
+            storage_diff: None,
+            storage_diff_count: None,
+            diff_status: None,
+            built_block_hash: None,
+            harness: None,
+            // A dry_run row has no route and no anchor: it dispatches through a
+            // runtime API, not through the scheduler.
+            dispatch_route: None,
+            agenda_anchor: None,
         });
         // THE BASELINE: an ordinary recorded row, which is the whole design —
         // `system.remark()` at the same state, whose forwarded list is the
@@ -7030,20 +9200,20 @@ pub(crate) mod tests {
             call_summary: Some("system.remark".into()),
             origin_spec: "root".into(),
             origin: serde_json::json!({"resolved": "system:Root"}),
-            xcm_version: 4,
+            xcm_version: Some(4),
             status: "executed".into(),
             dispatch_ok: Some(true),
             dispatch_error: None,
             emitted_events: serde_json::json!([]),
             event_count: 0,
             local_xcm: None,
-            forwarded_xcms: serde_json::json!([
+            forwarded_xcms: Some(serde_json::json!([
                 {"destination": sim_destination(2034), "messages": [sim_msg(1)]}
-            ]),
+            ])),
             effects: serde_json::json!({"Ok": []}),
             note: None,
             spec_version: 2_003_002,
-            api_version: 2,
+            api_version: Some(2),
             metadata_version: 15,
             sim_version: 2,
             raw_location: "raw/polkadot-asset-hub/sim/cd/02/\
@@ -7051,6 +9221,17 @@ pub(crate) mod tests {
                 .into(),
             observed_at: None,
             baseline_input_hash: Some(format!("0x{}", "02".repeat(32))),
+            overrides: None,
+            override_hash: None,
+            storage_diff: None,
+            storage_diff_count: None,
+            diff_status: None,
+            built_block_hash: None,
+            harness: None,
+            // A dry_run row has no route and no anchor: it dispatches through a
+            // runtime API, not through the scheduler.
+            dispatch_route: None,
+            agenda_anchor: None,
         });
         // A THIRD row with NO baseline at all — every row recorded before slice
         // 5 looks like this, and the endpoint must say so rather than let the
@@ -7065,20 +9246,20 @@ pub(crate) mod tests {
             call_summary: Some("system.remark".into()),
             origin_spec: "root".into(),
             origin: serde_json::json!({"resolved": "system:Root"}),
-            xcm_version: 4,
+            xcm_version: Some(4),
             status: "executed".into(),
             dispatch_ok: Some(true),
             dispatch_error: None,
             emitted_events: serde_json::json!([]),
             event_count: 0,
             local_xcm: None,
-            forwarded_xcms: serde_json::json!([
+            forwarded_xcms: Some(serde_json::json!([
                 {"destination": sim_destination(2040), "messages": [sim_msg(5)]}
-            ]),
+            ])),
             effects: serde_json::json!({"Ok": []}),
             note: None,
             spec_version: 2_003_002,
-            api_version: 2,
+            api_version: Some(2),
             metadata_version: 15,
             sim_version: 1,
             raw_location: "raw/polkadot-asset-hub/sim/ce/03/\
@@ -7086,7 +9267,133 @@ pub(crate) mod tests {
                 .into(),
             observed_at: None,
             baseline_input_hash: None,
+            overrides: None,
+            override_hash: None,
+            storage_diff: None,
+            storage_diff_count: None,
+            diff_status: None,
+            built_block_hash: None,
+            harness: None,
+            // A dry_run row has no route and no anchor: it dispatches through a
+            // runtime API, not through the scheduler.
+            dispatch_route: None,
+            agenda_anchor: None,
         });
+
+        // ---------------------------------------------------------------------
+        // TWO FORK ROWS, ONE PER ROUTE — and until slice 10 there were NONE.
+        //
+        // Slice 8 shipped this tier and its own verification recorded that
+        // "nothing in crates/api or pg_integration tests a fork row at all, so
+        // every claim about how a fork row RENDERS rests on this drill and on
+        // nothing offline". Slice 9 promised two route tests and wrote zero.
+        // These are them.
+        //
+        // THEY CARRY THEIR OWN CALL HASH, deliberately. Adding a row under the
+        // existing `ab…` hash would have lengthened the list two shipped tests
+        // assert the length of — which is exactly how slice 2's registration of
+        // Hydration silently satisfied a test's precondition and moved its
+        // subject, and how slice 7's new fixture account moved `segments[0]`.
+        let fork_hash = format!("0x{}", "f0".repeat(32));
+        let fork_row = |input: &str, height: u64, route: &str, status: &str| SimulationRow {
+            chain_id: "polkadot-asset-hub".into(),
+            at_height: height,
+            at_block_hash: format!("0x{}", "8e".repeat(32)),
+            input_hash: input.into(),
+            tier: sim::TIER_FORK.into(),
+            call_hash: fork_hash.clone(),
+            call_summary: Some("multiassetbounties.fund_bounty".into()),
+            origin_spec: if route == sim::ROUTE_SCHEDULED {
+                "Origins:MediumSpender".into()
+            } else {
+                "signed:13UVJyLnbVp9RBZYFwkxtG4qWk5QkHc1Jgu85QifAbobheY9".into()
+            },
+            origin: if route == sim::ROUTE_SCHEDULED {
+                serde_json::json!({"resolved": "Origins:MediumSpender"})
+            } else {
+                serde_json::json!({"resolved": "system:Signed", "account": "0xd6a3eadc"})
+            },
+            // A FORK ROW CALLS NEITHER RUNTIME API, so both version columns are
+            // NULL. Nullable since 0021 — and reading a NULL as 0 would put "XCM
+            // v0" and "DryRunApi v0" on a row that asked neither question.
+            xcm_version: None,
+            api_version: None,
+            status: status.into(),
+            dispatch_ok: Some(status == "executed"),
+            // A FAILED DISPATCH KEEPS THE ERROR THE CHAIN GAVE. A fixture that
+            // paired `dispatch_failed` with no error would teach a shape this
+            // tier cannot produce — slice 7's green-test-with-a-wrong-number,
+            // one column over.
+            dispatch_error: (status != "executed")
+                .then(|| serde_json::json!({"raw": {"Token": [{"FundsUnavailable": []}]}})),
+            emitted_events: serde_json::json!([
+                {"name": "system.NewAccount", "data": {}},
+                {"name": "assets.Transferred", "data": {"asset_id": 1984, "amount": "83760000000"}},
+                {"name": "multiassetbounties.BountyCreated", "data": {"index": 2}}
+            ]),
+            event_count: 3,
+            local_xcm: None,
+            // NULL, NOT `[]` — a fork row has no forwarded list at all, and this
+            // is the exact column whose non-null read would have made every fork
+            // row fail to load through Pg (slice 8 caught that by compiling, on
+            // the one surface the tier exists to serve).
+            forwarded_xcms: None,
+            effects: serde_json::json!({"diff_method": "dev_dryRun"}),
+            note: None,
+            spec_version: 2_003_002,
+            metadata_version: 15,
+            sim_version: 2,
+            raw_location: format!(
+                "raw/polkadot-asset-hub/sim/8e/{}/chopsticks_fork.response.json",
+                input.trim_start_matches("0x")
+            ),
+            observed_at: None,
+            // No baseline: a fork run has no forwarded list to difference.
+            baseline_input_hash: None,
+            overrides: None,
+            override_hash: None,
+            storage_diff: Some(serde_json::json!([
+                {"key": "0x26aa394e", "readable": "System.Account(0x…)", "change": "changed"}
+            ])),
+            storage_diff_count: Some(1),
+            // WHAT SLICE 9 RECORDED AS `decoded`. The bytes came from
+            // `dev_dryRun`, which returns the applied extrinsic's phase and
+            // nothing before it.
+            diff_status: Some(sim::DIFF_STATUS_EXTRINSIC_ONLY.into()),
+            // NULL on the live route: no block is built.
+            built_block_hash: None,
+            harness: Some(serde_json::json!({
+                "tool": "chopsticks",
+                "version": "1.5.1",
+                "mocked": ["mocked tx pool", "mocked signature host"],
+            })),
+            dispatch_route: Some(route.into()),
+            agenda_anchor: (route == sim::ROUTE_SCHEDULED).then(|| {
+                serde_json::json!({
+                    "provider": "relay",
+                    "at_parent": 32_519_445u64,
+                    "written_at": 32_519_445u64,
+                    "system_number": 19_368_576u64,
+                    "relay_number": 32_519_445u64,
+                    "agenda_keys_observed": 35,
+                    "decided_by": "agenda key range",
+                })
+            }),
+        };
+        // The scheduled row sits HIGHER, so `at_height desc` puts it first and
+        // the pair is ordered rather than incidental.
+        sim.insert(fork_row(
+            &format!("0x{}", "f1".repeat(32)),
+            19_368_576,
+            sim::ROUTE_SCHEDULED,
+            "executed",
+        ));
+        sim.insert(fork_row(
+            &format!("0x{}", "f2".repeat(32)),
+            19_368_575,
+            sim::ROUTE_DRY_RUN_EXTRINSIC,
+            "dispatch_failed",
+        ));
 
         // ONE PREVIEWED ARRIVAL, stitched to the subject above by its source
         // columns: the message the call really queued, previewed on the chain it
@@ -7170,6 +9477,35 @@ pub(crate) mod tests {
         // one message — the router's wire hash first, then pallet-xcm's topic —
         // and the receiving chain reports the TOPIC, under the AMBIGUOUS id kind
         // because messageQueue never says which of the two it is holding.
+        // Core occupancy on the relay, shaped so the TWO ratios cannot come out
+        // equal by accident: 10 blocks, 10 declared cores, and 3 cores that
+        // produce 10 / 6 / 1 blocks. Cores touched = 3/10 = 30%; slots filled =
+        // 17/100 = 17%. The three fill levels also land in three different
+        // bands, so the DISTRIBUTION is exercised rather than just the totals.
+        // If a future change collapses the two ratios into one number, this
+        // fixture is what makes the collapse visible.
+        let coretime = Arc::new(MemoryCoretimeIndex::new());
+        for h in 100..=109u64 {
+            coretime.insert_indexed_height("polkadot", h);
+            coretime.insert_row("polkadot", h, 0, "included", 0, 2004);
+            if h < 106 {
+                coretime.insert_row("polkadot", h, 1, "included", 1, 2034);
+            }
+            if h == 100 {
+                coretime.insert_row("polkadot", h, 2, "included", 2, 3344);
+            }
+            // A `backed` row in the same window, on a core that is otherwise
+            // idle. It must NOT reach either ratio — async backing means nearly
+            // every inclusion has one, and counting them would roughly double
+            // every figure this endpoint serves.
+            coretime.insert_row("polkadot", h, 3, "backed", 7, 2004);
+        }
+        coretime.insert_config(
+            "polkadot",
+            CoreConfigRow { block_height: 109, num_cores: 10, runtime_version: 2_003_002 },
+        );
+        let coretime: Arc<dyn CoretimeIndex> = coretime;
+
         let xcm = Arc::new(MemoryXcmIndex::new());
         let xcm_row = |chain: &str, height: u64, side: &str, id_kind: &str| XcmMessageRow {
             chain_id: chain.into(),
@@ -7782,6 +10118,20 @@ pub(crate) mod tests {
         // USDT as Asset Hub really names it: TrustBacked 1984, six decimals,
         // and the XCM location a treasury spend refers to it BY.
         let assets = Arc::new(MemoryAssetIndex::new());
+        // built through the real normalizer rather than hand-written, so these
+        // are the strings production would produce (slice 6's lesson: a test
+        // that hand-writes both sides of an identity comparison proves nothing)
+        let ah_path = adapter_substrate::orml::chain_path("polkadot", Some(1000));
+        let ah_usdt_absolute = adapter_substrate::orml::absolutize(
+            &ah_path,
+            &adapter_substrate::assets::local_asset_location(50, 1984),
+        )
+        .expect("usdt absolutizes");
+        let relay_dot_absolute = adapter_substrate::orml::absolutize(
+            &ah_path,
+            &registry::NativeToken::Relay.location(),
+        )
+        .expect("AH's native token is the relay's DOT");
         assets.insert(
             "polkadot-asset-hub",
             AssetRow {
@@ -7799,6 +10149,10 @@ pub(crate) mod tests {
                     .expect("canonical"),
                 ),
                 xcm_location: Some(adapter_substrate::assets::local_asset_location(50, 1984)),
+                // the observer-free name Asset Hub gives its own asset 1984
+                absolute_key: Some(ah_usdt_absolute.to_string()),
+                absolute_location: Some(ah_usdt_absolute.clone()),
+                asset_type: None,
             },
         );
 
@@ -7814,8 +10168,125 @@ pub(crate) mod tests {
                 decimals: Some(10),
                 supply: None,
                 status: None,
+                // xcm_location stays SELF-RELATIVE (this chain's own currency);
+                // absolute_key says the RELAY, because Asset Hub issues nothing
+                // and its native token is DOT — the distinction slice 6's review
+                // caught, and the reason `native_token: relay` is a seed field
                 location_key: Some(r#"{"interior":[],"parents":0}"#.into()),
                 xcm_location: Some(serde_json::json!({"parents": 0, "interior": []})),
+                absolute_key: Some(relay_dot_absolute.to_string()),
+                absolute_location: Some(relay_dot_absolute.clone()),
+                asset_type: None,
+            },
+        );
+
+        // ---- the HYDRATION leg of the SAME logical asset (slice 7) --------
+        // This is what makes the consolidation test real rather than a
+        // one-chain sum wearing a cross-chain name. Note the location: Hydration
+        // observes Asset Hub's USDT ONE HOP AWAY, so its `location_key` genuinely
+        // differs from Asset Hub's — and its `absolute_key` genuinely matches.
+        let hydra_path = adapter_substrate::orml::chain_path("polkadot", Some(2034));
+        let hydra_usdt_location = serde_json::json!({
+            "parents": 1,
+            "interior": {"X3": [[
+                {"Parachain": [1000]}, {"PalletInstance": [50]}, {"GeneralIndex": [1984]}
+            ]]}
+        });
+        let hydra_usdt_absolute =
+            adapter_substrate::orml::absolutize(&hydra_path, &hydra_usdt_location)
+                .expect("usdt absolutizes from hydration too");
+        assets.insert(
+            "hydration",
+            AssetRow {
+                asset_key: "tokens:10".into(),
+                representation_kind: "orml".into(),
+                symbol: Some("USDT".into()),
+                name: Some("Tether USD".into()),
+                decimals: Some(6),
+                supply: None,
+                status: None,
+                location_key: Some(
+                    adapter_substrate::assets::canonical_location(&hydra_usdt_location)
+                        .expect("canonical"),
+                ),
+                xcm_location: Some(hydra_usdt_location.clone()),
+                absolute_key: Some(hydra_usdt_absolute.to_string()),
+                absolute_location: Some(hydra_usdt_absolute.clone()),
+                asset_type: Some("Token".into()),
+            },
+        );
+        // HDX — Hydration's OWN token, so it absolutizes to Hydration itself and
+        // must NOT land in the same group as anybody's DOT
+        let hdx_absolute =
+            adapter_substrate::orml::absolutize(&hydra_path, &registry::NativeToken::Own.location())
+                .expect("hdx absolutizes");
+        assets.insert(
+            "hydration",
+            AssetRow {
+                asset_key: "native".into(),
+                representation_kind: "native".into(),
+                symbol: Some("HDX".into()),
+                name: Some("HDX".into()),
+                decimals: Some(12),
+                supply: None,
+                status: None,
+                location_key: Some(r#"{"interior":[],"parents":0}"#.into()),
+                xcm_location: Some(serde_json::json!({"parents": 0, "interior": []})),
+                absolute_key: Some(hdx_absolute.to_string()),
+                absolute_location: Some(hdx_absolute.clone()),
+                asset_type: Some("Token".into()),
+            },
+        );
+        // an Erc20 asset: named, located, and unanchorable by construction
+        assets.insert(
+            "hydration",
+            AssetRow {
+                asset_key: "tokens:1001".into(),
+                representation_kind: "orml".into(),
+                symbol: Some("aDOT".into()),
+                name: Some("aDOT".into()),
+                decimals: Some(10),
+                supply: None,
+                status: None,
+                location_key: None,
+                xcm_location: None,
+                absolute_key: None,
+                absolute_location: None,
+                asset_type: Some("Erc20".into()),
+            },
+        );
+
+        // USDC on Hydration: a REGISTERED asset with an absolute name, whose
+        // balance has been seen MOVING and never read from state. This is what
+        // an un-swept chain looks like, and it is the shape that used to be
+        // dropped from its group (see the test below).
+        let hydra_usdc_location = serde_json::json!({
+            "parents": 1,
+            "interior": {"X3": [[
+                {"Parachain": [1000]}, {"PalletInstance": [50]}, {"GeneralIndex": [1337]}
+            ]]}
+        });
+        let hydra_usdc_absolute =
+            adapter_substrate::orml::absolutize(&hydra_path, &hydra_usdc_location)
+                .expect("usdc absolutizes");
+        assets.insert(
+            "hydration",
+            AssetRow {
+                asset_key: "tokens:22".into(),
+                representation_kind: "orml".into(),
+                symbol: Some("USDC".into()),
+                name: Some("USD Coin".into()),
+                decimals: Some(6),
+                supply: None,
+                status: None,
+                location_key: Some(
+                    adapter_substrate::assets::canonical_location(&hydra_usdc_location)
+                        .expect("canonical"),
+                ),
+                xcm_location: Some(hydra_usdc_location),
+                absolute_key: Some(hydra_usdc_absolute.to_string()),
+                absolute_location: Some(hydra_usdc_absolute),
+                asset_type: Some("Token".into()),
             },
         );
 
@@ -7843,12 +10314,114 @@ pub(crate) mod tests {
                 free: "20895000000".into(),
                 reserved: "0".into(),
                 total: "20895000000".into(),
+                frozen: None,
                 spec_version: Some(2003002),
                 source: "treasury-holdings".into(),
                 note: None,
                 status: Some("liquid".into()),
             },
         );
+        // ---- Hydration: a SECOND chain holding the SAME logical asset -----
+        // (the USDC movement below is added after `hydra_holder` exists)
+        // Seeded rather than derived, and honestly so: the real Polkadot
+        // treasury position on Hydration sits at a location-derived
+        // (HashedDescription) sovereign address dotlens cannot derive, which is
+        // this slice's stated gap. The fixture registers an account so the
+        // CONSOLIDATION path is exercised; it does not pretend the derivation
+        // problem is solved.
+        let hydra_holder = adapter_substrate::accounts::sibling_sovereign(1000);
+        treasury.insert_account(
+            "polkadot",
+            TreasuryAccountRow {
+                chain_id: "hydration".into(),
+                account_id: hydra_holder.to_vec(),
+                role: "seeded".into(),
+                instance: None,
+                label: "Treasury position on Hydration".into(),
+                derivation: None,
+                source: "registry".into(),
+                ss58: None,
+            },
+        );
+        balances.insert_anchor(
+            "hydration",
+            &hydra_holder,
+            "tokens:10",
+            BalanceAnchorRow {
+                height: 13_652_000,
+                free: "5000000000".into(),
+                reserved: "0".into(),
+                total: "5000000000".into(),
+                // THE FROZEN HALF, recorded since Phase 1 and read by nothing
+                // until this slice. A position that is largely locked is not a
+                // position that can be spent.
+                frozen: Some("1000000000".into()),
+                spec_version: Some(435),
+                source: "treasury-holdings".into(),
+                note: None,
+                status: None,
+            },
+        );
+        // AND AN HDX HOLDING. Without it the HDX-vs-DOT assertion below finds no
+        // HDX position and silently does nothing — which would leave slice 6's
+        // sharpest review finding (Asset Hub's native token absolutizing to the
+        // RELAY, not to Asset Hub) protected by a test that cannot fail. Swapping
+        // `NativeToken::Own`/`Relay` in the seeds must turn this suite red.
+        balances.insert_anchor(
+            "hydration",
+            &hydra_holder,
+            "native",
+            BalanceAnchorRow {
+                height: 13_652_000,
+                free: "700000000000000".into(),
+                reserved: "0".into(),
+                total: "700000000000000".into(),
+                frozen: None,
+                spec_version: Some(435),
+                source: "treasury-holdings".into(),
+                note: None,
+                status: None,
+            },
+        );
+        // MOVEMENT WITH NO ANCHOR — a balance we have watched change and never
+        // read. Deliberately left un-anchored: it is the test subject.
+        balances.insert_change(
+            "hydration",
+            &hydra_holder,
+            "tokens:22",
+            BalanceChangeRow {
+                height: 13_652_500,
+                timestamp: None,
+                event_index: 0,
+                delta: "4800000000".into(),
+                reason: "deposit".into(),
+                counterparty: None,
+            },
+        );
+
+        // AN Erc20 MOVEMENT, so `coverage.erc20_positions` is EXERCISED rather
+        // than merely reachable. The counter was a shipped blocker precisely
+        // because it sat behind the anchor check and an Erc20 can never have an
+        // anchor; moving it in front fixed it, but nothing asserted it could
+        // ever be non-zero — and a fixture that registers an Erc20 asset no
+        // holding references leaves the fix protected by the same emptiness
+        // that hid the bug. Erc20 balances DO reach `balance_changes` (slice 6
+        // measured assets 222/4444/55 arriving as orml Unreserved/Withdrawn),
+        // so a movement with no anchor is the honest live shape.
+        balances.insert_change(
+            "hydration",
+            &hydra_holder,
+            "tokens:1001",
+            BalanceChangeRow {
+                height: 13_652_600,
+                timestamp: None,
+                event_index: 0,
+                delta: "123000000000".into(),
+                reason: "withdraw".into(),
+                counterparty: None,
+            },
+        );
+
         balances.insert_change(
             "polkadot-asset-hub",
             &holder,
@@ -8026,6 +10599,7 @@ pub(crate) mod tests {
             sim,
             xcm_sim,
             xcm,
+            coretime,
             parse_account: Arc::new(|s| {
                 adapter_substrate::accounts::parse_account(s).map(|a| a.to_vec())
             }),
@@ -8234,6 +10808,26 @@ pub(crate) mod tests {
         assert!(gaps.iter().any(|g| g.as_str().unwrap().contains("NOT the state at enactment")));
         assert!(gaps.iter().any(|g| g.as_str().unwrap().contains("proposal_origin")));
 
+        // EVERY ROW ON THIS PAGE IS ENRICHED THE SAME WAY IT IS ON /v1/sim/…,
+        // through the same function. Until slice 10 this page serialized rows
+        // RAW, so a fork row appeared here with the DRY-RUN coverage list, no
+        // `diff_covers` to say its storage diff describes the vehicle rather
+        // than the call, and — the sharp one — a counterfactual's `overrides`
+        // with no `is_counterfactual` marker: fabricated state on a governance
+        // page, unlabelled. This asserts the enrichment RUNS here; that it is
+        // correct per tier is `a_fork_rows_coverage_is_chosen_by_its_route…`.
+        assert_eq!(
+            sims[0]["tier_coverage"]["tier"], "dry_run",
+            "the referendum page must carry each row's own tier coverage, not only the \
+             response-level list"
+        );
+        // …and a dry-run row genuinely has no diff to describe, so it gets no
+        // `diff_covers` — a block that names a field belongs to rows that have one.
+        assert!(sims[0]["diff_covers"].is_null());
+        // The response-level hint fires only when a fork row is present, and
+        // there is none here.
+        assert!(json["simulation_coverage"]["tiers_carry_their_own"].is_null());
+
         // A referendum we HAVE no proposal hash for must not be described as one
         // nobody previewed: we never looked, and saying otherwise would assert
         // something unchecked. Ref 1400 has no hash on either chain.
@@ -8242,9 +10836,16 @@ pub(crate) mod tests {
         let why = j1400["simulation_coverage"]["recorded_only"].as_str().unwrap();
         assert!(why.contains("no proposal hash indexed yet"), "{why}");
         assert!(
-            !why.contains("no Tier 1 preview has been run"),
+            !why.contains("no preview of any tier has been run"),
             "an empty list because we could not look is a different claim from an empty \
              list because we looked and found nothing: {why}"
+        );
+        // …and the sentence for "we looked and found nothing" must not name a
+        // TIER, because the lookup is untiered: an empty list there means nobody
+        // previewed the call on any tier, not that Tier 1 specifically is absent.
+        assert!(
+            !why.contains("Tier 1"),
+            "this list is not tier-filtered, so no claim about it may name one: {why}"
         );
     }
 
@@ -8527,6 +11128,202 @@ pub(crate) mod tests {
         )
         .await;
         assert_eq!(s, StatusCode::NOT_FOUND, "an unknown chain is refused, not empty");
+    }
+
+    /// Pull the two fork rows out of the response by their ROUTE rather than by
+    /// index. Slice 7 lost a test to exactly this: a new fixture row moved
+    /// `segments[0]` and the assertion then described a different subject.
+    fn fork_rows(json: &serde_json::Value) -> (serde_json::Value, serde_json::Value) {
+        let rows = json["simulations"].as_array().expect("a list");
+        let by = |route: &str| {
+            rows.iter()
+                .find(|r| r["dispatch_route"] == route)
+                .unwrap_or_else(|| panic!("no {route} fork row in the response"))
+                .clone()
+        };
+        (by(sim::ROUTE_SCHEDULED), by(sim::ROUTE_DRY_RUN_EXTRINSIC))
+    }
+
+    #[tokio::test]
+    async fn a_fork_rows_coverage_is_chosen_by_its_route_and_says_what_its_diff_covers() {
+        let app = router(test_state().await);
+        let (status, json) = get_json(
+            &app,
+            &format!("/v1/sim/polkadot-asset-hub/calls/0x{}", "f0".repeat(32)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let (scheduled, extrinsic) = fork_rows(&json);
+
+        let covers = |v: &serde_json::Value| -> String {
+            v["tier_coverage"]["not_covered"]
+                .as_array()
+                .expect("a list")
+                .iter()
+                .map(|l| l.as_str().unwrap_or_default())
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        // LOWERCASED BEFORE MATCHING. The two arms deliberately shout different
+        // parts of their sentences, and an assertion that depends on which words
+        // are capitalised is an assertion about typography.
+        let (sched_text, extr_text) = (
+            covers(&scheduled).to_lowercase(),
+            covers(&extrinsic).to_lowercase(),
+        );
+
+        // THE TWO LISTS ARE STRUCTURALLY DIFFERENT, asserted as a PROPERTY and
+        // not as wording: a shared list carefully worded until it is true of both
+        // is the defect this project shipped five times before splitting them.
+        assert_ne!(
+            sched_text, extr_text,
+            "the two routes model different things and must not share one coverage list"
+        );
+        assert!(
+            extr_text.contains("transaction extensions did run"),
+            "an applied extrinsic runs the whole pipeline with only the signature faked"
+        );
+        assert!(
+            sched_text.contains("no transaction extension"),
+            "a scheduled dispatch is not an extrinsic"
+        );
+        // ...and neither list may make the OTHER route's claim.
+        assert!(!sched_text.contains("transaction extensions did run"));
+        assert!(!extr_text.contains("no transaction extension"));
+
+        // THE MEASURED DEFECT, on the row. The same `extrinsic_only` bytes are
+        // the call's own writes on one route and the no-op vehicle's on the
+        // other, and the row says which rather than leaving it to a coverage
+        // list somebody may not read.
+        assert_eq!(scheduled["diff_status"], sim::DIFF_STATUS_EXTRINSIC_ONLY);
+        assert_eq!(extrinsic["diff_status"], sim::DIFF_STATUS_EXTRINSIC_ONLY);
+        assert_eq!(
+            scheduled["diff_covers"]["covers_this_call"], false,
+            "a scheduled dispatch happens in on_initialize, which an extrinsic-scoped diff omits"
+        );
+        assert_eq!(
+            extrinsic["diff_covers"]["covers_this_call"], true,
+            "on the extrinsic route the subject IS the extrinsic, so the same scope is complete"
+        );
+        assert_eq!(
+            scheduled["diff_covers"]["read_instead"], "emitted_events",
+            "a row whose diff does not describe its call must name what does"
+        );
+        assert!(
+            extrinsic["diff_covers"]["read_instead"].is_null(),
+            "nothing to redirect to when the diff already covers the call"
+        );
+        // The diff is STILL SERVED on both — it is scope that differs, not
+        // readability, and blanking it would lose the vehicle's real writes.
+        assert_eq!(scheduled["storage_diff_count"], 1);
+        assert_eq!(extrinsic["storage_diff_count"], 1);
+
+        // And the coverage list carries the same fact, so a consumer reading
+        // either one is not told a different story.
+        assert!(
+            sched_text.contains("does not describe its call"),
+            "the scheduled route's list names the diff blindness: {sched_text}"
+        );
+        assert!(
+            !sched_text.contains("head+1"),
+            "the agenda height is decided from data and recorded in `agenda_anchor`; head+1 was \
+             slice 8's assumption and was wrong by ~13.15M blocks: {sched_text}"
+        );
+        assert_eq!(
+            scheduled["agenda_anchor"]["provider"], "relay",
+            "the anchor decision is surfaced unconditionally on a scheduled row"
+        );
+
+        // ...AND THE FAITHFUL-FORK NOTE IS SELECTED BY ROUTE TOO, which is the
+        // same defect one field over: `counterfactual.reads_as` described "the
+        // scheduled task", "the agenda slot (see `agenda_anchor`)" and "entries
+        // marked `from_harness`" on EVERY faithful fork row — every clause of
+        // which is false on the extrinsic route, where `agenda_anchor` is NULL
+        // and no entry is ever `from_harness`. Asserted as a PROPERTY: the
+        // extrinsic arm may not describe scheduler machinery it never used.
+        assert_eq!(scheduled["counterfactual"]["is_counterfactual"], false);
+        assert_eq!(extrinsic["counterfactual"]["is_counterfactual"], false);
+        let extr_faithful = extrinsic["counterfactual"]["reads_as"]
+            .as_str()
+            .expect("a faithful fork row explains that it is one")
+            .to_lowercase();
+        // The precise defect was DIRECTING THE READER AT FIELDS THAT ARE EMPTY
+        // on this route: `agenda_anchor` is NULL on every extrinsic row and no
+        // diff entry is ever `from_harness`. Denying the machinery in prose is
+        // fine and useful; citing the columns as if they held something is not,
+        // so the assertion is on the field pointers rather than on the words.
+        for absent_field in ["agenda_anchor", "from_harness"] {
+            assert!(
+                !extr_faithful.contains(absent_field),
+                "the extrinsic route leaves `{absent_field}` empty, so its faithful-fork note \
+                 must not send a reader to it: {extr_faithful}"
+            );
+        }
+        assert_ne!(
+            extr_faithful,
+            scheduled["counterfactual"]["reads_as"]
+                .as_str()
+                .expect("a string")
+                .to_lowercase(),
+            "the two routes inject different things and must not share one faithful-fork note"
+        );
+        assert!(
+            scheduled["counterfactual"]["reads_as"]
+                .as_str()
+                .expect("a string")
+                .to_lowercase()
+                .contains("agenda"),
+            "the scheduled route DOES replace an agenda slot and must keep saying so"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_fork_row_carries_no_forwarded_list_and_therefore_no_legs_or_attribution() {
+        let app = router(test_state().await);
+        let (_, json) = get_json(
+            &app,
+            &format!("/v1/sim/polkadot-asset-hub/calls/0x{}", "f0".repeat(32)),
+        )
+        .await;
+        let (scheduled, extrinsic) = fork_rows(&json);
+
+        for row in [&scheduled, &extrinsic] {
+            let keys: Vec<&String> = row.as_object().expect("an object").keys().collect();
+            // ASSERTED ON `keys()`, NOT ON A NULL. `legs: []` beside a coverage
+            // line saying "an empty list means nobody followed them" would be
+            // false of a row where nothing COULD be followed — the fifth
+            // recurrence of a line being wrong on its second consumer, which is
+            // why these two fields are attached only to rows that have a
+            // forwarded list at all.
+            assert!(
+                !keys.iter().any(|k| k.as_str() == "legs"),
+                "a fork row must not carry `legs`: {keys:?}"
+            );
+            assert!(
+                !keys.iter().any(|k| k.as_str() == "forwarded_attribution"),
+                "a fork row has no forwarded_xcms to attribute: {keys:?}"
+            );
+            assert!(
+                row["forwarded_xcms"].is_null(),
+                "NULL, never [] — and reading this column as a bare value is what would make \
+                 every fork row fail to load through Pg"
+            );
+            // Both runtime-API version columns are absent for the same reason:
+            // this tier calls neither.
+            assert!(row["xcm_version"].is_null());
+            assert!(row["api_version"].is_null());
+        }
+
+        // The dry-run row one call hash over DOES carry both, so this is a
+        // property of the tier and not of the endpoint having dropped them.
+        let (_, dry) = get_json(
+            &app,
+            &format!("/v1/sim/polkadot-asset-hub/calls/0x{}", "ab".repeat(32)),
+        )
+        .await;
+        let keys: Vec<&String> = dry["simulations"][0].as_object().unwrap().keys().collect();
+        assert!(keys.iter().any(|k| k.as_str() == "legs"));
+        assert!(keys.iter().any(|k| k.as_str() == "forwarded_attribution"));
     }
 
     #[tokio::test]
@@ -8994,9 +11791,24 @@ pub(crate) mod tests {
         let (status, json) = get_json(&app, "/v1/treasury/polkadot/holdings").await;
         assert_eq!(status, StatusCode::OK);
 
-        let seg = &json["segments"][0];
+        // BY CHAIN, NOT BY INDEX. The treasury index orders by (chain, role,
+        // label), so adding a Hydration account in slice 7 moved this segment
+        // from position 0 — the same shape as Phase 3 slice 2, where registering
+        // Hydration silently satisfied a test's precondition and moved its
+        // subject. Selecting by name cannot drift again.
+        let seg = json["segments"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["chain"] == "polkadot-asset-hub")
+            .expect("the Asset Hub segment");
         assert_eq!(seg["chain"], "polkadot-asset-hub");
-        let account = &seg["accounts"][0];
+        let account = seg["accounts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|a| a["role"] == "pot")
+            .expect("the treasury pot");
         // the account says WHY it is treasury money, re-derivably
         assert_eq!(account["derivation"], "modl:py/trsry");
         assert_eq!(account["role"], "pot");
@@ -9045,12 +11857,389 @@ pub(crate) mod tests {
         assert_eq!((native["symbol"].as_str(), native["decimals"].as_u64()), (Some("DOT"), Some(10)));
         assert_eq!(native["display"], "0.0000000700");
 
-        assert_eq!(coverage["positions_with_an_anchor"], 2);
-        assert_eq!(coverage["positions_without_an_anchor"], 1);
+        // 3 anchored: AH's USDT and native, plus Hydration's USDT (slice 7's
+        // fixture addition). These are GLOBAL counters across every segment, so
+        // they move when the fixture gains a chain — updated deliberately rather
+        // than discovered as a failure.
+        // the Hydration segment is asserted rather than merely present, so a
+        // fixture that stops registering it fails here instead of quietly
+        // shrinking every count below
+        let hydra = json["segments"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["chain"] == "hydration")
+            .expect("the Hydration segment");
+        let hydra_usdt = hydra["accounts"][0]["positions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["asset"] == "tokens:10")
+            .expect("Hydration's orml USDT position");
+        assert_eq!(hydra_usdt["amount"], "5000000000");
+        assert_eq!(hydra_usdt["display"], "5000.000000");
+
+        // 4 anchored: AH's USDT and native, Hydration's USDT and native. These
+        // are GLOBAL counters across every segment, so they move when the
+        // fixture gains a chain — updated deliberately rather than discovered as
+        // a failure.
+        assert_eq!(coverage["positions_with_an_anchor"], 4);
+        // 2 unanchored: AH's USDC (no registry entry at all) and Hydration's
+        // USDC (registered, absolute-named, never swept) — different causes,
+        // and the consolidation endpoint treats them differently. The THIRD is
+        // Hydration's Erc20 aDOT movement: this endpoint has no Erc20 branch, so
+        // it counts one as plainly unanchored (which it is), while
+        // /consolidated classifies it BEFORE the anchor check and holds its own
+        // unanchored count at 2. The two surfaces disagreeing here is the design
+        // working — "never swept" and "unanchorable in principle" are different
+        // failures with different remedies, and only one of them has a remedy.
+        assert_eq!(coverage["positions_without_an_anchor"], 3);
         assert!(coverage["valuation"].as_str().unwrap().contains("quantities only"));
         let gaps = coverage["not_covered"].as_array().unwrap();
         assert!(gaps.iter().any(|g| g.as_str().unwrap().contains("bounty")));
-        assert!(gaps.iter().any(|g| g.as_str().unwrap().contains("Hydration")));
+
+        // THE ACCOUNT-VISIBILITY LINE IS DERIVED FROM THE ACCOUNT LIST, and the
+        // assertion here has to be on the PROPERTY rather than the wording.
+        // Slice 6 asserted `contains("Hydration")` against a line that read
+        // "positions on chains dotlens has not registered — notably the
+        // Hydration …"; registering Hydration made that line false on its own
+        // page, slice 7 replaced it with a derived one that names no chain, and
+        // this assertion went stale with it. Asserting the wording is how a
+        // check outlives the thing it was checking.
+        let visibility = gaps
+            .iter()
+            .map(|g| g.as_str().unwrap())
+            .find(|g| g.contains("only as visible as its ACCOUNTS"))
+            .expect("the derived account-visibility line");
+        // The fixture seeds a Hydration account with a NULL derivation, so the
+        // line must say some accounts are seeded. Neuter the derivation and
+        // this clause disappears and this fails — which is the point.
+        assert!(
+            visibility.contains("seeded rather than derived"),
+            "an account with a null `derivation` is listed above, so the derived \
+             line must say so instead of implying every account was derived: \
+             {visibility}"
+        );
+
+        // …and the defect that forced the rewrite must not come back in any
+        // wording: no gap may call a chain unregistered while this same
+        // response lists accounts on it. Chain ids are lowercase and the prose
+        // capitalises, so the comparison folds case.
+        let listed: Vec<&str> = json["segments"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|s| !s["accounts"].as_array().unwrap().is_empty())
+            .map(|s| s["chain"].as_str().unwrap())
+            .collect();
+        assert!(listed.contains(&"hydration"), "the fixture must list Hydration accounts");
+        for gap in gaps.iter().map(|g| g.as_str().unwrap().to_lowercase()) {
+            if !gap.contains("not registered") {
+                continue;
+            }
+            for chain in &listed {
+                assert!(
+                    !gap.contains(chain),
+                    "`{chain}` has accounts in this very response, so no coverage \
+                     line may describe it as unregistered: {gap}"
+                );
+            }
+        }
+    }
+
+    /// THE SLICE'S HEADLINE: one logical asset, two chains, one number — and
+    /// the negative half asserted first, because without it this test would be
+    /// summing two rows that were never distinguishable in the first place.
+    #[tokio::test]
+    async fn one_asset_on_two_chains_consolidates_into_a_single_addable_position() {
+        let app = router(test_state().await);
+        let (status, json) = get_json(&app, "/v1/treasury/polkadot/consolidated").await;
+        assert_eq!(status, StatusCode::OK);
+
+        let positions = json["positions"].as_array().unwrap();
+        let usdt = positions
+            .iter()
+            .find(|p| p["symbol"] == "USDT")
+            .expect("the consolidated USDT position");
+
+        // THE NEGATIVE HALF FIRST. The two legs' SELF-RELATIVE names differ —
+        // Hydration sees Asset Hub's USDT one hop away — so `location_key`
+        // could never have joined them. If these are ever equal, everything
+        // below proves nothing.
+        let legs = usdt["legs"].as_array().unwrap();
+        assert_eq!(legs.len(), 2);
+        let state = test_state().await;
+        let ah_rows = state.assets.assets("polkadot-asset-hub").await.unwrap();
+        let hy_rows = state.assets.assets("hydration").await.unwrap();
+        let ah_usdt = ah_rows.iter().find(|a| a.asset_key == "assets:1984").unwrap();
+        let hy_usdt = hy_rows.iter().find(|a| a.asset_key == "tokens:10").unwrap();
+        assert_ne!(
+            ah_usdt.location_key, hy_usdt.location_key,
+            "a Location is relative to its observer — version-stripping CANNOT \
+             reconcile two frames, which is the whole reason absolute_key exists"
+        );
+        assert_eq!(
+            ah_usdt.absolute_key, hy_usdt.absolute_key,
+            "…and absolutizing them does"
+        );
+
+        // the sum, and the units it is summed in
+        assert_eq!(usdt["addable"], true);
+        assert_eq!(usdt["decimals"], 6);
+        assert_eq!(usdt["total"], "25000000000", "20,000 on AH + 5,000 on Hydration");
+        assert_eq!(usdt["display"], "25000.000000");
+        let chains: Vec<&str> = usdt["chains"].as_array().unwrap()
+            .iter().map(|c| c.as_str().unwrap()).collect();
+        assert_eq!(chains, vec!["hydration", "polkadot-asset-hub"]);
+        // cross-chain positions sort first — the ones this endpoint exists for
+        assert_eq!(positions[0]["symbol"], "USDT");
+        assert_eq!(json["coverage"]["spanning_more_than_one_chain"], 1);
+
+        // EVERY LEG KEEPS ITS PROVENANCE, so the sum is re-derivable and the
+        // legs are re-derivable from the chain. A total whose parts cannot be
+        // checked is what every incumbent already offers.
+        let hydra_leg = legs.iter().find(|l| l["chain"] == "hydration").unwrap();
+        assert_eq!(hydra_leg["amount"], "5000000000");
+        assert_eq!(hydra_leg["provenance"]["anchor_height"], 13_652_000);
+        assert_eq!(hydra_leg["provenance"]["anchor_spec_version"], 435);
+        // THE FROZEN HALF, surfaced for the first time since Phase 1 — and the
+        // field is `frozen_at_anchor`, not `frozen`, on purpose: it is read from
+        // the ANCHOR while `amount` is anchor + deltas, so the two are as-of
+        // different heights and it is NOT subtracted from any total. A bare
+        // `frozen` beside `amount` invites exactly that subtraction.
+        assert_eq!(hydra_leg["frozen_at_anchor"], "1000000000");
+        assert!(
+            hydra_leg.get("frozen").is_none(),
+            "the un-qualified name must not come back: it is what a reader \
+             would subtract"
+        );
+
+        // HDX MUST NOT JOIN ANYBODY'S DOT. Hydration issues its own token, so it
+        // absolutizes to Hydration itself; Asset Hub issues nothing, so its
+        // native row absolutizes to the RELAY. Two different logical assets, and
+        // getting this wrong was slice 6's sharpest review finding.
+        let hdx = positions
+            .iter()
+            .find(|p| p["symbol"] == "HDX")
+            .expect("Hydration's own token is a position of its own");
+        let dot = positions
+            .iter()
+            .find(|p| p["symbol"] == "DOT")
+            .expect("Asset Hub's native token");
+        assert_ne!(
+            hdx["absolute_key"], dot["absolute_key"],
+            "HDX is Hydration's own token and absolutizes to Hydration; Asset \
+             Hub issues NOTHING, so its native token is the relay's DOT and \
+             absolutizes to the relay. Merging them would be the defect slice \
+             6's review caught, one endpoint later"
+        );
+        assert!(
+            dot["absolute_key"].as_str().unwrap().contains("Parachain") == false,
+            "the relay's DOT names no parachain: {}", dot["absolute_key"]
+        );
+
+        // NOTHING IS SUMMED ACROSS ASSETS and the response says why. Assert the
+        // two load-bearing CLAIMS rather than a phrase: that a cross-asset total
+        // is refused, and that a price is the reason. (The first draft of this
+        // test asserted `contains("no price")` against a string that says
+        // "needs a price" — a wording check that fails on wording alone.)
+        let valuation = json["coverage"]["valuation"].as_str().unwrap();
+        assert!(valuation.contains("no cross-asset total"), "{valuation}");
+        assert!(valuation.contains("price"), "{valuation}");
+        assert!(json.get("total_usd").is_none());
+        assert!(json.get("total").is_none());
+        // and no valuation leaks in beside a quantity anywhere in the payload
+        let body = json.to_string().to_lowercase();
+        for forbidden in ["usd_est", "\"usd\"", "price_usd"] {
+            assert!(
+                !body.contains(forbidden),
+                "a quantity is exact and self-provenanced; a price is neither, \
+                 and `{forbidden}` appears in the payload"
+            );
+        }
+    }
+
+    /// What CANNOT be consolidated is listed, not dropped — the amended Phase 3
+    /// criterion 3 ("enumerated and counted, never estimated") as an assertion.
+    #[tokio::test]
+    async fn what_cannot_be_consolidated_is_listed_with_its_reason() {
+        let app = router(test_state().await);
+        let (_, json) = get_json(&app, "/v1/treasury/polkadot/consolidated").await;
+
+        let un = json["unconsolidated"].as_array().unwrap();
+        // the USDC position was seen MOVING and never anchored: real money, an
+        // unknown balance, and it must not silently make the totals look complete
+        let unanchored = un
+            .iter()
+            .find(|u| u["asset_key"] == "assets:1337")
+            .expect("the unanchored position is listed, not dropped");
+        assert!(unanchored["amount"].is_null());
+        assert!(unanchored["reason"].as_str().unwrap().contains("not in core.assets"));
+        // BOTH unanchored positions are counted, but only ONE of them lands
+        // here: the other has an absolute name, so it joins its group and
+        // suppresses that group's total instead (see the test above). The two
+        // are different failures and the endpoint does not blur them.
+        assert_eq!(json["coverage"]["positions_without_an_anchor"], 2);
+        // TWO unconsolidated rows for two different reasons — Hydration's USDC
+        // (registered and absolute-named, simply never swept: a remedy exists)
+        // and Hydration's Erc20 aDOT (no remedy exists at all). Counting them
+        // together would hide the distinction the Erc20 line is written to make.
+        assert_eq!(un.len(), 2);
+
+        // and the gaps are NAMED, including the one this slice cannot close
+        let gaps = json["coverage"]["not_covered"].as_array().unwrap();
+        assert!(gaps.iter().any(|g| g.as_str().unwrap().contains("Erc20")));
+
+        // THE Erc20 COUNTER MUST BE ABLE TO FIRE. It was a shipped blocker for
+        // sitting behind the anchor check — an Erc20 can never HAVE an anchor,
+        // so it read 0 forever while claiming to measure the largest uncovered
+        // position dotlens knows about. Moving it in front fixed the code; this
+        // asserts the fix, because "reachable by inspection" is what the
+        // original was too. Move it back behind the anchor check and this fails.
+        assert_eq!(json["coverage"]["erc20_positions"], 1);
+        let erc20 = un
+            .iter()
+            .find(|u| u["asset_key"] == "tokens:1001")
+            .expect("the Erc20 position is LISTED, not dropped");
+        assert!(erc20["amount"].is_null(), "an Erc20 has no readable position");
+        assert_eq!(
+            erc20["movement_only"], "123000000000",
+            "the event-stream total is shown as movement, never as a position"
+        );
+        assert!(erc20["reason"].as_str().unwrap().contains("pallet_evm"));
+        // and the remedy that cannot work is not offered
+        assert!(
+            !erc20["reason"].as_str().unwrap().contains("run treasury-holdings"),
+            "advising a sweep that skips Erc20 by design is worse than no advice"
+        );
+        assert!(gaps
+            .iter()
+            .any(|g| g.as_str().unwrap().contains("HashedDescription")));
+        assert!(gaps
+            .iter()
+            .any(|g| g.as_str().unwrap().contains("DIFFERENT blocks")),
+            "a consolidated total is as-of its anchors, not as of one instant");
+
+        // every registered chain declares `native_token`, so nothing is silently
+        // under-reported for that reason — and the endpoint says so rather than
+        // leaving it to be assumed
+        assert_eq!(
+            json["coverage"]["chains_without_native_token"]
+                .as_array()
+                .unwrap()
+                .len(),
+            0
+        );
+    }
+
+    /// THE DEFECT A REVIEWER CAUGHT, as a test — and it is the one that would
+    /// have produced a wrong number rather than a missing one.
+    ///
+    /// A leg whose asset IS consolidatable but whose balance has never been read
+    /// from state was, in the first draft, classified as "unconsolidated" and
+    /// dropped BEFORE grouping. Its position then rendered a clean total across
+    /// the remaining chains with nothing to say a leg was missing. Hydration is
+    /// in exactly that state on live data today — slice 6 verified
+    /// `treasury-holdings hydration` reports 0 accounts — so this is the shape
+    /// production would have hit first.
+    #[tokio::test]
+    async fn a_leg_of_unknown_size_suppresses_its_total_instead_of_vanishing() {
+        let app = router(test_state().await);
+        let (_, json) = get_json(&app, "/v1/treasury/polkadot/consolidated").await;
+
+        let usdc = json["positions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["symbol"] == "USDC")
+            .expect("USDC is a REGISTERED asset with an absolute name, so it \
+                     belongs in `positions` even though its balance is unknown");
+
+        // the leg JOINED its group rather than being filed away elsewhere…
+        assert_eq!(usdc["legs"].as_array().unwrap().len(), 1);
+        assert_eq!(usdc["legs_of_unknown_size"], 1);
+        assert_eq!(usdc["complete"], false);
+        // …and the group therefore has NO total, rather than one that omits a
+        // leg and looks whole. A null beside a populated leg list is
+        // unmistakable; a smaller number would not have been.
+        assert!(
+            usdc["total"].is_null(),
+            "a total over only the KNOWN legs would be wrong AND look right"
+        );
+        assert!(usdc["display"].is_null());
+        // the units still agree, so `addable` stays true — "can these be added"
+        // and "do we know all the numbers" are different questions and are
+        // reported separately rather than collapsed into one flag
+        assert_eq!(usdc["addable"], true);
+        assert_eq!(json["coverage"]["positions_with_a_leg_of_unknown_size"], 1);
+
+        // and the unknown leg says WHY, in the payload rather than in a doc
+        let leg = &usdc["legs"][0];
+        assert!(leg["amount"].is_null());
+        assert_eq!(leg["basis"], "deltas_only");
+        assert!(leg["unknown_because"]
+            .as_str()
+            .unwrap()
+            .contains("never read from state"));
+
+        // CONTRAST, in the same response: the fully-anchored USDT position DOES
+        // carry a total. Without this the test would pass on an endpoint that
+        // simply never totals anything.
+        let usdt = json["positions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["symbol"] == "USDT")
+            .expect("the USDT position");
+        assert_eq!(usdt["complete"], true);
+        assert_eq!(usdt["total"], "25000000000");
+    }
+
+    /// The reader that earns `assets_absolute_key_idx` (migration 0020).
+    #[tokio::test]
+    async fn asset_identity_lists_every_representation_and_says_if_they_are_addable() {
+        let state = test_state().await;
+        let ah = state.assets.assets("polkadot-asset-hub").await.unwrap();
+        let key = ah
+            .iter()
+            .find(|a| a.asset_key == "assets:1984")
+            .unwrap()
+            .absolute_key
+            .clone()
+            .unwrap();
+
+        let app = router(test_state().await);
+        let (status, json) = get_json(
+            &app,
+            &format!("/v1/assets/identity?key={}", urlencode(&key)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["representation_count"], 2);
+        assert_eq!(json["addable"], true);
+        let reps = json["representations"].as_array().unwrap();
+        assert_eq!(reps[0]["chain"], "hydration");
+        assert_eq!(reps[0]["asset_key"], "tokens:10");
+        assert_eq!(reps[1]["chain"], "polkadot-asset-hub");
+        assert_eq!(reps[1]["asset_key"], "assets:1984");
+        // the two self-relative names are kept beside the absolute one, because
+        // their DIFFERING is the finding and a reader should not have to take
+        // the normalizer on trust
+        assert_ne!(reps[0]["location_key"], reps[1]["location_key"]);
+        assert!(json["reads_as"].as_str().unwrap().contains("directly addable"));
+
+        // an unknown key is an honest empty answer, not a 404 — "we have not
+        // indexed this" and "this does not exist" are different claims
+        let (s2, j2) = get_json(&app, "/v1/assets/identity?key=%5B%5D").await;
+        assert_eq!(s2, StatusCode::OK);
+        assert_eq!(j2["representation_count"], 0);
+        assert_eq!(
+            j2["addable"], false,
+            "a claim of addability about nothing — the first draft returned true \
+             here, because `distinct.len() <= 1` is vacuously satisfied by an \
+             empty set"
+        );
+        assert!(j2["reads_as"].as_str().unwrap().contains("not the same as"));
     }
 
     #[tokio::test]
@@ -9255,6 +12444,154 @@ pub(crate) mod tests {
             "24310025.5393737286"
         );
         assert!(format_units("not-a-number", 6).is_none());
+    }
+
+    /// THE SLICE'S PRODUCT CLAIM, ASSERTED AS A PROPERTY RATHER THAN AS WORDING.
+    ///
+    /// Two ratios, never one. The fixture is built so they cannot come out equal
+    /// by accident — 3 of 10 cores produce, filling 17 of 100 slots — and the
+    /// test asserts BOTH exist, that they DIFFER, and that no field anywhere in
+    /// the payload is called `utilization`. That last assertion is the one that
+    /// catches the failure this endpoint exists to prevent: a later change that
+    /// helpfully collapses the two into "the" utilization number would keep
+    /// every other assertion here green.
+    #[tokio::test]
+    async fn core_occupancy_serves_two_ratios_and_never_collapses_them_into_one() {
+        let app = router(test_state().await);
+        let (status, json) = get_json(&app, "/v1/coretime/polkadot/occupancy?from=100&to=109").await;
+        assert_eq!(status, StatusCode::OK);
+
+        let occ = &json["occupancy"];
+        let touched = occ["cores_touched_ratio"].as_f64().expect("cores touched ratio");
+        let filled = occ["slots_filled_ratio"].as_f64().expect("slots filled ratio");
+        assert!((touched - 0.30).abs() < 1e-9, "3 of 10 declared cores produced: {touched}");
+        assert!((filled - 0.17).abs() < 1e-9, "17 of 100 core-block slots: {filled}");
+        assert!(
+            touched > filled,
+            "the gap between them IS the finding — even the cores that are used sit idle"
+        );
+        // Both numerator/denominator pairs travel with the ratios, so every
+        // figure here is re-derivable rather than taken on trust.
+        assert_eq!(occ["cores_that_produced_anything"], 3);
+        assert_eq!(occ["included_candidates"], 17);
+        assert_eq!(occ["core_block_slots"], 100);
+
+        // `backed` rows are in the window and in `by_kind`, and in NEITHER
+        // ratio: async backing means nearly every inclusion has one, so counting
+        // them would roughly double every figure above.
+        assert_eq!(json["by_kind"]["included"], 17);
+        assert_eq!(json["by_kind"]["backed"], 10);
+
+        // No key anywhere in the payload may be called `utilization`.
+        fn keys_named(v: &serde_json::Value, name: &str) -> bool {
+            match v {
+                serde_json::Value::Object(m) => {
+                    m.keys().any(|k| k == name) || m.values().any(|x| keys_named(x, name))
+                }
+                serde_json::Value::Array(a) => a.iter().any(|x| keys_named(x, name)),
+                _ => false,
+            }
+        }
+        assert!(
+            !keys_named(&json, "utilization"),
+            "one `utilization` field would report one of these two ratios and call it the other"
+        );
+
+        // The denominator DATES itself: which reading, from which block, and
+        // where that block sits relative to the window.
+        let den = &json["denominator"];
+        assert_eq!(den["num_cores"], 10);
+        assert_eq!(den["read_at_height"], 109);
+        assert_eq!(den["position"], "inside_window");
+        assert_eq!(den["stable_across_window"], true);
+        assert_eq!(
+            den["max_core_index_observed"], 7,
+            "the detector spans EVERY kind: core 7 carries only a `backed` row and is still the \
+             highest core the runtime scheduled work onto in this window"
+        );
+        assert_eq!(
+            den["stale_suspected"], false,
+            "7 is below the 10 the reading declares, so the denominator is not contradicted"
+        );
+
+        // The memory index carries no per-row lineage, so the list is EMPTY —
+        // an honest absence rather than a fabricated runtime version. The pg
+        // round-trip is what proves a real one comes through.
+        assert_eq!(occ["lineage"].as_array().expect("a list, never null").len(), 0);
+
+        // The distribution, which is the shape no marketplace view shows: one
+        // saturated core (10/10), one at 60%, one at 10%, seven producing
+        // nothing at all.
+        let bands = &json["bands"];
+        assert_eq!(bands["saturated_over_95"], 1);
+        assert_eq!(bands["half_50_to_75"], 1);
+        assert_eq!(bands["sparse_5_to_25"], 1);
+        assert_eq!(bands["producing_nothing"], 7);
+
+        // The window states what it was computed over, not just what was asked.
+        assert_eq!(json["window"]["blocks_indexed"], 10);
+        assert_eq!(json["window"]["contiguous"], true);
+        assert_eq!(json["window"]["heights_with_occupancy"], 10);
+
+        // A registered PARACHAIN is a 404 with a reason rather than an empty
+        // window that would read as "this chain's cores did nothing".
+        let (status, json) =
+            get_json(&app, "/v1/coretime/polkadot-asset-hub/occupancy?from=100&to=109").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert!(
+            json["error"].as_str().unwrap().contains("RELAY pallet"),
+            "the 404 must say why, not just that: {}",
+            json["error"]
+        );
+
+        // And an unbounded request is refused rather than given a default window
+        // nobody chose.
+        let (status, _) = get_json(&app, "/v1/coretime/polkadot/occupancy").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+
+        // A WINDOW WE HOLD NO BLOCKS FOR IS UNDEFINED, NOT ZERO — the arm a
+        // two-way match would have sent to "no `num_cores` reading is on
+        // record" while naming the reading three lines below it.
+        let (status, json) = get_json(&app, "/v1/coretime/polkadot/occupancy?from=900&to=910").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["window"]["blocks_indexed"], 0);
+        assert!(
+            json["occupancy"]["slots_filled_ratio"].is_null(),
+            "0/0 has no value, and a fill ratio of zero would be a claim about the network"
+        );
+        // ITS SIBLING TOO, and this is the one that reads as defensible and is
+        // not. `cores_touched_ratio`'s denominator SURVIVES an empty window —
+        // 10 cores are declared whether or not we indexed a block — so 0/10 is
+        // arithmetically fine and factually says the network sat idle over a
+        // range nobody looked at. It is the last screenshot-able 0% on a
+        // payload that nulls the fill ratio and the whole band table precisely
+        // to prevent one.
+        assert!(
+            json["occupancy"]["cores_touched_ratio"].is_null(),
+            "a touched ratio of zero over 0 indexed blocks is 'we did not look' rendered as \
+             'there is nothing there': {}",
+            json["occupancy"]
+        );
+        assert!(
+            json["occupancy"]["reads_as"]
+                .as_str()
+                .unwrap()
+                .contains("UNDEFINED, NOT ZERO"),
+            "{}",
+            json["occupancy"]["reads_as"]
+        );
+        assert!(
+            json["bands"].is_null(),
+            "a band table full of zeroes is a distribution somebody would screenshot"
+        );
+        // The denominator IS on record — it is the window that is missing, and
+        // the two claims must not be confused.
+        assert_eq!(json["denominator"]["num_cores"], 10);
+        assert_eq!(json["denominator"]["position"], "before_window");
+        assert!(
+            json["denominator"]["stable_across_window"].is_null(),
+            "no reading falls inside this window, so nothing here can say the denominator held"
+        );
     }
 
     #[tokio::test]

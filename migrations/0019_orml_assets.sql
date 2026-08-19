@@ -1,0 +1,172 @@
+-- 0019_orml_assets: absolute asset identity + the ORML representation
+-- (Phase 3, slice 6 — the Hydration money mapper).
+--
+-- THE DEFECT THIS CLOSES was measured one chain over and stated in the
+-- Hydration seed before a line of it was written: money lives in THREE places
+-- on Hydration, our mapper read one of them, and the one it read is the one
+-- with almost nothing in it. `pallet_balances` there holds HDX only;
+-- `orml_tokens` holds DOT, USDT, USDC, vDOT, LRNA and the stablepool shares.
+-- Enabling the balances module without an orml mapper would have indexed HDX
+-- and reported the Polkadot treasury's largest non-DOT position as zero — the
+-- same shape of silent hole as the ≈$592k stablecoin gap Phase 2 slice 6
+-- measured on Asset Hub, larger, and on the one chain with an EXTERNAL
+-- benchmark (OpenGov.Watch) to be caught by.
+--
+-- THREE DELIBERATE NON-DECISIONS, each easy and each wrong:
+--
+-- 1. NO NEW BALANCE TABLES, again. `balances.balance_changes` /
+--    `balance_anchors` have carried an `asset` column since 0005 and it is in
+--    the changes PK. An orml holding is the same fact about a different asset;
+--    it lands in the same tables through the same worker with the same lineage
+--    rules, on key `tokens:<currency_id>`. This migration adds NO table.
+--
+-- 2. NO `logical_assets` GRAPH TABLE. `absolute_key` below is the fungible half
+--    of PRODUCT.md's asset-identity graph arriving early, and it arrives as a
+--    COLUMN rather than a join table on purpose: an absolute location is a pure
+--    function of (observer chain, observed location), both of which are already
+--    stored, so a table keyed on it would be a third copy of a derivable fact —
+--    verbatim the argument that killed `treasury.consolidated_position` (P2
+--    slice 6), `graph.cross_chain_operations` (P3 slice 3) and the stored
+--    forwarded-attribution (P3 slice 5). Group by the column; add the table the
+--    day a NON-fungible identity needs one, because that one is not derivable.
+--
+-- 3. NO CROSS-CHAIN SUM. Nothing in this migration adds a "total USDT across
+--    chains" anywhere. The column makes such a sum POSSIBLE and correct; whether
+--    the treasury endpoint should present one is a product question with its own
+--    provenance obligations, and it gets its own slice.
+
+-- ------------------------------------------------ core.assets: absolute names
+--
+-- WHY `location_key` WAS NOT ENOUGH, and it is the finding that shaped the
+-- slice. `location_key` is version-stripped — the relay's V3 `Concrete` + flat
+-- `X1` and Asset Hub's V4/V5 nested `X1` normalize to one string, which slice 5
+-- proved was a real problem and really solved. It does NOT make two OBSERVERS
+-- agree, because **a Location is relative to its observer**:
+--
+--     Hydration calls USDT   {parents:1, X3[Parachain(1000),
+--                                           PalletInstance(50),
+--                                           GeneralIndex(1984)]}
+--     Asset Hub calls USDT   {parents:0, X2[PalletInstance(50),
+--                                           GeneralIndex(1984)]}
+--
+-- Those normalize to different strings and always will. **DOT happens to match
+-- from both** (`{parents:1, Here}`), which is exactly the coincidence that would
+-- have made a naive join look like it worked while every stablecoin fell
+-- through it — and stablecoins are where the treasury's money is.
+--
+-- THE FIX IS DERIVABLE FROM REGISTRY DATA ALONE, with no chain named in code:
+-- a chain's absolute path is [GlobalConsensus(network)] for a relay and
+-- [GlobalConsensus(network), Parachain(id)] for a parachain, so absolutizing
+-- {parents: p, interior: J} observed from chain C is "drop the last p junctions
+-- of C's path, then append J". Hand-checked both ways above: from Hydration USDT
+-- drops Parachain(2034) and appends; from Asset Hub it drops nothing and
+-- appends; both land on
+--     [GC(Polkadot), Parachain(1000), PalletInstance(50), GeneralIndex(1984)]
+-- and DOT lands on [GC(Polkadot)] from either.
+--
+-- SHAPE: an absolute location is a bare junction ARRAY and carries NO `parents`,
+-- because there is nothing left for it to be relative to. That also makes it
+-- structurally impossible to confuse with `xcm_location` (always an object), so
+-- a query cannot accidentally join a relative name to an absolute one.
+--
+-- NULL means "not absolutizable", and the real population is worth naming so
+-- nobody reads a NULL as a bug: an asset with no `AssetLocations` entry at all
+-- (most of an ORML registry, including every Erc20), a location whose `parents`
+-- reaches above the consensus root (not a place), a location that is ALREADY
+-- absolute while some of the observer's own path remains (nonsense, refused
+-- rather than re-rooted), and a chain whose seed does not declare `native_token`.
+--
+-- **THE NATIVE ROW IS THE SUBTLE ONE, and getting it wrong was caught in
+-- review.** "This chain's native currency" and "this chain as a location" are
+-- different things that coincide only when the chain ISSUES its own token.
+-- Hydration issues HDX, so HDX absolutizes to [GC(Polkadot), Parachain(2034)].
+-- **Asset Hub issues nothing — its native token is the RELAY's DOT** — so
+-- absolutizing `{parents:0, Here}` there would produce a key naming the
+-- PARACHAIN, AH's DOT would join nothing, and the position that split off would
+-- be the treasury's 24.3M DOT. `para_id` cannot tell the two cases apart
+-- (Hydration and Asset Hub are both parachains) and no runtime constant states
+-- it, so it is a registry seed field (`native_token: own | relay`) and ABSENT
+-- MEANS NULL rather than a default. `core.assets.xcm_location` for the native
+-- row is unchanged and still self-relative — the two columns answer different
+-- questions.
+--
+-- Producer: adapter_substrate::orml::{absolutize, absolute_key}.
+alter table core.assets add column absolute_location jsonb;
+alter table core.assets add column absolute_key text;
+
+-- The asset's own declared TYPE, where its registry has one. On Hydration:
+-- Token | XYK | StableSwap | Bond | External | Erc20.
+--
+-- THIS COLUMN EXISTS TO MAKE THIS SLICE'S SCOPE BOUNDARY VISIBLE IN THE DATA
+-- RATHER THAN ONLY IN A DOC. The AAVE-V3-fork money market on Hydration (aDOT
+-- 1001, aUSDT 1002, aUSDC 1003, and ten more) is `asset_type: Erc20`, and an
+-- Erc20 asset's BALANCE lives in `pallet_evm` storage, not in orml-tokens — so
+-- it can be registered, named and located here, and it can never be anchored by
+-- this slice. A reader can see that from the column instead of being told it.
+--
+-- Measured, and it refutes the clean split it looks like it implies: Erc20
+-- assets 222, 4444 and 55 DO appear in `tokens.*` — as `Unreserved`/`Withdrawn`
+-- only, never `Transfer`/`Deposited`. So "Erc20 ⇒ not in orml-tokens" is FALSE
+-- at the boundary, and the mapper must not (and does not) filter on this column.
+-- It is metadata for the reader, never a rule for the writer — with ONE
+-- exception, added in review and worth stating because it is the difference
+-- between a gap and a wrong number: the HOLDINGS SWEEP skips `Erc20` rows
+-- instead of probing them. Probing returns nothing, and nothing was being
+-- recorded as a ZERO anchor noted 'absent', which would have put the treasury's
+-- ~5.7M DOT money-market position into the data as a confident zero. Skipped
+-- probes are COUNTED (`HoldingsReport.skipped_unanchorable`), because "we did
+-- not look" and "there is nothing there" must never be the same number.
+alter table core.assets add column asset_type text;
+
+-- AND AN AMENDMENT TO 0010, which enumerated this column's vocabulary in a
+-- comment that two slices have since outgrown:
+--     core.assets.representation_kind is now
+--     native | trust_backed | pool | foreign | orml | other
+-- `orml` is added here (an orml-tokens balance — different storage, different
+-- key ORDER, and a free/reserved split, so it is not a variation on any of the
+-- pallet-assets three); `other` has been written since 0010 by
+-- assets::Representation::Unmapped and was never listed.
+
+-- NO INDEX ON `absolute_key` YET, on purpose, and the reason is 0008's and
+-- 0009's rule rather than laziness: every read this slice ships fetches ALL of
+-- one chain's assets through the PK prefix and matches in Rust. The query that
+-- WOULD earn this index is "every representation of one asset across every
+-- chain", which is the cross-chain consolidation surface — it does not exist
+-- yet, and it should arrive WITH its index. (0013 is the precedent for what
+-- happens when the reader ships without it: a pasted hash sequential-scanned
+-- every partition until the search slice measured it.)
+
+-- ------------------------------------------- balances.balance_anchors: orml
+--
+-- NO SCHEMA CHANGE NEEDED HERE, and stating why is the point, because the
+-- obvious move is wrong. 0010 records an ASSET anchor as
+--     free = balance, reserved = 0, frozen = null, total = balance
+-- which is exactly right for pallet-assets, where `AssetAccount { balance,
+-- status, reason, extra }` genuinely has ONE number and inventing a split would
+-- be inventing a distinction the pallet does not make.
+--
+-- **orml-tokens is the opposite case.** `AccountData { free, reserved, frozen }`
+-- is the pallet-balances shape: total is free + reserved, and a position can
+-- have a real reserved half. Pushing an orml holding through
+-- `insert_asset_anchor` would therefore write `reserved = 0` and silently drop
+-- it. orml anchors take the NATIVE writer (`balances_pg::insert_anchor`)
+-- instead, which already has the right three columns — so the fix is a routing
+-- decision in one function, not a column.
+--
+-- `status` (added by 0010 for AccountStatus) stays NULL for orml anchors, the
+-- same as it does for native ones: orml has no per-account asset status, and a
+-- column filled with a plausible-looking default is how a schema starts lying.
+
+-- ------------------------------------------------------------------ rebuilds
+--
+-- BALANCES `MAPPER_VERSION` MOVES 2 → 3 WITH THIS SLICE, and it costs nothing:
+-- no existing row is missing orml coverage, because `balances` was never an
+-- enabled module on the only orml chain in the registry. Every v2 row was
+-- written on a chain with no orml pallets, where a v2 row and a v3 row are
+-- byte-identical. There is NO `delete from` recipe here and none is needed —
+-- unlike 0017, where version-1 rows were genuinely wrong on a column.
+--
+-- What DOES need re-running is anything that reads `core.assets`: the two new
+-- columns are NULL on every existing row until a `sync-assets` refreshes that
+-- chain. That is a visible, deliberate refresh rather than a silent
+-- inconsistency, which is what the columns being nullable is for.
