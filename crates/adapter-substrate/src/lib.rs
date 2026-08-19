@@ -21,6 +21,8 @@
 pub mod source;
 
 /// Real SCALE decoding against archived metadata (decoder_version 2).
+pub mod envelope;
+
 pub mod frame_decoder;
 
 /// System-account derivation + labeling primitives (modl/para/sibl, SS58

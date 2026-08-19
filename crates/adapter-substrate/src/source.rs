@@ -389,30 +389,28 @@ impl SubstrateSource {
             })
             .await?;
 
-        // Raw block artifact: deterministic JSON envelope; extrinsic bytes are
-        // the SCALE hex exactly as returned by the node. (The JSON-RPC layer is
-        // what "as received" means over this transport — noted in ARCHITECTURE §6.)
+        // Raw block artifact: the v2 BINARY envelope. Extrinsic bytes are exactly
+        // as returned by the node; what changed in the format slice is only how
+        // they are framed — hex-in-JSON cost 8.4%-15.2% of every decode and 2.00x
+        // the uncompressed bytes, for nothing the entropy coder was not already
+        // recovering. (The JSON-RPC layer is still what "as received" means over
+        // this transport — ARCHITECTURE §6.)
         let header = &block.block.header;
-        let block_json = serde_json::json!({
-            "chain_id": self.chain_id,
-            "height": height,
-            "hash": hex32(&hash),
-            "parent_hash": hex32(&header.parent_hash),
-            "state_root": hex32(&header.state_root),
-            "extrinsics_root": hex32(&header.extrinsics_root),
-            "spec_version": runtime.spec_version,
-            "finalized": finalized,
-            "extrinsics": block
-                .block
-                .extrinsics
-                .iter()
-                .map(|xt| format!("0x{}", hex::encode(&xt.0)))
-                .collect::<Vec<_>>(),
-        });
+        let env = crate::envelope::BlockEnvelope {
+            chain_id: self.chain_id.clone(),
+            height,
+            hash: hex32(&hash),
+            parent_hash: hex32(&header.parent_hash),
+            state_root: hex32(&header.state_root),
+            extrinsics_root: hex32(&header.extrinsics_root),
+            spec_version: runtime.spec_version,
+            finalized,
+            extrinsics: block.block.extrinsics.iter().map(|xt| xt.0.clone()).collect(),
+        };
         let mut artifacts = vec![RawArtifact {
-            item: "block.json".into(),
-            bytes: serde_json::to_vec(&block_json)
-                .map_err(|e| SourceError::Rpc(format!("serializing block envelope: {e}")))?,
+            item: crate::envelope::ITEM_V2.into(),
+            bytes: crate::envelope::encode_v2(&env)
+                .map_err(|e| SourceError::Rpc(format!("encoding block envelope: {e}")))?,
         }];
         if let Some(ev) = events {
             artifacts.push(RawArtifact {

@@ -99,6 +99,7 @@ struct Backends {
     xcm_sim: Arc<dyn api::XcmSimIndex>,
     xcm: Arc<dyn api::XcmIndex>,
     coretime: Arc<dyn api::CoretimeIndex>,
+    broker: Arc<dyn api::BrokerIndex>,
     runtime_versions: Arc<dyn RuntimeVersionSink>,
     /// Kept for label sync/verify (they need direct SQL, not a trait).
     #[cfg(feature = "pg")]
@@ -121,6 +122,7 @@ fn memory_backends() -> Backends {
         xcm_sim: Arc::new(api::MemoryXcmSimIndex::new()),
         xcm: Arc::new(api::MemoryXcmIndex::new()),
         coretime: Arc::new(api::MemoryCoretimeIndex::new()),
+        broker: Arc::new(api::MemoryBrokerIndex::new()),
         runtime_versions: Arc::new(NoopRuntimeVersionSink),
         #[cfg(feature = "pg")]
         pool: None,
@@ -144,6 +146,8 @@ enum Command {
     Migrate,
     Backfill { chain: String, from: u64, to: u64, workers: u64 },
     DecodeRange { chain: String, from: u64, to: u64 },
+    CompactRaw { chain: String, from: u64, to: u64 },
+    VerifyRaw { chain: String, from: u64, to: u64 },
     CaptureFixture { chain: String, height: u64 },
     SyncLabels,
     VerifyLabels { chain: String },
@@ -328,6 +332,14 @@ fn parse_args() -> Result<Command> {
         Some("decode-range") => {
             let (chain, from, to) = range("usage: dotlens-node decode-range <chain> <from> <to>")?;
             Ok(Command::DecodeRange { chain, from, to })
+        }
+        Some("compact-raw") => {
+            let (chain, from, to) = range("usage: dotlens-node compact-raw <chain> <from> <to>")?;
+            Ok(Command::CompactRaw { chain, from, to })
+        }
+        Some("verify-raw") => {
+            let (chain, from, to) = range("usage: dotlens-node verify-raw <chain> <from> <to>")?;
+            Ok(Command::VerifyRaw { chain, from, to })
         }
         Some("capture-fixture") => {
             let usage = "usage: dotlens-node capture-fixture <chain> <height>";
@@ -600,6 +612,7 @@ async fn main() -> Result<()> {
             xcm_sim: Arc::new(api::pg::PgXcmSimIndex::new(pool.clone())),
             xcm: Arc::new(api::pg::PgXcmIndex::new(pool.clone())),
             coretime: Arc::new(api::pg::PgCoretimeIndex::new(pool.clone())),
+            broker: Arc::new(api::pg::PgBrokerIndex::new(pool.clone())),
             runtime_versions: Arc::new(PgRuntimeVersionSink::new(pool.clone())),
             pool: Some(pool),
             persistent: true,
@@ -619,7 +632,15 @@ async fn main() -> Result<()> {
     });
 
     let raw_root = env_or("RAW_STORE_PATH", "./data/raw");
-    let raw: Arc<dyn RawStore> = Arc::new(FsRawStore::new(&raw_root));
+    let bucket_blocks: u64 = env_or("RAW_BUCKET_BLOCKS", "1000").parse().unwrap_or(1000);
+    // Every READ goes through the bucket layer: a block artifact resolves to its
+    // per-object copy or to the compacted bucket holding it, and no caller can
+    // tell which. Writes delegate straight through — buckets are written only by
+    // `compact-raw`, and nothing else may write one.
+    let raw: Arc<dyn RawStore> = Arc::new(raw_store::BucketedStore::new(
+        FsRawStore::new(&raw_root),
+        bucket_blocks,
+    ));
 
     // -- one-shot subcommands: run, report, exit ------------------------------
     if let Command::Backfill { chain, from, to, workers } = &command {
@@ -635,6 +656,56 @@ async fn main() -> Result<()> {
             "decode-range requires DATABASE_URL (canonical rows must persist)"
         );
         return run_decode_range(&registry, &backends, raw.as_ref(), chain, *from, *to).await;
+    }
+    if let Command::CompactRaw { chain, from, to } = &command {
+        // deliberately the PLAIN store, not the bucket layer: compaction reads
+        // the per-object copies, and reading through the bucket layer would let
+        // it pack a bucket's own output back into a bucket.
+        let plain = FsRawStore::new(&raw_root);
+        let level: i32 = env_or("RAW_ZSTD_LEVEL", "3").parse().unwrap_or(3);
+        let report = dotlens_node::compact::compact_range(
+            &plain, &dotlens_node::compact::NoopReceipts, chain, *from, *to, bucket_blocks, level,
+        )
+        .await?;
+        println!(
+            "compact {chain} {from}..={to}: buckets_written={} already_present={} \
+heights_packed={} members={} absent={} unpacked={} raw_bytes={} stored_bytes={} ratio={:.1}x",
+            report.buckets_written, report.buckets_already_present, report.heights_packed,
+            report.members_packed, report.heights_absent.len(), report.heights_unpacked.len(),
+            report.raw_bytes, report.stored_bytes, report.ratio()
+        );
+        if !report.heights_absent.is_empty() {
+            println!(
+                "  {} height(s) in range had no artifact at all (first few: {:?}) — a hole here is \
+a gap in the raw store, not something compaction may close over",
+                report.heights_absent.len(),
+                &report.heights_absent[..report.heights_absent.len().min(10)]
+            );
+        }
+        if !report.heights_unpacked.is_empty() {
+            println!(
+                "  {} height(s) in range have a per-object copy that the EXISTING bucket does not hold (first few: {:?}) — buckets are write-once, so nothing will ever pack these; their per-object copies must not be retired, and the fix is to compact a span only once its backfill is complete",
+                report.heights_unpacked.len(),
+                &report.heights_unpacked[..report.heights_unpacked.len().min(10)]
+            );
+        }
+        return Ok(());
+    }
+    if let Command::VerifyRaw { chain, from, to } = &command {
+        let plain = FsRawStore::new(&raw_root);
+        let report =
+            dotlens_node::compact::verify_range(&plain, chain, *from, *to, bucket_blocks).await?;
+        println!(
+            "verify {chain} {from}..={to}: buckets_checked={} missing={} members_verified={} \
+mismatched={} retirable_heights={}",
+            report.buckets_checked, report.buckets_missing, report.members_verified,
+            report.mismatched.len(), report.retirable_heights
+        );
+        if !report.mismatched.is_empty() {
+            println!("  MISMATCHED (do NOT retire these): {:?}", report.mismatched);
+            anyhow::bail!("bucket contents disagree with their per-object copies");
+        }
+        return Ok(());
     }
     if let Command::CaptureFixture { chain, height } = &command {
         return run_capture_fixture(&registry, chain, *height).await;
@@ -927,6 +998,7 @@ async fn main() -> Result<()> {
         xcm_sim: backends.xcm_sim.clone(),
         xcm: backends.xcm.clone(),
         coretime: backends.coretime.clone(),
+        broker: backends.broker.clone(),
         // family-encoded address parsing is adapter-owned (Invariant 4); with
         // more families this becomes registry-driven dispatch
         parse_account: Arc::new(|s| {
@@ -2540,8 +2612,42 @@ async fn run_sync_broker_config(
             )
         })?;
 
-    let view = ab::decode_broker_config(&metadata, &status_bytes, &configuration_bytes)
+    // AND THE THIRD READ, WHOSE ABSENCE IS A FACT RATHER THAN A FAILURE.
+    //
+    // `Broker.SaleInfo` is an `OptionQuery` StorageValue: before the first sale
+    // ever starts there is no key at all, so `None` here means "sales have not
+    // started" and is recorded as such. That is the one place this command
+    // differs from the two reads above, which treat an absence as a wrong key
+    // derivation — and the difference is load-bearing, because `first_core = 0`
+    // would move every reserved system core into the bulk market and put the
+    // delta's waste on the wrong side of the boundary.
+    //
+    // It is read HERE rather than in a later slice because `first_core` has a
+    // reader now (the delta's reserved-vs-market split), and because
+    // `cores_sold` moves on every purchase with NO EVENT — a reading not taken
+    // cannot be taken later, and Phase 4's backfill is the deadline.
+    let sale_info_bytes = source
+        .storage_at(&ab::sale_info_key(), hash)
+        .await
         .map_err(|e| anyhow::anyhow!(e))?;
+    if sale_info_bytes.is_none() {
+        tracing::warn!(
+            chain = %cfg.id,
+            height,
+            "{}.{} is ABSENT from state — recording that sales have not started. This is a fact, \
+             not a failure, and it is NOT the same as first_core = 0",
+            ab::BROKER_STORAGE_PALLET,
+            ab::SALE_INFO_ENTRY
+        );
+    }
+
+    let view = ab::decode_broker_config(
+        &metadata,
+        &status_bytes,
+        &configuration_bytes,
+        sale_info_bytes.as_deref(),
+    )
+    .map_err(|e| anyhow::anyhow!(e))?;
     dotlens_node::broker_pg::insert_broker_config(
         pool,
         &cfg.id,
@@ -2549,18 +2655,30 @@ async fn run_sync_broker_config(
         view.core_count,
         &view.status,
         &view.configuration,
+        view.first_core,
+        view.sale_info.as_ref(),
         spec,
     )
     .await?;
     println!(
-        "broker config {chain} @#{height} (spec {spec}): core_count={}",
-        view.core_count
+        "broker config {chain} @#{height} (spec {spec}): core_count={} first_core={}",
+        view.core_count,
+        match view.first_core {
+            Some(c) => c.to_string(),
+            None => "none (SaleInfo absent — sales have not started)".to_string(),
+        }
     );
     println!(
         "  this reading DATES the entitlement denominator, and it is also the CROSS-CHECK: \
          compare it against the relay's own num_cores at a nearby height (sync-core-config). Two \
          chains agreeing on one number is what makes the entitlement-vs-occupancy delta a \
          comparison rather than two unrelated ratios."
+    );
+    println!(
+        "  `first_core` is the boundary between RESERVED system cores and the bulk market, and \
+         /v1/coretime/<network>/delta uses it to say which side idle entitlement sits on. It \
+         moves every sale, and this reading is dated on THIS chain's heights — which cannot be \
+         ordered against a relay window."
     );
     Ok(())
 }

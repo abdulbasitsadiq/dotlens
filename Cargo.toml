@@ -26,6 +26,9 @@ thiserror = "1"
 anyhow = "1"
 hex = "0.4"
 blake2 = "0.10"
+# the raw-store format slice: solid-bucket compression. Measured -3 as the knee
+# (AH 101.2x bucketed vs 111x at -19 for 4.6x the time; relay flat at 2.4x).
+zstd = "0.13"
 chrono = { version = "0.4", features = ["serde"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "net", "time", "sync", "process", "io-util"] }
 subxt = "0.50"

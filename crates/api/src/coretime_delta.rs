@@ -24,21 +24,25 @@
 //!
 //! The figures, from slice 13's verification, over relay 32613537–32614536:
 //!
+//! ```text
 //!     AGREE 47 / DISAGREE 0 / 34,690 of 34,690 candidates attributed
 //!     57 Task-entitled cores, 43 Pool; 60.86% of TASK-ENTITLED slots used
 //!     22,310 entitled slots bought or reserved and unused
 //!     10 idle Task cores, every index >= 11 (waste is market-side)
 //!     43 + 10 = 53 = slice 11's own "53 cores producing nothing"
 //!     cores 53 and 13 are Task-entitled bulk using 1.0% and 2.9%
+//! ```
 //!
-//! **AND `first_core = 11` IS AN INFERENCE, NOT ONE OF THOSE MEASUREMENTS.**
-//! Slice 13 never captured `Broker.SaleInfo` — its own known-gaps list says so —
-//! so the 11 comes from `Broker.Reservations` holding 11 entries at the same
-//! time, and "all ten idle cores are above `first_core`" is a conclusion drawn
-//! across two readings that were never taken together. That inference is
-//! precisely what migration 0026's new column replaces with a dated reading, and
-//! it is why the market/reserved split is ABSENT rather than assumed when no
-//! reading exists.
+//! **`first_core = 11` WAS AN INFERENCE WHEN THIS FILE WAS WRITTEN, AND SLICE
+//! 14's VERIFICATION MEASURED IT.** Slice 13 never captured `Broker.SaleInfo` —
+//! its own known-gaps list says so — so the 11 came from `Broker.Reservations`
+//! holding 11 entries at a DIFFERENT moment, and "all ten idle cores are above
+//! `first_core`" was a conclusion drawn across two readings never taken
+//! together. `sync-broker-config` has now read it: **`first_core = 11` at
+//! coretime #4928280, spec 2003002**, and the two agree. So the claim is a dated
+//! reading rather than an inference, which is the whole reason 0026 adds the
+//! column — and it is why the market/reserved split is ABSENT rather than
+//! assumed when no reading exists.
 //!
 //! ---------------------------------------------------------------------------
 //! THE THREE RULES THIS FILE REFUSES TO BREAK

@@ -417,6 +417,13 @@ impl ingest::decode::RawBlockDecoder for MockBlockDecoder {
             events: vec![],
         })
     }
+
+    fn spec_version_of(&self, envelope: &[u8]) -> Result<u32, String> {
+        let v: serde_json::Value =
+            serde_json::from_slice(envelope).map_err(|e| e.to_string())?;
+        v["spec_version"].as_u64().map(|s| s as u32).ok_or("no spec_version".into())
+    }
+
 }
 
 #[tokio::test]
@@ -4291,6 +4298,453 @@ async fn occupancy_resolves_its_relay_parents_and_serves_two_ratios_that_differ(
          `stale_suspected` rather than clamping it away",
         chosen.num_cores
     );
+
+    db.drop_db().await;
+}
+
+/// THE DEBT SLICE 13 RECORDED AND SLICE 14 PAYS: the broker sink has never been
+/// tested offline.
+///
+/// Slice 13's own "known gaps" listed it verbatim — "the two-table transaction,
+/// the duplicate-event-index refusal, partition routing, replay idempotence and
+/// the `assignment_refused` 23514 branch are still uncovered offline (replay and
+/// routing are now proven by DRILL, not by test)". This is that test, and it
+/// also exercises the READER migration 0026 gives those tables, because the
+/// governing-assignment probe is the one query the whole delta rests on and it
+/// cannot be checked against a hand-built fixture: `distinct on` with a
+/// three-column tie-break either picks one announcement per core or it does not.
+#[tokio::test]
+async fn broker_facts_land_in_two_tables_and_the_governing_assignment_is_one_announcement() {
+    use adapter_substrate::broker::SubstrateBrokerMapper;
+    use api::BrokerIndex as _;
+    use canonical::{CanonicalBlock, CanonicalEvent, Lineage};
+    use ingest::broker::{BrokerRow, BrokerSink, CoreAssignmentRow};
+
+    let Some(db) = TestDb::create().await else { return };
+    let reg = seeds();
+    sync_registry(&db.pool, &reg).await.expect("registry sync");
+
+    const CHAIN: &str = "polkadot-coretime";
+
+    let ev = |index: u32, name: &str, data: serde_json::Value| CanonicalEvent {
+        index,
+        transaction_index: None,
+        name: name.into(),
+        data,
+    };
+    let block = |height: u64, events: Vec<CanonicalEvent>| CanonicalBlock {
+        chain_id: CHAIN.into(),
+        height,
+        hash: format!("0x{height:064x}"),
+        parent_hash: format!("0x{:064x}", height - 1),
+        timestamp: Some("2026-08-19T00:00:00Z".parse().unwrap()),
+        finalized: true,
+        lineage: Lineage {
+            runtime_version: 2_003_002,
+            decoder_version: 2,
+            raw_location: format!("raw/{CHAIN}/test/{height}"),
+        },
+        transactions: vec![],
+        events,
+    };
+
+    let blocks = api::pg::PgBlockIndex::new(db.pool.clone());
+
+    // A SALE BOUNDARY, in the shape the chain really emits: a bare u16 `core`, a
+    // relay block in `when` (an exact multiple of 80), and a one-element vector
+    // whose assignment is a NEWTYPE variant one array layer deep.
+    api::BlockIndex::insert(
+        &blocks,
+        block(
+            100,
+            vec![
+                ev(
+                    0,
+                    "broker.CoreAssigned",
+                    serde_json::json!({
+                        "core": 0, "when": 80u64,
+                        "assignment": [[{"Task": [2004]}, 57600]]
+                    }),
+                ),
+                ev(
+                    1,
+                    "broker.CoreAssigned",
+                    serde_json::json!({"core": 1, "when": 80u64, "assignment": [[{"Pool": []}, 57600]]}),
+                ),
+                // AN INTERLACED CORE: one event, TWO assignment rows. Never seen
+                // on live data, which is exactly why the expansion needs a test
+                // — a reader that took the first element would drop the second
+                // entitlement permanently.
+                ev(
+                    2,
+                    "broker.CoreAssigned",
+                    serde_json::json!({
+                        "core": 2, "when": 80u64,
+                        "assignment": [[{"Task": [2034]}, 28800], [{"Task": [3344]}, 28800]]
+                    }),
+                ),
+                // A variant that is NOT the seam: it must land in broker_events
+                // with its core promoted and produce no assignment row at all.
+                // `Renewed` carries BOTH old_core and core, and the row takes
+                // `core` — the renewal MOVED the index.
+                ev(
+                    3,
+                    "broker.Renewed",
+                    serde_json::json!({
+                        "who": [vec![9u8; 32]], "price": "1000",
+                        "old_core": 7, "core": 9, "begin": 322663, "duration": 5040,
+                        "workload": []
+                    }),
+                ),
+                // Names a TASK and a core — the row the task timeline finds.
+                ev(
+                    4,
+                    "broker.AutoRenewalEnabled",
+                    serde_json::json!({"core": 9, "task": 2004}),
+                ),
+            ],
+        ),
+    )
+    .await
+    .expect("insert sale-boundary block");
+
+    // A LATER SALE for core 0 only, so `entitlement_at` has something to choose
+    // between rather than something to find.
+    api::BlockIndex::insert(
+        &blocks,
+        block(
+            200,
+            vec![ev(
+                0,
+                "broker.CoreAssigned",
+                serde_json::json!({
+                    "core": 0, "when": 160u64,
+                    "assignment": [[{"Task": [3388]}, 57600]]
+                }),
+            )],
+        ),
+    )
+    .await
+    .expect("insert second-sale block");
+
+    let source = dotlens_node::balances_pg::PgEventSource::new(db.pool.clone());
+    let sink = dotlens_node::broker_pg::PgBrokerSink::new(db.pool.clone());
+    let checkpoints = ingest::pg::PgCheckpointStore::new(db.pool.clone());
+    let deps = ingest::broker::BrokerDeps {
+        checkpoints: &checkpoints,
+        source: &source,
+        sink: &sink,
+    };
+    ingest::broker::broker_range(CHAIN, &SubstrateBrokerMapper, &deps, 100, 200)
+        .await
+        .expect("map entitlement");
+
+    // ONE EVENT, TWO TABLES. Six events map to six `broker_events` rows; the
+    // four `CoreAssigned` among them expand into five assignment rows, because
+    // core 2 carries two.
+    let (events,): (i64,) = sqlx::query_as("select count(*) from coretime.broker_events")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(events, 6, "one row per Broker event, seam or not");
+    let (assignments,): (i64,) = sqlx::query_as("select count(*) from coretime.core_assignments")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(assignments, 5, "four CoreAssigned, one of them interlaced");
+
+    // The non-seam variants produced NO assignment rows, and `Renewed` took the
+    // NEW core.
+    let (renewed_core,): (Option<i32>,) = sqlx::query_as(
+        "select core_index from coretime.broker_events where variant = 'Renewed'",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(renewed_core, Some(9), "the NEW core, never old_core");
+
+    // PARTITION ROUTING, exact. A chain must land in its own partition and the
+    // default must stay empty — a row in `_default` is a chain the registry sync
+    // never created a partition for.
+    for (part, want) in [
+        ("coretime.broker_events_p_polkadot_coretime", 6),
+        ("coretime.broker_events_default", 0),
+        ("coretime.core_assignments_p_polkadot_coretime", 5),
+        ("coretime.core_assignments_default", 0),
+    ] {
+        let (n,): (i64,) = sqlx::query_as(&format!("select count(*) from {part}"))
+            .fetch_one(&db.pool)
+            .await
+            .unwrap_or_else(|e| panic!("counting {part}: {e}"));
+        assert_eq!(n, want, "{part}");
+    }
+
+    // REPLAY IS A GENUINE NO-OP. `relay_block` is stated by the chain inside the
+    // event, so a row written today and one written after a wider backfill are
+    // byte-identical — which is why this sink does `do nothing` where the
+    // occupancy sink one file over does a monotone fill.
+    ingest::broker::broker_range(CHAIN, &SubstrateBrokerMapper, &deps, 100, 200)
+        .await
+        .expect("replay");
+    let (again_events, again_assignments): (i64, i64) = sqlx::query_as(
+        "select (select count(*) from coretime.broker_events), \
+                (select count(*) from coretime.core_assignments)",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        (again_events, again_assignments),
+        (6, 5),
+        "re-running a range must not duplicate facts in either table"
+    );
+    let (dupes,): (i64,) = sqlx::query_as(
+        "select count(*) from (select chain_id, block_height, event_index, assignment_index \
+         from coretime.core_assignments group by 1,2,3,4 having count(*) > 1) d",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(dupes, 0);
+
+    // The checkpoint is this module's own key. Sharing another module's would
+    // corrupt one checkpoint while every other assertion here still passed, and
+    // `ingest::broker` ships no worker tests, so this is the only thing that
+    // pins it.
+    let cp = ingest::CheckpointStore::get(&checkpoints, CHAIN, ingest::broker::MODULE_BROKER)
+        .await
+        .expect("checkpoint read")
+        .expect("the broker worker advanced its own checkpoint");
+    assert_eq!(cp.last_height, 200);
+    assert_eq!(cp.module, ingest::broker::MODULE_BROKER);
+
+    // ---------------------------------------------------------------- refusals
+
+    // TWO FACTS AT ONE EVENT INDEX ARE REFUSED, not silently halved.
+    // `broker_events` is keyed by it, so insert-ignore would keep the first and
+    // drop the second without a word.
+    let row = |variant: &str| BrokerRow {
+        variant: variant.into(),
+        core_index: Some(0),
+        task_id: None,
+        data: serde_json::json!({}),
+        assignments: vec![],
+    };
+    let err = sink
+        .write(CHAIN, 300, 2_003_002, 1, &[(0, row("Renewable")), (0, row("Renewed"))])
+        .await
+        .expect_err("two facts at one event index must be refused");
+    assert!(err.contains("keyed by event index"), "{err}");
+
+    // AND THE CHECK CONSTRAINT'S BOTH DIRECTIONS. 0025's
+    // `core_assignments_task_names_its_para` is a BICONDITIONAL, so a `task`
+    // with no para and a `pool` carrying one are both refused — and the sink
+    // names the constraint rather than passing a bare 23514 through, because
+    // what it means is specific: the delta attributes occupancy BY TASK, so a
+    // task row with no task is an entitlement nobody can be credited with and a
+    // pool row with one credits the wrong chain.
+    for (kind, task_id, label) in [
+        ("task", None, "a task assignment naming no para"),
+        ("pool", Some(2004u32), "a pool assignment pretending to name one"),
+    ] {
+        let mut r = row("CoreAssigned");
+        r.assignments = vec![CoreAssignmentRow {
+            assignment_index: 0,
+            core_index: 0,
+            relay_block: 80,
+            kind: kind.into(),
+            task_id,
+            parts: 57_600,
+        }];
+        let err = sink
+            .write(CHAIN, 301, 2_003_002, 1, &[(0, r)])
+            .await
+            .unwrap_err();
+        assert!(
+            err.contains("ASSIGNMENT KIND AND TASK DISAGREE"),
+            "{label}: {err}"
+        );
+    }
+    // The refused batch left NOTHING behind — one event, two tables, one
+    // transaction, so a failing assignment must roll the event row back too.
+    let (orphans,): (i64,) = sqlx::query_as(
+        "select count(*) from coretime.broker_events where block_height in (300, 301)",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        orphans, 0,
+        "a seam row that fails must not leave its announcing event committed — an entitlement \
+         with no provenance, or an event whose seam rows silently vanished from the delta"
+    );
+
+    // ------------------------------------------------------------- the reader
+
+    let broker = api::pg::PgBrokerIndex::new(db.pool.clone());
+
+    // THE GOVERNING ASSIGNMENT AT A RELAY HEIGHT, which is the one query the
+    // whole delta rests on. At relay 80 core 0 is task 2004; at relay 160 the
+    // later sale has taken over and it is task 3388 — while cores 1 and 2 are
+    // unchanged, because their announcement is still the newest at or before.
+    let at_80 = broker.entitlement_at(CHAIN, 80).await.expect("entitlement at 80");
+    assert_eq!(at_80.len(), 4, "three cores, one of them interlaced into two");
+    assert_eq!(at_80[0].core_index, 0);
+    assert_eq!(at_80[0].task_id, Some(2004));
+    assert_eq!(at_80[1].kind, "pool");
+    assert_eq!(at_80[1].task_id, None);
+    assert_eq!(
+        (at_80[2].assignment_index, at_80[3].assignment_index),
+        (0, 1),
+        "an interlaced core keeps BOTH entitlements, in ordinal order"
+    );
+    assert_eq!(at_80[2].parts, 28_800);
+
+    let at_160 = broker.entitlement_at(CHAIN, 160).await.expect("entitlement at 160");
+    let core0: Vec<_> = at_160.iter().filter(|r| r.core_index == 0).collect();
+    assert_eq!(core0.len(), 1, "one announcement governs, never two");
+    assert_eq!(core0[0].task_id, Some(3388), "the LATER sale governs at 160");
+    assert_eq!(core0[0].relay_block, 160);
+    assert_eq!(at_160.len(), 4, "the other cores' older announcements still govern");
+
+    // AND BELOW EVERY ANNOUNCEMENT THERE IS NOTHING, which is what the delta
+    // renders as `unknown` and never as idle.
+    assert!(broker.entitlement_at(CHAIN, 79).await.unwrap().is_empty());
+
+    // THE TIE-BREAK IS NOT DECORATION. Two announcements can share a
+    // `relay_block` and come from different events — a re-announcement — and
+    // returning both would make one core look INTERLACED, which withholds the
+    // delta's waste figure for a reason that never happened.
+    let mut re = row("CoreAssigned");
+    // The announcing event's own core must match the core it assigns — a real
+    // `CoreAssigned` cannot say core 0 and assign core 1, and leaving them
+    // inconsistent would quietly add a third row to `events_for_core(0)` and
+    // weaken the timeline assertions below.
+    re.core_index = Some(1);
+    re.assignments = vec![CoreAssignmentRow {
+        assignment_index: 0,
+        core_index: 1,
+        relay_block: 80,
+        kind: "task".into(),
+        task_id: Some(2222),
+        parts: 57_600,
+    }];
+    sink.write(CHAIN, 150, 2_003_002, 1, &[(0, re)])
+        .await
+        .expect("a re-announcement at the same relay block is a legal row");
+    let after = broker.entitlement_at(CHAIN, 80).await.unwrap();
+    let core1: Vec<_> = after.iter().filter(|r| r.core_index == 1).collect();
+    assert_eq!(core1.len(), 1, "one ANNOUNCEMENT per core, not one relay block per core");
+    assert_eq!(
+        core1[0].task_id,
+        Some(2222),
+        "the newest announcing coordinate wins the tie, so a re-announcement replaces rather \
+         than doubling"
+    );
+
+    // THE TWO TIMELINE SUBJECTS DIVERGE, which is why the endpoint takes both.
+    // Task 2004's auto-renewal sits on core 9 while its assignment sits on core
+    // 0, so asking by core follows a SLOT and asking by task follows the TENANT.
+    let by_task = broker.events_for_task(CHAIN, 2004, 50).await.unwrap();
+    assert_eq!(by_task.len(), 1);
+    assert_eq!(by_task[0].variant, "AutoRenewalEnabled");
+    assert_eq!(by_task[0].core_index, Some(9));
+    let by_core = broker.events_for_core(CHAIN, 0, 50).await.unwrap();
+    assert!(
+        by_core.iter().all(|e| e.variant == "CoreAssigned"),
+        "asking by core 0 must not return the renewal that moved the tenant to core 9"
+    );
+    // Newest first, and `data` survives intact — the region ids, prices and
+    // `old_core` that nothing reads yet all live in there.
+    assert_eq!(by_core[0].block_height, 200);
+    assert_eq!(by_core[0].data["core"], 0);
+    let assigns = broker.assignments_for_task(CHAIN, 2004, 50).await.unwrap();
+    assert_eq!(assigns.len(), 1);
+    assert_eq!(assigns[0].core_index, 0);
+
+    // ------------------------------------------- the denominator and 0026's columns
+
+    dotlens_node::broker_pg::insert_broker_config(
+        &db.pool,
+        CHAIN,
+        4_927_655,
+        100,
+        &serde_json::json!({"core_count": 100, "last_timeslice": 400_361}),
+        &serde_json::json!({"region_length": 5040, "leadin_length": 100}),
+        Some(11),
+        Some(&serde_json::json!({"first_core": 11, "cores_sold": 41, "cores_offered": 89})),
+        2_003_002,
+    )
+    .await
+    .expect("record broker config");
+    // An OLDER reading, to prove `latest_broker_config` picks by height rather
+    // than by insertion order — and one with NO SaleInfo at all, which is the
+    // honest shape before sales start and must not become `first_core = 0`.
+    dotlens_node::broker_pg::insert_broker_config(
+        &db.pool,
+        CHAIN,
+        1_000_000,
+        50,
+        &serde_json::json!({"core_count": 50}),
+        &serde_json::json!({}),
+        None,
+        None,
+        2_000_000,
+    )
+    .await
+    .expect("record an older, sale-less reading");
+
+    let cfg = broker
+        .latest_broker_config(CHAIN)
+        .await
+        .unwrap()
+        .expect("a reading is on record");
+    assert_eq!(cfg.block_height, 4_927_655, "the NEWEST reading");
+    assert_eq!(cfg.core_count, 100);
+    assert_eq!(cfg.first_core, Some(11), "migration 0026's column round-trips");
+    // `sale_info` is CAPTURED AND READ BY NOTHING, which 0026 states plainly —
+    // but a column nobody reads is still a column whose storage must work, or
+    // the Dutch price curve it exists to make reconstructible is not there when
+    // somebody finally looks.
+    let (si,): (Option<serde_json::Value>,) = sqlx::query_as(
+        "select sale_info from coretime.broker_config where block_height = 4927655",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        si.expect("the whole record round-trips")["cores_sold"],
+        41,
+        "captured whole; nothing in this slice reads it, and that is the point"
+    );
+    let (early,): (Option<i32>,) = sqlx::query_as(
+        "select first_core from coretime.broker_config where block_height = 1000000",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        early, None,
+        "sales that never started leave a NULL, not a zero — a zero would move every reserved \
+         system core into the bulk market"
+    );
+    // Immutable per (chain, height): a second reading at the same block is the
+    // same observation and must not rewrite it.
+    dotlens_node::broker_pg::insert_broker_config(
+        &db.pool,
+        CHAIN,
+        4_927_655,
+        99,
+        &serde_json::json!({}),
+        &serde_json::json!({}),
+        Some(0),
+        None,
+        2_003_002,
+    )
+    .await
+    .expect("re-recording is a no-op");
+    let cfg = broker.latest_broker_config(CHAIN).await.unwrap().unwrap();
+    assert_eq!((cfg.core_count, cfg.first_core), (100, Some(11)));
 
     db.drop_db().await;
 }

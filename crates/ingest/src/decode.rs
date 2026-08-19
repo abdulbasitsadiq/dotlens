@@ -62,6 +62,16 @@ pub trait RawBlockDecoder: Send + Sync {
         spec_version: u32,
         raw_location: &str,
     ) -> Result<CanonicalBlock, String>;
+
+    /// Read `spec_version` out of a raw envelope WITHOUT decoding the block —
+    /// the worker needs it to pick which metadata blob to decode against, and a
+    /// block always decodes against the metadata of its own spec_version.
+    ///
+    /// This is on the adapter and not in the worker because an envelope's layout
+    /// is protocol knowledge (Invariant 4). It used to be a `serde_json` parse
+    /// inline in this file, which was invisible while there was exactly one
+    /// envelope format and became a bug the moment there were two.
+    fn spec_version_of(&self, envelope: &[u8]) -> Result<u32, String>;
 }
 
 /// Where canonical blocks land (the API's BlockIndex, adapted node-side —
@@ -84,20 +94,59 @@ pub struct DecodeDeps<'a> {
 pub const MODULE_DECODE: &str = "blocks";
 
 /// The envelope peek: our own written field, nothing family-specific.
-fn peek_spec_version(chain: &str, height: u64, envelope: &[u8]) -> Result<u32, DecodeWorkerError> {
-    let v: serde_json::Value =
-        serde_json::from_slice(envelope).map_err(|e| DecodeWorkerError::BadEnvelope {
+/// Fetch a block's envelope, trying the item names newest-first, and return the
+/// key it was found under so lineage records where the bytes actually came from.
+///
+/// A height may hold either generation: v1 for everything ingested before the
+/// format slice (compaction never re-encodes, so those stay v1 forever), v2 for
+/// everything after. Behind a `BucketedStore` the bytes may equally come out of
+/// a compacted bucket — the caller cannot tell and does not need to.
+fn read_block_envelope(
+    raw: &dyn RawStore,
+    chain_id: &str,
+    height: u64,
+) -> Result<(String, Vec<u8>), RawStoreError> {
+    let mut last = None;
+    for item in keys::BLOCK_ITEMS {
+        let key = keys::block(chain_id, height, item);
+        match raw.get(&key) {
+            Ok(bytes) => return Ok((key, bytes)),
+            Err(e @ RawStoreError::NotFound(_)) => last = Some(e),
+            Err(e) => return Err(e),
+        }
+    }
+    // report the NEWEST name in the not-found error: it is the one a fresh
+    // ingestion would have written, so it is the one worth looking for.
+    Err(last.unwrap_or_else(|| {
+        RawStoreError::NotFound(keys::block(chain_id, height, keys::BLOCK_ITEM_V2))
+    }))
+}
+
+fn block_envelope_exists(
+    raw: &dyn RawStore,
+    chain_id: &str,
+    height: u64,
+) -> Result<bool, RawStoreError> {
+    for item in keys::BLOCK_ITEMS {
+        if raw.exists(&keys::block(chain_id, height, item))? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn peek_spec_version(
+    decoder: &dyn RawBlockDecoder,
+    chain: &str,
+    height: u64,
+    envelope: &[u8],
+) -> Result<u32, DecodeWorkerError> {
+    decoder
+        .spec_version_of(envelope)
+        .map_err(|reason| DecodeWorkerError::BadEnvelope {
             chain: chain.to_string(),
             height,
-            reason: e.to_string(),
-        })?;
-    v["spec_version"]
-        .as_u64()
-        .map(|s| s as u32)
-        .ok_or_else(|| DecodeWorkerError::BadEnvelope {
-            chain: chain.to_string(),
-            height,
-            reason: "missing spec_version".into(),
+            reason,
         })
 }
 
@@ -128,9 +177,8 @@ pub async fn decode_range(
         if behind_frontier && deps.sink.contains(chain_id, height).await? {
             continue;
         }
-        let envelope_key = keys::block(chain_id, height, "block.json");
-        let envelope = deps.raw.get(&envelope_key)?;
-        let events = match deps.raw.get(&keys::block(chain_id, height, "events.scale")) {
+        let (envelope_key, envelope) = read_block_envelope(deps.raw, chain_id, height)?;
+        let events = match deps.raw.get(&keys::block(chain_id, height, keys::EVENTS_ITEM)) {
             Ok(bytes) => Some(bytes),
             Err(RawStoreError::NotFound(_)) => {
                 // legitimately absent — but success flags then default true
@@ -139,7 +187,7 @@ pub async fn decode_range(
             }
             Err(e) => return Err(e.into()),
         };
-        let spec_version = peek_spec_version(chain_id, height, &envelope)?;
+        let spec_version = peek_spec_version(decoder, chain_id, height, &envelope)?;
         let meta_key = keys::metadata(chain_id, spec_version);
         let metadata = deps.raw.get(&meta_key).map_err(|e| match e {
             RawStoreError::NotFound(_) => DecodeWorkerError::MetadataMissing {
@@ -204,7 +252,7 @@ pub async fn decode_tick(
     // pipeline's high-water mark, far below the live tip). If the next height
     // has no raw block, jump to the raw tip instead of erroring forever —
     // covering the gap is `decode-range`'s job, exactly like the None branch.
-    if from < target && !deps.raw.exists(&keys::block(chain_id, from, "block.json"))? {
+    if from < target && !block_envelope_exists(deps.raw, chain_id, from)? {
         tracing::warn!(
             chain = %chain_id, from, target,
             "no raw block at decode resume point — jumping to raw tip (backfill gap via decode-range)"
@@ -286,6 +334,13 @@ mod tests {
                 events: vec![],
             })
         }
+
+        fn spec_version_of(&self, envelope: &[u8]) -> Result<u32, String> {
+            let v: serde_json::Value =
+                serde_json::from_slice(envelope).map_err(|e| e.to_string())?;
+            v["spec_version"].as_u64().map(|s| s as u32).ok_or("no spec_version".into())
+        }
+
     }
 
     #[derive(Default)]

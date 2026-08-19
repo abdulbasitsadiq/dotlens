@@ -11,6 +11,7 @@ live = ["dep:subxt", "dep:async-trait", "dep:tokio", "dep:tracing"]
 
 [dependencies]
 canonical.workspace = true
+raw-store.workspace = true
 ingest.workspace = true
 # the tier-agnostic simulation vocabulary this crate implements the Substrate
 # half of (same direction as the `ingest` dependency: generic ← protocol)

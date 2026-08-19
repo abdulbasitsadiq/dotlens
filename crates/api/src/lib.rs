@@ -12,7 +12,14 @@ use axum::{
 };
 use canonical::{AccountLabel, CanonicalBlock};
 use chrono::{DateTime, Utc};
+/// The coretime delta's arithmetic, as a PURE function with no database in it —
+/// see the module header for why that is the design and not a convenience.
+pub mod coretime_delta;
 pub mod search;
+
+pub use coretime_delta::{
+    Check, CoreDelta, DeltaInput, DeltaReport, EntitlementRow, OccupancyCell, PARTS_WHOLE_CORE,
+};
 
 use registry::Registry;
 use serde::Deserialize;
@@ -738,7 +745,8 @@ pub fn coretime_not_covered() -> Vec<&'static str> {
          coretime.broker_events / coretime.core_assignments (slice 13). The delta between what \
          was PAID FOR and what was USED is a join across the two, and NOTHING ON THIS ENDPOINT \
          COMPUTES IT: the ratios here divide by every declared core, entitled or not, so a low \
-         figure mixes 'nobody bought it' with 'somebody bought it and did not use it'",
+         figure mixes 'nobody bought it' with 'somebody bought it and did not use it'. \
+         /v1/coretime/{network}/delta is the endpoint that separates them",
         "bulk and on-demand cannot be distinguished from relay data AT ALL, and slice 13 measured \
          what that costs rather than leaving it as a caveat. A core used for a handful of blocks \
          looks like an on-demand core and looks equally like a bulk core whose chain was idle, \
@@ -780,6 +788,123 @@ pub fn coretime_not_covered() -> Vec<&'static str> {
          not how much work it carried: PoV size, weight and transaction counts are not read \
          here, and `head_data` is deliberately not stored at all (20.0 MB across 17,763 rows in \
          a 555-block subset, and occupancy needs none of it)",
+    ]
+}
+
+/// What the entitlement-vs-occupancy delta is not.
+///
+/// THE FIRST THREE LINES ARE THE THREE RULES `api::coretime_delta` refuses to
+/// break, and they are stated to the reader rather than kept in the code that
+/// enforces them: an unknown core is not an idle one, pool time is not waste,
+/// and an assignment announced is not an assignment applied.
+pub fn coretime_delta_not_covered() -> Vec<&'static str> {
+    vec![
+        "A CORE WITH NO ASSIGNMENT AT OR BEFORE THE ANCHOR IS `unknown`, NEVER `idle`. \
+         `Broker.CoreAssigned` fires only at SALE BOUNDARIES — the sale governing the measured \
+         1,000-block window sat ~157,000 coretime blocks (~335,000 relay blocks) before it — so \
+         a core with no entitlement on record means 'our index does not reach the sale that \
+         governs it', which is not 'nobody bought it'. `entitlement.unknown_cores` names them, \
+         and the waste figure is WITHHELD entirely while any exist, because an unknown core may \
+         be task-entitled and idle and omitting it under-states waste, which is the direction \
+         that flatters the product",
+        "POOL CORES ARE NOT WASTE. A `Pool` core was sold and donated to the instantaneous \
+         market, so its time belongs to no purchaser BY CONSTRUCTION rather than by our \
+         ignorance. 43 of 100 cores in the measured sale, i.e. 43,000 slots that would become \
+         invented waste the moment somebody folded them in. `waste.pool_slots` reports them \
+         beside the figure they are excluded from",
+        "AN ASSIGNMENT ANNOUNCED IS NOT AN ASSIGNMENT APPLIED, and this endpoint reads the \
+         announcement. `Broker.CoreAssigned` is emitted on the Coretime chain when the \
+         instruction is SENT by XCM Transact; the relay emits its own `coretime.CoreAssigned` \
+         only after `scheduler::assign_core` returns Ok. Measured at a sale boundary: 97 sent, \
+         97 applied, ZERO unpartnered — so the failure mode is expressible here and has NO LIVE \
+         INSTANCE, which is stated as unobserved rather than impossible. Nothing here reads the \
+         relay's applied half",
+        "THE TWO DENOMINATORS ARE DATED ON DIFFERENT NUMBER LINES AND ARE NOT COMPARABLE IN \
+         TIME. `denominators.relay_num_cores` is read at a RELAY height; \
+         `denominators.broker_core_count` is read at a CORETIME height. They are compared by \
+         VALUE (both read 100, on two chains, from two storage items) and never ordered against \
+         each other. So `denominators` carries a `relay_reading_position` for the relay half and \
+         NOTHING of the kind for the broker half, and no `stable_across_window` for either — the \
+         occupancy endpoint serves both for its own denominator and neither is answerable here. \
+         (`entitlement.stable_across_window` is a DIFFERENT subject: whether the ASSIGNMENTS \
+         moved inside the window, which is answerable and is served.) A disagreement WITHHOLDS \
+         the waste figure rather than picking a winner, which is what migration 0025 requires of \
+         this reader — and an ABSENT reading leaves `checks.denominators_agree` at `unknown`, \
+         which is not `ok`",
+        "`first_core` IS A DATED READING TOO, and it is taken from the NEWEST \
+         `coretime.broker_config` row rather than from one aligned with the window — because it \
+         is dated on the coretime chain's number line and cannot be positioned against a relay \
+         window at all. It moves every sale. So the reserved-vs-market split is as of \
+         `market.read_at_height` and NOT as of the window, and with no reading at all the split \
+         is ABSENT rather than assumed: `first_core = 0` would move every reserved system core \
+         into the market and put the waste on the wrong side of the boundary",
+        "THE MASK DOES NOT CROSS. `pallet-broker`'s tick converts a region's 80-bit `CoreMask` \
+         to the relay's ratio as `count_ones() * 720`, so the BIT COUNT crosses and the PATTERN \
+         does not — two interlaced regions on one core assigned to the same task are \
+         indistinguishable on the relay side forever. `parts` is the only surviving trace, this \
+         reader never divides by it, and a MIXED or FRACTIONAL core withholds the waste figure \
+         rather than counting a fraction of a core as a whole one. Measured three independent \
+         ways as currently empty: every live assignment carries a full 57,600",
+        "the occupancy side counts `included` rows ONLY, for the reason \
+         /v1/coretime/{chain}/occupancy gives: async backing puts a `backed` row 2-6 blocks \
+         before nearly every inclusion, so counting them would roughly double every figure",
+        "THE DELTA IS COMPUTED PER REQUEST AND NEVER STORED. Both sides carry `runtime_version` \
+         and `mapper_version`, so a materialised join would be the one copy WITHOUT lineage — \
+         the fifth refusal of that shape in this project, after treasury.consolidated_position, \
+         graph.cross_chain_operations, the stored forwarded-attribution and a logical_assets \
+         join table. `entitlement.lineage` is the entitlement side's own Invariant-3 stamp; more \
+         than one entry means the governing assignments were mapped under two rule sets",
+        "A RENEWAL MOVES THE CORE INDEX, so the key here is (core, task, relay-block window) and \
+         never the region. Measured at coretime 4919882: para 3428 renewed five cores and every \
+         index changed (35->43, 36->44, 37->45, 40->46, 41->47). A core index therefore \
+         identifies an entitlement only WITHIN one region, and following a tenant across sale \
+         cycles by core index silently follows a different tenant after every sale",
+        "`Broker.SaleInfo` is captured whole in coretime.broker_config and only `first_core` is \
+         read from it. `cores_sold`, `end_price` and `sellout_price` move on every purchase with \
+         NO EVENT, so the Dutch leadin price curve is not reconstructible from anything else \
+         this project stores — but reconstructing it (against Configuration.leadin_length and \
+         the sale geometry) is its own slice and nothing here does it. What a core COST is not \
+         served by this endpoint at any point",
+        "on-demand traffic is invisible from both sides. The relay cannot tell bulk from \
+         on-demand at all, and a `Pool` core's occupancy is unattributable by construction, so a \
+         pool core carrying blocks would appear here as `pool_used` with no way to say who \
+         bought the time. Zero live instances: no pool core produced anything in the measured \
+         window, which is also what refutes reading two barely-used bulk cores as on-demand",
+        "`window.blocks_indexed` is the slot denominator, NOT the requested span. A GAP THEREFORE \
+         DIVIDES OUT: it removes the block from the numerator and from `blocks_indexed` in the \
+         same proportion, so a window with holes is not biased towards more waste — \
+         `window.contiguous` says whether it has any, which is a different question. What DOES \
+         bias the used ratio down is a block that is DECODED but not yet coretime-mapped: it \
+         counts in `blocks_indexed` and contributes no occupancy. Compare \
+         `window.blocks_indexed` against `window.heights_with_occupancy` to see it",
+    ]
+}
+
+/// What an entitlement timeline is not.
+pub fn entitlement_not_covered() -> Vec<&'static str> {
+    vec![
+        "this is the ANNOUNCEMENT stream, not the applied one — see the delta endpoint's own \
+         coverage list. `assignments` are rows of coretime.core_assignments, i.e. what the \
+         broker said it was sending to the relay",
+        "A CORE INDEX IS NOT A DURABLE IDENTITY. Asking by `core` follows a SLOT across sale \
+         cycles and therefore follows whichever tenant holds it; asking by `task` follows the \
+         TENANT. Measured: para 3428's five renewals every one moved the index (35->43, 36->44, \
+         37->45, 40->46, 41->47). If you are tracking a chain, ask by task",
+        "18 of the 37 declared `Broker` variants name no core and 31 name no task, so a timeline \
+         asked by either shows a SUBSET of what happened. The whole vocabulary for a block is in \
+         coretime.broker_events keyed by (chain, height, event_index); this endpoint indexes it \
+         by subject",
+        "`data` is the variant's whole decoded payload, kept intact (schema-on-read). Two shapes \
+         measured and worth knowing before querying it: the broker's core index renders as a \
+         BARE u16 (`\"core\": 0`) where the relay's renders as `{\"core\":[0]}`, and \
+         `RegionRecord.owner` is an `Option<AccountId32>` rendering THREE array layers deep",
+        "31 of the 37 variants have NO LIVE INSTANCE in the sampled windows, so their field \
+         lists are pinned against `pallet-broker` 0.28.0 rather than measured. `Purchased` is \
+         among them, and its absence is a GAP IN THE SAMPLE and not a finding about the market: \
+         653 blocks is a fraction of a 28-day cycle and purchases spread across a 14-day leadin",
+        "region OWNERSHIP is not here. A region's owner lives in the storage VALUE \
+         (`RegionRecord.owner`) and not in any event's id, and this project ships no reader for \
+         it — so 'who holds this entitlement' is not a question these rows answer",
     ]
 }
 
@@ -2633,6 +2758,27 @@ pub trait CoretimeIndex: Send + Sync {
         from: u64,
         to: u64,
     ) -> Result<Vec<CoreOccupancyRow>, IndexError>;
+    /// Inclusion counts per (core, para) over `[from, to]`, ascending.
+    ///
+    /// PER (core, para) AND NOT PER CORE, because the delta attributes occupancy
+    /// to the task that was ENTITLED to it. A core that carried two paras has
+    /// part of its occupancy attributable and part not, and a per-core total
+    /// cannot express that — it would force the reader to call the whole core
+    /// agreeing or the whole core disagreeing, and either is a wrong number
+    /// rather than a coarse one.
+    ///
+    /// Core->para rotation is unexercised on live data (all 47 used cores in the
+    /// measured window served exactly one para), so this is the shape the reader
+    /// is designed against rather than one anyone has seen. It needs NO NEW
+    /// INDEX: `core_index` is unconstrained here, so the `(chain_id,
+    /// block_height)` PK prefix serves the range directly, exactly as
+    /// `occupancy_by_core` does.
+    async fn occupancy_by_core_and_para(
+        &self,
+        chain_id: &str,
+        from: u64,
+        to: u64,
+    ) -> Result<Vec<coretime_delta::OccupancyCell>, IndexError>;
     /// Row counts per `kind` — so a reader can see how much `backed` and
     /// `timed_out` sit beside the `included` rows the ratios are built from.
     async fn kind_counts(
@@ -2774,6 +2920,30 @@ impl CoretimeIndex for MemoryCoretimeIndex {
             .collect())
     }
 
+    async fn occupancy_by_core_and_para(
+        &self,
+        chain_id: &str,
+        from: u64,
+        to: u64,
+    ) -> Result<Vec<coretime_delta::OccupancyCell>, IndexError> {
+        let rows = self.rows.read().map_err(|e| IndexError(e.to_string()))?;
+        let mut by: std::collections::BTreeMap<(u32, u32), u64> = std::collections::BTreeMap::new();
+        for (c, h, _, kind, core, para) in rows.iter() {
+            if c != chain_id || *h < from || *h > to || kind != "included" {
+                continue;
+            }
+            *by.entry((*core, *para)).or_default() += 1;
+        }
+        Ok(by
+            .into_iter()
+            .map(|((core_index, para_id), included_blocks)| coretime_delta::OccupancyCell {
+                core_index,
+                para_id,
+                included_blocks,
+            })
+            .collect())
+    }
+
     async fn kind_counts(
         &self,
         chain_id: &str,
@@ -2881,6 +3051,275 @@ impl CoretimeIndex for MemoryCoretimeIndex {
             .map(|(_, r)| r.num_cores)
             .collect();
         Ok(set.into_iter().collect())
+    }
+}
+
+// ------------------------------------------------------------------ broker
+
+/// One `Broker.*` event, for the entitlement timeline.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct BrokerEventRow {
+    pub block_height: u64,
+    pub event_index: u32,
+    /// The variant WITHOUT the pallet prefix, exactly as the runtime spells it.
+    pub variant: String,
+    pub core_index: Option<u32>,
+    pub task_id: Option<u32>,
+    /// The whole decoded payload, kept intact (schema-on-read).
+    pub data: serde_json::Value,
+    pub runtime_version: u64,
+    pub mapper_version: u32,
+}
+
+/// One dated reading of the entitlement side's denominator and sale geometry.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct BrokerConfigRow {
+    /// A CORETIME chain height. Not comparable with a relay height, and
+    /// therefore never positioned against a relay window — see the delta's
+    /// coverage list.
+    pub block_height: u64,
+    pub core_count: u32,
+    /// `SaleInfo.first_core`: cores below it are reserved system cores. NULL
+    /// when sales never started or when the reading predates 0026.
+    pub first_core: Option<u32>,
+    pub runtime_version: u64,
+}
+
+/// Reads over the ENTITLEMENT half — `coretime.broker_events`,
+/// `coretime.core_assignments` and `coretime.broker_config`.
+///
+/// 0025 shipped all three tables and no reader for any of them, and dropped the
+/// four indexes it had described because "the query that WOULD earn this index
+/// does not exist yet and should arrive WITH its index". This trait is those
+/// queries; migration 0026 is those indexes.
+#[async_trait]
+pub trait BrokerIndex: Send + Sync {
+    /// The assignment GOVERNING each core at `relay_height` — the newest
+    /// announcement at or before it, expanded into its `(kind, task, parts)`
+    /// rows.
+    ///
+    /// THE LOOKBACK IS UNBOUNDED ON PURPOSE. `Broker.CoreAssigned` fires only at
+    /// sale boundaries, and the sale governing the measured 1,000-block window
+    /// sat ~157,000 coretime blocks before it — so "look recently" would find
+    /// nothing and then have to decide what nothing means.
+    ///
+    /// ONE ANNOUNCEMENT PER CORE, not one relay block per core: two rows sharing
+    /// a `relay_block` may come from two different announcing events (a
+    /// re-announcement), and returning both would make one core look interlaced.
+    /// The newest announcing coordinate wins.
+    async fn entitlement_at(
+        &self,
+        chain_id: &str,
+        relay_height: u64,
+    ) -> Result<Vec<coretime_delta::EntitlementRow>, IndexError>;
+
+    /// The newest `broker_config` reading for this chain, with its own height.
+    ///
+    /// NEWEST RATHER THAN AT-OR-BEFORE-THE-WINDOW, because there is no
+    /// at-or-before to ask: this reading is dated on the CORETIME chain's number
+    /// line and the window is relay heights. The reader states the height and
+    /// refuses to imply the two are the same instant.
+    async fn latest_broker_config(
+        &self,
+        chain_id: &str,
+    ) -> Result<Option<BrokerConfigRow>, IndexError>;
+
+    /// `Broker.*` events naming this core, newest first.
+    async fn events_for_core(
+        &self,
+        chain_id: &str,
+        core_index: u32,
+        limit: u32,
+    ) -> Result<Vec<BrokerEventRow>, IndexError>;
+    /// `Broker.*` events naming this task, newest first.
+    async fn events_for_task(
+        &self,
+        chain_id: &str,
+        task_id: u32,
+        limit: u32,
+    ) -> Result<Vec<BrokerEventRow>, IndexError>;
+    /// Assignments on this core, newest relay block first.
+    async fn assignments_for_core(
+        &self,
+        chain_id: &str,
+        core_index: u32,
+        limit: u32,
+    ) -> Result<Vec<coretime_delta::EntitlementRow>, IndexError>;
+    /// Assignments naming this task, newest relay block first — the query that
+    /// follows a TENANT across sale cycles, which following a core index cannot
+    /// do because a renewal moves it.
+    async fn assignments_for_task(
+        &self,
+        chain_id: &str,
+        task_id: u32,
+        limit: u32,
+    ) -> Result<Vec<coretime_delta::EntitlementRow>, IndexError>;
+}
+
+#[derive(Default)]
+pub struct MemoryBrokerIndex {
+    events: RwLock<Vec<(String, BrokerEventRow)>>,
+    assignments: RwLock<Vec<(String, u64, u32, coretime_delta::EntitlementRow)>>,
+    configs: RwLock<Vec<(String, BrokerConfigRow)>>,
+}
+
+impl MemoryBrokerIndex {
+    pub fn new() -> Self {
+        Self::default()
+    }
+    pub fn insert_event(&self, chain_id: &str, row: BrokerEventRow) {
+        self.events.write().expect("lock").push((chain_id.into(), row));
+    }
+    /// `block_height` and `event_index` are the ANNOUNCING coordinate — the
+    /// tie-break that keeps a re-announcement from looking like interlacing.
+    pub fn insert_assignment(
+        &self,
+        chain_id: &str,
+        block_height: u64,
+        event_index: u32,
+        row: coretime_delta::EntitlementRow,
+    ) {
+        self.assignments
+            .write()
+            .expect("lock")
+            .push((chain_id.into(), block_height, event_index, row));
+    }
+    pub fn insert_config(&self, chain_id: &str, row: BrokerConfigRow) {
+        self.configs.write().expect("lock").push((chain_id.into(), row));
+    }
+}
+
+#[async_trait]
+impl BrokerIndex for MemoryBrokerIndex {
+    async fn entitlement_at(
+        &self,
+        chain_id: &str,
+        relay_height: u64,
+    ) -> Result<Vec<coretime_delta::EntitlementRow>, IndexError> {
+        let rows = self.assignments.read().map_err(|e| IndexError(e.to_string()))?;
+        // The winning ANNOUNCEMENT per core: newest relay_block, then newest
+        // announcing coordinate. Mirrors the pg `distinct on` exactly, or the
+        // two backends disagree about which entitlement governs.
+        let mut best: std::collections::BTreeMap<u32, (u64, u64, u32)> =
+            std::collections::BTreeMap::new();
+        for (c, h, ei, r) in rows.iter() {
+            if c != chain_id || r.relay_block > relay_height {
+                continue;
+            }
+            let key = (r.relay_block, *h, *ei);
+            best.entry(r.core_index)
+                .and_modify(|cur| {
+                    if key > *cur {
+                        *cur = key;
+                    }
+                })
+                .or_insert(key);
+        }
+        let mut out: Vec<coretime_delta::EntitlementRow> = rows
+            .iter()
+            .filter(|(c, h, ei, r)| {
+                c == chain_id && best.get(&r.core_index) == Some(&(r.relay_block, *h, *ei))
+            })
+            .map(|(_, _, _, r)| r.clone())
+            .collect();
+        out.sort_by_key(|r| (r.core_index, r.assignment_index));
+        Ok(out)
+    }
+
+    async fn latest_broker_config(
+        &self,
+        chain_id: &str,
+    ) -> Result<Option<BrokerConfigRow>, IndexError> {
+        let configs = self.configs.read().map_err(|e| IndexError(e.to_string()))?;
+        Ok(configs
+            .iter()
+            .filter(|(c, _)| c == chain_id)
+            .max_by_key(|(_, r)| r.block_height)
+            .map(|(_, r)| r.clone()))
+    }
+
+    async fn events_for_core(
+        &self,
+        chain_id: &str,
+        core_index: u32,
+        limit: u32,
+    ) -> Result<Vec<BrokerEventRow>, IndexError> {
+        self.events_where(chain_id, limit, |r| r.core_index == Some(core_index))
+    }
+
+    async fn events_for_task(
+        &self,
+        chain_id: &str,
+        task_id: u32,
+        limit: u32,
+    ) -> Result<Vec<BrokerEventRow>, IndexError> {
+        self.events_where(chain_id, limit, |r| r.task_id == Some(task_id))
+    }
+
+    async fn assignments_for_core(
+        &self,
+        chain_id: &str,
+        core_index: u32,
+        limit: u32,
+    ) -> Result<Vec<coretime_delta::EntitlementRow>, IndexError> {
+        self.assignments_where(chain_id, limit, |r| r.core_index == core_index)
+    }
+
+    async fn assignments_for_task(
+        &self,
+        chain_id: &str,
+        task_id: u32,
+        limit: u32,
+    ) -> Result<Vec<coretime_delta::EntitlementRow>, IndexError> {
+        self.assignments_where(chain_id, limit, |r| r.task_id == Some(task_id))
+    }
+}
+
+impl MemoryBrokerIndex {
+    fn events_where(
+        &self,
+        chain_id: &str,
+        limit: u32,
+        pred: impl Fn(&BrokerEventRow) -> bool,
+    ) -> Result<Vec<BrokerEventRow>, IndexError> {
+        let rows = self.events.read().map_err(|e| IndexError(e.to_string()))?;
+        let mut out: Vec<BrokerEventRow> = rows
+            .iter()
+            .filter(|(c, r)| c == chain_id && pred(r))
+            .map(|(_, r)| r.clone())
+            .collect();
+        out.sort_by(|a, b| {
+            (b.block_height, b.event_index).cmp(&(a.block_height, a.event_index))
+        });
+        out.truncate(limit as usize);
+        Ok(out)
+    }
+
+    fn assignments_where(
+        &self,
+        chain_id: &str,
+        limit: u32,
+        pred: impl Fn(&coretime_delta::EntitlementRow) -> bool,
+    ) -> Result<Vec<coretime_delta::EntitlementRow>, IndexError> {
+        let rows = self.assignments.read().map_err(|e| IndexError(e.to_string()))?;
+        let mut out: Vec<(u64, u32, coretime_delta::EntitlementRow)> = rows
+            .iter()
+            .filter(|(c, _, _, r)| c == chain_id && pred(r))
+            .map(|(_, h, ei, r)| (*h, *ei, r.clone()))
+            .collect();
+        // relay_block desc, announcing coordinate desc, ordinal ASC — the same
+        // ordering the pg query spells, because two backends that disagree
+        // about ordering return different rows under `limit`.
+        out.sort_by_key(|(h, ei, r)| {
+            (
+                std::cmp::Reverse(r.relay_block),
+                std::cmp::Reverse(*h),
+                std::cmp::Reverse(*ei),
+                r.assignment_index,
+            )
+        });
+        out.truncate(limit as usize);
+        Ok(out.into_iter().map(|(_, _, r)| r).collect())
     }
 }
 
@@ -3575,6 +4014,39 @@ pub mod pg {
                 .collect())
         }
 
+        async fn occupancy_by_core_and_para(
+            &self,
+            chain_id: &str,
+            from: u64,
+            to: u64,
+        ) -> Result<Vec<super::coretime_delta::OccupancyCell>, IndexError> {
+            // Same `kind = 'included'` filter and the same index as
+            // `occupancy_by_core` — this is that query with `para_id` moved from
+            // the aggregate into the grouping, because the delta attributes per
+            // task and a per-core total cannot say which half of a two-para
+            // core's occupancy was entitled.
+            let rows: Vec<(i32, i32, i64)> = sqlx::query_as(
+                "select core_index, para_id, count(*) \
+                 from coretime.core_occupancy \
+                 where chain_id = $1 and block_height between $2 and $3 and kind = 'included' \
+                 group by core_index, para_id order by core_index, para_id",
+            )
+            .bind(chain_id)
+            .bind(from as i64)
+            .bind(to as i64)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| IndexError(e.to_string()))?;
+            Ok(rows
+                .into_iter()
+                .map(|(core, para, n)| super::coretime_delta::OccupancyCell {
+                    core_index: core as u32,
+                    para_id: para as u32,
+                    included_blocks: n as u64,
+                })
+                .collect())
+        }
+
         async fn kind_counts(
             &self,
             chain_id: &str,
@@ -3735,6 +4207,258 @@ pub mod pg {
             .await
             .map_err(|e| IndexError(e.to_string()))?;
             Ok(rows.into_iter().map(|(n,)| n as u32).collect())
+        }
+    }
+
+    /// Postgres-backed entitlement reads over `coretime.core_assignments`,
+    /// `coretime.broker_events` and `coretime.broker_config`.
+    ///
+    /// EVERY QUERY HERE IS THE READER FOR AN INDEX MIGRATION 0026 CREATES, and
+    /// 0026 exists because 0025 dropped those four indexes for lack of exactly
+    /// this. `core_assignments_core_idx` serves the governing-assignment probe,
+    /// `core_assignments_task_idx` the tenant timeline, and the two
+    /// `broker_events_*_idx` the event timelines.
+    pub struct PgBrokerIndex {
+        pool: PgPool,
+    }
+
+    impl PgBrokerIndex {
+        pub fn new(pool: PgPool) -> Self {
+            Self { pool }
+        }
+    }
+
+    /// The assignment columns, in one place so the name-read select and the
+    /// tuple it decodes into cannot drift apart.
+    const ASSIGNMENT_COLS: &str = "core_index, assignment_index, relay_block, assignment_kind, \
+                                   task_id, parts, runtime_version, mapper_version";
+
+    type AssignmentTuple = (i32, i32, i64, String, Option<i32>, i32, i64, i32);
+
+    fn assignment_row(t: AssignmentTuple) -> super::coretime_delta::EntitlementRow {
+        super::coretime_delta::EntitlementRow {
+            core_index: t.0 as u32,
+            assignment_index: t.1 as u32,
+            relay_block: t.2 as u64,
+            kind: t.3,
+            task_id: t.4.map(|v| v as u32),
+            parts: t.5 as u32,
+            runtime_version: t.6 as u64,
+            mapper_version: t.7 as u32,
+        }
+    }
+
+    const BROKER_EVENT_COLS: &str = "block_height, event_index, variant, core_index, task_id, \
+                                     data, runtime_version, mapper_version";
+
+    type BrokerEventTuple = (
+        i64,
+        i32,
+        String,
+        Option<i32>,
+        Option<i32>,
+        serde_json::Value,
+        i64,
+        i32,
+    );
+
+    fn broker_event_row(t: BrokerEventTuple) -> super::BrokerEventRow {
+        super::BrokerEventRow {
+            block_height: t.0 as u64,
+            event_index: t.1 as u32,
+            variant: t.2,
+            core_index: t.3.map(|v| v as u32),
+            task_id: t.4.map(|v| v as u32),
+            data: t.5,
+            runtime_version: t.6 as u64,
+            mapper_version: t.7 as u32,
+        }
+    }
+
+    #[async_trait]
+    impl super::BrokerIndex for PgBrokerIndex {
+        async fn entitlement_at(
+            &self,
+            chain_id: &str,
+            relay_height: u64,
+        ) -> Result<Vec<super::coretime_delta::EntitlementRow>, IndexError> {
+            // `distinct on (core_index)` picks ONE ANNOUNCEMENT per core — the
+            // newest `relay_block`, tie-broken by the newest announcing
+            // coordinate. The join then returns that announcement's WHOLE
+            // assignment vector, so an interlaced core keeps both entitlements.
+            //
+            // The tie-break is not decoration: two rows can share a
+            // `relay_block` and come from different events (a re-announcement),
+            // and taking both would make one core look interlaced when it is
+            // not — inventing a fractional entitlement, which withholds the
+            // waste figure for a reason that never happened.
+            // THE CTE'S COLUMNS ARE RENAMED, and that is not style. `a` and `g`
+            // both expose `core_index` and `relay_block`, and `ASSIGNMENT_COLS`
+            // is unqualified (it is shared with the two single-table queries
+            // below), so an unaliased CTE makes every one of those references
+            // ambiguous — Postgres 42702, at RUNTIME, on a query that compiles
+            // perfectly because `query_as` is the untyped form.
+            let rows: Vec<AssignmentTuple> = sqlx::query_as(&format!(
+                "with governing as ( \
+                   select distinct on (core_index) core_index as g_core, \
+                          relay_block as g_relay, block_height as g_height, \
+                          event_index as g_event \
+                     from coretime.core_assignments \
+                    where chain_id = $1 and relay_block <= $2 \
+                    order by core_index, relay_block desc, block_height desc, event_index desc \
+                 ) \
+                 select {ASSIGNMENT_COLS} from coretime.core_assignments a \
+                   join governing g on g.g_core = a.core_index \
+                    and g.g_relay = a.relay_block and g.g_height = a.block_height \
+                    and g.g_event = a.event_index \
+                  where a.chain_id = $1 \
+                  order by a.core_index, a.assignment_index"
+            ))
+            .bind(chain_id)
+            .bind(relay_height as i64)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| IndexError(e.to_string()))?;
+            Ok(rows.into_iter().map(assignment_row).collect())
+        }
+
+        async fn latest_broker_config(
+            &self,
+            chain_id: &str,
+        ) -> Result<Option<super::BrokerConfigRow>, IndexError> {
+            let row: Option<(i64, i32, Option<i32>, i64)> = sqlx::query_as(
+                "select block_height, core_count, first_core, runtime_version \
+                 from coretime.broker_config \
+                 where chain_id = $1 order by block_height desc limit 1",
+            )
+            .bind(chain_id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| IndexError(e.to_string()))?;
+            Ok(row.map(|(h, n, fc, rv)| super::BrokerConfigRow {
+                block_height: h as u64,
+                core_count: n as u32,
+                first_core: fc.map(|v| v as u32),
+                runtime_version: rv as u64,
+            }))
+        }
+
+        async fn events_for_core(
+            &self,
+            chain_id: &str,
+            core_index: u32,
+            limit: u32,
+        ) -> Result<Vec<super::BrokerEventRow>, IndexError> {
+            // `core_index = $2` keeps the indexed column BARE on the left, which
+            // is what lets Postgres prove the partial predicate `core_index is
+            // not null` (0020's caveat, measured in slice 7's verification:
+            // `= any($1)` still proves it, `lower(col) = $1` does not).
+            self.events(
+                &format!(
+                    "select {BROKER_EVENT_COLS} from coretime.broker_events \
+                     where chain_id = $1 and core_index = $2 \
+                     order by block_height desc, event_index desc limit $3"
+                ),
+                chain_id,
+                core_index,
+                limit,
+            )
+            .await
+        }
+
+        async fn events_for_task(
+            &self,
+            chain_id: &str,
+            task_id: u32,
+            limit: u32,
+        ) -> Result<Vec<super::BrokerEventRow>, IndexError> {
+            self.events(
+                &format!(
+                    "select {BROKER_EVENT_COLS} from coretime.broker_events \
+                     where chain_id = $1 and task_id = $2 \
+                     order by block_height desc, event_index desc limit $3"
+                ),
+                chain_id,
+                task_id,
+                limit,
+            )
+            .await
+        }
+
+        async fn assignments_for_core(
+            &self,
+            chain_id: &str,
+            core_index: u32,
+            limit: u32,
+        ) -> Result<Vec<super::coretime_delta::EntitlementRow>, IndexError> {
+            self.assignments(
+                &format!(
+                    "select {ASSIGNMENT_COLS} from coretime.core_assignments \
+                     where chain_id = $1 and core_index = $2 \
+                     order by relay_block desc, block_height desc, event_index desc, \
+                              assignment_index limit $3"
+                ),
+                chain_id,
+                core_index,
+                limit,
+            )
+            .await
+        }
+
+        async fn assignments_for_task(
+            &self,
+            chain_id: &str,
+            task_id: u32,
+            limit: u32,
+        ) -> Result<Vec<super::coretime_delta::EntitlementRow>, IndexError> {
+            self.assignments(
+                &format!(
+                    "select {ASSIGNMENT_COLS} from coretime.core_assignments \
+                     where chain_id = $1 and task_id = $2 \
+                     order by relay_block desc, block_height desc, event_index desc, \
+                              assignment_index limit $3"
+                ),
+                chain_id,
+                task_id,
+                limit,
+            )
+            .await
+        }
+    }
+
+    impl PgBrokerIndex {
+        async fn events(
+            &self,
+            sql: &str,
+            chain_id: &str,
+            subject: u32,
+            limit: u32,
+        ) -> Result<Vec<super::BrokerEventRow>, IndexError> {
+            let rows: Vec<BrokerEventTuple> = sqlx::query_as(sql)
+                .bind(chain_id)
+                .bind(subject as i32)
+                .bind(limit as i64)
+                .fetch_all(&self.pool)
+                .await
+                .map_err(|e| IndexError(e.to_string()))?;
+            Ok(rows.into_iter().map(broker_event_row).collect())
+        }
+
+        async fn assignments(
+            &self,
+            sql: &str,
+            chain_id: &str,
+            subject: u32,
+            limit: u32,
+        ) -> Result<Vec<super::coretime_delta::EntitlementRow>, IndexError> {
+            let rows: Vec<AssignmentTuple> = sqlx::query_as(sql)
+                .bind(chain_id)
+                .bind(subject as i32)
+                .bind(limit as i64)
+                .fetch_all(&self.pool)
+                .await
+                .map_err(|e| IndexError(e.to_string()))?;
+            Ok(rows.into_iter().map(assignment_row).collect())
         }
     }
 
@@ -5270,6 +5994,7 @@ pub struct AppState {
     pub xcm_sim: Arc<dyn XcmSimIndex>,
     pub xcm: Arc<dyn XcmIndex>,
     pub coretime: Arc<dyn CoretimeIndex>,
+    pub broker: Arc<dyn BrokerIndex>,
     pub parse_account: AccountParser,
 }
 
@@ -5307,6 +6032,14 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/v1/coretime/{chain}/occupancy",
             get(get_coretime_occupancy),
+        )
+        // NETWORK-SCOPED, unlike its two neighbours, and the difference is the
+        // point: the delta spans TWO CHAINS and a request that named one would
+        // have to name the other in code. Both are resolved from the registry.
+        .route("/v1/coretime/{network}/delta", get(get_coretime_delta))
+        .route(
+            "/v1/coretime/{chain}/entitlement",
+            get(get_coretime_entitlement),
         )
         .route("/v1/search", get(get_search))
         .route("/v1/domains/{network}/{domain}", get(resolve_domain))
@@ -6318,6 +7051,416 @@ async fn get_coretime_occupancy(
         "bands": bands,
         "cores": &cores,
         "coverage": { "not_covered": coretime_not_covered() },
+    }))
+    .into_response()
+}
+
+// -------------------------------------------------------------- the delta
+
+/// The two chains carrying the two halves of coretime on one network, resolved
+/// from the registry and named nowhere in this file.
+///
+/// REFUSES RATHER THAN PICKS when the answer is not exactly one of each. Zero
+/// leaves the reader with nothing and a decision about what nothing means — the
+/// one decision 0025 forbids it to get wrong — and two leaves it choosing. Both
+/// are seed errors, and a registry test asserts the shipped seeds give exactly
+/// one of each.
+fn coretime_pair<'a>(
+    registry: &'a Registry,
+    network: &str,
+) -> Result<(&'a registry::ChainConfig, &'a registry::ChainConfig), String> {
+    let pick = |module: &str, half: &str, why: &str| -> Result<&'a registry::ChainConfig, String> {
+        let found = registry.chains_with_module(network, module);
+        match found.len() {
+            1 => Ok(found[0]),
+            0 => Err(format!(
+                "no chain on network '{network}' declares the `{module}` module, so the {half} \
+                 half of coretime cannot be read at all. {why}"
+            )),
+            n => Err(format!(
+                "{n} chains on network '{network}' declare the `{module}` module ({}), so the \
+                 {half} half is ambiguous. This reader refuses to pick one: a delta computed \
+                 against the wrong chain's rows would be a wrong number rather than a missing \
+                 one. Fix the registry seeds",
+                found
+                    .iter()
+                    .map(|c| c.id.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )),
+        }
+    };
+    let occupancy = pick(
+        "coretime",
+        "OCCUPANCY",
+        "Occupancy is read from `paraInclusion`, a relay pallet that names both the para id and \
+         the core index",
+    )?;
+    let entitlement = pick(
+        "broker",
+        "ENTITLEMENT",
+        "Entitlement is `pallet-broker`, which lives on the coretime parachain and nowhere else",
+    )?;
+    Ok((occupancy, entitlement))
+}
+
+/// Entitlement purchased vs occupancy realized, over one relay-block window.
+///
+/// THE CLAIM NOBODY ELSE CAN MAKE, and the reason both halves were built.
+/// RegionX and Lastic draw core grids; both are MARKETPLACES, so they render the
+/// LEASE. `/v1/coretime/{chain}/occupancy` renders the USAGE. This renders the
+/// difference, and the difference is a number slice 11 could not compute at all:
+/// it could only say "34.69% of ALL slots", which silently adds "nobody bought
+/// it" to "somebody bought it and did not use it".
+///
+/// NETWORK-SCOPED, and both chains come from the registry. The path segment is a
+/// NETWORK where its two neighbours on `/v1/coretime/` take a chain, because a
+/// join across two chains cannot name one of them in a URL without naming the
+/// other in code.
+async fn get_coretime_delta(
+    State(state): State<AppState>,
+    Path(network): Path<String>,
+    Query(q): Query<CoretimeQuery>,
+) -> Response {
+    let (occ_chain, ent_chain) = match coretime_pair(&state.registry, &network) {
+        Ok(pair) => pair,
+        Err(e) => {
+            // 404 rather than 400: the request is well formed and this network
+            // is not one we can answer for. The message names the networks that
+            // are, derived from the registry so it cannot drift.
+            // The list is filtered by the SAME predicate that just refused, so
+            // it names networks this endpoint can actually answer for rather
+            // than every network in the registry — which is true today only
+            // because there is one.
+            let answerable: Vec<String> = search::known_networks(&state.registry)
+                .into_iter()
+                .filter(|n| coretime_pair(&state.registry, n).is_ok())
+                .collect();
+            return error(
+                StatusCode::NOT_FOUND,
+                format!(
+                    "{e}. Networks this endpoint can answer for: {}",
+                    if answerable.is_empty() {
+                        "none".to_string()
+                    } else {
+                        answerable.join(", ")
+                    }
+                ),
+            );
+        }
+    };
+    let (Some(from), Some(to)) = (q.from, q.to) else {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "both `from` and `to` are required, in RELAY block numbers. A delta is only \
+             meaningful over a stated window, and defaulting to one would put a window nobody \
+             chose underneath a percentage somebody quotes"
+                .to_string(),
+        );
+    };
+    if from > to {
+        return error(StatusCode::BAD_REQUEST, "`from` must not exceed `to`".to_string());
+    }
+    let span = (to - from).saturating_add(1);
+    if span > CORETIME_MAX_SPAN {
+        return error(
+            StatusCode::BAD_REQUEST,
+            format!("window of {span} blocks exceeds the {CORETIME_MAX_SPAN}-block limit"),
+        );
+    }
+
+    let ise = |e: IndexError| error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string());
+    let occupancy = match state
+        .coretime
+        .occupancy_by_core_and_para(&occ_chain.id, from, to)
+        .await
+    {
+        Ok(o) => o,
+        Err(e) => return ise(e),
+    };
+    let coverage = match state.coretime.window_coverage(&occ_chain.id, from, to).await {
+        Ok(c) => c,
+        Err(e) => return ise(e),
+    };
+    // The relay's denominator, dated EXACTLY the way the occupancy endpoint
+    // dates it — including the `core_config_after` fallback, which is not
+    // optional.
+    //
+    // WITHOUT THE FALLBACK THE TWO ENDPOINTS DISAGREE ON LIVE DATA TODAY. Slice
+    // 11's verification recorded `position` coming back `after_window` (the
+    // reading is at #32620900, its window ends #32614536), so on exactly the
+    // window this slice's own drill uses, an at-or-before-only probe returns
+    // NOTHING: `/occupancy` would report 100 declared cores and `/delta` would
+    // report null, over the same blocks, in the same minute.
+    let at_or_before = match state.coretime.core_config_at_or_before(&occ_chain.id, to).await {
+        Ok(c) => c,
+        Err(e) => return ise(e),
+    };
+    let (relay_config, relay_position) = match at_or_before {
+        Some(c) if c.block_height >= from => (Some(c), "inside_window"),
+        Some(c) => (Some(c), "before_window"),
+        None => match state.coretime.core_config_after(&occ_chain.id, to).await {
+            Ok(Some(c)) => (Some(c), "after_window"),
+            Ok(None) => (None, "none"),
+            Err(e) => return ise(e),
+        },
+    };
+    // The broker's denominator, and there is no at-or-before to ask for: this
+    // reading is dated on the CORETIME chain's number line, which cannot be
+    // ordered against a relay window at all. Newest, with its height stated.
+    let broker_config = match state.broker.latest_broker_config(&ent_chain.id).await {
+        Ok(c) => c,
+        Err(e) => return ise(e),
+    };
+    // THE ANCHOR IS THE WINDOW'S END, and the entitlement is whatever was
+    // governing then. `relay_block <= to` is the constraint slice 13's own
+    // VERIFY doc omitted, and omitting it produces a join that matches on core
+    // index alone — which proves the two INDEX SPACES align and not that the
+    // entitlement agreed with the usage at a shared instant.
+    let entitlement = match state.broker.entitlement_at(&ent_chain.id, to).await {
+        Ok(e) => e,
+        Err(e) => return ise(e),
+    };
+
+    let occupancy_lineage = match state.coretime.occupancy_lineage(&occ_chain.id, from, to).await {
+        Ok(l) => l,
+        Err(e) => return ise(e),
+    };
+
+    let report = coretime_delta::compute(coretime_delta::DeltaInput {
+        occupancy: &occupancy,
+        entitlement: &entitlement,
+        blocks_indexed: coverage.blocks_indexed,
+        window_from: from,
+        anchor_relay_block: to,
+        relay_num_cores: relay_config.as_ref().map(|c| c.num_cores),
+        broker_core_count: broker_config.as_ref().map(|c| c.core_count),
+        first_core: broker_config.as_ref().and_then(|c| c.first_core),
+    });
+
+    // Invariant 3 applies to an aggregate as much as to a row, and the
+    // entitlement side needs its own stamp: two entries mean the governing
+    // assignments were mapped under two RULE SETS.
+    let mut ent_lineage: std::collections::BTreeMap<(u64, u32), u64> =
+        std::collections::BTreeMap::new();
+    for r in &entitlement {
+        *ent_lineage.entry((r.runtime_version, r.mapper_version)).or_default() += 1;
+    }
+
+    Json(serde_json::json!({
+        "network": network,
+        "chains": {
+            "occupancy": occ_chain.id,
+            "entitlement": ent_chain.id,
+            "reads_as": "the occupancy half is the RELAY's candidate events and the entitlement \
+                         half is `pallet-broker` on the coretime chain. Both were resolved from \
+                         the registry; neither id appears in this reader's code.",
+        },
+        "window": {
+            "from": from,
+            "to": to,
+            "span": span,
+            "blocks_indexed": coverage.blocks_indexed,
+            "contiguous": coverage.blocks_indexed == span,
+            "heights_with_occupancy": coverage.heights_with_occupancy,
+            "unit": "RELAY block numbers. `core_assignments.relay_block` is on this same line \
+                     (it is `CoreAssigned.when`, an exact multiple of 80), which is what makes \
+                     this a join and not a correlation.",
+        },
+        "entitlement": {
+            "anchor_relay_block": report.anchor_relay_block,
+            "governing_relay_blocks": report.governing_relay_blocks,
+            "stable_across_window": report.entitlement_stable_across_window,
+            "changed_in_window": report.changed_in_window,
+            "cores_with_entitlement": report.cores_with_entitlement,
+            "cores_without_entitlement": report.cores_without_entitlement,
+            "unknown_cores": report.unknown_cores,
+            "task_entitled_cores": report.task_entitled_cores,
+            "pool_cores": report.pool_cores,
+            "idle_cores": report.idle_cores,
+            "unattributable_cores": report.unattributable_cores,
+            "lineage": ent_lineage
+                .iter()
+                .map(|((rv, mv), n)| serde_json::json!({
+                    "runtime_version": rv, "mapper_version": mv, "rows": n
+                }))
+                .collect::<Vec<_>>(),
+        },
+        "attribution": {
+            "agree_cores": report.agree_cores,
+            "disagree_cores": report.disagree_cores,
+            "pool_cores_with_occupancy": report.pool_cores_with_occupancy,
+            "idle_cores_with_occupancy": report.idle_cores_with_occupancy,
+            "unknown_cores_with_occupancy": report.unknown_cores_with_occupancy,
+            "candidates_total": report.candidates_total,
+            "attributed_candidates": report.attributed_candidates,
+            "unattributed_candidates": report.unattributed_candidates,
+            "unattributed_by_reason": report.unattributed_by_reason,
+        },
+        "waste": report.waste,
+        "waste_withheld_because": report.waste_withheld_because,
+        "denominators": {
+            "relay_num_cores": report.relay_num_cores,
+            "relay_read_at_height": relay_config.as_ref().map(|c| c.block_height),
+            "relay_runtime_version": relay_config.as_ref().map(|c| c.runtime_version),
+            // Where the relay's reading sits relative to the window. There is
+            // deliberately no counterpart for the broker's: that one is dated on
+            // the coretime chain's own heights and cannot be positioned against
+            // a relay window at all.
+            "relay_reading_position": relay_position,
+            "broker_core_count": report.broker_core_count,
+            "broker_read_at_height": broker_config.as_ref().map(|c| c.block_height),
+            "broker_runtime_version": broker_config.as_ref().map(|c| c.runtime_version),
+            // TWO ARMS, because the one-arm version declared two numbers on a
+            // payload that could be serving one. On a DB where `sync-core-config`
+            // has not run — or where its only reading sits after the window and
+            // the fallback finds nothing — the cross-check 0025 calls "what
+            // makes the join believable" simply did not happen, and a sentence
+            // saying otherwise would hide that.
+            "reads_as": if report.relay_num_cores.is_some() && report.broker_core_count.is_some() {
+                "TWO CHAINS, TWO STORAGE ITEMS, ONE NUMBER — and the two heights are on DIFFERENT \
+                 NUMBER LINES. `relay_read_at_height` is a relay block and `broker_read_at_height` \
+                 is a coretime block; they are compared by VALUE and never ordered against each \
+                 other or against the window. A disagreement means one half is being counted \
+                 against the wrong denominator, and this reader withholds the waste figure rather \
+                 than picking one."
+            } else {
+                "ONE OF THE TWO DENOMINATORS IS ABSENT, so the cross-check that makes this join \
+                 believable DID NOT HAPPEN — `checks.denominators_agree` reads `unknown`, which \
+                 is not `ok`. Run `sync-core-config` on the occupancy chain and \
+                 `sync-broker-config` on the entitlement chain; until both are on record, nothing \
+                 here has compared the two chains' core counts at all."
+            },
+        },
+        "market": {
+            "first_core": report.first_core,
+            "read_at_height": broker_config.as_ref().map(|c| c.block_height),
+            "reads_as": "cores below `first_core` are reserved system cores and cores at or \
+                         above it are the bulk market. It is `SaleInfo.first_core`, read at the \
+                         CORETIME height above and NOT aligned with this window — it moves every \
+                         sale. NULL means sales never started or no reading was taken, and the \
+                         split is then ABSENT rather than assumed: `first_core = 0` would move \
+                         every reserved core into the market.",
+        },
+        "checks": report.checks,
+        "occupancy_lineage": occupancy_lineage
+            .iter()
+            .map(|(rv, mv, n)| serde_json::json!({
+                "runtime_version": rv, "mapper_version": mv, "rows": n
+            }))
+            .collect::<Vec<_>>(),
+        "reads_as": report.reads_as,
+        "cores": report.cores,
+        "coverage": { "not_covered": coretime_delta_not_covered() },
+    }))
+    .into_response()
+}
+
+/// `?core=` | `?task=` — the entitlement timeline for one subject.
+#[derive(Deserialize)]
+struct EntitlementQuery {
+    core: Option<u32>,
+    task: Option<u32>,
+    limit: Option<u32>,
+}
+
+const ENTITLEMENT_DEFAULT_LIMIT: u32 = 50;
+const ENTITLEMENT_MAX_LIMIT: u32 = 500;
+
+/// What happened to one core, or to one task.
+///
+/// TWO SUBJECTS AND NOT ONE, because they are different questions and the
+/// difference is measured: a renewal MOVES the core index (para 3428's five
+/// renewals moved every one — 35→43, 36→44, 37→45, 40→46, 41→47), so asking by
+/// core follows a SLOT and asking by task follows the TENANT. A single endpoint
+/// that quietly accepted either and answered one would be the second kind of
+/// wrong number this module exists to avoid.
+///
+/// This is what earns migration 0026's other three indexes.
+async fn get_coretime_entitlement(
+    State(state): State<AppState>,
+    Path(chain): Path<String>,
+    Query(q): Query<EntitlementQuery>,
+) -> Response {
+    let Some(cfg) = state.registry.chain(&chain) else {
+        return error(StatusCode::NOT_FOUND, format!("unknown chain '{chain}'"));
+    };
+    if !cfg.has_module("broker") {
+        return error(
+            StatusCode::NOT_FOUND,
+            format!(
+                "'{chain}' does not declare the `broker` module. Entitlement is `pallet-broker`, \
+                 which lives on the coretime parachain — the relay carries the OCCUPANCY half \
+                 (/v1/coretime/{chain}/occupancy) and no broker events whatsoever, so an empty \
+                 answer here would read as 'nobody bought a core' rather than as 'wrong chain'"
+            ),
+        );
+    }
+    let subject = match (q.core, q.task) {
+        (Some(c), None) => Ok(("core", c)),
+        (None, Some(t)) => Ok(("task", t)),
+        (Some(_), Some(_)) => Err(
+            "pass `core` OR `task`, not both: a core index identifies an entitlement only within \
+             one region while a task is durable across sale cycles, so a combined filter would \
+             answer a question with no stable meaning"
+                .to_string(),
+        ),
+        (None, None) => Err(
+            "one of `core` or `task` is required. Ask by `task` to follow a CHAIN across sale \
+             cycles and by `core` to follow a SLOT — a renewal moves the index, so the two \
+             diverge by construction"
+                .to_string(),
+        ),
+    };
+    let (kind, id) = match subject {
+        Ok(s) => s,
+        Err(e) => return error(StatusCode::BAD_REQUEST, e),
+    };
+    let limit = q
+        .limit
+        .unwrap_or(ENTITLEMENT_DEFAULT_LIMIT)
+        .clamp(1, ENTITLEMENT_MAX_LIMIT);
+
+    let ise = |e: IndexError| error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string());
+    let (events, assignments) = if kind == "core" {
+        (
+            state.broker.events_for_core(&chain, id, limit).await,
+            state.broker.assignments_for_core(&chain, id, limit).await,
+        )
+    } else {
+        (
+            state.broker.events_for_task(&chain, id, limit).await,
+            state.broker.assignments_for_task(&chain, id, limit).await,
+        )
+    };
+    let events = match events {
+        Ok(e) => e,
+        Err(e) => return ise(e),
+    };
+    let assignments = match assignments {
+        Ok(a) => a,
+        Err(e) => return ise(e),
+    };
+
+    Json(serde_json::json!({
+        "chain": chain,
+        "subject": { "kind": kind, "id": id },
+        "limit": limit,
+        // PER LIST, because one boolean over two lists cannot say which was cut.
+        "truncated": {
+            "events": events.len() as u32 == limit,
+            "assignments": assignments.len() as u32 == limit,
+        },
+        "events": events,
+        "assignments": assignments,
+        "reads_as": if kind == "task" {
+            "asked by TASK, so this follows the tenant across sale cycles even when its core \
+             index moves — which a renewal does."
+        } else {
+            "asked by CORE, so this follows a SLOT. A renewal moves the index, so a tenant may \
+             leave this timeline and continue on another core; ask by `task` to follow it."
+        },
+        "coverage": { "not_covered": entitlement_not_covered() },
     }))
     .into_response()
 }
@@ -9506,6 +10649,96 @@ pub(crate) mod tests {
         );
         let coretime: Arc<dyn CoretimeIndex> = coretime;
 
+        // THE ENTITLEMENT HALF FOR THE SAME TEN BLOCKS, shaped so that every
+        // number the delta serves is DIFFERENT from every number the occupancy
+        // endpoint serves over the identical window — which is the whole product
+        // claim, and a fixture where they coincided would let a collapse of the
+        // two pass every assertion.
+        //
+        // 10 declared cores: core 0 task 2004 (fully used), core 1 task 2034
+        // (used 6 of 10), core 2 task 3344 (used 1 of 10), core 3 task 3388
+        // (ENTITLED AND IDLE — the waste), cores 4..9 pool (idle, and NOT
+        // waste).
+        //
+        // The entitled denominator is 4 cores x 10 blocks = 40 slots against
+        // occupancy's 100, so the delta reads 42.5% where the occupancy
+        // endpoint reads 17% over the IDENTICAL window. Core 7 carries a
+        // `backed` row and no inclusion, so it must also prove the delta counts
+        // inclusions only.
+        let broker = Arc::new(MemoryBrokerIndex::new());
+        let assign = |core: u32, kind: &str, task: Option<u32>| EntitlementRow {
+            core_index: core,
+            assignment_index: 0,
+            // BELOW the window (100..=109), which is the ordinary case: a sale
+            // boundary sits far from the window it governs.
+            relay_block: 80,
+            kind: kind.into(),
+            task_id: task,
+            parts: PARTS_WHOLE_CORE,
+            runtime_version: 2_003_002,
+            mapper_version: 1,
+        };
+        for (i, (core, kind, task)) in [
+            (0u32, "task", Some(2004u32)),
+            (1, "task", Some(2034)),
+            (2, "task", Some(3344)),
+            (3, "task", Some(3388)),
+            (4, "pool", None),
+            (5, "pool", None),
+            (6, "pool", None),
+            (7, "pool", None),
+            (8, "pool", None),
+            (9, "pool", None),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            broker.insert_assignment("polkadot-coretime", 7, i as u32, assign(core, kind, task));
+        }
+        broker.insert_config(
+            "polkadot-coretime",
+            BrokerConfigRow {
+                block_height: 4_927_655,
+                core_count: 10,
+                // Cores 0 and 1 are RESERVED; 2 upward are the bulk market. So
+                // the one idle entitled core (3) is market-side, which is the
+                // shape slice 13 measured at scale (all ten idle cores >= 11).
+                first_core: Some(2),
+                runtime_version: 2_003_002,
+            },
+        );
+        broker.insert_event(
+            "polkadot-coretime",
+            BrokerEventRow {
+                block_height: 7,
+                event_index: 0,
+                variant: "CoreAssigned".into(),
+                core_index: Some(0),
+                task_id: None,
+                data: serde_json::json!({
+                    "core": 0, "when": 80, "assignment": [[{"Task": [2004]}, 57600]]
+                }),
+                runtime_version: 2_003_002,
+                mapper_version: 1,
+            },
+        );
+        // A renewal that MOVED a core index, so the two timeline subjects
+        // genuinely diverge: task 2004 appears on an event whose core is 9.
+        broker.insert_event(
+            "polkadot-coretime",
+            BrokerEventRow {
+                block_height: 9,
+                event_index: 0,
+                variant: "AutoRenewalEnabled".into(),
+                core_index: Some(9),
+                task_id: Some(2004),
+                data: serde_json::json!({ "core": 9, "task": 2004 }),
+                runtime_version: 2_003_002,
+                mapper_version: 1,
+            },
+        );
+        let broker: Arc<dyn BrokerIndex> = broker;
+
         let xcm = Arc::new(MemoryXcmIndex::new());
         let xcm_row = |chain: &str, height: u64, side: &str, id_kind: &str| XcmMessageRow {
             chain_id: chain.into(),
@@ -10600,6 +11833,7 @@ pub(crate) mod tests {
             xcm_sim,
             xcm,
             coretime,
+            broker,
             parse_account: Arc::new(|s| {
                 adapter_substrate::accounts::parse_account(s).map(|a| a.to_vec())
             }),
@@ -12444,6 +13678,245 @@ pub(crate) mod tests {
             "24310025.5393737286"
         );
         assert!(format_units("not-a-number", 6).is_none());
+    }
+
+    /// THE DELTA IS A DIFFERENT NUMBER FROM THE OCCUPANCY RATIO OVER THE SAME
+    /// WINDOW, and that difference is the whole slice.
+    ///
+    /// Asserted as arithmetic rather than as wording: the identical window
+    /// returns 17% from `/occupancy` (17 of 100 declared core-block slots) and
+    /// 42.5% from `/delta` (17 of 40 ENTITLED slots), because 6 of the 10 cores
+    /// were pooled and never entitled to a task at all. A change that quietly
+    /// divided by the declared count again would keep every other assertion here
+    /// green and would report 25,000 of the measured window's 43,000 pool slots
+    /// as waste nobody bought.
+    #[tokio::test]
+    async fn the_delta_divides_by_what_was_bought_and_never_by_every_declared_core() {
+        let app = router(test_state().await);
+
+        // THE REQUEST NAMES A NETWORK AND NEITHER CHAIN. Both are resolved from
+        // the registry — Invariant 2 on this surface, and the reason the path
+        // segment differs in kind from its two neighbours.
+        let (status, d) = get_json(&app, "/v1/coretime/polkadot/delta?from=100&to=109").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(d["chains"]["occupancy"], "polkadot");
+        assert_eq!(d["chains"]["entitlement"], "polkadot-coretime");
+
+        // Attribution: three cores produced, every candidate belongs to the task
+        // entitled to it.
+        assert_eq!(d["attribution"]["agree_cores"], 3);
+        assert_eq!(d["attribution"]["disagree_cores"], 0);
+        assert_eq!(d["attribution"]["candidates_total"], 17);
+        assert_eq!(d["attribution"]["attributed_candidates"], 17);
+        assert_eq!(d["attribution"]["unattributed_candidates"], 0);
+
+        // Census: 4 task-entitled, 6 pooled, nothing unknown.
+        assert_eq!(d["entitlement"]["task_entitled_cores"], 4);
+        assert_eq!(d["entitlement"]["pool_cores"], 6);
+        assert_eq!(d["entitlement"]["cores_without_entitlement"], 0);
+        assert_eq!(d["entitlement"]["stable_across_window"], true);
+
+        // THE COMPARISON. 17/40 against 17/100 over the same ten blocks.
+        let w = &d["waste"];
+        assert_eq!(w["task_entitled_slots"], 40);
+        assert_eq!(w["used_by_entitled_task"], 17);
+        assert_eq!(w["unused"], 23);
+        let entitled_ratio = w["used_ratio"].as_f64().expect("a served waste ratio");
+        let (_, o) = get_json(&app, "/v1/coretime/polkadot/occupancy?from=100&to=109").await;
+        let slots_filled = o["occupancy"]["slots_filled_ratio"].as_f64().unwrap();
+        assert!((entitled_ratio - 0.425).abs() < 1e-9, "{entitled_ratio}");
+        assert!((slots_filled - 0.17).abs() < 1e-9, "{slots_filled}");
+        assert!(
+            entitled_ratio > slots_filled,
+            "dividing by what was BOUGHT must not give the same answer as dividing by every \
+             declared core: {entitled_ratio} vs {slots_filled}"
+        );
+
+        // POOL TIME IS REPORTED AND IS NOT IN THE DENOMINATOR. 60 slots sat
+        // beside 40 entitled ones and contributed nothing to the ratio.
+        assert_eq!(w["pool_slots"], 60);
+        assert_eq!(w["idle_task_cores"], 1);
+        // The one idle entitled core is core 3, at or above first_core = 2, so
+        // the waste is market-side and no reserved core is idle.
+        assert_eq!(w["idle_task_cores_market"], 1);
+        assert_eq!(w["idle_task_cores_reserved"], 0);
+        // 6 pool + 1 idle task = 7 = the cores producing nothing. The identity
+        // slice 11 recorded (43 + 10 = 53) without being able to say why.
+        assert_eq!(w["cores_producing_nothing"], 7);
+
+        // A `backed` row is not occupancy. Core 7 carries one and no inclusion,
+        // so it must read as an unused POOL core rather than as a used one.
+        let core = |i: u64| {
+            d["cores"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|c| c["core_index"] == i)
+                .unwrap_or_else(|| panic!("core {i} present"))
+                .clone()
+        };
+        assert_eq!(core(7)["verdict"], "pool_unused");
+        assert_eq!(core(7)["included_blocks"], 0);
+        // The per-core ratio that refutes an on-demand reading: core 2 bought a
+        // whole core and used one block of ten.
+        assert_eq!(core(2)["entitlement_kind"], "task");
+        assert_eq!(core(2)["parts"], 57_600);
+        assert!((core(2)["used_ratio"].as_f64().unwrap() - 0.1).abs() < 1e-9);
+        assert_eq!(core(3)["verdict"], "entitled_unused");
+
+        // Two chains, two storage items, one number — and two heights on two
+        // number lines, which the payload states rather than reconciling.
+        assert_eq!(d["denominators"]["relay_num_cores"], 10);
+        assert_eq!(d["denominators"]["broker_core_count"], 10);
+        assert_eq!(d["denominators"]["relay_read_at_height"], 109);
+        assert_eq!(d["denominators"]["relay_reading_position"], "inside_window");
+        assert_eq!(d["denominators"]["broker_read_at_height"], 4_927_655);
+        assert!(
+            d["denominators"]["reads_as"].as_str().unwrap().contains("ONE NUMBER"),
+            "both readings are present, so the cross-check DID happen"
+        );
+        assert_eq!(d["checks"]["denominators_agree"], "ok");
+        assert_eq!(d["checks"]["entitlement_stable"], "ok");
+        assert_eq!(d["checks"]["cores_within_denominator"], "ok");
+        assert_eq!(d["checks"]["cores_account_for_the_denominator"], "ok");
+        assert!(d["waste_withheld_because"].as_array().unwrap().is_empty());
+
+        // EVERY FIELD THE COVERAGE LIST NAMES MUST EXIST IN THE PAYLOAD. Slice
+        // 10's FIX 3 in a new place: denying the machinery in prose is honest
+        // and useful, citing fields that are not there is not — a consumer
+        // greps for the name and finds nothing. These are the pointers
+        // `coretime_delta_not_covered()` sends a reader to.
+        for (parent, key) in [
+            ("entitlement", "unknown_cores"),
+            ("entitlement", "lineage"),
+            ("entitlement", "stable_across_window"),
+            ("denominators", "relay_num_cores"),
+            ("denominators", "broker_core_count"),
+            ("market", "read_at_height"),
+            ("waste", "pool_slots"),
+            ("window", "blocks_indexed"),
+            ("window", "heights_with_occupancy"),
+            ("window", "contiguous"),
+            ("checks", "denominators_agree"),
+        ] {
+            assert!(
+                d[parent].get(key).is_some(),
+                "coverage names `{parent}.{key}` and the payload has no such field"
+            );
+        }
+
+        // An unknown network is a 404 that lists the ones we can answer for,
+        // never an empty delta reading as "this network wasted nothing".
+        let (status, e) = get_json(&app, "/v1/coretime/kusama/delta?from=1&to=2").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert!(e["error"].as_str().unwrap().contains("polkadot"));
+        // And an unbounded request is refused for the reason its sibling gives.
+        let (status, _) = get_json(&app, "/v1/coretime/polkadot/delta").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    /// A CORE WITH NO ASSIGNMENT IS `unknown`, AND THE WASTE FIGURE REFUSES.
+    ///
+    /// This is the rule 0025 wrote down and nothing enforced until slice 14, and
+    /// it is asserted on the RENDERED payload rather than only in the pure
+    /// function — because the failure it prevents is a screenshot: a page saying
+    /// ten cores were bought and idle when the truth is that our index does not
+    /// reach the sale that sold them.
+    #[tokio::test]
+    async fn cores_with_no_assignment_render_unknown_and_withhold_the_waste_figure() {
+        let mut state = test_state().await;
+        // The entitlement half indexed for none of the window's cores — exactly
+        // what a shallow `broker-range` leaves behind, since `CoreAssigned`
+        // fires only at sale boundaries.
+        state.broker = Arc::new(MemoryBrokerIndex::new());
+        let app = router(state);
+
+        let (status, d) = get_json(&app, "/v1/coretime/polkadot/delta?from=100&to=109").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(d["entitlement"]["cores_without_entitlement"], 10);
+        assert_eq!(d["entitlement"]["task_entitled_cores"], 0);
+
+        // NOT IDLE, ANYWHERE IN THE PAYLOAD. The two words are the difference
+        // between "we did not look" and "nobody bought it".
+        for c in d["cores"].as_array().unwrap() {
+            assert_eq!(c["entitlement_kind"], "unknown", "core {}", c["core_index"]);
+            assert_ne!(c["verdict"], "entitled_unused");
+        }
+        assert_eq!(d["cores"].as_array().unwrap().len(), 10);
+
+        // The waste figure is absent and SAYS SO, rather than reading as zero
+        // waste — which would be this endpoint's most flattering wrong answer.
+        assert!(d["waste"].is_null());
+        let why = d["waste_withheld_because"].as_array().unwrap();
+        assert!(
+            why.iter()
+                .any(|s| s.as_str().unwrap().contains("NO assignment at or before the anchor")),
+            "{why:?}"
+        );
+        assert!(d["reads_as"].as_str().unwrap().contains("NO WASTE FIGURE IS SERVED"));
+
+        // The ATTRIBUTION is still served — it is a count over rows we hold, and
+        // "0 of 17 attributed" is itself the coverage statement.
+        assert_eq!(d["attribution"]["candidates_total"], 17);
+        assert_eq!(d["attribution"]["attributed_candidates"], 0);
+        assert_eq!(d["attribution"]["unattributed_by_reason"]["unknown"], 17);
+        assert_eq!(d["attribution"]["unknown_cores_with_occupancy"], 3);
+    }
+
+    /// ASKING BY CORE AND ASKING BY TASK ARE DIFFERENT QUESTIONS, because a
+    /// renewal moves the index — measured at coretime 4919882, where para 3428
+    /// renewed five cores and every one changed (35->43, 36->44, 37->45, 40->46,
+    /// 41->47).
+    ///
+    /// The fixture puts task 2004's renewal on core 9 while its assignment sits
+    /// on core 0, so a reader that answered either question with the other's
+    /// rows fails here.
+    #[tokio::test]
+    async fn an_entitlement_timeline_follows_a_task_even_when_its_core_index_moves() {
+        let app = router(test_state().await);
+
+        let (status, t) =
+            get_json(&app, "/v1/coretime/polkadot-coretime/entitlement?task=2004").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(t["subject"]["kind"], "task");
+        let events = t["events"].as_array().unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["variant"], "AutoRenewalEnabled");
+        assert_eq!(events[0]["core_index"], 9, "the tenant is on a DIFFERENT core now");
+        // Its assignment is still keyed on the core it held.
+        assert_eq!(t["assignments"].as_array().unwrap().len(), 1);
+        assert_eq!(t["assignments"][0]["core_index"], 0);
+        assert_eq!(t["assignments"][0]["parts"], 57_600);
+
+        let (status, c) =
+            get_json(&app, "/v1/coretime/polkadot-coretime/entitlement?core=0").await;
+        assert_eq!(status, StatusCode::OK);
+        let events = c["events"].as_array().unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["variant"], "CoreAssigned");
+        assert!(
+            !events.iter().any(|e| e["variant"] == "AutoRenewalEnabled"),
+            "asking by core must not return the renewal that moved the tenant off it"
+        );
+
+        // Both, or neither, is a refusal rather than a silent choice — the
+        // defect class where a query parameter is accepted and ignored.
+        for uri in [
+            "/v1/coretime/polkadot-coretime/entitlement?core=0&task=2004",
+            "/v1/coretime/polkadot-coretime/entitlement",
+        ] {
+            let (status, _) = get_json(&app, uri).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{uri}");
+        }
+
+        // THE RELAY IS A 404 WITH A REASON. It carries the occupancy half and no
+        // broker events at all, so an empty answer here would read as "nobody
+        // bought a core" rather than as "wrong chain".
+        let (status, e) = get_json(&app, "/v1/coretime/polkadot/entitlement?core=0").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert!(e["error"].as_str().unwrap().contains("occupancy"));
+        let (status, _) = get_json(&app, "/v1/coretime/nosuchchain/entitlement?core=0").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
     }
 
     /// THE SLICE'S PRODUCT CLAIM, ASSERTED AS A PROPERTY RATHER THAN AS WORDING.

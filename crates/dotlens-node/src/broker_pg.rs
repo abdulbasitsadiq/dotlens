@@ -200,6 +200,13 @@ fn assignment_refused(
 /// deferred again rather than built on the count going up. (`xcm.channels`,
 /// owed since slice 2, would be the sixth and is the only one that needs its
 /// readings DIFFED rather than merely recorded.)
+/// `first_core` and `sale_info` were added by migration 0026 (slice 14), which
+/// is also the slice that first READS `first_core` — cores below it are reserved
+/// system cores, and without it the delta cannot say whether idle entitlement is
+/// market-side. Both are `Option` because `Broker.SaleInfo` is an `OptionQuery`
+/// StorageValue that is genuinely absent before the first sale, and because rows
+/// written by slice 13 predate the columns entirely.
+#[allow(clippy::too_many_arguments)]
 pub async fn insert_broker_config(
     pool: &PgPool,
     chain_id: &str,
@@ -207,12 +214,15 @@ pub async fn insert_broker_config(
     core_count: u32,
     status: &serde_json::Value,
     configuration: &serde_json::Value,
+    first_core: Option<u32>,
+    sale_info: Option<&serde_json::Value>,
     runtime_version: u32,
 ) -> Result<()> {
     sqlx::query(
         "insert into coretime.broker_config \
-             (chain_id, block_height, core_count, status, configuration, runtime_version) \
-         values ($1,$2,$3,$4,$5,$6) \
+             (chain_id, block_height, core_count, status, configuration, first_core, sale_info, \
+              runtime_version) \
+         values ($1,$2,$3,$4,$5,$6,$7,$8) \
          on conflict (chain_id, block_height) do nothing",
     )
     .bind(chain_id)
@@ -220,6 +230,8 @@ pub async fn insert_broker_config(
     .bind(core_count as i32)
     .bind(status)
     .bind(configuration)
+    .bind(first_core.map(|c| c as i32))
+    .bind(sale_info)
     .bind(runtime_version as i64)
     .execute(pool)
     .await

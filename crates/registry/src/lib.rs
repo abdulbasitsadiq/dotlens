@@ -415,6 +415,30 @@ impl Registry {
         out
     }
 
+    /// Every chain on `network` that declares `module`, in id order.
+    ///
+    /// ADDED FOR A READER THAT SPANS TWO CHAINS AND MUST NAME NEITHER. The
+    /// coretime delta joins occupancy (the relay's `coretime` module) to
+    /// entitlement (the coretime chain's `broker` module), and both sides have
+    /// to be found by ASKING rather than by writing `polkadot` and
+    /// `polkadot-coretime` into Rust — which is Invariant 2 exactly, and which
+    /// `registry-seeds/polkadot-coretime.yaml` already prescribed as the shape
+    /// to build to before there was a reader to build it for.
+    ///
+    /// Residency is the wrong mechanism for this and deliberately not used: it
+    /// exists for domains that MIGRATED between chains, and the coretime market
+    /// has lived on one chain since its genesis, so there is no window to
+    /// encode. The caller decides what "not exactly one" means — this returns
+    /// the set rather than an `Option`, because a network with two chains
+    /// declaring the same module is a seed error the reader must REFUSE rather
+    /// than resolve by picking the first.
+    pub fn chains_with_module(&self, network: &str, module: &str) -> Vec<&ChainConfig> {
+        self.chains
+            .values()
+            .filter(|c| c.network == network && c.has_module(module))
+            .collect()
+    }
+
     /// Which chain hosts `domain` on `network` at time `at`?
     /// THE query behind migration-aware lookups (ARCHITECTURE.md §4).
     pub fn resolve_domain(
@@ -680,6 +704,44 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// THE DELTA READER FINDS BOTH HALVES BY ASKING, AND EXACTLY ONE OF EACH IS
+    /// WHAT MAKES THAT SAFE.
+    ///
+    /// Zero would leave the reader with nothing and a choice about what nothing
+    /// means; two would leave it picking one. Both are seed errors, and this is
+    /// the test that turns them into a failing build rather than a wrong number
+    /// on a page — the same standing as the assertion one test up that a chain
+    /// declaring `coretime` must be a relay.
+    #[test]
+    fn exactly_one_chain_per_network_carries_each_half_of_coretime() {
+        let reg = Registry::load_from_dir(&seeds_dir()).unwrap();
+
+        let occupancy = reg.chains_with_module("polkadot", "coretime");
+        assert_eq!(
+            occupancy.iter().map(|c| c.id.as_str()).collect::<Vec<_>>(),
+            vec!["polkadot"],
+            "occupancy is read from `paraInclusion`, a RELAY pallet"
+        );
+        let entitlement = reg.chains_with_module("polkadot", "broker");
+        assert_eq!(
+            entitlement.iter().map(|c| c.id.as_str()).collect::<Vec<_>>(),
+            vec!["polkadot-coretime"],
+            "entitlement is `pallet-broker`, which lives on the coretime chain"
+        );
+
+        // THE TWO MODULES MUST NOT BE THE SAME CHAIN'S, which is the property
+        // that makes the join a join. Stated as a property rather than as two
+        // ids, so registering Kusama's pair does not restage this test.
+        assert!(
+            occupancy[0].id != entitlement[0].id,
+            "the two halves of coretime live on different chains by construction"
+        );
+        // And an unregistered network answers empty for both, rather than
+        // falling back to something plausible.
+        assert!(reg.chains_with_module("kusama", "coretime").is_empty());
+        assert!(reg.chains_with_module("kusama", "broker").is_empty());
     }
 
     #[test]

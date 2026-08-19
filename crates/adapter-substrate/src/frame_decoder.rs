@@ -25,7 +25,6 @@ use frame_metadata::{RuntimeMetadata, RuntimeMetadataPrefixed};
 use parity_scale_codec::Decode;
 use scale_info::PortableRegistry;
 use scale_value::{Composite, Value, ValueDef};
-use serde::Deserialize;
 
 /// Decoder version for THIS decoder. Rows it writes are rebuildable: bump on
 /// any behavior change (Phase 0's envelope decoder stays DECODER_VERSION = 1).
@@ -43,24 +42,6 @@ pub enum FrameDecodeError {
     Extrinsic { index: u32, reason: String },
     #[error("events: {0}")]
     Events(String),
-}
-
-fn default_true() -> bool {
-    true
-}
-
-/// The live envelope written by SubstrateSource (slice 2).
-#[derive(Debug, Deserialize)]
-struct LiveEnvelope {
-    height: u64,
-    hash: String,
-    parent_hash: String,
-    spec_version: u32,
-    // default TRUE: `finalized: false` now means "replaceable + invisible to
-    // balances", so an absent field must fail SAFE (immutable), never open
-    #[serde(default = "default_true")]
-    finalized: bool,
-    extrinsics: Vec<String>,
 }
 
 /// One parsed metadata blob, ready to decode blocks of its spec_version.
@@ -108,7 +89,10 @@ impl FrameDecoder {
         events_bytes: Option<&[u8]>,
         raw_location: &str,
     ) -> Result<CanonicalBlock, FrameDecodeError> {
-        let env: LiveEnvelope = serde_json::from_slice(envelope)
+        // v1 (serde_json + hex) and v2 (binary) are one reader: the format is
+        // sniffed from the bytes, so a bucket holding both generations decodes
+        // without anyone telling it which is which.
+        let env = crate::envelope::decode_any(envelope)
             .map_err(|e| FrameDecodeError::Envelope(e.to_string()))?;
         if env.spec_version != self.spec_version {
             return Err(FrameDecodeError::Envelope(format!(
@@ -140,14 +124,10 @@ impl FrameDecoder {
         // ---- extrinsics
         let mut transactions = Vec::with_capacity(env.extrinsics.len());
         let mut timestamp: Option<chrono::DateTime<chrono::Utc>> = None;
-        for (i, xt_hex) in env.extrinsics.iter().enumerate() {
+        for (i, bytes) in env.extrinsics.iter().enumerate() {
             let index = i as u32;
-            let bytes = decode_hex(xt_hex).map_err(|reason| FrameDecodeError::Extrinsic {
-                index,
-                reason,
-            })?;
             let tx = self
-                .decode_extrinsic(index, &bytes)
+                .decode_extrinsic(index, bytes)
                 .map_err(|reason| FrameDecodeError::Extrinsic { index, reason })?;
             // block time from the timestamp inherent — protocol knowledge,
             // allowed here (adapter), never in core/modules
@@ -474,9 +454,6 @@ fn json_as_u64(v: &serde_json::Value) -> Option<u64> {
 
 // ------------------------------------------------------------------- helpers
 
-fn decode_hex(s: &str) -> Result<Vec<u8>, String> {
-    hex::decode(s.trim_start_matches("0x")).map_err(|e| e.to_string())
-}
 
 /// Extrinsic hash: blake2b-256 of the full encoded extrinsic (standard).
 fn extrinsic_hash(bytes: &[u8]) -> String {
@@ -552,6 +529,12 @@ impl ingest::decode::RawBlockDecoder for SubstrateFrameDecoder {
         let decoder = self.decoder_for(spec_version, metadata)?;
         decoder
             .decode_block(chain_id, envelope, events, raw_location)
+            .map_err(|e| e.to_string())
+    }
+
+    fn spec_version_of(&self, envelope: &[u8]) -> Result<u32, String> {
+        crate::envelope::decode_any(envelope)
+            .map(|e| e.spec_version)
             .map_err(|e| e.to_string())
     }
 }

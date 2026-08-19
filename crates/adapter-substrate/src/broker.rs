@@ -508,6 +508,14 @@ impl BrokerMapper for SubstrateBrokerMapper {
 pub const BROKER_STORAGE_PALLET: &str = "Broker";
 pub const STATUS_ENTRY: &str = "Status";
 pub const CONFIGURATION_ENTRY: &str = "Configuration";
+/// `Broker.SaleInfo` — added in slice 14, and the one entry here that may
+/// legitimately be ABSENT from state.
+///
+/// It is an `OptionQuery` StorageValue, so before the first sale ever starts
+/// there is no key at all. `Status` and `Configuration` missing means a wrong
+/// key derivation; this missing means "sales have not started", and the two must
+/// not be recorded as the same thing.
+pub const SALE_INFO_ENTRY: &str = "SaleInfo";
 
 /// One dated reading of the broker's own view of how many cores exist.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -523,6 +531,19 @@ pub struct BrokerConfigView {
     /// geometry a price curve is evaluated against, and NOTHING READS IT YET —
     /// it is captured because a reading not taken cannot be taken later.
     pub configuration: serde_json::Value,
+    /// The whole `SaleInfo` record, or None when sales have never started.
+    /// Captured for the same reason as `configuration`, and read from for
+    /// exactly one field.
+    pub sale_info: Option<serde_json::Value>,
+    /// `SaleInfo.first_core`. THE BOUNDARY BETWEEN RESERVED AND MARKET, and the
+    /// only field this project reads out of `SaleInfo`.
+    ///
+    /// Slice 13 measured all ten idle Task-entitled cores at index >= 11 =
+    /// `first_core`, i.e. every reserved system core produced blocks and the
+    /// waste was entirely market-side. Without this the delta reader would have
+    /// to write 11 into Rust — a chain-specific constant Invariant 2 forbids,
+    /// and a number nobody could date.
+    pub first_core: Option<u32>,
 }
 
 pub fn status_key() -> Vec<u8> {
@@ -531,6 +552,25 @@ pub fn status_key() -> Vec<u8> {
 
 pub fn configuration_key() -> Vec<u8> {
     crate::assets::map_prefix(BROKER_STORAGE_PALLET, CONFIGURATION_ENTRY)
+}
+
+pub fn sale_info_key() -> Vec<u8> {
+    crate::assets::map_prefix(BROKER_STORAGE_PALLET, SALE_INFO_ENTRY)
+}
+
+/// Read `first_core` out of a decoded `SaleInfo`, BY NAME and never by a search
+/// for something core-shaped.
+///
+/// THE SAME TRAP THE EVENT MAPPER IS BUILT AROUND, in a smaller space and
+/// therefore easier to fall into: `SaleInfoRecord` carries `first_core`,
+/// `cores_offered`, `cores_sold` AND `ideal_cores_sold`, so three of its ten
+/// fields are core-shaped COUNTS sitting beside the one core-shaped INDEX. A
+/// depth-first search finds a plausible number and puts the reserved/market
+/// boundary in the wrong place — which does not fail loudly, it just moves the
+/// waste to the wrong side.
+pub fn first_core_from_sale_info(sale_info: &serde_json::Value) -> Option<u32> {
+    let n = sale_info.get("first_core").and_then(bare_u64)?;
+    u32::try_from(n).ok()
 }
 
 /// Decode both readings against the block's own metadata.
@@ -544,9 +584,35 @@ pub fn decode_broker_config(
     metadata_blob: &[u8],
     status_bytes: &[u8],
     configuration_bytes: &[u8],
+    // `None` = the key is absent from state, i.e. sales have never started. That
+    // is a fact and is recorded as one; it is NOT the same as a reading nobody
+    // took, and neither is `first_core = 0`.
+    sale_info_bytes: Option<&[u8]>,
 ) -> Result<BrokerConfigView, String> {
     let status = decode_plain(metadata_blob, STATUS_ENTRY, status_bytes)?;
     let configuration = decode_plain(metadata_blob, CONFIGURATION_ENTRY, configuration_bytes)?;
+    let sale_info = match sale_info_bytes {
+        Some(b) => Some(decode_plain(metadata_blob, SALE_INFO_ENTRY, b)?),
+        None => None,
+    };
+    // A PRESENT `SaleInfo` WITH NO READABLE `first_core` IS AN ERROR, not a
+    // None. A None here would be indistinguishable from "sales never started"
+    // one field over, and the delta reader treats that as "cannot separate
+    // reserved from market" — a silent downgrade of a shape change into a
+    // coverage gap.
+    let first_core = match &sale_info {
+        Some(si) => Some(first_core_from_sale_info(si).ok_or_else(|| {
+            format!(
+                "{BROKER_STORAGE_PALLET}.{SALE_INFO_ENTRY} carries no readable `first_core`: \
+                 {si}. It is the boundary between reserved system cores and the bulk market, and \
+                 there is no other source for it — a delta computed without it cannot say whether \
+                 idle entitlement is market-side or reserved, and reading a neighbouring \
+                 core-shaped COUNT (cores_offered, cores_sold, ideal_cores_sold) instead would \
+                 put that boundary somewhere plausible and wrong"
+            )
+        })?),
+        None => None,
+    };
 
     let core_count = status
         .get("core_count")
@@ -563,6 +629,8 @@ pub fn decode_broker_config(
         core_count,
         status,
         configuration,
+        sale_info,
+        first_core,
     })
 }
 
@@ -805,6 +873,47 @@ mod tests {
         ))
         .expect_err("a fourth CoreAssignment variant must halt");
         assert!(err.contains("unknown CoreAssignment variant"), "{err}");
+    }
+
+    /// THE COUNT-VS-INDEX TRAP AGAIN, IN A SMALLER SPACE.
+    ///
+    /// `SaleInfoRecord` carries `first_core` beside `cores_offered`,
+    /// `cores_sold` and `ideal_cores_sold` — three core-shaped COUNTS around one
+    /// core-shaped INDEX — so a depth-first search finds a plausible number and
+    /// puts the reserved/market boundary somewhere wrong. It does not fail
+    /// loudly; it moves the waste to the other side of the boundary. The field
+    /// is read by name and the fixture is ordered to make a positional or
+    /// first-match read wrong.
+    #[test]
+    fn first_core_is_read_by_name_and_never_from_a_core_shaped_count() {
+        let sale = json!({
+            "sale_start": 322_663,
+            "leadin_length": 100,
+            "end_price": "1000000000",
+            "sellout_price": {"Some": ["2000000000"]},
+            "region_begin": 322_663,
+            "region_end": 327_703,
+            // Three counts BEFORE the index in this rendering, and every one of
+            // them a number a search would happily accept.
+            "cores_offered": 89,
+            "ideal_cores_sold": 50,
+            "cores_sold": 41,
+            "first_core": 11
+        });
+        assert_eq!(first_core_from_sale_info(&sale), Some(11));
+
+        // A record without the field yields None rather than a neighbour's
+        // value — `decode_broker_config` turns that None into a loud error,
+        // because a present SaleInfo that cannot state its own first core is a
+        // shape change and not a coverage gap.
+        let missing = json!({"cores_offered": 89, "cores_sold": 41});
+        assert_eq!(first_core_from_sale_info(&missing), None);
+
+        // The broker's CoreIndex is a bare u16 here as everywhere else, so a
+        // newtype-wrapped value is refused rather than peeled — the same
+        // asymmetry the event mapper asserts.
+        let wrapped = json!({"first_core": [11]});
+        assert_eq!(first_core_from_sale_info(&wrapped), None);
     }
 
     /// The mapper trait's contract: zero or one row per event, and the sink is

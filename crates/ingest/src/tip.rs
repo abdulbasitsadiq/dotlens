@@ -149,12 +149,16 @@ pub async fn tip_tick(
                 .record(&receipt)
                 .await
                 .map_err(|e| SinkError(e.to_string()))?;
+            // either envelope generation is accepted here: the unfinalized path
+            // is hash-keyed and per-object by design (forks coexist, the window
+            // is 2-3 blocks, there is no contiguous run to bucket), so it simply
+            // stores whatever the source produced.
             match artifact.item.as_str() {
-                "block.json" => {
+                it if it == keys::BLOCK_ITEM_V2 || it == keys::BLOCK_ITEM_V1 => {
                     envelope = Some(artifact.bytes.clone());
                     envelope_key = key;
                 }
-                "events.scale" => events = Some(artifact.bytes.clone()),
+                it if it == keys::EVENTS_ITEM => events = Some(artifact.bytes.clone()),
                 _ => {}
             }
         }
@@ -162,7 +166,8 @@ pub async fn tip_tick(
             return Err(TipError::Decode {
                 chain: chain_id.to_string(),
                 height,
-                reason: "source returned no block.json artifact".into(),
+                reason: format!("source returned no {} or {} artifact",
+                    keys::BLOCK_ITEM_V2, keys::BLOCK_ITEM_V1),
             });
         };
 
@@ -348,6 +353,13 @@ mod tests {
                 events: vec![],
             })
         }
+
+        fn spec_version_of(&self, envelope: &[u8]) -> Result<u32, String> {
+            let v: serde_json::Value =
+                serde_json::from_slice(envelope).map_err(|e| e.to_string())?;
+            v["spec_version"].as_u64().map(|s| s as u32).ok_or("no spec_version".into())
+        }
+
     }
 
     /// Mock canonical store with the REPLACEMENT RULE (finalized immutable,

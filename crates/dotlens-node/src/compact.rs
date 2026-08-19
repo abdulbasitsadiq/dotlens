@@ -51,6 +51,14 @@ pub struct CompactReport {
     /// gap-accounting reports, and a compaction that quietly closed over one
     /// would make the bucket look complete.
     pub heights_absent: Vec<u64>,
+    /// Heights whose per-object copy exists but which an ALREADY-PRESENT bucket
+    /// does not hold. Buckets are write-once, so nothing will ever pack these:
+    /// a bucket written while its span was still being backfilled under-covers
+    /// that span permanently. Reported because the alternative is a silent
+    /// `absent=0` on a range that is only half inside a bucket — "we did not
+    /// look" rendering as "there is nothing there", which is the one shape this
+    /// project keeps catching. Their per-object copies must never be retired.
+    pub heights_unpacked: Vec<u64>,
     pub raw_bytes: u64,
     pub stored_bytes: u64,
 }
@@ -62,6 +70,17 @@ impl CompactReport {
         }
         self.raw_bytes as f64 / self.stored_bytes as f64
     }
+}
+
+/// Does `height` have a per-object block envelope on disk? Uses the same
+/// definition as the packing loop: any one of `keys::BLOCK_ITEMS`.
+fn has_per_object(raw: &dyn RawStore, chain_id: &str, height: u64) -> Result<bool> {
+    for item in keys::BLOCK_ITEMS {
+        if raw.exists(&keys::block(chain_id, height, item))? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// Pack `from..=to` into aligned buckets of `bucket_blocks`.
@@ -94,6 +113,25 @@ pub async fn compact_range(
         // range command in this project.
         if raw.exists(&key)? {
             report.buckets_already_present += 1;
+            // Write-once: the bucket is left exactly as it is. But we still owe
+            // the caller the coverage of the range they asked about, because an
+            // existing bucket may hold only part of it — reading the manifest
+            // costs no decompression (it sits outside the frame for exactly
+            // this reason).
+            let held: std::collections::BTreeSet<u64> = bucket::read_manifest(&raw.get(&key)?)
+                .with_context(|| format!("reading manifest of {key}"))?
+                .map(|m| m.heights().into_iter().collect())
+                .unwrap_or_default();
+            for h in b_from.max(from)..=b_to.min(to) {
+                if held.contains(&h) {
+                    continue;
+                }
+                if has_per_object(raw, chain_id, h)? {
+                    report.heights_unpacked.push(h);
+                } else {
+                    report.heights_absent.push(h);
+                }
+            }
             bstart = b_to + 1;
             continue;
         }
@@ -304,6 +342,10 @@ mod tests {
             .unwrap();
         assert_eq!(again.buckets_written, 0);
         assert_eq!(again.buckets_already_present, 3);
+        // and a replay still reports the coverage of the range it was asked
+        // about: an existing bucket must not turn a hole into silence.
+        assert_eq!(again.heights_absent, vec![10, 11], "replay still sees the holes");
+        assert!(again.heights_unpacked.is_empty(), "nothing arrived after packing");
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -344,6 +386,43 @@ mod tests {
 
     /// Both envelope generations compact into one bucket, and each height's
     /// newest generation is the one packed.
+    /// A bucket written while its span was still being backfilled under-covers
+    /// that span FOREVER, because buckets are write-once and nothing reopens
+    /// them. The blocks that arrive later stay per-object — which is safe, and
+    /// is exactly why it must not be reported as `absent=0`.
+    #[tokio::test]
+    async fn a_bucket_written_mid_backfill_reports_what_it_will_never_pack() {
+        let (raw, dir) = tmp("undercover");
+        // only the tail of bucket 0-9 has been backfilled so far
+        seed(&raw, "mock", 5..10, keys::BLOCK_ITEM_V2);
+        let first = compact_range(&raw, &NoopReceipts, "mock", 0, 9, 10, 3).await.unwrap();
+        assert_eq!(first.buckets_written, 1);
+        assert_eq!(first.heights_packed, 5);
+        assert_eq!(first.heights_absent, vec![0, 1, 2, 3, 4], "not yet backfilled");
+
+        // the rest of the span arrives afterwards
+        seed(&raw, "mock", 0..5, keys::BLOCK_ITEM_V2);
+        let after = compact_range(&raw, &NoopReceipts, "mock", 0, 9, 10, 3).await.unwrap();
+
+        assert_eq!(after.buckets_written, 0, "write-once: the bucket is not reopened");
+        assert_eq!(after.buckets_already_present, 1);
+        assert!(
+            after.heights_absent.is_empty(),
+            "these heights are no longer absent — they are on disk"
+        );
+        assert_eq!(
+            after.heights_unpacked,
+            vec![0, 1, 2, 3, 4],
+            "a per-object copy the existing bucket does not hold must be NAMED, not counted as \
+             covered: nothing will ever pack it and it must never be retired"
+        );
+
+        // and the retirement precondition never over-claims for them
+        let v = verify_range(&raw, "mock", 0, 9, 10).await.unwrap();
+        assert_eq!(v.retirable_heights, 5, "only what the bucket actually holds");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     #[tokio::test]
     async fn a_bucket_holds_both_envelope_generations() {
         let (raw, dir) = tmp("mixed");
