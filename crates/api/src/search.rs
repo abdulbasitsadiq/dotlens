@@ -9,9 +9,10 @@
 //!
 //! 1. **Ambiguity is DATA, never a guess.** A 32-byte hash is up to six honest
 //!    candidates (block, extrinsic, preimage, whitelisted call, account, and —
-//!    since Phase 3 slice 3 — XCM message); a bare number is three. Each new
-//!    module makes the paste MORE ambiguous, not less, and that is the design
-//!    working. The response lists them with the reason each was offered.
+//!    since Phase 3 slice 3 — XCM message); a bare number is up to four (block,
+//!    referendum, parachain, and — since Phase 3 slice 15 — a coretime core).
+//!    Each new module makes the paste MORE ambiguous, not less, and that is the
+//!    design working. The response lists them with the reason each was offered.
 //!    Guessing looks decisive and is occasionally catastrophic — the whole
 //!    point of an explorer is that you can trust what it tells you.
 //!
@@ -27,12 +28,22 @@
 //!    nothing. (ROADMAP §Phase 2.)
 //!
 //! WHAT THIS DELIBERATELY DOES NOT DO. Codewords ship in the phase of the
-//! module that can answer them, so `sale`, `sel` and `contract` are NOT accepted —
+//! module that can answer them, so `sel` and `contract` are NOT accepted —
 //! typing one gets a parse error naming the valid set, not a promise. But a
 //! bare NAME is a SHAPE, not vocabulary: people paste display names without
 //! being taught to, so `TEXT` resolves from day one to an honest "no name index
 //! yet". That reservation is why identity search can land with the People-chain
 //! module instead of needing a grammar change.
+//!
+//! AND ONE WORD IS REFUSED FOR A REASON THAT IS NOT A PHASE. `sale` was refused
+//! from slice 10 with "coretime lands in Phase 3"; coretime landed four slices
+//! ago and the word is STILL not in the grammar, because `pallet-broker` numbers
+//! no sales — `SaleInitialized` carries a region and prices and no ordinal — so
+//! `sale 42`, which reads as an ordinal to everybody who types it, would have to
+//! be redefined against a coordinate nobody types (a relay block) and would then
+//! parse into a confident empty answer about relay block 42. A refusal that says
+//! why is better than an answer to a question nobody asked.
+//! See `Codeword::refused`.
 //!
 //! And this is EXACT-IDENTIFIER resolution only. "Find the referendum about the
 //! moderation bounty" is a different product with a different failure mode;
@@ -61,6 +72,11 @@ pub enum Codeword {
     Para,
     Asset,
     Xcm,
+    /// A coretime core index. Answerable since Phase 3 slice 14, which shipped
+    /// the READER and the indexes — slice 13 shipped the tables and a mapper and
+    /// explicitly no reader at all, and every index it created was dropped again
+    /// for want of one. See `push_core` below for what it can and cannot probe.
+    Core,
 }
 
 impl Codeword {
@@ -82,6 +98,7 @@ impl Codeword {
             "para" | "chain" | "parachain" => Self::Para,
             "asset" | "token" => Self::Asset,
             "xcm" | "message" => Self::Xcm,
+            "core" => Self::Core,
             _ => return None,
         })
     }
@@ -101,12 +118,13 @@ impl Codeword {
             Self::Para => "para",
             Self::Asset => "asset",
             Self::Xcm => "xcm",
+            Self::Core => "core",
         }
     }
 
     /// Every codeword v1 serves, for the grammar reference and for the error
     /// message an unknown one produces.
-    pub const ALL: [Codeword; 13] = [
+    pub const ALL: [Codeword; 14] = [
         Self::Ref,
         Self::Acc,
         Self::Block,
@@ -120,14 +138,54 @@ impl Codeword {
         Self::Para,
         Self::Asset,
         Self::Xcm,
+        Self::Core,
     ];
 
-    /// Codewords reserved for modules that do not exist yet. Named explicitly
-    /// so the parse error can say "Phase 3" rather than "unknown", which is the
-    /// difference between a roadmap and a typo.
-    pub fn planned(word: &str) -> Option<&'static str> {
+    /// Words the grammar REFUSES, and why. Two different reasons, and conflating
+    /// them is what this function was renamed to stop.
+    ///
+    /// 1. A module that has not shipped. The refusal names the PHASE, which is
+    ///    the difference between a roadmap and a typo — and it is a promise with
+    ///    an expiry date, so it must be paid off in the slice that ships the
+    ///    module. `xcm` was paid in Phase 3 slice 3; `core` in slice 15.
+    ///
+    /// 2. A spelling that can never work, however many modules ship. `sale` is
+    ///    the only one, and it is here because the refusal it USED to carry —
+    ///    "coretime lands in Phase 3" — was still being served three slices after
+    ///    coretime landed, telling readers to wait for something that already
+    ///    existed. Naming a phase that has shipped is worse than naming one that
+    ///    has not.
+    ///
+    /// WHY `sale <n>` IS NOT DEFINABLE, stated so nobody redefines it by
+    /// accident. `pallet-broker` emits no sale identifier: `SaleInitialized`
+    /// carries `region_begin`/`region_end`, `first_core` and prices, and a sale
+    /// is identified by the REGION it sells or by the relay block its
+    /// assignments take effect at — which this API already calls
+    /// `governing_relay_block`. NEITHER IS AN ORDINAL, and that alone carries the
+    /// refusal: nobody typing `sale 42` means relay block 42 or timeslice 42, so
+    /// defining the codeword against either would parse a question the caller
+    /// did not ask and answer it emptily. Minting an ordinal of our own is worse
+    /// — it is the `bounty 999999` defect (a candidate fabricated for any id at
+    /// all) with a coretime label on it.
+    ///
+    /// A SECOND ARGUMENT WAS CONSIDERED AND IS DELIBERATELY NOT LOAD-BEARING,
+    /// because it turned out to be weaker than it first read. "No endpoint
+    /// serves a whole sale" is true of the SUBJECT lines — `/entitlement` takes
+    /// a core or a task, `/delta` takes a window — but `/delta?from=X&to=X` with
+    /// `X` a governing relay block does return that sale's whole workload per
+    /// core, so a relay-block-keyed candidate would in fact have somewhere to
+    /// point. It is the ordinal that does not exist, not the destination.
+    pub fn refused(word: &str) -> Option<&'static str> {
         Some(match word {
-            "sale" | "core" => "coretime lands in Phase 3",
+            "sale" => {
+                "`pallet-broker` numbers no sales, so there is nothing for `sale <n>` to name. \
+                 A sale is identified by the REGION it sells (`region_begin`/`region_end`, in \
+                 timeslices) or by the relay block its assignments take effect at, which this \
+                 API calls `governing_relay_block` — and neither is an ordinal, so `sale 42` \
+                 would have to mean something nobody typing it means. Ask `core <n>` instead: \
+                 a candidate carrying an assignment reports the `governing_relay_block` of the \
+                 sale that assigned it"
+            }
             "contract" | "sel" | "selector" => "contracts land in Phase 5",
             _ => return None,
         })
@@ -217,7 +275,7 @@ pub fn parse(raw: &str, registry: &Registry) -> Result<Query, ParseError> {
                 // with a codeword or be a single self-identifying token.
                 let first = tail.split_whitespace().next().unwrap_or("").to_ascii_lowercase();
                 let looks_like_a_query = Codeword::parse(&first).is_some()
-                    || Codeword::planned(&first).is_some()
+                    || Codeword::refused(&first).is_some()
                     || (tail.split_whitespace().count() == 1
                         && !matches!(infer_shape(tail), Shape::Text(_) | Shape::Symbol(_)));
                 if looks_like_a_query {
@@ -295,10 +353,10 @@ pub fn parse(raw: &str, registry: &Registry) -> Result<Query, ParseError> {
                     word,
                     arg: arg.trim().to_string(),
                 },
-                None => match Codeword::planned(&lower) {
-                    Some(when) => {
+                None => match Codeword::refused(&lower) {
+                    Some(why) => {
                         return Err(ParseError {
-                            message: format!("'{lower}' is not in the v1 grammar — {when}"),
+                            message: format!("'{lower}' is not in the grammar — {why}"),
                             expected: Codeword::ALL.iter().map(|c| c.as_str().into()).collect(),
                         })
                     }
@@ -318,9 +376,9 @@ pub fn parse(raw: &str, registry: &Registry) -> Result<Query, ParseError> {
                     expected: vec![format!("{lower} <value>")],
                 });
             }
-            if let Some(when) = Codeword::planned(&lower) {
+            if let Some(why) = Codeword::refused(&lower) {
                 return Err(ParseError {
-                    message: format!("'{lower}' is not in the v1 grammar — {when}"),
+                    message: format!("'{lower}' is not in the grammar — {why}"),
                     expected: Codeword::ALL.iter().map(|c| c.as_str().into()).collect(),
                 });
             }
@@ -455,7 +513,7 @@ fn readout(network: &str, chain: Option<&str>, term: &Term) -> String {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct Candidate {
     /// referendum | block | extrinsic | account | preimage | whitelisted_call |
-    /// asset | track | spend | bounty | para | xcm_message
+    /// asset | track | spend | bounty | para | xcm_message | coretime_core
     pub kind: &'static str,
     /// The chain it was FOUND on — never one the caller had to name.
     pub chain: Option<String>,
@@ -493,7 +551,9 @@ pub struct SearchResponse {
 }
 
 /// The bounded fan-out. Every probe below is a POINT lookup on an indexed key
-/// — verified per key in migration 0013, which had to CREATE two of them.
+/// — verified per key in migration 0013, which had to CREATE two of them, and
+/// in migration 0026 for the two coretime keys this file gained in slice 15
+/// (`core_assignments_core_idx`, `broker_events_core_idx`).
 /// Nothing here scans, and nothing here prefix-matches a hash.
 pub async fn resolve(q: &Query, state: &crate::AppState, raw: &str) -> SearchResponse {
     let mut candidates = Vec::new();
@@ -605,7 +665,16 @@ async fn resolve_shape(
             for chain in gov_chains(state, &q.network) {
                 push_block(state, &chain, *n, HEIGHT_IS_INDEXED, out).await;
             }
-            push_referendum(state, q, *n, out).await;
+            push_referendum(state, q, *n, out, gaps).await;
+            // A small number is also a plausible CORE INDEX, and since slice 14
+            // there is an indexed key to ask. `explicit = false`: the probe is
+            // silent when it misses, because a gap line on every bare number
+            // saying "this might have been a core" would be noise on the most
+            // common shape in the grammar. A miss produces nothing; a HIT
+            // produces a candidate and the one caveat that candidate needs.
+            if let Ok(core) = u32::try_from(*n) {
+                push_core(state, q, core, false, out, gaps).await;
+            }
             if let Some(c) = state
                 .registry
                 .chains()
@@ -683,8 +752,23 @@ async fn resolve_codeword(
     let num = arg.replace(',', "").parse::<u64>().ok();
     match word {
         Codeword::Ref => match num {
-            Some(n) => push_referendum(state, q, n, out).await,
+            Some(n) => push_referendum(state, q, n, out, gaps).await,
             None => gaps.push(format!("'ref {arg}' — a referendum id is a number")),
+        },
+        // The codeword refused since slice 10 with "coretime lands in Phase 3".
+        // It landed — occupancy in slice 11, entitlement in 13, the delta in 14 —
+        // and a refusal naming a phase that has SHIPPED tells a reader to wait
+        // for something that already exists, which is worse than one naming a
+        // phase that has not.
+        Codeword::Core => match num.and_then(|n| u32::try_from(n).ok()) {
+            Some(core) => {
+                push_core(state, q, core, true, out, gaps).await;
+            }
+            None => gaps.push(format!(
+                "'core {arg}' — a core index is a small non-negative number (the relay's \
+                 `CoreIndex`, a u32). It is not a para id and not a task id: core 47 and \
+                 parachain 47 are different id spaces that happen to share a number line"
+            )),
         },
         Codeword::Block => match (num, &q.chain) {
             (Some(n), Some(chain)) => push_block(state, chain, n, HEIGHT_IS_INDEXED, out).await,
@@ -850,6 +934,336 @@ async fn push_xcm(state: &crate::AppState, id: &str, expand: bool, out: &mut Vec
     }
 }
 
+/// Why a core candidate carrying an assignment was offered. Long, because the
+/// caveat belongs ON the candidate and not only in `not_covered`: a dropdown that
+/// renders candidates and throws coverage away must still not imply that a core
+/// index is a durable identity.
+/// TWO WORDS IN HERE ARE DELIBERATE. "ASSIGNED", never "sold": cores below
+/// `SaleInfo.first_core` are RESERVED system cores set by governance and never
+/// bought (measured `first_core = 11` on Polkadot, so cores 0-10 are all of that
+/// kind), and this candidate does not read that boundary. "ANNOUNCED", because
+/// `core_assignments` is the broker's own XCM-side announcement and the relay's
+/// applied half is not read here — the first line of the entitlement endpoint's
+/// own coverage list, which a candidate rendered without it would contradict.
+const WHY_CORE_ASSIGNED: &str =
+    "the coretime chain ANNOUNCED an assignment for this core index — a SLOT rather than a \
+     tenant: a renewal MOVES the index, so this is what the core was assigned to do as of the \
+     `governing_relay_block` in this candidate's id, and not necessarily what holds it now. \
+     Announced is not applied: the relay's own applied half is not read here";
+
+/// Why a core candidate with no assignment was offered. A different fact, and
+/// the difference is the one migration 0025 forbids this project to blur: an
+/// absent assignment is `unknown`, never `idle`.
+const WHY_CORE_EVENT: &str =
+    "a `pallet-broker` event on the coretime chain names this core index, though our index holds \
+     no assignment for it — which means the sale that governs it is outside what we indexed, and \
+     NOT that the core was unsold";
+
+/// A coretime core index → the entitlement on record for it.
+///
+/// THIS PROBES ONE HALF OF CORETIME AND SAYS SO. Entitlement (what a core was
+/// ASSIGNED to do — never "sold", see `WHY_CORE_ASSIGNED`) is a point lookup on
+/// `core_assignments_core_idx` and needs no window; occupancy (what it actually
+/// did) is a RATIO over a window, and both endpoints
+/// that serve one refuse to invent a window for exactly the reason search would
+/// have to invent one — "defaulting to one would put a window nobody chose
+/// underneath a percentage somebody quotes". So the occupancy half and the delta
+/// are named in `not_covered` with their query parameters, never guessed at.
+///
+/// `explicit` distinguishes the codeword from the bare-number probe. A bare
+/// number is the commonest shape in the grammar and reaches here on every one;
+/// annotating all of them with coretime caveats would be noise, so a silent miss
+/// is right there and a stated one is right for `core <n>`, where the caller
+/// asked the question. THE COST IS STATED RATHER THAN GLOSSED: a bare number
+/// costs one indexed lookup on a hit and TWO on a miss, and a miss is the normal
+/// case for a block height. Both are point lookups on
+/// `core_assignments_core_idx` / `broker_events_core_idx` (migration 0026). The
+/// EXPLICIT miss path makes a third read, `latest_broker_config`, which is an
+/// ordered read of one row off the `(chain_id, block_height)` primary key rather
+/// than a point lookup — still nothing that scans, and named here rather than
+/// hidden under the file's opening claim.
+///
+/// BOTH CHAINS COME FROM THE REGISTRY through `coretime_pair`, which refuses on
+/// zero or two rather than picking (Invariant 2 — no chain id appears here).
+async fn push_core(
+    state: &crate::AppState,
+    q: &Query,
+    core: u32,
+    explicit: bool,
+    out: &mut Vec<Candidate>,
+    gaps: &mut Vec<String>,
+) {
+    let (occ_chain, ent_chain) = match crate::coretime_pair(&state.registry, &q.network) {
+        Ok(pair) => pair,
+        Err(e) => {
+            if explicit {
+                gaps.push(format!(
+                    "'core {core}' cannot be resolved on network '{}': {e}",
+                    q.network
+                ));
+            }
+            return;
+        }
+    };
+
+    // SCOPE IS CHECKED HERE AND NOT LEFT TO `resolve`, and that is a fix rather
+    // than a preference. `resolve` filters CANDIDATES by `on <chain>` in one
+    // place and never filters GAPS — correctly, since a gap is about the search
+    // and not about a row — so a probe that pushes coverage describing a
+    // candidate the filter is about to drop leaves a response whose
+    // `not_covered` talks about a row that is not there. That is the defect
+    // class this file's header is about, and `core 0 on ah` is the input that
+    // reaches it. The single enforcement point is untouched; this refuses to
+    // PRODUCE the mismatch rather than cleaning up after it.
+    if let Some(want) = &q.chain {
+        if want != &ent_chain.id {
+            if explicit {
+                gaps.push(format!(
+                    "'core {core}' scoped to '{want}' can only be empty: entitlement is \
+                     `pallet-broker`, which on this network lives on '{}' and nowhere else. \
+                     Drop the scope or name that chain. ('{want}' may still have carried the \
+                     core — what it did is OCCUPANCY, which is a different question and a \
+                     different endpoint.)",
+                    ent_chain.id
+                ));
+            }
+            return;
+        }
+    }
+
+    // THE PROBES KEEP THEIR `Result`. Every other probe in this file uses
+    // `if let Ok(..)` and then makes no claim on failure; this one ends in a
+    // sentence that says a core is NOT indexed, so swallowing the error with
+    // `.ok()` would render a failed read as a confident absence — "we did not
+    // look" as "there is nothing there", which this project has now caught four
+    // times and never in search.
+    //
+    // `limit = 2` rather than 1: one row titles the candidate, and the SECOND
+    // row is the only way to see that more than one assignment governs this core
+    // at the same announcement. An interlaced or shared core is the state
+    // `coretime_delta` withholds its entire waste figure for, and rendering it
+    // as a confident single tenant would answer where the endpoint this
+    // candidate points at refuses.
+    let assignments = state.broker.assignments_for_core(&ent_chain.id, core, 2).await;
+    let rows: &[crate::EntitlementRow] =
+        assignments.as_ref().map(|v| v.as_slice()).unwrap_or(&[]);
+    let events = if rows.is_empty() {
+        state.broker.events_for_core(&ent_chain.id, core, 1).await
+    } else {
+        Ok(Vec::new())
+    };
+    let read_failed = assignments.is_err() || events.is_err();
+
+    let href = format!("/v1/coretime/{}/entitlement?core={core}", ent_chain.id);
+    let mut shared = false;
+    let pushed = if let Some(a) = rows.first() {
+        // TWO independent signals that this core is not wholly one tenant's, and
+        // they are different facts: a second row at the SAME `relay_block` means
+        // the announcement itself assigned the core more than once (rows at
+        // DIFFERENT relay blocks are just history and mean nothing of the kind),
+        // while `parts` below a whole core means the region was interlaced. The
+        // mask's PATTERN does not cross to the relay, so neither is recoverable
+        // later; both are reported and neither is divided by.
+        shared = rows.get(1).is_some_and(|b| b.relay_block == a.relay_block)
+            || a.parts < crate::PARTS_WHOLE_CORE;
+        out.push(Candidate {
+            kind: "coretime_core",
+            chain: Some(ent_chain.id.clone()),
+            title: if shared {
+                format!("core {core} — shared or interlaced (more than one entitlement)")
+            } else {
+                match (a.kind.as_str(), a.task_id) {
+                    ("task", Some(t)) => format!("core {core} — assigned to task {t}"),
+                    // "assigned idle" and not "idle": the chain really did
+                    // announce Idle here, which is a different fact from NO
+                    // assignment, and 0025 forbids this project to let those two
+                    // words look alike.
+                    ("idle", _) => format!("core {core} — assigned idle"),
+                    ("pool", _) => format!("core {core} — pool (instantaneous market)"),
+                    (k, _) => format!("core {core} — {k}"),
+                }
+            },
+            // Moved, not cloned: the two arms are mutually exclusive and the
+            // borrow checker knows it.
+            href,
+            why: WHY_CORE_ASSIGNED,
+            id: serde_json::json!({
+                "core_index": core,
+                "chain": ent_chain.id,
+                "assignment_kind": a.kind,
+                "task_id": a.task_id,
+                // `EntitlementRow.relay_block` under the name the delta endpoint
+                // already gives it. It is the closest thing this chain has to a
+                // SALE identifier, which is why `sale <n>` is refused and this
+                // is what the refusal points at.
+                "governing_relay_block": a.relay_block,
+                "parts": a.parts,
+            }),
+            lineage: Some(serde_json::json!({
+                "runtime_version": a.runtime_version,
+                "mapper_version": a.mapper_version,
+            })),
+        });
+        true
+    } else if let Some(e) = events.as_ref().ok().and_then(|v| v.first()) {
+        out.push(Candidate {
+            kind: "coretime_core",
+            chain: Some(ent_chain.id.clone()),
+            title: format!("core {core} — {} (broker event)", e.variant),
+            href,
+            why: WHY_CORE_EVENT,
+            id: serde_json::json!({
+                "core_index": core,
+                "chain": ent_chain.id,
+                "block_height": e.block_height,
+                "event_index": e.event_index,
+            }),
+            lineage: Some(serde_json::json!({
+                "runtime_version": e.runtime_version,
+                "mapper_version": e.mapper_version,
+            })),
+        });
+        true
+    } else {
+        false
+    };
+
+    // THE DURABILITY CAVEAT IS GATED ON THE ASSIGNMENT ARM, because it cites a
+    // field only that arm's candidate carries. Both reviewers found the
+    // ungated version independently: an event-only candidate has no
+    // `governing_relay_block` (deliberately — there is no assignment to take one
+    // from), so the line would point at a field the row beside it does not have,
+    // AND would say "this candidate identifies an entitlement" beside a `why`
+    // saying our index holds no assignment for it. Two sentences in one response
+    // asserting opposite things about one row: slice 14's fixed defect, verbatim.
+    if rows.first().is_some() {
+        gaps.push(format!(
+            "A CORE INDEX IS A SLOT, NOT A TENANT. Measured at coretime block 4919882: para 3428 \
+             renewed five cores and every index moved (35->43, 36->44, 37->45, 40->46, 41->47). \
+             So this candidate identifies an entitlement only WITHIN one region — its \
+             `governing_relay_block` says which — and following a chain across sale cycles by \
+             core index silently follows a different tenant after every sale. To follow the \
+             TENANT, ask /v1/coretime/{}/entitlement?task=<task id>",
+            ent_chain.id
+        ));
+    }
+    if shared {
+        gaps.push(format!(
+            "MORE THAN ONE ENTITLEMENT GOVERNS THIS CORE and only the newest assignment row is \
+             shown here. Either the announcement assigned it more than once at one relay block, \
+             or `parts` is below a whole core ({} = the whole mask), i.e. the region was \
+             interlaced. `pallet-broker`'s tick converts an 80-bit `CoreMask` to the relay's \
+             ratio as `count_ones() * 720`, so the bit COUNT crosses and the PATTERN does not — \
+             two entitlements on one core are indistinguishable on the relay side forever. The \
+             delta endpoint WITHHOLDS its waste figure entirely for such a core rather than \
+             counting a fraction as a whole one, and nothing here divides by `parts` either. \
+             /v1/coretime/{}/entitlement?core={core} shows every row",
+            crate::PARTS_WHOLE_CORE,
+            ent_chain.id
+        ));
+    }
+
+    if explicit {
+        gaps.push(format!(
+            "THE OCCUPANCY HALF IS NOT PROBED HERE, and that is the endpoints' own rule rather \
+             than a shortcut: what a core DID is a ratio, only meaningful over a stated window, \
+             and /v1/coretime/{occ}/occupancy refuses to serve one without `from` and `to` \
+             because defaulting to a window nobody chose puts it underneath a percentage \
+             somebody quotes. A search box has no window to pass, so it resolves the \
+             ENTITLEMENT — which needs none — and names the rest: \
+             /v1/coretime/{occ}/occupancy?from=&to= for what the core did, and \
+             /v1/coretime/{net}/delta?from=&to= for the difference between the two, which is \
+             the number neither half gives alone",
+            occ = occ_chain.id,
+            net = q.network
+        ));
+        // GATED ON THE ASSIGNMENT ARM for the same reason the durability line
+        // is, and the review caught it firing one arm too wide: this line says
+        // "which is why the candidate says `assigned to`", and an event-only
+        // candidate is titled "core 63 — Renewable (broker event)", which says
+        // neither `assigned to` nor `sold to`. A coverage line describing a
+        // property the row beside it does not have, again — so the gate is the
+        // same expression, not a similar one.
+        if rows.first().is_some() {
+            gaps.push(format!(
+                "WHETHER THIS CORE IS RESERVED OR MARKET-SIDE IS NOT READ HERE. Cores below \
+                 `SaleInfo.first_core` are reserved system cores set by governance and never \
+                 bought — measured `first_core = 11` on Polkadot, so cores 0-10 are all of that \
+                 kind — which is why the candidate says `assigned to` and never `sold to`. That \
+                 reading is dated on the CORETIME chain's own number line, moves every sale and \
+                 cannot be aligned with a relay window at all, so it is omitted rather than \
+                 quoted at a moment nobody chose. /v1/coretime/{}/delta reports it as \
+                 `market.first_core` beside the height it was read at",
+                q.network
+            ));
+        }
+        if !pushed {
+            // FIVE OUTCOMES, NOT ONE. An entitlement read that failed, a
+            // configuration read that failed, a core above the declared count, a
+            // core inside it with nothing indexed, and no configuration reading
+            // at all are five different facts, and the single sentence this used
+            // to be asserted one of them for all five. In particular the delta's
+            // `unknown` clause is FALSE for a core above the declared count:
+            // `coretime_delta` enumerates the universe from `num_cores` plus the
+            // cores it actually saw, so such a core is never enumerated, never
+            // renders `unknown` and withholds nothing on its account. That
+            // clause now ships only where it is true.
+            if read_failed {
+                gaps.push(format!(
+                    "the entitlement index on '{}' could not be read, so NOTHING here says \
+                     whether core {core} is indexed — this is our failure and not an absence on \
+                     chain",
+                    ent_chain.id
+                ));
+            } else {
+                // THE THIRD PROBE KEEPS ITS `Result` TOO. A first draft wrote
+                // `.ok().flatten()` here — twelve lines below the comment
+                // forbidding exactly that — so a failed config read fell into
+                // the `None` arm and told an operator to run `sync-broker-config`
+                // against an index that may be fully populated and merely
+                // unreadable. Same defect class as the two probes above, one
+                // probe over, inside the function that names it.
+                let cfg = state.broker.latest_broker_config(&ent_chain.id).await;
+                gaps.push(match cfg {
+                    Err(e) => format!(
+                        "nothing is indexed for core {core} on '{}', and the broker \
+                         CONFIGURATION could not be read either ({e}) — so this cannot say \
+                         whether that core index exists, and the absence above is our failure \
+                         rather than a fact about the chain",
+                        ent_chain.id
+                    ),
+                    Ok(Some(c)) if core >= c.core_count => format!(
+                        "core {core} is at or above the declared core count of {} on '{}', read \
+                         at coretime block {} — so on that reading there is no such core to \
+                         resolve. The reading is DATED and the count moves (it is governance \
+                         configuration, not a constant), so this says what was declared then \
+                         and not what is declared now",
+                        c.core_count, ent_chain.id, c.block_height
+                    ),
+                    Ok(Some(c)) => format!(
+                        "core {core} is within the declared core count of {} on '{}' (read at \
+                         coretime block {}) and NOTHING is indexed for it. THAT IS NOT 'the core \
+                         was never sold': `Broker.CoreAssigned` fires only at SALE BOUNDARIES — \
+                         the sale governing one measured 1,000-block window sat ~335,000 relay \
+                         blocks before it — so an absence here means our index does not reach \
+                         the sale that governs this core. The delta endpoint renders exactly \
+                         this state as `unknown` and WITHHOLDS its waste figure while any such \
+                         core exists, for the same reason",
+                        c.core_count, ent_chain.id, c.block_height
+                    ),
+                    Ok(None) => format!(
+                        "nothing is indexed for core {core} on '{}', AND no `pallet-broker` \
+                         configuration reading is on record there — so this cannot even say \
+                         whether that core index exists. Run `sync-broker-config` before reading \
+                         the absence as a finding",
+                        ent_chain.id
+                    ),
+                });
+            }
+        }
+    }
+}
+
 fn gov_chains(state: &crate::AppState, network: &str) -> Vec<String> {
     state
         .registry
@@ -925,6 +1339,7 @@ async fn push_referendum(
     q: &Query,
     id: u64,
     out: &mut Vec<Candidate>,
+    gaps: &mut Vec<String>,
 ) {
     // Deliberately via residency, so `ref 1930` never names a chain — the thing
     // that survived the Nov-2025 migration and the reason this is a moat rather
@@ -938,6 +1353,54 @@ async fn push_referendum(
             classes.push(c.class.clone());
         }
     }
+
+    // ROADMAP's `ref 42 on hydration` scope axis, answered HONESTLY rather than
+    // implemented. `resolve` filters every candidate by the named chain, so a
+    // `ref` scoped to a chain that carries none of this network's governance
+    // windows returns an empty list with nothing to say why — the silent-nothing
+    // defect this project has caught at the FIELD level three times and never at
+    // the QUERY level.
+    //
+    // ONE MESSAGE, NOT TWO, and that is a review finding rather than brevity. A
+    // first draft branched on whether the chain declares the `governance` module
+    // and told the "declares it" arm that the chain therefore "runs its OWN
+    // referendum id space". Two things were wrong with it. The arm is
+    // UNREACHABLE with the shipped seeds — every chain declaring the module also
+    // carries a window — and a gate that never fires is a gate nobody has
+    // checked. And the conclusion does not follow: a missing residency window is
+    // equally consistent with an incomplete seed, which the registry cannot tell
+    // apart from a chain with its own governance. So the message states the
+    // registry FACT, reports the module bit as evidence, and names both causes
+    // without picking one.
+    //
+    // NO CHAIN IS NAMED IN THIS CODE (Invariant 2): every chain in it is
+    // formatted from the registry or from what the caller typed.
+    if let Some(named) = &q.chain {
+        let carries_a_window = crate::all_gov_windows(&state.registry, &q.network)
+            .iter()
+            .any(|w| &w.chain == named);
+        if !carries_a_window {
+            let declares = state
+                .registry
+                .chain(named)
+                .is_some_and(|c| c.has_module("governance"));
+            gaps.push(format!(
+                "'{named}' carries none of the '{network}' network's governance residency \
+                 windows — and it {module} the `governance` module — so this resolver has no \
+                 referendum id space to search there and `ref {id} on {named}` can only ever be \
+                 empty. TWO CAUSES REACH THAT STATE AND THE REGISTRY CANNOT TELL THEM APART, so \
+                 nothing here picks: the chain may run its OWN governance, which needs the \
+                 module enabled AND its class map scoped to the chain before anything can \
+                 resolve to it (an INDEXING change, not a grammar one — its pallet names would \
+                 otherwise merge into this network's class id space); or its residency seed may \
+                 simply be incomplete. What did NOT happen is this quietly answering with the \
+                 network's own referendum {id} instead",
+                network = q.network,
+                module = if declares { "declares" } else { "does not declare" },
+            ));
+        }
+    }
+
     for w in crate::all_gov_windows(&state.registry, &q.network) {
         for class in &classes {
             let class = class.as_str();
@@ -1027,6 +1490,16 @@ mod tests {
         Registry::load_from_dir(&seeds).expect("seeds")
     }
 
+    /// The shared fixture with a purpose-built broker index swapped in. The
+    /// unsizing coercion is spelled with a typed let, exactly as `test_state`
+    /// spells it, so the two cannot drift.
+    async fn state_with_broker(broker: crate::MemoryBrokerIndex) -> crate::AppState {
+        let mut state = crate::tests::test_state().await;
+        let broker: std::sync::Arc<dyn crate::BrokerIndex> = std::sync::Arc::new(broker);
+        state.broker = broker;
+        state
+    }
+
     #[test]
     fn shapes_are_inferred_from_the_value_alone() {
         assert_eq!(infer_shape("1930"), Shape::Number(1930));
@@ -1097,17 +1570,55 @@ mod tests {
 
     /// A codeword ships in the phase of the module that can answer it — and the
     /// refusal says WHEN, which is the difference between a roadmap and a typo.
+    ///
+    /// AND A PHASE THAT HAS SHIPPED IS NOT A REFUSAL, IT IS A LIE. This test
+    /// used to assert `sale 42` says "Phase 3", which stayed true for exactly as
+    /// long as coretime had not landed and then kept being served for three
+    /// slices after it did. The shipped assertion is what made the lie
+    /// invisible, which is why the fix has to move the test and not only the
+    /// string: `sale` is refused for a reason that can never expire, and `core`
+    /// is no longer refused at all.
     #[test]
-    fn planned_codewords_are_refused_with_their_phase() {
+    fn refused_codewords_say_why_and_sale_is_not_a_phase_away() {
         let r = reg();
-        // `xcm` used to live here. It moved into the grammar with the
-        // correlation slice, which is the rule working rather than an exception
-        // to it: the codeword shipped in the phase of the module that answers it.
-        for (word, when) in [("sale 42", "Phase 3"), ("sel 0xa9059cbb", "Phase 5")] {
-            let err = parse(word, &r).unwrap_err();
-            assert!(err.message.contains(when), "{}: {}", word, err.message);
-            assert!(err.expected.iter().any(|e| e == "ref"));
+        // `xcm` used to live here, and `core` used to live here. Both moved into
+        // the grammar with the module that answers them, which is the rule
+        // working rather than an exception to it.
+        let err = parse("sel 0xa9059cbb", &r).unwrap_err();
+        assert!(err.message.contains("Phase 5"), "{}", err.message);
+        assert!(err.expected.iter().any(|e| e == "ref"));
+
+        // `core` is IN the grammar now — the debt this slice pays.
+        assert_eq!(
+            parse("core 47", &r).unwrap().term,
+            Term::Codeword { word: Codeword::Core, arg: "47".into() }
+        );
+        assert!(Codeword::ALL.contains(&Codeword::Core));
+        assert!(Codeword::refused("core").is_none(), "core is answerable now");
+
+        // `sale` is still refused, and NOT because a phase is pending. Asserted
+        // as a property — no phase claim of any kind — so that a later slice
+        // cannot reintroduce one without this failing.
+        let err = parse("sale 42", &r).unwrap_err();
+        for phase in ["Phase 3", "Phase 4", "Phase 5", "lands in"] {
+            assert!(
+                !err.message.contains(phase),
+                "`sale` must not promise a phase — the chain numbers no sales, ever: {}",
+                err.message
+            );
         }
+        assert!(
+            err.message.contains("numbers no sales"),
+            "the refusal must say WHY: {}",
+            err.message
+        );
+        assert!(
+            err.message.contains("governing_relay_block"),
+            "…and name the coordinate that DOES identify a sale: {}",
+            err.message
+        );
+        // …and point at a codeword that exists, rather than at a phase.
+        assert!(err.expected.iter().any(|e| e == "core"));
     }
 
     /// A bare NAME is a shape people paste without being taught to, so it must
@@ -1305,6 +1816,517 @@ mod tests {
         let r = resolve(&q, &state, "xcm 1930").await;
         assert!(r.candidates.iter().all(|c| c.kind != "xcm_message"));
         assert!(r.not_covered.iter().any(|g| g.contains("32-byte 0x hash")));
+    }
+
+    /// The coretime half of the grammar, and the caveat it must never drop.
+    ///
+    /// `core <n>` resolves the ENTITLEMENT, which needs no window, and states
+    /// the occupancy half rather than inventing one — because both endpoints
+    /// that serve a ratio refuse to default a window, and a search box that
+    /// defaulted one would undermine that refusal from the outside.
+    #[tokio::test]
+    async fn the_core_codeword_answers_and_says_a_core_index_is_not_a_tenant() {
+        let state = crate::tests::test_state().await;
+
+        let q = parse("core 0", &state.registry).expect("no longer refused");
+        assert_eq!(q.term, Term::Codeword { word: Codeword::Core, arg: "0".into() });
+        assert_eq!(q.reads_as, "core 0 on polkadot");
+        let r = resolve(&q, &state, "core 0").await;
+
+        let c = r
+            .candidates
+            .iter()
+            .find(|c| c.kind == "coretime_core")
+            .unwrap_or_else(|| panic!("core 0 must resolve: {:?}", r.candidates));
+        // The chain comes from the REGISTRY (`coretime_pair`), and the caller
+        // named none — the same Invariant-2 property `ref 1930` has.
+        assert_eq!(c.chain.as_deref(), Some("polkadot-coretime"));
+        assert_eq!(c.href, "/v1/coretime/polkadot-coretime/entitlement?core=0");
+        // ASSIGNED, never SOLD: core 0 is below the fixture's `first_core = 2`,
+        // i.e. a RESERVED system core that governance set and nobody bought. On
+        // live Polkadot `first_core = 11`, so cores 0-10 are all of that kind and
+        // "sold" would be wrong on every one of them.
+        assert!(c.title.contains("assigned to task 2004"), "{}", c.title);
+        assert!(!c.title.contains("sold"), "a reserved core was not sold: {}", c.title);
+        // Lineage, on every candidate — slice 10 shipped two arms without it and
+        // slice 14 shipped two coverage lines naming fields that did not exist.
+        let lineage = c.lineage.as_ref().expect("an entitlement row carries lineage");
+        for field in ["runtime_version", "mapper_version"] {
+            assert!(
+                lineage.get(field).is_some_and(|v| !v.is_null()),
+                "lineage must carry {field}: {lineage:?}"
+            );
+        }
+        // The coordinate the `sale` refusal points at, present on the candidate
+        // it points at — so the refusal is navigable rather than merely correct.
+        assert_eq!(c.id.get("governing_relay_block").and_then(|v| v.as_u64()), Some(80));
+        // The caveat rides on the CANDIDATE, not only in coverage, because a
+        // dropdown renders candidates and throws coverage away.
+        assert!(c.why.contains("SLOT"), "{}", c.why);
+
+        let gaps = r.not_covered.join(" | ");
+        assert!(gaps.contains("35->43"), "the measured renewal evidence: {gaps}");
+        assert!(gaps.contains("occupancy?from=&to="), "{gaps}");
+        assert!(gaps.contains("delta?from=&to="), "{gaps}");
+        // The reserved-vs-market split is NOT read here, and the omission is
+        // stated rather than left for a reader to assume the opposite.
+        assert!(gaps.contains("first_core"), "{gaps}");
+
+        // EVERY FIELD A COVERAGE LINE CITES MUST EXIST ON THE CANDIDATE IT
+        // DESCRIBES. Slice 14 shipped two `not_covered` lines pointing at fields
+        // that did not exist and had to add a walk like this one; the first draft
+        // of THIS slice did it again, citing `governing_relay_block` on an arm
+        // whose candidate deliberately has no such field.
+        for field in ["governing_relay_block", "core_index", "parts"] {
+            if gaps.contains(field) {
+                assert!(
+                    c.id.get(field).is_some(),
+                    "coverage cites `{field}` but the candidate's id is {:?}",
+                    c.id
+                );
+            }
+        }
+
+        // A core with nothing indexed fabricates NOTHING — the `bounty 999999`
+        // defect. And the reason it gives is the one that is TRUE of this input:
+        // 4242 is far above the fixture's declared core count of 10, so the
+        // honest statement is "no such core was declared", NOT the sale-boundary
+        // story (which is about a core that DOES exist and whose governing sale
+        // we did not index). The delta's `unknown` clause must not appear either:
+        // `coretime_delta` enumerates its universe from `num_cores` plus the
+        // cores it saw, so a core above the count is never enumerated, never
+        // renders `unknown` and withholds nothing.
+        let q = parse("core 4242", &state.registry).unwrap();
+        let r = resolve(&q, &state, "core 4242").await;
+        assert!(
+            r.candidates.iter().all(|c| c.kind != "coretime_core"),
+            "no probe hit, so no candidate: {:?}",
+            r.candidates
+        );
+        let gaps = r.not_covered.join(" | ");
+        assert!(gaps.contains("at or above the declared core count of 10"), "{gaps}");
+        assert!(
+            !gaps.contains("SALE BOUNDARIES") && !gaps.contains("WITHHOLDS"),
+            "a core that was never declared is not a core whose sale we missed: {gaps}"
+        );
+
+        // A codeword with the wrong shape of argument is a gap, not a candidate.
+        let q = parse("core notanumber", &state.registry).unwrap();
+        let r = resolve(&q, &state, "core notanumber").await;
+        assert!(r.candidates.iter().all(|c| c.kind != "coretime_core"));
+        assert!(r.not_covered.iter().any(|g| g.contains("core index is a small")));
+    }
+
+    /// Each module makes a bare number MORE ambiguous, and the probe is what
+    /// keeps that honest: a hit is a candidate, a miss is silence. The silence
+    /// is the assertion here — a coretime caveat on every bare number would be
+    /// noise on the commonest shape in the grammar.
+    #[tokio::test]
+    async fn a_bare_number_offers_the_core_reading_only_when_it_is_probed() {
+        let state = crate::tests::test_state().await;
+
+        let q = parse("0", &state.registry).unwrap();
+        let r = resolve(&q, &state, "0").await;
+        let kinds: Vec<&str> = r.candidates.iter().map(|c| c.kind).collect();
+        assert!(kinds.contains(&"coretime_core"), "{kinds:?}");
+        // The candidate's caveat travels with it even unasked-for…
+        assert!(r.not_covered.iter().any(|g| g.contains("SLOT, NOT A TENANT")));
+        // …but the endpoint tour does NOT, because the caller asked "what is 0",
+        // not "tell me about core 0".
+        assert!(
+            !r.not_covered.iter().any(|g| g.contains("occupancy?from=&to=")),
+            "an unasked-for probe must not lecture: {:?}",
+            r.not_covered
+        );
+
+        // The silent miss. NOTE the assertion above it is what keeps this one
+        // honest: `not_covered` is empty for `4242` whatever happens, so this
+        // clause alone would still pass with `push_core` deleted from the
+        // bare-number path entirely. The `parse("0")` half is the wiring check.
+        let q = parse("4242", &state.registry).unwrap();
+        let r = resolve(&q, &state, "4242").await;
+        assert!(r.candidates.iter().all(|c| c.kind != "coretime_core"));
+        assert!(
+            !r.not_covered.iter().any(|g| g.contains("core")),
+            "a miss on an unasked-for probe is silent: {:?}",
+            r.not_covered
+        );
+    }
+
+    /// The five things a miss can mean, and they are five different facts. A
+    /// first draft asserted ONE of them for all five — including for a core index
+    /// above the declared count, where the delta's `unknown` clause it invoked is
+    /// flatly false, because `coretime_delta` never enumerates such a core and
+    /// therefore withholds nothing on its account.
+    #[tokio::test]
+    async fn a_core_that_misses_says_which_of_the_five_things_it_means() {
+        // (a) declared, and nothing indexed for it: the sale-boundary story, and
+        //     the ONLY case where the delta's `unknown`/withhold clause is true.
+        let broker = crate::MemoryBrokerIndex::new();
+        broker.insert_config(
+            "polkadot-coretime",
+            crate::BrokerConfigRow {
+                block_height: 4_927_655,
+                core_count: 100,
+                first_core: Some(11),
+                runtime_version: 2_003_002,
+            },
+        );
+        let state = state_with_broker(broker).await;
+        let q = parse("core 63", &state.registry).unwrap();
+        let gaps = resolve(&q, &state, "core 63").await.not_covered.join(" | ");
+        assert!(gaps.contains("within the declared core count of 100"), "{gaps}");
+        assert!(gaps.contains("SALE BOUNDARIES"), "{gaps}");
+        assert!(gaps.contains("WITHHOLDS its waste figure"), "{gaps}");
+
+        // (b) above the declared count: no such core, and the reading is dated.
+        let q = parse("core 4242", &state.registry).unwrap();
+        let gaps = resolve(&q, &state, "core 4242").await.not_covered.join(" | ");
+        assert!(gaps.contains("at or above the declared core count of 100"), "{gaps}");
+        assert!(gaps.contains("DATED"), "the count is configuration, not a constant: {gaps}");
+        assert!(!gaps.contains("SALE BOUNDARIES"), "{gaps}");
+
+        // (c) no configuration reading at all: we cannot say whether the core
+        //     even exists, and saying so is the whole point — this is the arm
+        //     that must not read as "there is no such core".
+        let state = state_with_broker(crate::MemoryBrokerIndex::new()).await;
+        let q = parse("core 63", &state.registry).unwrap();
+        let gaps = resolve(&q, &state, "core 63").await.not_covered.join(" | ");
+        assert!(gaps.contains("sync-broker-config"), "{gaps}");
+        assert!(
+            !gaps.contains("declared core count") && !gaps.contains("SALE BOUNDARIES"),
+            "with no reading, neither claim is available: {gaps}"
+        );
+
+        // (d) THE READ ITSELF FAILED. `MemoryBrokerIndex` cannot produce this —
+        // it errors only on a poisoned lock — so the arm needs a stub, and a
+        // gate that never fires is a gate nobody has checked. This is the whole
+        // point of keeping the `Result`: a failed read must never render as a
+        // confident absence, and must never send an operator to run
+        // `sync-broker-config` against an index that is merely unreadable.
+        let mut state = crate::tests::test_state().await;
+        state.broker = std::sync::Arc::new(UnreadableBroker { config_only: false });
+        let q = parse("core 63", &state.registry).unwrap();
+        let gaps = resolve(&q, &state, "core 63").await.not_covered.join(" | ");
+        assert!(gaps.contains("entitlement index on"), "{gaps}");
+        assert!(gaps.contains("our failure and not an absence on chain"), "{gaps}");
+        assert!(
+            !gaps.contains("sync-broker-config")
+                && !gaps.contains("declared core count")
+                && !gaps.contains("SALE BOUNDARIES"),
+            "a failed read supports NONE of the absence claims: {gaps}"
+        );
+
+        // (e) the entitlement reads SUCCEEDED and were empty, but the
+        // CONFIGURATION read failed. Its own arm, and it needs its own stub —
+        // the previous one short-circuits before the config is ever consulted,
+        // so without this the config `Err` arm would be unreachable and
+        // therefore unchecked, which is the same objection as (d).
+        let mut state = crate::tests::test_state().await;
+        state.broker = std::sync::Arc::new(UnreadableBroker { config_only: true });
+        let q = parse("core 63", &state.registry).unwrap();
+        let gaps = resolve(&q, &state, "core 63").await.not_covered.join(" | ");
+        assert!(gaps.contains("CONFIGURATION could not be read"), "{gaps}");
+        assert!(
+            !gaps.contains("sync-broker-config") && !gaps.contains("declared core count"),
+            "an unreadable configuration supports neither claim: {gaps}"
+        );
+    }
+
+    /// A `BrokerIndex` whose reads fail, so the two failure arms of `push_core`
+    /// can be exercised at all. `MemoryBrokerIndex` returns `Err` only on a
+    /// poisoned lock, which a test cannot arrange without poisoning one.
+    ///
+    /// `config_only` exists because the two arms are reached by DIFFERENT
+    /// failures: an entitlement read that fails short-circuits before the
+    /// configuration is consulted, so a stub that fails everything can only ever
+    /// reach the first one.
+    struct UnreadableBroker {
+        config_only: bool,
+    }
+
+    impl UnreadableBroker {
+        fn err<T>(&self) -> Result<Vec<T>, crate::IndexError> {
+            if self.config_only {
+                Ok(Vec::new())
+            } else {
+                Err(crate::IndexError("index unreadable".into()))
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::BrokerIndex for UnreadableBroker {
+        async fn entitlement_at(
+            &self,
+            _chain_id: &str,
+            _relay_height: u64,
+        ) -> Result<Vec<crate::EntitlementRow>, crate::IndexError> {
+            self.err()
+        }
+        /// ALWAYS fails, on both settings — it is the read this stub exists for.
+        async fn latest_broker_config(
+            &self,
+            _chain_id: &str,
+        ) -> Result<Option<crate::BrokerConfigRow>, crate::IndexError> {
+            Err(crate::IndexError("index unreadable".into()))
+        }
+        async fn events_for_core(
+            &self,
+            _chain_id: &str,
+            _core_index: u32,
+            _limit: u32,
+        ) -> Result<Vec<crate::BrokerEventRow>, crate::IndexError> {
+            self.err()
+        }
+        async fn events_for_task(
+            &self,
+            _chain_id: &str,
+            _task_id: u32,
+            _limit: u32,
+        ) -> Result<Vec<crate::BrokerEventRow>, crate::IndexError> {
+            self.err()
+        }
+        async fn assignments_for_core(
+            &self,
+            _chain_id: &str,
+            _core_index: u32,
+            _limit: u32,
+        ) -> Result<Vec<crate::EntitlementRow>, crate::IndexError> {
+            self.err()
+        }
+        async fn assignments_for_task(
+            &self,
+            _chain_id: &str,
+            _task_id: u32,
+            _limit: u32,
+        ) -> Result<Vec<crate::EntitlementRow>, crate::IndexError> {
+            self.err()
+        }
+    }
+
+    /// A core carrying more than one entitlement is not one tenant's, and the
+    /// candidate must not render it as though it were. The endpoint this
+    /// candidate points at WITHHOLDS its whole waste figure for such a core, so a
+    /// confident single-tenant title here would answer where the endpoint
+    /// refuses. Interlacing has never been observed on this chain — measured
+    /// three independent ways — which is exactly the standing this project states
+    /// rather than omits.
+    #[tokio::test]
+    async fn a_core_with_more_than_one_entitlement_is_not_rendered_as_a_whole_one() {
+        let broker = crate::MemoryBrokerIndex::new();
+        let row = |ai: u32, task: u32, parts: u32| crate::EntitlementRow {
+            core_index: 47,
+            assignment_index: ai,
+            relay_block: 32_278_800,
+            kind: "task".into(),
+            task_id: Some(task),
+            parts,
+            runtime_version: 2_003_002,
+            mapper_version: 1,
+        };
+        // TWO assignments at ONE relay block — the announcement itself split the
+        // core. (Two rows at DIFFERENT relay blocks are ordinary history and must
+        // NOT trip this; the sibling assertion below pins that.)
+        broker.insert_assignment("polkadot-coretime", 7, 0, row(0, 3428, 28_800));
+        broker.insert_assignment("polkadot-coretime", 7, 1, row(1, 2034, 28_800));
+        let state = state_with_broker(broker).await;
+
+        let q = parse("core 47", &state.registry).unwrap();
+        let r = resolve(&q, &state, "core 47").await;
+        let c = r.candidates.iter().find(|c| c.kind == "coretime_core").expect("candidate");
+        assert!(
+            c.title.contains("shared or interlaced"),
+            "one of two entitlements must not read as the whole core: {}",
+            c.title
+        );
+        let gaps = r.not_covered.join(" | ");
+        assert!(gaps.contains("MORE THAN ONE ENTITLEMENT"), "{gaps}");
+        assert!(gaps.contains("count_ones"), "the mask's pattern does not cross: {gaps}");
+
+        // CONTROL: two assignments at DIFFERENT relay blocks are successive
+        // sales, not a split core, and must render as an ordinary single tenant.
+        let broker = crate::MemoryBrokerIndex::new();
+        let mut older = row(0, 3428, crate::PARTS_WHOLE_CORE);
+        older.relay_block = 31_875_600;
+        let mut newer = row(0, 2034, crate::PARTS_WHOLE_CORE);
+        newer.relay_block = 32_278_800;
+        broker.insert_assignment("polkadot-coretime", 5, 0, older);
+        broker.insert_assignment("polkadot-coretime", 7, 0, newer);
+        let state = state_with_broker(broker).await;
+        let q = parse("core 47", &state.registry).unwrap();
+        let r = resolve(&q, &state, "core 47").await;
+        let c = r.candidates.iter().find(|c| c.kind == "coretime_core").expect("candidate");
+        assert!(
+            c.title.contains("assigned to task 2034"),
+            "the NEWEST sale wins and nothing is shared: {}",
+            c.title
+        );
+        assert!(
+            !r.not_covered.iter().any(|g| g.contains("MORE THAN ONE ENTITLEMENT")),
+            "history is not interlacing: {:?}",
+            r.not_covered
+        );
+    }
+
+    /// A `pallet-broker` event naming a core with NO assignment on record is a
+    /// different fact from an assignment, and the candidate says which. The
+    /// distinction is migration 0025's: an absent assignment is `unknown`, never
+    /// `idle`, and a candidate that blurred them would put the delta endpoint's
+    /// central refusal back on the table one surface over.
+    #[tokio::test]
+    async fn a_core_known_only_from_an_event_says_the_sale_is_outside_our_index() {
+        let broker = crate::MemoryBrokerIndex::new();
+        broker.insert_event(
+            "polkadot-coretime",
+            crate::BrokerEventRow {
+                block_height: 11,
+                event_index: 0,
+                variant: "Renewable".into(),
+                core_index: Some(63),
+                task_id: None,
+                data: serde_json::json!({ "core": 63 }),
+                runtime_version: 2_003_002,
+                mapper_version: 1,
+            },
+        );
+        let state = state_with_broker(broker).await;
+
+        let q = parse("core 63", &state.registry).unwrap();
+        let r = resolve(&q, &state, "core 63").await;
+        let c = r
+            .candidates
+            .iter()
+            .find(|c| c.kind == "coretime_core")
+            .unwrap_or_else(|| panic!("the event is evidence: {:?}", r.candidates));
+        assert!(c.title.contains("Renewable"), "{}", c.title);
+        assert!(
+            c.why.contains("no assignment") && c.why.contains("NOT that the core was unsold"),
+            "an absent assignment is unknown, never idle: {}",
+            c.why
+        );
+        // Lineage from the EVENT row, not a hardcoded literal: assert the values
+        // rather than the presence, or this passes by construction.
+        let lineage = c.lineage.as_ref().expect("the event row carries lineage");
+        assert_eq!(lineage.get("runtime_version").and_then(|v| v.as_u64()), Some(2_003_002));
+        assert_eq!(lineage.get("mapper_version").and_then(|v| v.as_u64()), Some(1));
+        assert_eq!(c.chain.as_deref(), Some("polkadot-coretime"));
+        // No assignment, so no sale coordinate to offer — absent rather than a
+        // zero pretending to be one.
+        assert!(c.id.get("governing_relay_block").is_none(), "{:?}", c.id);
+        // …AND NO COVERAGE LINE MAY CITE IT EITHER. This is the pointer walk in
+        // its sharpest form: the first draft pushed the slot/tenant caveat on
+        // both arms, so this response carried a line naming a field the row
+        // beside it does not have — while that row's own `why` said we hold no
+        // assignment at all. Two sentences, one response, opposite claims.
+        assert!(
+            !r.not_covered.iter().any(|g| g.contains("governing_relay_block")),
+            "coverage must not cite a field this arm's candidate has no way to carry: {:?}",
+            r.not_covered
+        );
+        assert!(
+            !r.not_covered.iter().any(|g| g.contains("this candidate identifies an entitlement")),
+            "we hold no assignment for this core: {:?}",
+            r.not_covered
+        );
+    }
+
+    /// The coretime chain's aliases were seeded in slice 13 and
+    /// `Registry::chain_by_alias` is generic, so `on ct` resolves with NO code in
+    /// this file. This VERIFIES that rather than claiming it as new work — and
+    /// it also pins the scope enforcement, which lives in exactly one place.
+    #[tokio::test]
+    async fn coretime_chain_aliases_already_resolve_and_the_scope_is_enforced_once() {
+        let state = crate::tests::test_state().await;
+        for form in [
+            "core 0 on ct",
+            "core 0 on coretime",
+            "core 0 on broker",
+            "core 0 @ct",
+            "core 0 on Polkadot Coretime",
+            "core 0 on polkadot-coretime",
+        ] {
+            let q = parse(form, &state.registry).unwrap_or_else(|e| panic!("{form}: {e:?}"));
+            assert_eq!(q.chain.as_deref(), Some("polkadot-coretime"), "{form}");
+            let r = resolve(&q, &state, form).await;
+            assert!(
+                r.candidates.iter().any(|c| c.kind == "coretime_core"),
+                "{form}: {:?}",
+                r.candidates
+            );
+        }
+        // …and scoping to a chain the entitlement does not live on returns
+        // nothing AND SAYS SO. `resolve`'s single filter drops candidates and —
+        // correctly — never touches gaps, so a probe that pushed coverage before
+        // the filter ran would leave a response whose `not_covered` describes a
+        // row that is not there. `push_core` therefore checks the scope itself
+        // rather than producing the mismatch and hoping.
+        let q = parse("core 0 on ah", &state.registry).unwrap();
+        let r = resolve(&q, &state, "core 0 on ah").await;
+        assert!(
+            r.candidates.iter().all(|c| c.kind != "coretime_core"),
+            "entitlement lives on the coretime chain, not on Asset Hub: {:?}",
+            r.candidates
+        );
+        assert!(
+            !r.not_covered.iter().any(|g| g.contains("this candidate")),
+            "no candidate survived, so nothing may describe one: {:?}",
+            r.not_covered
+        );
+        assert!(
+            r.not_covered
+                .iter()
+                .any(|g| g.contains("polkadot-asset-hub") && g.contains("polkadot-coretime")),
+            "an empty scoped result must name the chain that WOULD answer: {:?}",
+            r.not_covered
+        );
+    }
+
+    /// ROADMAP's `ref 42 on hydration` scope axis, answered honestly rather than
+    /// implemented. `resolve` filters by the named chain, so scoping a `ref` to a
+    /// chain that carries none of the network's governance windows returns an
+    /// empty list — and an empty list with no explanation is the silent-nothing
+    /// defect this project has caught at the field level three times and never at
+    /// the query level.
+    #[tokio::test]
+    async fn a_referendum_scoped_to_a_chain_outside_the_governance_windows_says_so() {
+        let state = crate::tests::test_state().await;
+
+        let q = parse("ref 42 on hydration", &state.registry).unwrap();
+        assert_eq!(q.chain.as_deref(), Some("hydration"));
+        let r = resolve(&q, &state, "ref 42 on hydration").await;
+        assert!(r.candidates.iter().all(|c| c.kind != "referendum"));
+        let gaps = r.not_covered.join(" | ");
+        // The chain, and the reason, and the module bit as EVIDENCE rather than
+        // as a conclusion.
+        assert!(gaps.contains("hydration"), "{gaps}");
+        assert!(gaps.contains("governance residency windows"), "{gaps}");
+        assert!(gaps.contains("does not declare"), "the module bit is reported: {gaps}");
+        // AND IT MUST NOT PICK A CAUSE. A first draft branched and told one arm
+        // the chain "runs its OWN referendum id space" — a conclusion the
+        // registry cannot support, since a missing residency window is equally
+        // consistent with an incomplete seed. Both causes are named; neither is
+        // asserted. Pinned so a later slice cannot quietly re-add the inference.
+        assert!(
+            gaps.contains("TWO CAUSES") && gaps.contains("residency seed may"),
+            "a missing window has two causes and the registry cannot tell them apart: {gaps}"
+        );
+        // …and the thing that did NOT happen is stated, because answering with
+        // the network's own referendum 42 is the failure this line exists for.
+        assert!(gaps.contains("referendum 42 instead"), "{gaps}");
+
+        // NEGATIVE CONTROL, taken from the registry rather than written down: a
+        // chain that IS in the network's governance windows gets no such line.
+        let windows = crate::all_gov_windows(&state.registry, "polkadot");
+        let gov_chain = windows.first().expect("a governance window").chain.clone();
+        let raw = format!("ref 1500 on {gov_chain}");
+        let q = parse(&raw, &state.registry).unwrap();
+        let r = resolve(&q, &state, &raw).await;
+        assert!(
+            !r.not_covered.iter().any(|g| g.contains("governance")),
+            "{gov_chain} carries this network's governance: {:?}",
+            r.not_covered
+        );
     }
 
     #[test]
