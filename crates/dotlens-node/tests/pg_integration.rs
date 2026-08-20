@@ -4748,3 +4748,212 @@ async fn broker_facts_land_in_two_tables_and_the_governing_assignment_is_one_ann
 
     db.drop_db().await;
 }
+
+#[tokio::test]
+async fn channel_readings_are_immutable_and_a_missing_reading_is_not_an_empty_graph() {
+    use adapter_substrate::hrmp::{ChannelEdge, STATE_OPEN, STATE_REQUESTED};
+    use api::ChannelIndex as _;
+    use dotlens_node::hrmp_pg::{insert_channel_reading, read_heights, ChannelReading};
+
+    let Some(db) = TestDb::create().await else { return };
+    let reg = seeds();
+    sync_registry(&db.pool, &reg).await.expect("registry sync");
+
+    const CHAIN: &str = "polkadot";
+
+    let open = |sender: u32, recipient: u32| ChannelEdge {
+        sender,
+        recipient,
+        state: STATE_OPEN,
+        max_capacity: 1000,
+        max_total_size: 102_400,
+        max_message_size: 102_400,
+        // A deposit above u64::MAX, so the NUMERIC path is exercised rather than
+        // assumed. `balances` proved this matters on live data (4.5% of
+        // Hydration amounts); nothing had proved it for this table.
+        sender_deposit: u128::from(u64::MAX) + 1,
+        recipient_deposit: Some(u128::from(u64::MAX) + 2),
+        confirmed: None,
+    };
+    let requested = |sender: u32, recipient: u32| ChannelEdge {
+        state: STATE_REQUESTED,
+        recipient_deposit: None,
+        confirmed: Some(true),
+        ..open(sender, recipient)
+    };
+
+    let write = |height: u64, session: u64, edges: Vec<ChannelEdge>| {
+        let pool = db.pool.clone();
+        async move {
+            let digest = adapter_substrate::hrmp::topology_digest(&edges);
+            insert_channel_reading(
+                &pool,
+                ChannelReading {
+                    chain_id: CHAIN,
+                    block_height: height,
+                    session_index: session,
+                    topology_digest: &digest,
+                    spec_version: 2_003_002,
+                    source: "pg_integration",
+                    edges: &edges,
+                },
+            )
+            .await
+        }
+    };
+
+    // Three readings, with session 13 SKIPPED so the coverage half has something
+    // real to report rather than an empty list nobody checked.
+    assert!(write(2400, 11, vec![open(1000, 2034)]).await.expect("first reading"));
+    assert!(write(4800, 12, vec![open(1000, 2034), requested(2000, 1000)])
+        .await
+        .expect("second reading"));
+    assert!(write(9600, 14, vec![open(1000, 2034), open(2000, 1000)])
+        .await
+        .expect("third reading"));
+
+    let channels = api::pg::PgChannelIndex::new(db.pool.clone());
+
+    // --- the header/detail split, and the FK that enforces it -----------------
+    let readings = channels.readings(CHAIN).await.expect("readings");
+    assert_eq!(readings.len(), 3, "ascending by height");
+    assert_eq!(
+        readings.iter().map(|r| r.block_height).collect::<Vec<_>>(),
+        vec![2400, 4800, 9600]
+    );
+    assert_eq!((readings[1].channel_count, readings[1].open_request_count), (1, 1));
+
+    // Detail cannot exist without its header — the structural half of "we did
+    // not look" never being confusable with "there was nothing there".
+    let orphan = sqlx::query(
+        "insert into xcm.channel_snapshots \
+             (chain_id, block_height, sender, recipient, state, max_capacity, max_total_size, \
+              max_message_size, sender_deposit) \
+         values ($1, 999999, 1, 2, 'open', 1, 1, 1, 0)",
+    )
+    .bind(CHAIN)
+    .execute(&db.pool)
+    .await;
+    assert!(orphan.is_err(), "a snapshot with no reading must be refused by the FK");
+
+    // --- the two CHECKs, in BOTH directions ----------------------------------
+    // An 'open' row with no recipient deposit, and a 'requested' row carrying
+    // one, are equally wrong: both mean the writer confused the two maps.
+    for (state, rdep, confirmed) in [
+        ("open", None::<&str>, Some(true)),
+        ("requested", Some("1"), Some(true)),
+        ("requested", None, None),
+    ] {
+        let bad = sqlx::query(
+            "insert into xcm.channel_snapshots \
+                 (chain_id, block_height, sender, recipient, state, max_capacity, \
+                  max_total_size, max_message_size, sender_deposit, recipient_deposit, confirmed) \
+             values ($1, 2400, 77, 88, $2, 1, 1, 1, 0, $3::numeric, $4)",
+        )
+        .bind(CHAIN)
+        .bind(state)
+        .bind(rdep)
+        .bind(confirmed)
+        .execute(&db.pool)
+        .await;
+        assert!(bad.is_err(), "state={state} rdep={rdep:?} confirmed={confirmed:?} must be refused");
+    }
+
+    // --- u128 round-trips, and direction survives ----------------------------
+    let edges = channels.edges_at(CHAIN, 4800).await.expect("edges");
+    assert_eq!(edges.len(), 2);
+    assert_eq!((edges[0].sender, edges[0].recipient), (1000, 2034), "sorted by (sender, recipient)");
+    assert_eq!(edges[0].sender_deposit, (u128::from(u64::MAX) + 1).to_string());
+    assert_eq!(
+        edges[0].recipient_deposit.as_deref(),
+        Some((u128::from(u64::MAX) + 2).to_string().as_str()),
+        "a deposit above u64::MAX must survive NUMERIC intact"
+    );
+    assert_eq!(edges[1].state, "requested");
+    assert_eq!(edges[1].recipient_deposit, None);
+    assert_eq!(edges[1].confirmed, Some(true));
+
+    // --- the LEFT JOIN is the design, not an optimisation --------------------
+    // 2000 -> 1000 is absent at reading 1, requested at 2, open at 3. An inner
+    // join would drop reading 1 entirely and turn "we looked and it was not
+    // there" into "we did not look".
+    let obs = channels
+        .edge_observations(CHAIN, 2000, 1000)
+        .await
+        .expect("observations");
+    assert_eq!(obs.len(), 3, "one row per READING, including the one with no edge");
+    assert_eq!(obs[0].state, None);
+    assert_eq!(obs[1].state.as_deref(), Some("requested"));
+    assert_eq!(obs[2].state.as_deref(), Some("open"));
+
+    let history = api::channels::derive_history(&obs);
+    assert_eq!(history.transitions.len(), 2);
+    assert!(history.transitions[0].exact, "sessions 11 -> 12 are adjacent");
+    assert!(!history.transitions[1].exact, "sessions 12 -> 14 skip one boundary");
+    assert_eq!(history.unread.len(), 1);
+    assert_eq!(history.unread[0].sessions, 1, "session 13 was never read");
+
+    // The reverse edge never existed, and that reads as a fact about the chain
+    // rather than as a gap, because the readings are there.
+    let reverse = channels.edge_observations(CHAIN, 1, 2).await.expect("observations");
+    assert_eq!(reverse.len(), 3);
+    assert!(reverse.iter().all(|o| o.state.is_none()));
+
+    // --- immutability and replay --------------------------------------------
+    // Re-reading the same historic state can only agree; a second write is a
+    // no-op and reports itself as one, which is what makes `channels-range`
+    // re-runnable.
+    assert!(
+        !write(4800, 12, vec![open(1000, 2034), requested(2000, 1000)])
+            .await
+            .expect("replay"),
+        "a second reading at the same height must report as already on record"
+    );
+    // …and it must not have doubled the detail either.
+    let (count,): (i64,) = sqlx::query_as(
+        "select count(*) from xcm.channel_snapshots where chain_id = $1 and block_height = 4800",
+    )
+    .bind(CHAIN)
+    .fetch_one(&db.pool)
+    .await
+    .expect("count");
+    assert_eq!(count, 2, "replay wrote no extra snapshot rows");
+
+    // A DIFFERENT graph at the same height HALTS LOUDLY rather than being
+    // silently discarded. The reading is immutable because re-reading the same
+    // historic state can only agree — so a disagreement is a defect to FIND, and
+    // a writer that merely ignored it would make that claim decoration. This is
+    // the raw store's "refusing to overwrite immutable object" rule applied to a
+    // table, and it is the assertion that keeps the claim honest.
+    let err = write(4800, 12, vec![])
+        .await
+        .expect_err("a reading that disagrees with the one on record must not be swallowed");
+    let msg = format!("{err:#}");
+    assert!(msg.contains("DISAGREES"), "{msg}");
+    assert!(msg.contains("defect to find"), "{msg}");
+    assert!(msg.contains("HRMP_READER_VERSION"), "the halt says what would explain it: {msg}");
+    let still = channels.edges_at(CHAIN, 4800).await.expect("edges");
+    assert_eq!(still.len(), 2, "and the recorded reading was not touched");
+
+    // --- what `channels-range` uses to skip work -----------------------------
+    let heights = read_heights(&db.pool, CHAIN, 0, 10_000).await.expect("heights");
+    assert_eq!(heights, vec![2400, 4800, 9600]);
+    assert!(read_heights(&db.pool, CHAIN, 5000, 9000).await.unwrap().is_empty());
+
+    // --- reading_at never extrapolates backwards -----------------------------
+    assert_eq!(
+        channels.reading_at(CHAIN, Some(9599)).await.unwrap().unwrap().block_height,
+        4800
+    );
+    assert_eq!(channels.reading_at(CHAIN, None).await.unwrap().unwrap().block_height, 9600);
+    assert!(
+        channels.reading_at(CHAIN, Some(100)).await.unwrap().is_none(),
+        "before the first reading there is nothing to report, and nothing is invented"
+    );
+
+    // A chain with no readings at all is EMPTY here, and the endpoint's
+    // `reads_as` is what tells the two apart — not this method.
+    assert!(channels.readings("polkadot-asset-hub").await.unwrap().is_empty());
+
+    db.drop_db().await;
+}

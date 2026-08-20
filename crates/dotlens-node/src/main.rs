@@ -56,6 +56,8 @@
 //!   dotlens-node sync-core-config <chain> [height]     # read + DATE the num_cores denominator
 //!   dotlens-node broker-range <chain> <from> <to>      # map coretime ENTITLEMENT from broker events
 //!   dotlens-node sync-broker-config <chain> [height]   # read + DATE the entitlement denominator
+//!   dotlens-node sync-channels <chain> [height]        # read + DATE the HRMP channel graph
+//!   dotlens-node channels-range <chain> <from> <to>    # one channel reading per session boundary
 //!
 //! Per-module followers are opt-in flags: LIVE_INGEST, DECODE_FOLLOW,
 //! BALANCES_FOLLOW, GOV_FOLLOW, VOTES_FOLLOW, TREASURY_FOLLOW, BOUNTIES_FOLLOW,
@@ -100,6 +102,7 @@ struct Backends {
     xcm: Arc<dyn api::XcmIndex>,
     coretime: Arc<dyn api::CoretimeIndex>,
     broker: Arc<dyn api::BrokerIndex>,
+    channels: Arc<dyn api::ChannelIndex>,
     runtime_versions: Arc<dyn RuntimeVersionSink>,
     /// Kept for label sync/verify (they need direct SQL, not a trait).
     #[cfg(feature = "pg")]
@@ -123,6 +126,7 @@ fn memory_backends() -> Backends {
         xcm: Arc::new(api::MemoryXcmIndex::new()),
         coretime: Arc::new(api::MemoryCoretimeIndex::new()),
         broker: Arc::new(api::MemoryBrokerIndex::new()),
+        channels: Arc::new(api::MemoryChannelIndex::new()),
         runtime_versions: Arc::new(NoopRuntimeVersionSink),
         #[cfg(feature = "pg")]
         pool: None,
@@ -164,6 +168,8 @@ enum Command {
     SyncCoreConfig { chain: String, height: Option<u64> },
     BrokerRange { chain: String, from: u64, to: u64 },
     SyncBrokerConfig { chain: String, height: Option<u64> },
+    SyncChannels { chain: String, height: Option<u64> },
+    ChannelsRange { chain: String, from: u64, to: u64 },
     SyncBountyAccounts,
     AnchorVoting { chain: String, account: String, track: u32, height: Option<u64> },
     SyncTracks,
@@ -416,6 +422,20 @@ fn parse_args() -> Result<Command> {
             };
             Ok(Command::SyncBrokerConfig { chain, height })
         }
+        Some("sync-channels") => {
+            let usage = "usage: dotlens-node sync-channels <chain> [height]";
+            let chain = args.get(1).context(usage)?.clone();
+            let height = match args.get(2) {
+                Some(h) => Some(h.parse::<u64>().context(usage)?),
+                None => None,
+            };
+            Ok(Command::SyncChannels { chain, height })
+        }
+        Some("channels-range") => {
+            let (chain, from, to) =
+                range("usage: dotlens-node channels-range <chain> <from> <to>")?;
+            Ok(Command::ChannelsRange { chain, from, to })
+        }
         Some("sync-bounty-accounts") => Ok(Command::SyncBountyAccounts),
         Some("anchor-voting") => {
             let usage = "usage: dotlens-node anchor-voting <chain> <account> <track> [height]";
@@ -613,6 +633,7 @@ async fn main() -> Result<()> {
             xcm: Arc::new(api::pg::PgXcmIndex::new(pool.clone())),
             coretime: Arc::new(api::pg::PgCoretimeIndex::new(pool.clone())),
             broker: Arc::new(api::pg::PgBrokerIndex::new(pool.clone())),
+            channels: Arc::new(api::pg::PgChannelIndex::new(pool.clone())),
             runtime_versions: Arc::new(PgRuntimeVersionSink::new(pool.clone())),
             pool: Some(pool),
             persistent: true,
@@ -802,6 +823,12 @@ mismatched={} retirable_heights={}",
     }
     if let Command::SyncBrokerConfig { chain, height } = &command {
         return run_sync_broker_config(&registry, &backends, raw.as_ref(), chain, *height).await;
+    }
+    if let Command::SyncChannels { chain, height } = &command {
+        return run_sync_channels(&registry, &backends, raw.as_ref(), chain, *height).await;
+    }
+    if let Command::ChannelsRange { chain, from, to } = &command {
+        return run_channels_range(&registry, &backends, raw.as_ref(), chain, *from, *to).await;
     }
     if matches!(command, Command::SyncBountyAccounts) {
         #[cfg(feature = "pg")]
@@ -999,6 +1026,7 @@ mismatched={} retirable_heights={}",
         xcm: backends.xcm.clone(),
         coretime: backends.coretime.clone(),
         broker: backends.broker.clone(),
+        channels: backends.channels.clone(),
         // family-encoded address parsing is adapter-owned (Invariant 4); with
         // more families this becomes registry-driven dispatch
         parse_account: Arc::new(|s| {
@@ -2692,6 +2720,527 @@ async fn run_sync_broker_config(
     _: Option<u64>,
 ) -> Result<()> {
     anyhow::bail!("sync-broker-config requires the `pg` and `live` features")
+}
+
+// ---------------------------------------------------------------------------
+// THE HRMP CHANNEL GRAPH (Phase 3, slice 16)
+//
+// The `sync-*-config` nine-step shape with a cadence bolted on, and it is a
+// COMMAND rather than a module on `ingest::module` for a reason worth stating
+// once: that runtime iterates `from..=to` over block heights, sources
+// `decoded_events`, and keys its rows `(height, event_index)`. A session-boundary
+// STATE reader has no event to key on, no per-height iteration, and its cadence
+// is sessions. Making it fit means faking an `EventSource` and inventing an
+// `event_index`, and `write_facts` has no slot for a block hash or a storage
+// read. The runtime exists because five IDENTICAL copies were measured; there is
+// one consumer here, and one copy is not a pattern.
+// ---------------------------------------------------------------------------
+
+/// One page of `state_getKeysPaged`. The whole 224-channel graph came back in a
+/// single page of this size in the prep, in 0.64s.
+#[cfg(all(feature = "pg", feature = "live"))]
+const CHANNEL_PAGE: u32 = 250;
+
+/// Enumerate one storage prefix and batch-read every value, at ONE block hash.
+///
+/// Two calls for the whole graph — `state_getKeysPaged` then a single batched
+/// `state_queryStorageAt`, measured at 1.49s and 27,808 bytes for 224 channels.
+/// Probing keys one at a time is what timed out the public endpoint in slice 12
+/// and must not be reintroduced.
+#[cfg(all(feature = "pg", feature = "live"))]
+async fn enumerate_entries(
+    source: &adapter_substrate::source::SubstrateSource,
+    prefix: &[u8],
+    hash: adapter_substrate::source::BlockHash,
+) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+    use std::collections::HashMap;
+
+    let mut keys: Vec<Vec<u8>> = Vec::new();
+    let mut start: Option<Vec<u8>> = None;
+    loop {
+        let page = source
+            .storage_keys_paged(prefix, CHANNEL_PAGE, start.as_deref(), hash)
+            .await
+            .map_err(|e| anyhow::anyhow!(e))?;
+        let short = page.len() < CHANNEL_PAGE as usize;
+        start = page.last().cloned();
+        keys.extend(page);
+        if short {
+            break;
+        }
+    }
+
+    let mut out = Vec::with_capacity(keys.len());
+    for chunk in keys.chunks(CHANNEL_PAGE as usize) {
+        let got = source
+            .storage_batch_at(chunk, hash)
+            .await
+            .map_err(|e| anyhow::anyhow!(e))?;
+        let by_key: HashMap<Vec<u8>, Option<Vec<u8>>> = got.into_iter().collect();
+        for key in chunk {
+            // Both reads are at the SAME hash, so a key that enumerated and then
+            // has no value cannot happen against a consistent state. If it does,
+            // the two calls saw different states and every count below would be
+            // a blend of two graphs — refuse rather than record a smaller one.
+            let value = by_key.get(key).cloned().flatten().with_context(|| {
+                format!(
+                    "key 0x{} enumerated at this block hash but carried no value in the batched \
+                     read of the SAME hash. The two reads saw different state; refusing rather \
+                     than recording a partial graph.",
+                    hex::encode(key)
+                )
+            })?;
+            out.push((key.clone(), value));
+        }
+    }
+    Ok(out)
+}
+
+/// Metadata for one spec, archived on first sight — the same archive-or-fetch
+/// the other dated readings use, so a reading stays re-derivable from raw.
+#[cfg(all(feature = "pg", feature = "live"))]
+async fn channel_metadata(
+    source: &adapter_substrate::source::SubstrateSource,
+    raw: &dyn RawStore,
+    chain_id: &str,
+    spec: u32,
+    height: u64,
+    source_name: &str,
+) -> Result<Vec<u8>> {
+    use ingest::live::ChainSource;
+    let meta_key = raw_store::keys::metadata(chain_id, spec);
+    match raw.get(&meta_key) {
+        Ok(blob) => Ok(blob),
+        Err(raw_store::RawStoreError::NotFound(_)) => {
+            let blob = source
+                .metadata_at(height)
+                .await
+                .map_err(|e| anyhow::anyhow!(e))?;
+            raw.put(&meta_key, &blob, source_name)?;
+            tracing::info!(chain = %chain_id, spec, "metadata archived while reading the channel graph");
+            Ok(blob)
+        }
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Read the whole graph at one height: the session index, the open channels, the
+/// pending requests, and the topology digest over the open set.
+#[cfg(all(feature = "pg", feature = "live"))]
+async fn read_channel_graph(
+    source: &adapter_substrate::source::SubstrateSource,
+    key_index: &adapter_substrate::fork::StorageKeyIndex,
+    hash: adapter_substrate::source::BlockHash,
+    height: u64,
+) -> Result<(u64, Vec<adapter_substrate::hrmp::ChannelEdge>, String)> {
+    use adapter_substrate::hrmp as ah;
+
+    // THE HEIGHT CONVENTION, and it is the thing most easily got wrong silently:
+    // both of these are read at the SAME hash, and at the height where
+    // `session.NewSession` fires the state is already POST-change. The parachains
+    // initializer BUFFERS the session notification and applies it in
+    // `on_finalize` of that same block, so end-of-block state at H carries the
+    // new channel set AND the new session index. Confirmed on live data at the
+    // largest topology change in four years: at H-1 both are old, at H both are
+    // new. Reading the session index at a different hash than the graph would
+    // date a reading to the wrong session.
+    let session_bytes = source
+        .storage_at(&ah::current_index_key(), hash)
+        .await
+        .map_err(|e| anyhow::anyhow!(e))?
+        .with_context(|| {
+            format!(
+                "Session.CurrentIndex is absent from state at #{height} — either this chain runs \
+                 no session pallet, or the plain-key derivation is wrong. A missing session index \
+                 would leave every reading undatable in the units topology changes in, so this \
+                 refuses rather than recording a zero."
+            )
+        })?;
+    let session_index =
+        ah::decode_session_index(key_index, &session_bytes).map_err(|e| anyhow::anyhow!(e))?;
+
+    let channel_entries = enumerate_entries(source, &ah::channels_prefix(), hash).await?;
+    let request_entries = enumerate_entries(source, &ah::open_requests_prefix(), hash).await?;
+
+    let channels =
+        ah::channels_from_entries(key_index, &channel_entries).map_err(|e| anyhow::anyhow!(e))?;
+    let requests = ah::open_requests_from_entries(key_index, &request_entries)
+        .map_err(|e| anyhow::anyhow!(e))?;
+    let edges = ah::merge_edges(channels, requests).map_err(|e| anyhow::anyhow!(e))?;
+    let digest = ah::topology_digest(&edges);
+    Ok((session_index, edges, digest))
+}
+
+/// Resolve the one chain in this network that carries the HRMP channel graph.
+///
+/// Refuses on zero or two rather than picking, which is `coretime_pair`'s rule:
+/// a graph read from the wrong chain is a WRONG answer rather than a missing
+/// one, and two chains declaring the module is a seed error the caller must not
+/// paper over.
+#[cfg(all(feature = "pg", feature = "live"))]
+fn channel_chain<'a>(registry: &'a Registry, chain: &str) -> Result<&'a registry::ChainConfig> {
+    let cfg = registry
+        .chain(chain)
+        .with_context(|| format!("unknown chain: {chain}"))?;
+    anyhow::ensure!(
+        cfg.has_module("hrmp"),
+        "{chain} does not declare the `hrmp` module, so this run would report success while \
+         reading nothing. HRMP channel state lives in the RELAY's `Hrmp` pallet and nowhere else: \
+         a parachain sees only an `AbridgedHrmpChannel` view of its OWN channels through the relay \
+         state proof, and cannot see channels it is not an endpoint of."
+    );
+    Ok(cfg)
+}
+
+#[cfg(all(feature = "pg", feature = "live"))]
+async fn run_sync_channels(
+    registry: &Registry,
+    backends: &Backends,
+    raw: &dyn RawStore,
+    chain: &str,
+    height: Option<u64>,
+) -> Result<()> {
+    use adapter_substrate::{hrmp as ah, source::SubstrateSource};
+    use ingest::live::ChainSource;
+
+    let pool = backends
+        .pool
+        .as_ref()
+        .context("sync-channels requires DATABASE_URL")?;
+    let cfg = channel_chain(registry, chain)?;
+    let source =
+        SubstrateSource::new(&cfg.id, cfg.endpoints.rpc.clone()).map_err(|e| anyhow::anyhow!(e))?;
+
+    let height = match height {
+        Some(h) => h,
+        None => source
+            .finalized_height()
+            .await
+            .map_err(|e| anyhow::anyhow!(e))?,
+    };
+    let hash = source
+        .block_hash(height)
+        .await
+        .map_err(|e| anyhow::anyhow!(e))?;
+    let spec = source
+        .runtime_version_at(hash)
+        .await
+        .map_err(|e| anyhow::anyhow!(e))?;
+    let metadata = channel_metadata(&source, raw, &cfg.id, spec, height, "sync-channels").await?;
+    let key_index = ah::key_index(&metadata).map_err(|e| anyhow::anyhow!(e))?;
+
+    let (session_index, edges, digest) =
+        read_channel_graph(&source, &key_index, hash, height).await?;
+    let open = edges.iter().filter(|e| e.is_open()).count();
+    let pending = edges.len() - open;
+
+    let recorded = dotlens_node::hrmp_pg::insert_channel_reading(
+        pool,
+        dotlens_node::hrmp_pg::ChannelReading {
+            chain_id: &cfg.id,
+            block_height: height,
+            session_index,
+            topology_digest: &digest,
+            spec_version: spec,
+            source: "sync-channels",
+            edges: &edges,
+        },
+    )
+    .await?;
+
+    println!(
+        "channel graph {chain} @#{height} (session {session_index}, spec {spec}): \
+         {open} open channel(s), {pending} pending request(s), digest {digest}{}",
+        if recorded { "" } else { "  [already on record]" }
+    );
+    println!(
+        "  The reading DATES the graph. Channel existence changes only at session boundaries, so \
+         one reading per session is lossless for topology — but a reading taken mid-session is \
+         still a fact about that session, and /v1/xcm/<network>/channels reports which sessions \
+         were never read rather than interpolating across them."
+    );
+    Ok(())
+}
+
+#[cfg(not(all(feature = "pg", feature = "live")))]
+async fn run_sync_channels(
+    _: &Registry,
+    _: &Backends,
+    _: &dyn RawStore,
+    _: &str,
+    _: Option<u64>,
+) -> Result<()> {
+    anyhow::bail!("sync-channels requires the `pg` and `live` features")
+}
+
+/// The first height after `after` whose session index differs from `current`,
+/// or `None` if there is none at or before `ceiling`.
+///
+/// Exponential probe to bracket, then binary search — the change-point technique
+/// this project has used five times (slices 3, 12, 13, 15 and this slice's own
+/// prep, which located eleven topology changes in 11-12 calls each). The probe
+/// starts at a session's measured length and DOUBLES rather than assuming one,
+/// because session length is a runtime parameter: it measured 2395-2400 blocks
+/// on Polkadot today and is not a constant this code may rely on.
+/// `Session.CurrentIndex` at one height. A plain `async fn` rather than a
+/// closure returning an async block, deliberately: the closure form borrows the
+/// enclosing scope and then moves that borrow into a future, which is a shape
+/// that compiles in some positions and not others. This is called ~14 times per
+/// boundary search and is the search's whole cost.
+#[cfg(all(feature = "pg", feature = "live"))]
+async fn session_index_at(
+    source: &adapter_substrate::source::SubstrateSource,
+    key_index: &adapter_substrate::fork::StorageKeyIndex,
+    height: u64,
+) -> Result<u64> {
+    use adapter_substrate::hrmp as ah;
+    let hash = source
+        .block_hash(height)
+        .await
+        .map_err(|e| anyhow::anyhow!(e))?;
+    let bytes = source
+        .storage_at(&ah::current_index_key(), hash)
+        .await
+        .map_err(|e| anyhow::anyhow!(e))?
+        .with_context(|| format!("Session.CurrentIndex is absent at #{height}"))?;
+    ah::decode_session_index(key_index, &bytes).map_err(|e| anyhow::anyhow!(e))
+}
+
+#[cfg(all(feature = "pg", feature = "live"))]
+async fn next_session_boundary(
+    source: &adapter_substrate::source::SubstrateSource,
+    key_index: &adapter_substrate::fork::StorageKeyIndex,
+    after: u64,
+    current: u64,
+    ceiling: u64,
+) -> Result<Option<u64>> {
+    if after >= ceiling {
+        return Ok(None);
+    }
+    // If the far end is still in the same session there is no boundary to find,
+    // and this one call saves the whole search. The result is REUSED as the
+    // bracket's upper bound below rather than being read a second time — on a
+    // full historical sweep that is ~9,331 round trips saved.
+    let ceiling_session = session_index_at(source, key_index, ceiling).await?;
+    if ceiling_session == current {
+        return Ok(None);
+    }
+
+    // Bracket: grow a window from `after` until its far end is in a later
+    // session. The probe starts at a measured session length (2395-2400 blocks
+    // on Polkadot today) and DOUBLES rather than assuming one, because session
+    // length is a runtime parameter and not a constant this code may rely on.
+    let mut lo = after;
+    let mut hi = ceiling;
+    let mut step: u64 = 2400;
+    loop {
+        let probe = after.saturating_add(step).min(ceiling);
+        if probe <= lo || probe == ceiling {
+            // Either saturation pinned the probe, or we reached the far end —
+            // whose session we already know differs. Either way the bracket is
+            // [lo, ceiling] and the binary search below finishes the job.
+            hi = ceiling;
+            break;
+        }
+        if session_index_at(source, key_index, probe).await? != current {
+            hi = probe;
+            break;
+        }
+        lo = probe;
+        step = step.saturating_mul(2);
+    }
+
+    // Binary search the transition. Session index is monotonic in height, so
+    // this converges on the FIRST height carrying a later session.
+    while hi - lo > 1 {
+        let mid = lo + (hi - lo) / 2;
+        if session_index_at(source, key_index, mid).await? == current {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    Ok(Some(hi))
+}
+
+#[cfg(all(feature = "pg", feature = "live"))]
+async fn run_channels_range(
+    registry: &Registry,
+    backends: &Backends,
+    raw: &dyn RawStore,
+    chain: &str,
+    from: u64,
+    to: u64,
+) -> Result<()> {
+    use adapter_substrate::{hrmp as ah, source::SubstrateSource};
+    use std::collections::HashMap;
+
+    anyhow::ensure!(from <= to, "`from` must not exceed `to`");
+    let pool = backends
+        .pool
+        .as_ref()
+        .context("channels-range requires DATABASE_URL")?;
+    let cfg = channel_chain(registry, chain)?;
+    let source =
+        SubstrateSource::new(&cfg.id, cfg.endpoints.rpc.clone()).map_err(|e| anyhow::anyhow!(e))?;
+
+    // Per-spec key index, because a range can cross a runtime upgrade and a
+    // reading must be decoded against the metadata of ITS OWN block. Cached
+    // in-process so one upgrade costs one fetch rather than one per reading.
+    // The metadata BLOB itself is not retained: it is archived to the raw store
+    // and consumed into the index, and holding a second copy per spec would pin
+    // hundreds of KB for nothing.
+    let mut indexes: HashMap<u32, adapter_substrate::fork::StorageKeyIndex> = HashMap::new();
+
+    let already: std::collections::HashSet<u64> =
+        dotlens_node::hrmp_pg::read_heights(pool, &cfg.id, from, to)
+            .await?
+            .into_iter()
+            .collect();
+
+    let mut height = from;
+    let mut readings = 0usize;
+    let mut skipped = 0usize;
+    let mut heights_visited = 0usize;
+    let mut boundaries = 0usize;
+    let mut last_digest: Option<String> = None;
+    let mut changes = 0usize;
+
+    loop {
+        let hash = source
+            .block_hash(height)
+            .await
+            .map_err(|e| anyhow::anyhow!(e))?;
+        let spec = source
+            .runtime_version_at(hash)
+            .await
+            .map_err(|e| anyhow::anyhow!(e))?;
+        if !indexes.contains_key(&spec) {
+            let blob =
+                channel_metadata(&source, raw, &cfg.id, spec, height, "channels-range").await?;
+            let idx = ah::key_index(&blob).map_err(|e| anyhow::anyhow!(e))?;
+            indexes.insert(spec, idx);
+        }
+        let key_index = indexes.get(&spec).expect("just inserted");
+
+        // The session index is needed either way — to date a reading, and to
+        // find the next boundary — so it is read even when the reading itself is
+        // skipped as already on record.
+        let session_index = if already.contains(&height) {
+            skipped += 1;
+            // A skipped boundary breaks the digest chain: this run did not read
+            // the graph here, so it cannot say whether the topology moved across
+            // it. Clearing `last_digest` reports NOTHING rather than comparing
+            // across a hole and inventing a change (or, worse, missing one).
+            last_digest = None;
+            session_index_at(&source, key_index, height).await?
+        } else {
+            let (s, edges, digest) = read_channel_graph(&source, key_index, hash, height).await?;
+            let open = edges.iter().filter(|e| e.is_open()).count();
+            let recorded = dotlens_node::hrmp_pg::insert_channel_reading(
+                pool,
+                dotlens_node::hrmp_pg::ChannelReading {
+                    chain_id: &cfg.id,
+                    block_height: height,
+                    session_index: s,
+                    topology_digest: &digest,
+                    spec_version: spec,
+                    source: "channels-range",
+                    edges: &edges,
+                },
+            )
+            .await?;
+            if recorded {
+                readings += 1;
+            } else {
+                skipped += 1;
+            }
+            if last_digest.as_deref().is_some_and(|prev| prev != digest) {
+                changes += 1;
+                tracing::info!(
+                    chain = %cfg.id, height, session = s, open,
+                    "channel topology changed at this session boundary"
+                );
+            }
+            last_digest = Some(digest);
+            s
+        };
+        heights_visited += 1;
+
+        match next_session_boundary(&source, key_index, height, session_index, to).await? {
+            Some(next) => {
+                height = next;
+                // Counted only here: the FIRST height in the range is wherever
+                // `from` happens to be, which is usually mid-session. Calling it
+                // a boundary would inflate the one number an operator uses to
+                // judge coverage.
+                boundaries += 1;
+            }
+            None => break,
+        }
+    }
+
+    println!(
+        "channel readings {chain} #{from}..#{to}: {heights_visited} height(s) visited of which \
+         {boundaries} session boundary/boundaries, {readings} newly recorded, {skipped} already on \
+         record, {changes} topology change(s) observed between consecutive readings IN THIS RUN"
+    );
+    if readings == 0 {
+        // The "we did not look rendered as nothing happened" trap, one level up:
+        // on a full replay `changes` is 0 because nothing was read, not because
+        // nothing moved, and printing the 1.7% paragraph here would say the
+        // opposite of the truth.
+        println!(
+            "  This run recorded NOTHING NEW, so its change count is 0 because it observed no \
+             interval at all — not because the topology held still. Re-run against a range with \
+             unread boundaries to observe anything."
+        );
+    } else if skipped > 0 {
+        // The SAME trap one arm over, and it is the one a partial replay walks
+        // into: a boundary already on record is not read again, which breaks the
+        // digest chain, so the interval across it is NOT observed by this run.
+        // A `changes` of 0 here can mean "nothing moved" OR "the intervals that
+        // moved were never compared" — the run cannot tell, and must not print
+        // the 1.7% reassurance as though it could. Measured live: a range over
+        // #32487000..#32497000 whose window CONTAINS the 28-channel Moonbeam
+        // teardown reported 0 changes, because the boundary that carried it was
+        // already on record.
+        println!(
+            "  {skipped} boundary/boundaries in this range were already on record and were NOT \
+             re-read, which BREAKS the digest chain: the interval across each of them was not \
+             observed by this run, so {changes} is a count over the intervals it did observe and \
+             not a statement about the whole range. The readings themselves are complete — diff \
+             them with /v1/xcm/<network>/channels/history, which compares every reading on record \
+             rather than only this run's."
+        );
+    } else if changes == 0 {
+        println!(
+            "  A change count of 0 across many boundaries is the NORMAL result: the graph was \
+             measured changing on 1.7% of sessions (3 of 179 intervals over 30 days). What makes \
+             the history trustworthy is that every boundary visited leaves a row saying it WAS \
+             read, so a session with no reading is visibly a gap rather than a quiet 'nothing \
+             happened'."
+        );
+    } else {
+        println!(
+            "  Every boundary in this range was read by this run, so the digest chain is unbroken \
+             and {changes} change(s) is the whole count for the range — each one dated to exactly \
+             one session boundary."
+        );
+    }
+    Ok(())
+}
+
+#[cfg(not(all(feature = "pg", feature = "live")))]
+async fn run_channels_range(
+    _: &Registry,
+    _: &Backends,
+    _: &dyn RawStore,
+    _: &str,
+    _: u64,
+    _: u64,
+) -> Result<()> {
+    anyhow::bail!("channels-range requires the `pg` and `live` features")
 }
 
 #[cfg(feature = "pg")]

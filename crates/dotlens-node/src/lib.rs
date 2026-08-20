@@ -60,6 +60,11 @@ pub mod broker_pg;
 #[cfg(feature = "pg")]
 pub mod coretime_pg;
 
+/// HRMP channel readings (Phase 3, slice 16) — a header saying we looked and a
+/// detail set saying what we saw, in one transaction so the two cannot part.
+#[cfg(feature = "pg")]
+pub mod hrmp_pg;
+
 /// Tier 1 simulation results (Phase 3, slice 1) — immutable observations.
 #[cfg(feature = "pg")]
 pub mod sim_pg;

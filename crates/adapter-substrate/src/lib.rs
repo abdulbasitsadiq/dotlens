@@ -296,3 +296,9 @@ pub mod broker;
 /// 3, slice 11) — the usage half of coretime, and the half no marketplace can
 /// show. Entitlement is `broker` above, and the product is the delta.
 pub mod coretime;
+
+/// The HRMP channel graph, read from the relay's `Hrmp` pallet STORAGE (Phase 3,
+/// slice 16). Not an event mapper: channels are created and destroyed at session
+/// boundaries with no event at all, so this is a dated state reading whose
+/// consumer DIFFS consecutive readings — the first of that shape in the project.
+pub mod hrmp;

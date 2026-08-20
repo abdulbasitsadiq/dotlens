@@ -14,6 +14,7 @@ use canonical::{AccountLabel, CanonicalBlock};
 use chrono::{DateTime, Utc};
 /// The coretime delta's arithmetic, as a PURE function with no database in it —
 /// see the module header for why that is the design and not a convenience.
+pub mod channels;
 pub mod coretime_delta;
 pub mod search;
 
@@ -3323,6 +3324,165 @@ impl MemoryBrokerIndex {
     }
 }
 
+// ------------------------------------------------------ hrmp channel readings
+
+/// One reading of the HRMP channel graph — the header row that says we looked.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ChannelReadingRow {
+    pub block_height: u64,
+    pub session_index: u64,
+    pub channel_count: u32,
+    pub open_request_count: u32,
+    pub topology_digest: String,
+    pub spec_version: u64,
+    pub source: String,
+}
+
+/// One directed edge as of one reading.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ChannelEdgeRow {
+    pub sender: u32,
+    pub recipient: u32,
+    pub state: String,
+    pub max_capacity: u32,
+    pub max_total_size: u32,
+    pub max_message_size: u32,
+    pub sender_deposit: String,
+    pub recipient_deposit: Option<String>,
+    pub confirmed: Option<bool>,
+}
+
+/// Reading the HRMP channel graph out of `xcm.channel_readings` /
+/// `xcm.channel_snapshots`.
+///
+/// Note what is NOT here: any method returning "when did this channel open".
+/// That is a DIFFERENCE between readings, computed by [`channels::derive_history`]
+/// from what `edge_observations` returns, and never stored — see 0027.
+#[async_trait]
+pub trait ChannelIndex: Send + Sync {
+    /// Every reading on record for this chain, ascending by height. The coverage
+    /// walk needs all of them, so this is deliberately unfiltered; the graph is
+    /// ~2,190 readings/year and the whole of Polkadot's history is ~9,331.
+    async fn readings(&self, chain_id: &str) -> Result<Vec<ChannelReadingRow>, IndexError>;
+
+    /// The newest reading at or before `at`, or the newest of all when `at` is
+    /// `None`. `None` means no reading is on record — which is NOT the same as
+    /// an empty graph, and the endpoint says so.
+    async fn reading_at(
+        &self,
+        chain_id: &str,
+        at: Option<u64>,
+    ) -> Result<Option<ChannelReadingRow>, IndexError>;
+
+    /// The full edge set of one reading, ordered by `(sender, recipient)`.
+    async fn edges_at(
+        &self,
+        chain_id: &str,
+        block_height: u64,
+    ) -> Result<Vec<ChannelEdgeRow>, IndexError>;
+
+    /// One edge's state at EVERY reading, ascending by height — a left join, so
+    /// a reading in which the edge was absent yields `state: None` rather than
+    /// no row. That asymmetry is the whole point: the reading's presence is what
+    /// makes the absence meaningful.
+    async fn edge_observations(
+        &self,
+        chain_id: &str,
+        sender: u32,
+        recipient: u32,
+    ) -> Result<Vec<channels::EdgeObservation>, IndexError>;
+}
+
+#[derive(Default)]
+pub struct MemoryChannelIndex {
+    readings: RwLock<Vec<(String, ChannelReadingRow)>>,
+    edges: RwLock<Vec<(String, u64, ChannelEdgeRow)>>,
+}
+
+impl MemoryChannelIndex {
+    pub fn new() -> Self {
+        Self::default()
+    }
+    pub fn insert_reading(&self, chain_id: &str, row: ChannelReadingRow) {
+        self.readings.write().expect("lock").push((chain_id.into(), row));
+    }
+    pub fn insert_edge(&self, chain_id: &str, block_height: u64, row: ChannelEdgeRow) {
+        self.edges
+            .write()
+            .expect("lock")
+            .push((chain_id.into(), block_height, row));
+    }
+}
+
+#[async_trait]
+impl ChannelIndex for MemoryChannelIndex {
+    async fn readings(&self, chain_id: &str) -> Result<Vec<ChannelReadingRow>, IndexError> {
+        let rows = self.readings.read().map_err(|e| IndexError(e.to_string()))?;
+        let mut out: Vec<ChannelReadingRow> = rows
+            .iter()
+            .filter(|(c, _)| c == chain_id)
+            .map(|(_, r)| r.clone())
+            .collect();
+        out.sort_by_key(|r| r.block_height);
+        Ok(out)
+    }
+
+    async fn reading_at(
+        &self,
+        chain_id: &str,
+        at: Option<u64>,
+    ) -> Result<Option<ChannelReadingRow>, IndexError> {
+        let rows = self.readings(chain_id).await?;
+        Ok(rows
+            .into_iter()
+            .filter(|r| at.is_none_or(|h| r.block_height <= h))
+            .next_back())
+    }
+
+    async fn edges_at(
+        &self,
+        chain_id: &str,
+        block_height: u64,
+    ) -> Result<Vec<ChannelEdgeRow>, IndexError> {
+        let rows = self.edges.read().map_err(|e| IndexError(e.to_string()))?;
+        let mut out: Vec<ChannelEdgeRow> = rows
+            .iter()
+            .filter(|(c, h, _)| c == chain_id && *h == block_height)
+            .map(|(_, _, r)| r.clone())
+            .collect();
+        // The same ordering the Pg backend uses, so `limit`-free listings agree
+        // between backends rather than differing by insertion order.
+        out.sort_by_key(|r| (r.sender, r.recipient));
+        Ok(out)
+    }
+
+    async fn edge_observations(
+        &self,
+        chain_id: &str,
+        sender: u32,
+        recipient: u32,
+    ) -> Result<Vec<channels::EdgeObservation>, IndexError> {
+        let readings = self.readings(chain_id).await?;
+        let edges = self.edges.read().map_err(|e| IndexError(e.to_string()))?;
+        Ok(readings
+            .into_iter()
+            .map(|r| channels::EdgeObservation {
+                block_height: r.block_height,
+                session_index: r.session_index,
+                state: edges
+                    .iter()
+                    .find(|(c, h, e)| {
+                        c == chain_id
+                            && *h == r.block_height
+                            && e.sender == sender
+                            && e.recipient == recipient
+                    })
+                    .map(|(_, _, e)| e.state.clone()),
+            })
+            .collect())
+    }
+}
+
 // -------------------------------------------------------------------- pg impl
 
 #[cfg(feature = "pg")]
@@ -3332,6 +3492,161 @@ pub mod pg {
     use canonical::{CanonicalBlock, CanonicalEvent, CanonicalTransaction, Lineage};
     use chrono::{DateTime, Utc};
     use sqlx::PgPool;
+
+    /// Postgres-backed HRMP channel graph over `xcm.channel_readings` /
+    /// `xcm.channel_snapshots` (Phase 3, slice 16).
+    ///
+    /// Every query here rides an existing key: the two per-reading reads use
+    /// `channel_readings`' primary key `(chain_id, block_height)` and
+    /// `channel_snapshots`' `(chain_id, block_height, …)` prefix, and the
+    /// per-edge walk is the one query that earns 0027's
+    /// `channel_snapshots_edge_idx (chain_id, sender, recipient, block_height)`.
+    /// That index arrives WITH this reader, which is 0019's rule.
+    pub struct PgChannelIndex {
+        pool: PgPool,
+    }
+
+    impl PgChannelIndex {
+        pub fn new(pool: PgPool) -> Self {
+            Self { pool }
+        }
+    }
+
+    #[async_trait]
+    impl super::ChannelIndex for PgChannelIndex {
+        async fn readings(
+            &self,
+            chain_id: &str,
+        ) -> Result<Vec<super::ChannelReadingRow>, IndexError> {
+            let rows: Vec<(i64, i64, i32, i32, String, i64, String)> = sqlx::query_as(
+                "select block_height, session_index, channel_count, open_request_count, \
+                        topology_digest, spec_version, source \
+                 from xcm.channel_readings where chain_id = $1 order by block_height",
+            )
+            .bind(chain_id)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| IndexError(e.to_string()))?;
+            Ok(rows.into_iter().map(reading_row).collect())
+        }
+
+        async fn reading_at(
+            &self,
+            chain_id: &str,
+            at: Option<u64>,
+        ) -> Result<Option<super::ChannelReadingRow>, IndexError> {
+            let row: Option<(i64, i64, i32, i32, String, i64, String)> = sqlx::query_as(
+                "select block_height, session_index, channel_count, open_request_count, \
+                        topology_digest, spec_version, source \
+                 from xcm.channel_readings \
+                 where chain_id = $1 and ($2::bigint is null or block_height <= $2) \
+                 order by block_height desc limit 1",
+            )
+            .bind(chain_id)
+            .bind(at.map(|h| h as i64))
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| IndexError(e.to_string()))?;
+            Ok(row.map(reading_row))
+        }
+
+        async fn edges_at(
+            &self,
+            chain_id: &str,
+            block_height: u64,
+        ) -> Result<Vec<super::ChannelEdgeRow>, IndexError> {
+            let rows: Vec<(i64, i64, String, i64, i64, i64, String, Option<String>, Option<bool>)> =
+                sqlx::query_as(
+                    "select sender, recipient, state, max_capacity, max_total_size, \
+                            max_message_size, sender_deposit::text, recipient_deposit::text, \
+                            confirmed \
+                     from xcm.channel_snapshots \
+                     where chain_id = $1 and block_height = $2 \
+                     order by sender, recipient",
+                )
+                .bind(chain_id)
+                .bind(block_height as i64)
+                .fetch_all(&self.pool)
+                .await
+                .map_err(|e| IndexError(e.to_string()))?;
+            Ok(rows
+                .into_iter()
+                .map(
+                    |(s, r, state, cap, total, msg, sdep, rdep, confirmed)| {
+                        super::ChannelEdgeRow {
+                            sender: s as u32,
+                            recipient: r as u32,
+                            state,
+                            max_capacity: cap as u32,
+                            max_total_size: total as u32,
+                            max_message_size: msg as u32,
+                            sender_deposit: sdep,
+                            recipient_deposit: rdep,
+                            confirmed,
+                        }
+                    },
+                )
+                .collect())
+        }
+
+        async fn edge_observations(
+            &self,
+            chain_id: &str,
+            sender: u32,
+            recipient: u32,
+        ) -> Result<Vec<super::channels::EdgeObservation>, IndexError> {
+            // A LEFT JOIN, and that is the whole design: the READING drives the
+            // row set, so a reading in which this edge was absent still produces
+            // a row, with a null state. An inner join would silently turn "we
+            // looked and it was not there" into "we did not look".
+            let rows: Vec<(i64, i64, Option<String>)> = sqlx::query_as(
+                "select r.block_height, r.session_index, s.state \
+                 from xcm.channel_readings r \
+                 left join xcm.channel_snapshots s \
+                        on s.chain_id = $1 \
+                       and s.block_height = r.block_height \
+                       and s.sender = $2 and s.recipient = $3 \
+                 where r.chain_id = $1 \
+                 order by r.block_height",
+            )
+            .bind(chain_id)
+            .bind(sender as i64)
+            .bind(recipient as i64)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| IndexError(e.to_string()))?;
+            Ok(rows
+                .into_iter()
+                .map(|(h, s, state)| super::channels::EdgeObservation {
+                    block_height: h as u64,
+                    session_index: s as u64,
+                    state,
+                })
+                .collect())
+        }
+    }
+
+    fn reading_row(
+        (height, session, channels, requests, digest, spec, source): (
+            i64,
+            i64,
+            i32,
+            i32,
+            String,
+            i64,
+            String,
+        ),
+    ) -> super::ChannelReadingRow {
+        super::ChannelReadingRow {
+            block_height: height as u64,
+            session_index: session as u64,
+            channel_count: channels as u32,
+            open_request_count: requests as u32,
+            topology_digest: digest,
+            spec_version: spec as u64,
+            source,
+        }
+    }
 
     /// Postgres-backed block index over `core.blocks/transactions/events`.
     /// One transaction per block insert; every row carries lineage
@@ -5995,6 +6310,7 @@ pub struct AppState {
     pub xcm: Arc<dyn XcmIndex>,
     pub coretime: Arc<dyn CoretimeIndex>,
     pub broker: Arc<dyn BrokerIndex>,
+    pub channels: Arc<dyn ChannelIndex>,
     pub parse_account: AccountParser,
 }
 
@@ -6040,6 +6356,11 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/v1/coretime/{chain}/entitlement",
             get(get_coretime_entitlement),
+        )
+        .route("/v1/xcm/{network}/channels", get(get_xcm_channels))
+        .route(
+            "/v1/xcm/{network}/channels/history",
+            get(get_xcm_channel_history),
         )
         .route("/v1/search", get(get_search))
         .route("/v1/domains/{network}/{domain}", get(resolve_domain))
@@ -7102,6 +7423,230 @@ fn coretime_pair<'a>(
         "Entitlement is `pallet-broker`, which lives on the coretime parachain and nowhere else",
     )?;
     Ok((occupancy, entitlement))
+}
+
+/// The one chain in this network that carries the HRMP channel graph.
+///
+/// Refuses on zero or two rather than picking, which is [`coretime_pair`]'s rule
+/// and for the same reason: a graph read from the wrong chain is a WRONG answer
+/// rather than a missing one.
+fn hrmp_chain<'a>(
+    registry: &'a Registry,
+    network: &str,
+) -> Result<&'a registry::ChainConfig, String> {
+    let found = registry.chains_with_module(network, "hrmp");
+    match found.len() {
+        1 => Ok(found[0]),
+        0 => Err(format!(
+            "no chain on network '{network}' declares the `hrmp` module, so the channel graph \
+             cannot be read at all. HRMP channel state lives in the relay's `Hrmp` pallet and \
+             nowhere else — a parachain sees only an abridged view of its own channels"
+        )),
+        n => Err(format!(
+            "{n} chains on network '{network}' declare the `hrmp` module ({}), so the channel \
+             graph is ambiguous. This reader refuses to pick one. Fix the registry seeds",
+            found.iter().map(|c| c.id.as_str()).collect::<Vec<_>>().join(", ")
+        )),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ChannelGraphQuery {
+    /// The graph as of the newest reading at or before this height. Absent means
+    /// the newest reading of all.
+    pub at: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ChannelEdgeQuery {
+    pub sender: Option<u32>,
+    pub recipient: Option<u32>,
+}
+
+/// The HRMP channel graph as of one reading, with the sessions nobody read.
+async fn get_xcm_channels(
+    State(state): State<AppState>,
+    Path(network): Path<String>,
+    Query(q): Query<ChannelGraphQuery>,
+) -> Response {
+    let cfg = match hrmp_chain(&state.registry, &network) {
+        Ok(c) => c,
+        Err(e) => {
+            let answerable: Vec<String> = search::known_networks(&state.registry)
+                .into_iter()
+                .filter(|n| hrmp_chain(&state.registry, n).is_ok())
+                .collect();
+            return error(
+                StatusCode::NOT_FOUND,
+                format!(
+                    "{e}. Networks this endpoint can answer for: {}",
+                    if answerable.is_empty() {
+                        "none".to_string()
+                    } else {
+                        answerable.join(", ")
+                    }
+                ),
+            );
+        }
+    };
+    let ise = |e: IndexError| error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string());
+
+    let all = match state.channels.readings(&cfg.id).await {
+        Ok(r) => r,
+        Err(e) => return ise(e),
+    };
+    let reading = match state.channels.reading_at(&cfg.id, q.at).await {
+        Ok(r) => r,
+        Err(e) => return ise(e),
+    };
+    let edges = match &reading {
+        Some(r) => match state.channels.edges_at(&cfg.id, r.block_height).await {
+            Ok(e) => e,
+            Err(e) => return ise(e),
+        },
+        None => Vec::new(),
+    };
+
+    let unread = channels::unread_intervals(
+        &all.iter()
+            .map(|r| (r.block_height, r.session_index))
+            .collect::<Vec<_>>(),
+    );
+
+    // A cheap integrity check the header exists to make possible: the reading
+    // says how big the graph was, and the detail rows are counted separately. A
+    // disagreement means a partial write survived, and it is reported rather
+    // than smoothed over — in `reads_as` as well as in the boolean, because a
+    // boolean nobody reads is not "loud".
+    let counts_agree = reading
+        .as_ref()
+        .map(|r| (r.channel_count + r.open_request_count) as usize == edges.len());
+
+    // FOUR ARMS, because "nobody read this chain", "no reading covers the height
+    // you asked about", "we read it and the graph was empty" and "here is the
+    // graph" are four different facts that all render as a short payload.
+    let mut reads_as = match (&reading, all.is_empty()) {
+        (None, true) => format!(
+            "NO READING of the HRMP channel graph is on record for '{}'. That is a statement about \
+             OUR INDEX and not about the chain — the graph almost certainly exists. Run \
+             `channels-range {} <from> <to>` to record one reading per session boundary.",
+            cfg.id, cfg.id
+        ),
+        (None, false) => format!(
+            "{} reading(s) are on record for '{}', but none of them is at or before the height you \
+             asked about. The earliest reading is #{}; this endpoint never extrapolates backwards \
+             from a later one.",
+            all.len(),
+            cfg.id,
+            all.first().map(|r| r.block_height).unwrap_or(0)
+        ),
+        (Some(r), _) if r.channel_count == 0 && r.open_request_count == 0 => format!(
+            "Read at #{} (session {}), and the graph was EMPTY — no open channel and no pending \
+             request. That is a reading, not a gap.",
+            r.block_height, r.session_index
+        ),
+        (Some(r), _) => format!(
+            "The graph as read at #{} (session {}): {} open channel(s) and {} pending request(s). \
+             Channel existence changes only at session boundaries, so this is exact for the WHOLE \
+             of session {} — every height inside that session has this graph. It says NOTHING \
+             about any later session: the graph can move at every boundary, and this endpoint does \
+             not extrapolate forward any more than it extrapolates backward.",
+            r.block_height, r.session_index, r.channel_count, r.open_request_count, r.session_index
+        ),
+    };
+
+    // `unread` is a windows(2) walk, so it can only ever describe gaps BETWEEN
+    // readings. Sessions after the last reading are not in it and never can be,
+    // and a sentence pointing at it for them would point at an empty list.
+    if let Some(last) = all.last() {
+        if reading.as_ref().is_some_and(|r| r.block_height == last.block_height) {
+            reads_as.push_str(&format!(
+                " This is the NEWEST reading on record (session {}); every session after it is \
+                 unread, and `coverage.unread` does not list those — it covers only the gaps \
+                 BETWEEN readings.",
+                last.session_index
+            ));
+        }
+    }
+
+    if counts_agree == Some(false) {
+        reads_as.push_str(&format!(
+            " DEFECT: the reading's own header says {} edge(s) but {} detail row(s) are on record. \
+             The two are written in one transaction, so a disagreement means rows were removed \
+             afterwards or the header was written by something other than this pipeline. Treat \
+             every count above as unreliable.",
+            reading
+                .as_ref()
+                .map(|r| r.channel_count + r.open_request_count)
+                .unwrap_or(0),
+            edges.len()
+        ));
+    }
+
+    Json(serde_json::json!({
+        "network": network,
+        "chain": cfg.id,
+        "reading": reading,
+        "edges": edges,
+        "reads_as": reads_as,
+        "coverage": {
+            "readings_on_record": all.len(),
+            "first_reading": all.first().map(|r| serde_json::json!({
+                "block_height": r.block_height, "session_index": r.session_index })),
+            "last_reading": all.last().map(|r| serde_json::json!({
+                "block_height": r.block_height, "session_index": r.session_index })),
+            "unread": unread,
+            "unread_sessions": unread.iter().map(|u| u.sessions).sum::<u64>(),
+            "header_matches_detail": counts_agree,
+            "not_covered": channels::channel_not_covered(),
+        }
+    }))
+    .into_response()
+}
+
+/// One directed edge's open/close history, DERIVED from the readings.
+async fn get_xcm_channel_history(
+    State(state): State<AppState>,
+    Path(network): Path<String>,
+    Query(q): Query<ChannelEdgeQuery>,
+) -> Response {
+    let cfg = match hrmp_chain(&state.registry, &network) {
+        Ok(c) => c,
+        Err(e) => return error(StatusCode::NOT_FOUND, e),
+    };
+    let (Some(sender), Some(recipient)) = (q.sender, q.recipient) else {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "both `sender` and `recipient` are required. A channel is DIRECTIONAL — (A -> B) and \
+             (B -> A) are two separate channels opened, closed and deposited for independently — \
+             so there is no honest way to answer for a pair without being told which direction"
+                .to_string(),
+        );
+    };
+
+    let obs = match state
+        .channels
+        .edge_observations(&cfg.id, sender, recipient)
+        .await
+    {
+        Ok(o) => o,
+        Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    };
+    let history = channels::derive_history(&obs);
+
+    Json(serde_json::json!({
+        "network": network,
+        "chain": cfg.id,
+        "edge": { "sender": sender, "recipient": recipient },
+        "history": history,
+        "coverage": {
+            "derived": "Open and close are the DIFFERENCE between two readings, computed per \
+                        request and never stored. A stored 'channel opened' row would be the one \
+                        copy without lineage.",
+            "not_covered": channels::channel_not_covered(),
+        }
+    }))
+    .into_response()
 }
 
 /// Entitlement purchased vs occupancy realized, over one relay-block window.
@@ -10666,6 +11211,54 @@ pub(crate) mod tests {
         // `backed` row and no inclusion, so it must also prove the delta counts
         // inclusions only.
         let broker = Arc::new(MemoryBrokerIndex::new());
+
+        // ------------------------------------------------- HRMP channel graph
+        // Four readings on ONE chain, built so the interesting cases cannot be
+        // reached by accident:
+        //   session 10 (#100)   — 1000->2034 absent
+        //   session 11 (#2500)  — 1000->2034 REQUESTED
+        //   session 12 (#4900)  — 1000->2034 OPEN
+        //   session 20 (#30000) — 1000->2034 absent again, and EIGHT sessions
+        //                         later, so the close is NOT exactly dated and
+        //                         the coverage list has something real in it.
+        // 2034->1000 is open throughout, which is what makes the directional
+        // assertions bite: a reader that folded the pair would report the
+        // reverse edge's history for the forward one.
+        let channels = Arc::new(MemoryChannelIndex::new());
+        let reading = |height: u64, session: u64, open: u32, requested: u32| ChannelReadingRow {
+            block_height: height,
+            session_index: session,
+            channel_count: open,
+            open_request_count: requested,
+            topology_digest: format!("0x{:064x}", height),
+            spec_version: 2003002,
+            source: "channels-range".into(),
+        };
+        let edge = |sender: u32, recipient: u32, state: &str| ChannelEdgeRow {
+            sender,
+            recipient,
+            state: state.into(),
+            max_capacity: 1000,
+            max_total_size: 102400,
+            max_message_size: 102400,
+            sender_deposit: "100000000000".into(),
+            recipient_deposit: if state == "open" {
+                Some("100000000000".into())
+            } else {
+                None
+            },
+            confirmed: if state == "open" { None } else { Some(true) },
+        };
+        channels.insert_reading("polkadot", reading(100, 10, 1, 0));
+        channels.insert_edge("polkadot", 100, edge(2034, 1000, "open"));
+        channels.insert_reading("polkadot", reading(2500, 11, 1, 1));
+        channels.insert_edge("polkadot", 2500, edge(2034, 1000, "open"));
+        channels.insert_edge("polkadot", 2500, edge(1000, 2034, "requested"));
+        channels.insert_reading("polkadot", reading(4900, 12, 2, 0));
+        channels.insert_edge("polkadot", 4900, edge(2034, 1000, "open"));
+        channels.insert_edge("polkadot", 4900, edge(1000, 2034, "open"));
+        channels.insert_reading("polkadot", reading(30000, 20, 1, 0));
+        channels.insert_edge("polkadot", 30000, edge(2034, 1000, "open"));
         let assign = |core: u32, kind: &str, task: Option<u32>| EntitlementRow {
             core_index: core,
             assignment_index: 0,
@@ -11834,6 +12427,7 @@ pub(crate) mod tests {
             xcm,
             coretime,
             broker,
+            channels,
             parse_account: Arc::new(|s| {
                 adapter_substrate::accounts::parse_account(s).map(|a| a.to_vec())
             }),
@@ -14079,5 +14673,253 @@ pub(crate) mod tests {
             .map(|c| c["id"].as_str().unwrap())
             .collect();
         assert!(ids.contains(&"polkadot") && ids.contains(&"polkadot-asset-hub"));
+    }
+
+    #[tokio::test]
+    async fn the_channel_graph_resolves_through_the_registry_with_no_chain_named() {
+        let app = router(test_state().await);
+
+        // INVARIANT 2: the caller names a NETWORK and never a chain, and the
+        // registry resolves the one chain declaring `hrmp`. If this ever needed
+        // a chain id in the URL, the graph would have stopped being a network
+        // fact.
+        let (status, body) = get_json(&app, "/v1/xcm/polkadot/channels").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["chain"], "polkadot");
+        assert_eq!(body["reading"]["block_height"], 30000, "the NEWEST reading by default");
+        assert_eq!(body["reading"]["session_index"], 20);
+        assert_eq!(body["coverage"]["readings_on_record"], 4);
+        assert_eq!(body["coverage"]["header_matches_detail"], true);
+
+        // The gap between session 12 and session 20 is a VALUE, not a silence.
+        assert_eq!(body["coverage"]["unread_sessions"], 7);
+        assert_eq!(body["coverage"]["unread"][0]["after_session"], 12);
+        assert_eq!(body["coverage"]["unread"][0]["before_session"], 20);
+
+        // `at` selects the newest reading at or before a height, and it must not
+        // extrapolate: asking at #5000 gives the #4900 reading, where the graph
+        // had two channels rather than the one it has now.
+        let (_, at) = get_json(&app, "/v1/xcm/polkadot/channels?at=5000").await;
+        assert_eq!(at["reading"]["block_height"], 4900);
+        assert_eq!(at["edges"].as_array().unwrap().len(), 2);
+
+        // …and asking before the first reading is NOT the same as never having
+        // read: the two say different things.
+        let (_, early) = get_json(&app, "/v1/xcm/polkadot/channels?at=50").await;
+        assert!(early["reading"].is_null());
+        let reads_as = early["reads_as"].as_str().unwrap();
+        assert!(reads_as.contains("none of them is at or before"), "{reads_as}");
+        assert!(
+            !reads_as.contains("NO READING"),
+            "a covered chain with an early `at` must not claim the index is empty: {reads_as}"
+        );
+
+        // A network with no `hrmp` chain 404s rather than serving an empty graph
+        // that reads as "this network has no channels".
+        let (status, _) = get_json(&app, "/v1/xcm/nosuchnetwork/channels").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn an_edge_history_is_directional_and_dates_only_what_the_readings_pin() {
+        let app = router(test_state().await);
+
+        let (status, body) =
+            get_json(&app, "/v1/xcm/polkadot/channels/history?sender=1000&recipient=2034").await;
+        assert_eq!(status, StatusCode::OK);
+        let h = &body["history"];
+        // absent -> requested -> open -> absent
+        assert_eq!(h["transitions"].as_array().unwrap().len(), 3);
+        assert_eq!(h["transitions"][0]["to"], "requested");
+        assert_eq!(h["transitions"][1]["from"], "requested");
+        assert_eq!(h["transitions"][1]["to"], "open");
+
+        // THE CLAIM THIS ENDPOINT EXISTS TO MAKE HONESTLY: the first two changes
+        // sit between adjacent sessions and are pinned to one boundary; the
+        // close spans eight sessions and is not.
+        assert_eq!(h["transitions"][0]["exact"], true);
+        assert_eq!(h["transitions"][1]["exact"], true);
+        assert_eq!(h["transitions"][2]["exact"], false, "sessions 12 -> 20 pins nothing");
+        assert_eq!(h["transitions"][2]["candidate_boundaries"], 8);
+        assert!(
+            h["reads_as"].as_str().unwrap().contains("opened AND CLOSED"),
+            "a gap must warn that a whole channel lifetime can hide in it: {}",
+            h["reads_as"]
+        );
+        assert!(h["state_at_last_reading"].is_null(), "closed by the newest reading");
+
+        // DIRECTIONALITY, and it is asserted as a PROPERTY rather than as
+        // wording: the reverse edge is open throughout and has NO transitions, so
+        // a reader that folded the pair would return this instead.
+        let (_, rev) =
+            get_json(&app, "/v1/xcm/polkadot/channels/history?sender=2034&recipient=1000").await;
+        assert!(
+            rev["history"]["transitions"].as_array().unwrap().is_empty(),
+            "2034 -> 1000 never changed state; folding the pair would have shown 3 changes"
+        );
+        assert_eq!(rev["history"]["state_at_last_reading"], "open");
+
+        // An edge nobody ever saw says so ABOUT THE CHAIN, because the readings
+        // exist — this is the arm that must not read like an unindexed chain.
+        let (_, never) =
+            get_json(&app, "/v1/xcm/polkadot/channels/history?sender=1000&recipient=9999").await;
+        assert_eq!(never["history"]["readings"], 4);
+        assert_eq!(never["history"]["readings_present"], 0);
+        let reads_as = never["history"]["reads_as"].as_str().unwrap();
+        assert!(reads_as.contains("ABSENT"), "{reads_as}");
+        assert!(reads_as.contains("statement about the chain"), "{reads_as}");
+
+        // Refusing a half-specified pair is the point, not friction.
+        let (status, _) = get_json(&app, "/v1/xcm/polkadot/channels/history?sender=1000").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn the_two_arms_that_justify_the_header_table_both_fire() {
+        // THE WHOLE REASON `channel_readings` EXISTS is that "nobody read this
+        // chain" and "we read it and the graph was empty" are different facts
+        // that both render as a short payload. Neither arm is reachable with the
+        // default fixture, and an unreachable arm is one nobody has checked —
+        // this project has caught that four times.
+
+        // ARM 1: no reading at all. A statement about OUR INDEX.
+        let mut state = test_state().await;
+        state.channels = Arc::new(MemoryChannelIndex::new());
+        let (status, body) = get_json(&router(state), "/v1/xcm/polkadot/channels").await;
+        assert_eq!(status, StatusCode::OK, "an unread chain is not an error");
+        assert_eq!(body["coverage"]["readings_on_record"], 0);
+        assert!(body["reading"].is_null());
+        let reads_as = body["reads_as"].as_str().unwrap();
+        assert!(reads_as.contains("NO READING"), "{reads_as}");
+        assert!(reads_as.contains("OUR INDEX"), "{reads_as}");
+        assert!(reads_as.contains("channels-range"), "and it says what to run: {reads_as}");
+
+        // ARM 3: a reading exists and the graph was empty. A statement about the
+        // CHAIN, and it must not borrow arm 1's wording.
+        let mut state = test_state().await;
+        let empty = MemoryChannelIndex::new();
+        empty.insert_reading(
+            "polkadot",
+            ChannelReadingRow {
+                block_height: 7,
+                session_index: 3,
+                channel_count: 0,
+                open_request_count: 0,
+                topology_digest: "0x00".into(),
+                spec_version: 2003002,
+                source: "test".into(),
+            },
+        );
+        state.channels = Arc::new(empty);
+        let (_, body) = get_json(&router(state), "/v1/xcm/polkadot/channels").await;
+        assert_eq!(body["coverage"]["readings_on_record"], 1);
+        assert_eq!(body["edges"].as_array().unwrap().len(), 0);
+        let reads_as = body["reads_as"].as_str().unwrap();
+        assert!(reads_as.contains("graph was EMPTY"), "{reads_as}");
+        assert!(reads_as.contains("not a gap"), "{reads_as}");
+        assert!(!reads_as.contains("NO READING"), "the two arms must not share wording");
+        assert_eq!(
+            body["coverage"]["header_matches_detail"], true,
+            "zero and zero agree"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_header_that_disagrees_with_its_detail_says_so_in_prose() {
+        // The migration calls a header/detail disagreement "a loud defect rather
+        // than a silent one". A boolean buried in `coverage` is not loud, so the
+        // sentence has to carry it too — otherwise the payload cheerfully prints
+        // "3 open channel(s)" beside an empty edge list.
+        let mut state = test_state().await;
+        let lying = MemoryChannelIndex::new();
+        lying.insert_reading(
+            "polkadot",
+            ChannelReadingRow {
+                block_height: 7,
+                session_index: 3,
+                channel_count: 3,
+                open_request_count: 0,
+                topology_digest: "0x00".into(),
+                spec_version: 2003002,
+                source: "test".into(),
+            },
+        );
+        // …and deliberately no edges.
+        state.channels = Arc::new(lying);
+        let (_, body) = get_json(&router(state), "/v1/xcm/polkadot/channels").await;
+        assert_eq!(body["coverage"]["header_matches_detail"], false);
+        let reads_as = body["reads_as"].as_str().unwrap();
+        assert!(reads_as.contains("DEFECT"), "{reads_as}");
+        assert!(
+            reads_as.contains("unreliable"),
+            "the prose must tell the reader not to trust the counts: {reads_as}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_newest_reading_says_that_later_sessions_are_unread() {
+        // The blocker this endpoint shipped with: it claimed the graph was exact
+        // "for every later session with no reading of its own" and pointed at
+        // `coverage.unread`, which structurally cannot contain those sessions.
+        // Extrapolating FORWARD is the same sin as extrapolating backward, which
+        // the arm two above explicitly refuses.
+        let app = router(test_state().await);
+        let (_, body) = get_json(&app, "/v1/xcm/polkadot/channels").await;
+        let reads_as = body["reads_as"].as_str().unwrap();
+        assert!(
+            reads_as.contains("WHOLE of session"),
+            "a reading is exact for its own session: {reads_as}"
+        );
+        assert!(
+            reads_as.contains("NOTHING about any later session"),
+            "…and for no other: {reads_as}"
+        );
+        assert!(
+            reads_as.contains("does not list those"),
+            "and it must say `unread` cannot cover the sessions after the last reading: {reads_as}"
+        );
+        assert!(
+            !reads_as.contains("exact for session"),
+            "the old forward-extrapolating wording must be gone, not merely joined"
+        );
+    }
+
+    #[tokio::test]
+    async fn no_channel_payload_carries_a_message_count_or_a_backlog() {
+        // The schema decision, enforced from OUTSIDE the schema. `msg_count`,
+        // `total_size` and `mqc_head` are message throughput and were measured
+        // moving 16 of 224 rows per session with the topology unchanged; a later
+        // change that helpfully surfaced them would make every reading look like
+        // a topology change, and every other assertion here would stay green.
+        fn key_named(v: &serde_json::Value, names: &[&str]) -> Option<String> {
+            match v {
+                serde_json::Value::Object(m) => {
+                    for (k, inner) in m {
+                        if names.contains(&k.as_str()) {
+                            return Some(k.clone());
+                        }
+                        if let Some(hit) = key_named(inner, names) {
+                            return Some(hit);
+                        }
+                    }
+                    None
+                }
+                serde_json::Value::Array(items) => items.iter().find_map(|i| key_named(i, names)),
+                _ => None,
+            }
+        }
+        let app = router(test_state().await);
+        let banned = ["msg_count", "total_size", "mqc_head", "backlog", "queue_depth"];
+        for uri in [
+            "/v1/xcm/polkadot/channels",
+            "/v1/xcm/polkadot/channels/history?sender=1000&recipient=2034",
+        ] {
+            let (_, body) = get_json(&app, uri).await;
+            assert_eq!(
+                key_named(&body, &banned),
+                None,
+                "{uri} must carry no throughput field"
+            );
+        }
     }
 }

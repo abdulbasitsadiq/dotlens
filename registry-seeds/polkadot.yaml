@@ -51,6 +51,18 @@ modules:
                            # UMP message (messageQueue, origin Ump(Para(id))) and SENDS
                            # every DMP one. Without this the xcm follower never starts
                            # here and half of every journey is invisible.
+  - hrmp                   # the CHANNEL GRAPH, and it is relay-only by construction:
+                           # a parachain sees an `AbridgedHrmpChannel` view of its
+                           # OWN channels through the relay state proof and cannot
+                           # see channels it is not an endpoint of, so the complete
+                           # graph exists on exactly one chain per network. A
+                           # separate module from `xcm` above because that one gates
+                           # a MESSAGE follower that runs on many chains, while this
+                           # gates a state reader that must resolve to exactly one —
+                           # `chains_with_module` returns a set precisely so the
+                           # caller can refuse on zero or two rather than pick.
+                           # (Note the `hrmp_admin` capability above is a different
+                           # mechanism and is still read by nothing.)
   - coretime               # OCCUPANCY only, and it lives HERE rather than on the
                            # Coretime chain: `paraInclusion` names both the para id
                            # and the core index, so which core actually produced a
