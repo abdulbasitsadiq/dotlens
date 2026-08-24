@@ -221,11 +221,20 @@ jobs:
 #
 # The floor is 3 minutes whatever happens: three jobs, each rounded up.
 #
-# `lint` IS UNMEASURED AS THIS LANDS. It is a check-shaped job with no Postgres
-# and no test binaries, so it should sit near `check`'s 0.3 warm / 1.2 cold
-# minutes — but that is an inference and the numbers above are not. Replace this
-# paragraph with the real figure after the first push, the way every other
-# number in this file was.
+# `lint` IS MEASURED, on the cleanup slice's own push (run 32758735224):
+#
+#   test   2m 10s      check  2m 33s      lint  2m 09s      => 9 billable
+#
+# AND THAT RUN IS NOT THE STEADY STATE, which is the more useful half of the
+# measurement. It carried a 59-file rustfmt sweep, so `rust-cache` restored the
+# DEPENDENCY half of its cache and every workspace crate was rebuilt from
+# scratch — `check` went 19s -> 2m 33s on the same cache key. The warm figures
+# above (test 1.9min, check 0.3min) are what a normal push costs; a push that
+# touches most of the workspace costs roughly this instead, whatever the job.
+#
+# So `lint`'s own steady-state number is still not known: 2m 09s is its
+# workspace-cold cost. Expect it near `check`'s 0.3min warm — an inference, and
+# labelled as one, unlike every other figure in this file.
 #
 # ~3 min/push warm against 2,000/month is ~660 pushes; even all-cold is ~330.
 # The whole of this pipeline's verification — five runs, four cold, including
