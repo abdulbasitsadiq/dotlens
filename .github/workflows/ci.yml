@@ -136,48 +136,38 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo check --workspace --no-default-features
 
-  # ---------------------------------------------------------------------------
-  # REMOVABLE BLOCK — see VERIFY-phase3.5-ci.md, "the lint decision".
-  # This job was authored in an environment with no Rust toolchain, so neither
-  # command below has been observed to pass on this tree. Run both locally
-  # BEFORE the first push. If either fails, DELETE THIS JOB rather than
-  # mass-reformatting the workspace — a formatting sweep is its own slice and
-  # must not ride along inside a CI commit.
-  lint:
-    name: fmt + clippy
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@v6
-      - name: toolchain
-        run: rustup show active-toolchain || rustup toolchain install
-      - uses: Swatinem/rust-cache@v2
-        with:
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-      - run: cargo fmt --all --check
-      # Separate steps on purpose: a formatting diff and a lint failure are
-      # different problems and should not be reported as one red job.
-      - run: cargo clippy --workspace --all-features -- -D warnings
-  # ---------------------------------------------------------------------------
-  # END REMOVABLE BLOCK
+# ---------------------------------------------------------------------------
+# THERE IS NO `lint` JOB, AND ITS ABSENCE IS A MEASUREMENT, NOT AN OVERSIGHT.
+# One was authored and deleted before the first push, because on this tree both
+# halves of it are red on arrival (measured 2026-08-24, rust 1.97.1):
+#
+#   cargo fmt --all --check                          992 diff hunks, 58 files
+#   cargo clippy --workspace --all-features -D warn  39 warnings, 5 targets
+#     (14 type_complexity, 4 doc_lazy_continuation, then a long tail)
+#
+# A gate that is red on arrival teaches you to ignore red, which costs more
+# than the gate was worth. The cleanup is its own slice; add this job back in
+# the SAME commit that lands it, never before. VERIFY-phase3.5-ci.md, "the
+# lint decision", carries the full breakdown.
 
 # COST, and whether it is sustainable.
 #
 # Private repos on GitHub Free include 2,000 Linux minutes/month (Pro and Team:
 # 3,000); Linux is the 1x multiplier and service containers add nothing. Billing
-# rounds each JOB up to the whole minute, so three jobs cost three roundings.
+# rounds each JOB up to the whole minute, so two jobs cost two roundings.
 #
 # ESTIMATES, not measurements — the first run's summary page gives the real
 # numbers and this comment should be corrected against them:
-#   warm cache (the common case): test ~6, check ~2, lint ~4  => ~12 min/push
-#   cold cache (Cargo.lock moved, or a new toolchain):         => ~45 min/push
+#   warm cache (the common case): test ~6, check ~2            => ~8 min/push
+#   cold cache (Cargo.lock moved, or a new toolchain):         => ~30 min/push
 # At a slice per session and a handful of pushes each, that is a few hundred
 # minutes a month against 2,000. Sustainable with room to spare.
 #
 # The levers, in the order to reach for them if that stops being true:
 #   1. `paths-ignore` above (already on) — README-only pushes cost nothing.
 #   2. `concurrency` above (already on)  — superseded pushes are cancelled.
-#   3. Drop `lint` to a main-only or scheduled job.
-#   4. Merge the three jobs into one so the toolchain+checkout setup is paid
+#   3. Drop `test` to a main-only or scheduled job, leaving the cheap
+#      `check` gate on every branch push.
+#   4. Merge the two jobs into one so the toolchain+checkout setup is paid
 #      once — costs parallel feedback and makes "which gate failed" harder to
 #      read, which is why it is last.
