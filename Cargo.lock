@@ -1026,6 +1026,7 @@ dependencies = [
  "sim",
  "sqlx",
  "tokio",
+ "tower",
  "tracing",
  "tracing-subscriber",
 ]

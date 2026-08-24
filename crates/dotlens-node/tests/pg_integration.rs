@@ -24,6 +24,11 @@ use std::path::{Path, PathBuf};
 struct TestDb {
     pool: PgPool,
     admin_url: String,
+    /// The throwaway database's OWN url. Kept because the pool-partitioning test
+    /// needs to build `dotlens_node::pools` over it rather than reuse `pool` —
+    /// the whole point there is to exercise the real connect path, session
+    /// settings and all.
+    url: String,
     name: String,
 }
 
@@ -74,7 +79,7 @@ impl TestDb {
             .run(&pool)
             .await
             .expect("migrations");
-        Some(TestDb { pool, admin_url, name })
+        Some(TestDb { pool, admin_url, url, name })
     }
 
     async fn drop_db(self) {
@@ -5163,5 +5168,284 @@ async fn a_halt_upserts_on_its_coordinates_and_stops_blocking_without_being_dele
         "the DB-less backend and Postgres must produce the same report from the same rows"
     );
 
+    db.drop_db().await;
+}
+
+// ---------------------------------------------------------------------------
+// Phase 3.5 operational floor item 3 — the pool split, against real Postgres.
+//
+// Everything the floor-item-3 write-up says about SQLSTATE 57014 was READ FROM
+// THE POSTGRES ERROR-CODE TABLE and never observed. These two tests are what
+// close that gap. They are the only place in the suite where a query is
+// actually cancelled by a `statement_timeout` and the rendered status code is
+// read off a real HTTP response.
+// ---------------------------------------------------------------------------
+
+/// `DOTLENS_SERVING_STATEMENT_TIMEOUT_SECS` is process-global, and these tests
+/// share a process with each other and with every other test in this file.
+///
+/// **The first version of these tests had no lock and one of them failed on the
+/// first run** — it read the default 10s because its neighbour had already
+/// removed the variable between its own set and its own connect. That is a real
+/// property of `std::env`, not a test artefact, and the same shape would bite
+/// anything that reconfigured a pool from the environment at runtime.
+///
+/// So every read of that variable happens under one mutex, held across the
+/// connect that consumes it. The value is baked into `after_connect`'s closure
+/// when the pool is built, so it is safe to remove the variable the moment
+/// `connect` returns — nothing reads it again.
+#[cfg(feature = "pg")]
+static SERVING_TIMEOUT_ENV: std::sync::LazyLock<tokio::sync::Mutex<()>> =
+    std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
+
+/// Connect both pools, optionally overriding the serving statement timeout.
+#[cfg(feature = "pg")]
+async fn connect_pools(url: &str, serving_timeout_secs: Option<u64>) -> dotlens_node::pools::Pools {
+    let _guard = SERVING_TIMEOUT_ENV.lock().await;
+    if let Some(secs) = serving_timeout_secs {
+        std::env::set_var("DOTLENS_SERVING_STATEMENT_TIMEOUT_SECS", secs.to_string());
+    }
+    let pools = dotlens_node::pools::connect(url)
+        .await
+        .expect("both pools connect");
+    if serving_timeout_secs.is_some() {
+        std::env::remove_var("DOTLENS_SERVING_STATEMENT_TIMEOUT_SECS");
+    }
+    pools
+}
+
+/// Build an `AppState` whose every reader goes through ONE pool.
+///
+/// Deliberately not a call into `main.rs`'s `pg_backends` — that is private to
+/// the binary. The duplication is the point of the test rather than a wart: what
+/// is being proven is that a reader on the SERVING pool refuses, so the pool
+/// under the readers has to be chosen by the test.
+#[cfg(feature = "pg")]
+fn app_over(pool: &PgPool, registry: std::sync::Arc<Registry>) -> api::AppState {
+    use std::sync::Arc;
+    api::AppState {
+        registry,
+        blocks: Arc::new(PgBlockIndex::new(pool.clone())),
+        labels: Arc::new(api::pg::PgLabelIndex::new(pool.clone())),
+        balances: Arc::new(api::pg::PgBalanceIndex::new(pool.clone())),
+        gov: Arc::new(api::pg::PgGovIndex::new(pool.clone())),
+        treasury: Arc::new(api::pg::PgTreasuryIndex::new(pool.clone())),
+        bounties: Arc::new(api::pg::PgBountyIndex::new(pool.clone())),
+        assets: Arc::new(api::pg::PgAssetIndex::new(pool.clone())),
+        sim: Arc::new(api::pg::PgSimIndex::new(pool.clone())),
+        xcm_sim: Arc::new(api::pg::PgXcmSimIndex::new(pool.clone())),
+        xcm: Arc::new(api::pg::PgXcmIndex::new(pool.clone())),
+        coretime: Arc::new(api::pg::PgCoretimeIndex::new(pool.clone())),
+        broker: Arc::new(api::pg::PgBrokerIndex::new(pool.clone())),
+        channels: Arc::new(api::pg::PgChannelIndex::new(pool.clone())),
+        parse_account: Arc::new(|s| {
+            adapter_substrate::accounts::parse_account(s).map(|a| a.to_vec())
+        }),
+    }
+}
+
+/// The session settings reach the SESSION, and the two pools carry DIFFERENT
+/// ones over the same URL.
+///
+/// This is the half of the split that nothing else could catch. `after_connect`
+/// is a closure handed to sqlx; if its statement silently failed, were applied
+/// to the wrong connection, or were dropped on a pool recycle, every unit test
+/// in `pools.rs` would still pass — they only ever inspect the SQL string and
+/// the constants, never a live session. `current_setting` is Postgres reporting
+/// what it actually believes, which is the only witness that counts.
+#[tokio::test]
+async fn the_two_pools_carry_different_session_settings_over_one_url() {
+    let Some(db) = TestDb::create().await else {
+        return;
+    };
+
+    // No override: this test pins the numbers that actually SHIP, so a later
+    // edit to the constants has to come past it.
+    let pools = connect_pools(&db.url, None).await;
+
+    let serving: String = sqlx::query_scalar("select current_setting('statement_timeout')")
+        .fetch_one(&pools.serving)
+        .await
+        .expect("serving pool answers");
+    let ingest: String = sqlx::query_scalar("select current_setting('statement_timeout')")
+        .fetch_one(&pools.ingest)
+        .await
+        .expect("ingest pool answers");
+
+    assert_eq!(
+        serving, "10s",
+        "the serving pool's after_connect must reach the session — a split that \
+         does not actually apply its settings looks identical from the outside"
+    );
+    assert_eq!(
+        ingest, "5min",
+        "and ingestion must keep ITS number. If both pools reported the same \
+         value the split would still exist and would be buying nothing"
+    );
+
+    let idle: String =
+        sqlx::query_scalar("select current_setting('idle_in_transaction_session_timeout')")
+            .fetch_one(&pools.serving)
+            .await
+            .expect("serving pool answers");
+    assert_eq!(
+        idle, "10s",
+        "the SECOND statement in the after_connect batch must land too — one \
+         `execute` carries both, so a mistake there drops this one silently"
+    );
+
+    pools.serving.close().await;
+    pools.ingest.close().await;
+    db.drop_db().await;
+}
+
+/// A query cancelled by the serving `statement_timeout` renders **503 with a
+/// refusal**, not 500 with the driver's English.
+///
+/// THE CENTRAL CLAIM OF FLOOR ITEM 3, and until this test nothing had observed
+/// any part of it. The whole chain is exercised end to end on real Postgres:
+/// `statement_timeout` fires → Postgres raises SQLSTATE 57014 →
+/// `From<sqlx::Error>` recognises it → `IndexError::timed_out()` is true →
+/// `read_failure` renders SERVICE_UNAVAILABLE → the body tells the caller to
+/// narrow the window.
+///
+/// **The cancellation is forced by a LOCK, not by a slow query.** An
+/// `access exclusive` lock held on `core.blocks` in another transaction makes
+/// the handler's `select` wait, and `statement_timeout` bounds the total
+/// statement duration including the lock wait — so the cancellation happens on
+/// a schedule the test controls instead of depending on a query being slow
+/// enough on whatever machine is running it. A timing-based version of this
+/// test would be flaky, and a flaky test on the one assertion that proves the
+/// design would eventually be deleted rather than fixed.
+///
+/// It doubles as the evidence for a decision `pools.rs` only argues in prose:
+/// `lock_timeout` is deliberately NOT set, so it is `statement_timeout` that
+/// fires on a lock wait. If someone adds one, this test changes SQLSTATE (55P03,
+/// `lock_not_available`) and goes red rather than quietly reclassifying every
+/// lock wait as a 500.
+#[tokio::test]
+async fn a_query_cancelled_by_the_serving_timeout_is_a_503_refusal_not_a_500_fault() {
+    use tower::util::ServiceExt;
+
+    let Some(db) = TestDb::create().await else {
+        return;
+    };
+
+    // 1s rather than the shipped 10 so this test costs a second, not twenty.
+    let pools = connect_pools(&db.url, Some(1)).await;
+    let applied: String = sqlx::query_scalar("select current_setting('statement_timeout')")
+        .fetch_one(&pools.serving)
+        .await
+        .expect("serving pool answers");
+    assert_eq!(
+        applied, "1s",
+        "the env override has to reach the SESSION, not just be parsed — \
+         otherwise this test would be timing out on the default and would still \
+         look like it proved the override"
+    );
+
+    let registry = std::sync::Arc::new(seeds());
+    let app = api::router(app_over(&pools.serving, registry.clone()));
+
+    // CONTROL FIRST. Without this the test could pass because the route is
+    // broken in some other way; 404 proves the reader reaches the table, runs,
+    // and answers honestly when nothing is in its way.
+    let ok = app
+        .clone()
+        .oneshot(
+            axum::http::Request::builder()
+                .uri("/v1/blocks/polkadot/1")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        ok.status(),
+        axum::http::StatusCode::NOT_FOUND,
+        "uncontended, this read must succeed and report an absent block"
+    );
+
+    // Now block the table. Held on a SEPARATE pool, which is also the shape of
+    // the failure being modelled: something else holding what the reader needs.
+    let mut blocker = db.pool.begin().await.expect("begin blocker txn");
+    sqlx::query("lock table core.blocks in access exclusive mode")
+        .execute(&mut *blocker)
+        .await
+        .expect("take the lock");
+
+    // (a) The driver level: a REAL 57014, classified.
+    let blocks = PgBlockIndex::new(pools.serving.clone());
+    let err = blocks
+        .get("polkadot", 1)
+        .await
+        .expect_err("the read must be cancelled while the table is locked");
+    assert!(
+        err.timed_out(),
+        "a query cancelled by statement_timeout must classify as a timeout, not \
+         as an unknown fault — got: {err}"
+    );
+
+    // (b) The HTTP level: the status a caller actually sees.
+    let refused = app
+        .clone()
+        .oneshot(
+            axum::http::Request::builder()
+                .uri("/v1/blocks/polkadot/1")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = refused.status();
+    let body = axum::body::to_bytes(refused.into_body(), 1_000_000)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).expect("error body is json");
+    let message = json["error"].as_str().unwrap_or_default().to_string();
+
+    assert_eq!(
+        status,
+        axum::http::StatusCode::SERVICE_UNAVAILABLE,
+        "we declined to spend more of a shared resource on one question — that \
+         is a capacity refusal, and a 500 would tell the caller the data is \
+         broken when it is fine. Body was: {message}"
+    );
+    assert!(
+        message.contains(api::TIMEOUT_REFUSAL),
+        "the marker must survive to the body: {message}"
+    );
+    assert!(
+        message.contains("Narrow it and retry"),
+        "the refusal must say what the caller should DO: {message}"
+    );
+    assert!(
+        message.contains("no partial answer"),
+        "a timeout mid-scan is exactly where 'we did not look' could start \
+         reading as 'there is nothing there'; the body must deny that: {message}"
+    );
+
+    // Release, and prove the pool is not wedged: the same request answers
+    // normally again. This is what makes the 503 above a REFUSAL rather than a
+    // breakage — the difference the status code is claiming.
+    blocker.rollback().await.expect("release the lock");
+    let recovered = app
+        .oneshot(
+            axum::http::Request::builder()
+                .uri("/v1/blocks/polkadot/1")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        recovered.status(),
+        axum::http::StatusCode::NOT_FOUND,
+        "once the contention is gone the same question must answer again — a \
+         refusal that did not recover would be a fault after all"
+    );
+
+    pools.serving.close().await;
+    pools.ingest.close().await;
     db.drop_db().await;
 }

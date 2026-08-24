@@ -37,3 +37,10 @@ sqlx = { workspace = true, optional = true }
 async-trait.workspace = true
 hex.workspace = true
 parity-scale-codec.workspace = true
+
+[dev-dependencies]
+# For the pool-partitioning integration test, which drives a REAL axum router
+# (ServiceExt::oneshot) rather than calling a handler's inner function — the
+# claim being proven is about the rendered HTTP status, so nothing short of a
+# real request through the real router proves it.
+tower.workspace = true
