@@ -19,7 +19,10 @@ pub struct BlockIndexSink(pub Arc<dyn BlockIndex>);
 #[async_trait::async_trait]
 impl ingest::decode::CanonicalSink for BlockIndexSink {
     async fn insert(&self, block: canonical::CanonicalBlock) -> Result<(), SinkError> {
-        self.0.insert(block).await.map_err(|e| SinkError(e.to_string()))
+        self.0
+            .insert(block)
+            .await
+            .map_err(|e| SinkError(e.to_string()))
     }
     async fn contains(&self, chain_id: &str, height: u64) -> Result<bool, SinkError> {
         self.0
@@ -44,8 +47,8 @@ pub async fn ingest_fixtures(
     // read + peek everything first, then process in (chain, height) order so
     // the high-water-mark checkpoint never silently drops an out-of-order file
     let mut items: Vec<(String, u64, String, Vec<u8>)> = Vec::new();
-    for entry in std::fs::read_dir(dir)
-        .with_context(|| format!("reading fixtures dir {}", dir.display()))?
+    for entry in
+        std::fs::read_dir(dir).with_context(|| format!("reading fixtures dir {}", dir.display()))?
     {
         let path = entry?.path();
         if !path.extension().map(|x| x == "json").unwrap_or(false) {

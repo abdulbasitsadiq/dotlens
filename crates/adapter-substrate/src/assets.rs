@@ -244,7 +244,8 @@ pub fn deltas_for_assets_event(event: &CanonicalEvent) -> Result<Vec<BalanceDelt
     // than no delta, because it silently credits a different currency.
     let key = || -> Result<String, String> {
         let id = field(data, "asset_id", 0).ok_or_else(|| ctx("no asset_id"))?;
-        asset_key_from_id(&prefix, id).ok_or_else(|| ctx("asset_id is not an integer or a location"))
+        asset_key_from_id(&prefix, id)
+            .ok_or_else(|| ctx("asset_id is not an integer or a location"))
     };
 
     let d = |asset: &str,
@@ -288,8 +289,22 @@ pub fn deltas_for_assets_event(event: &CanonicalEvent) -> Result<Vec<BalanceDelt
                 vec![]
             } else {
                 vec![
-                    d(&asset, owner, amount, true, "transfer_out", Some(destination)),
-                    d(&asset, destination, amount, false, "transfer_in", Some(owner)),
+                    d(
+                        &asset,
+                        owner,
+                        amount,
+                        true,
+                        "transfer_out",
+                        Some(destination),
+                    ),
+                    d(
+                        &asset,
+                        destination,
+                        amount,
+                        false,
+                        "transfer_in",
+                        Some(owner),
+                    ),
                 ]
             }
         }
@@ -322,13 +337,32 @@ pub fn deltas_for_assets_event(event: &CanonicalEvent) -> Result<Vec<BalanceDelt
             vec![d(&asset, who, amount, negative, reason, None)]
         }
         // deliberate ∅ — see the module docs for the reason attached to each
-        "Created" | "ForceCreated" | "Destroyed" | "DestructionStarted"
-        | "AccountsDestroyed" | "ApprovalsDestroyed" | "AssetStatusChanged"
-        | "AssetMinBalanceChanged" | "MetadataSet" | "MetadataCleared" | "TeamChanged"
-        | "OwnerChanged" | "AssetFrozen" | "AssetThawed" | "Frozen" | "Thawed"
-        | "Blocked" | "Touched" | "ApprovedTransfer" | "ApprovalCancelled"
-        | "ReservesUpdated" | "ReservesRemoved" | "IssuedCredit" | "BurnedCredit"
-        | "IssuedDebt" | "BurnedDebt" => vec![],
+        "Created"
+        | "ForceCreated"
+        | "Destroyed"
+        | "DestructionStarted"
+        | "AccountsDestroyed"
+        | "ApprovalsDestroyed"
+        | "AssetStatusChanged"
+        | "AssetMinBalanceChanged"
+        | "MetadataSet"
+        | "MetadataCleared"
+        | "TeamChanged"
+        | "OwnerChanged"
+        | "AssetFrozen"
+        | "AssetThawed"
+        | "Frozen"
+        | "Thawed"
+        | "Blocked"
+        | "Touched"
+        | "ApprovedTransfer"
+        | "ApprovalCancelled"
+        | "ReservesUpdated"
+        | "ReservesRemoved"
+        | "IssuedCredit"
+        | "BurnedCredit"
+        | "IssuedDebt"
+        | "BurnedDebt" => vec![],
         other => {
             return Err(format!(
                 "unknown {pallet} event {other} — assets mapper update required \
@@ -603,8 +637,7 @@ pub fn native_token_from_properties(props: &serde_json::Value) -> AssetMeta {
             other => other.cloned(),
         }
     };
-    let symbol = first(props.get("tokenSymbol"))
-        .and_then(|v| v.as_str().map(str::to_string));
+    let symbol = first(props.get("tokenSymbol")).and_then(|v| v.as_str().map(str::to_string));
     let decimals = first(props.get("tokenDecimals"))
         .and_then(|v| json_u128(&v))
         .and_then(|d| u8::try_from(d).ok());
@@ -634,7 +667,10 @@ pub fn native_token_from_properties(props: &serde_json::Value) -> AssetMeta {
 /// parents 0 is resolved here; anything else goes to the read-time join, which
 /// can consult the registry.
 pub fn metadata_free_asset_key(asset_location: &serde_json::Value) -> Option<String> {
-    let parents = asset_location.get("parents").and_then(json_u128).unwrap_or(0);
+    let parents = asset_location
+        .get("parents")
+        .and_then(json_u128)
+        .unwrap_or(0);
     let interior = asset_location.get("interior")?.as_array()?;
     (parents == 0 && interior.is_empty()).then(|| "native".to_string())
 }
@@ -1084,11 +1120,7 @@ pub fn decode_asset_id_with(
     Ok(crate::frame_decoder::value_to_json(&value.remove_context()))
 }
 
-fn decode_value(
-    info: &StorageEntryInfo,
-    bytes: &[u8],
-    what: &str,
-) -> Result<Value<()>, String> {
+fn decode_value(info: &StorageEntryInfo, bytes: &[u8], what: &str) -> Result<Value<()>, String> {
     let mut cursor = bytes;
     let value = scale_value::scale::decode_as_type(&mut cursor, info.value_type, &info.types)
         .map_err(|e| format!("{what} decode: {e}"))?;
@@ -1226,7 +1258,10 @@ mod tests {
         let key = &deltas_for_assets_event(&foreign).unwrap()[0].asset;
         assert!(key.starts_with("foreign:"), "{key}");
         assert!(key.contains("\"parents\":2"), "{key}");
-        assert!(key.contains("0xdadadada"), "byte arrays render as hex: {key}");
+        assert!(
+            key.contains("0xdadadada"),
+            "byte arrays render as hex: {key}"
+        );
         assert!(key.contains("\"network\":null"), "None collapses: {key}");
     }
 
@@ -1276,12 +1311,14 @@ mod tests {
         // and it is the location `local_asset_location` constructs for the
         // trust-backed instance at pallet index 50 — the join that renders
         // spend 265 as USDT rather than as a bare number
-        assert_eq!(a, canonical_location(&local_asset_location(50, 1984)).unwrap());
+        assert_eq!(
+            a,
+            canonical_location(&local_asset_location(50, 1984)).unwrap()
+        );
         // X1 in both spellings, too
         let x1_flat =
             serde_json::json!({"V3": {"parents": 1, "interior": {"X1": [{"Parachain": [1000]}]}}});
-        let x1_nested =
-            serde_json::json!({"V4": {"parents": 1, "interior": {"X1": [[{"Parachain": [1000]}]]}}});
+        let x1_nested = serde_json::json!({"V4": {"parents": 1, "interior": {"X1": [[{"Parachain": [1000]}]]}}});
         assert_eq!(
             canonical_location(&x1_flat).unwrap(),
             canonical_location(&x1_nested).unwrap()
@@ -1364,11 +1401,11 @@ mod tests {
         );
         assert_eq!(deltas_for_assets_event(&new).unwrap()[0].magnitude, 500);
         // positional form works for both, since the field never moved
-        let positional = ev(
-            "assets.Issued",
-            serde_json::json!([1337, acct(&who), 500]),
+        let positional = ev("assets.Issued", serde_json::json!([1337, acct(&who), 500]));
+        assert_eq!(
+            deltas_for_assets_event(&positional).unwrap()[0].magnitude,
+            500
         );
-        assert_eq!(deltas_for_assets_event(&positional).unwrap()[0].magnitude, 500);
     }
 
     #[test]
@@ -1493,7 +1530,10 @@ mod tests {
     /// reads someone else's balance.
     #[test]
     fn blake2_128_matches_a_known_vector() {
-        assert_eq!(hex::encode(blake2_128(b"")), "cae66941d9efbd404e4d88758ea67670");
+        assert_eq!(
+            hex::encode(blake2_128(b"")),
+            "cae66941d9efbd404e4d88758ea67670"
+        );
         assert_eq!(
             hex::encode(blake2_128(b"abc")),
             "cf4ab791c62b8d2b2109c90275287816"
@@ -1516,7 +1556,10 @@ mod tests {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../fixtures/real/polkadot-asset-hub-19498783/metadata.scale");
         let Ok(blob) = std::fs::read(&path) else {
-            eprintln!("SKIP: real fixture metadata not present at {}", path.display());
+            eprintln!(
+                "SKIP: real fixture metadata not present at {}",
+                path.display()
+            );
             return;
         };
         let pallets = assets_pallets_from_metadata(&blob).expect("walks");
@@ -1581,7 +1624,10 @@ mod tests {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../fixtures/real/polkadot-asset-hub-19498783/metadata.scale");
         let Ok(blob) = std::fs::read(&path) else {
-            eprintln!("SKIP: real fixture metadata not present at {}", path.display());
+            eprintln!(
+                "SKIP: real fixture metadata not present at {}",
+                path.display()
+            );
             return;
         };
         let pallets = assets_pallets_from_metadata(&blob).expect("walks");
@@ -1616,8 +1662,8 @@ mod tests {
         b"USDT".to_vec().encode_to(&mut m);
         m.push(6);
         m.push(0);
-        let meta = decode_asset_metadata(&blob, &tb.storage_prefix, &m)
-            .expect("AssetMetadata decodes");
+        let meta =
+            decode_asset_metadata(&blob, &tb.storage_prefix, &m).expect("AssetMetadata decodes");
         assert_eq!(meta.symbol.as_deref(), Some("USDT"));
         assert_eq!(meta.name.as_deref(), Some("Tether USD"));
         assert_eq!(meta.decimals, Some(6));

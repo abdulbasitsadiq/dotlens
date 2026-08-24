@@ -348,39 +348,140 @@ fn env_flag(key: &str) -> bool {
 enum Command {
     Run,
     Migrate,
-    Backfill { chain: String, from: u64, to: u64, workers: u64 },
-    DecodeRange { chain: String, from: u64, to: u64 },
-    CompactRaw { chain: String, from: u64, to: u64 },
-    VerifyRaw { chain: String, from: u64, to: u64 },
-    CaptureFixture { chain: String, height: u64 },
+    Backfill {
+        chain: String,
+        from: u64,
+        to: u64,
+        workers: u64,
+    },
+    DecodeRange {
+        chain: String,
+        from: u64,
+        to: u64,
+    },
+    CompactRaw {
+        chain: String,
+        from: u64,
+        to: u64,
+    },
+    VerifyRaw {
+        chain: String,
+        from: u64,
+        to: u64,
+    },
+    CaptureFixture {
+        chain: String,
+        height: u64,
+    },
     SyncLabels,
-    VerifyLabels { chain: String },
-    BalancesRange { chain: String, from: u64, to: u64 },
-    AnchorBalance { chain: String, account: String, height: u64 },
-    GovRange { chain: String, from: u64, to: u64 },
-    VotesRange { chain: String, from: u64, to: u64 },
-    TreasuryRange { chain: String, from: u64, to: u64 },
-    BountiesRange { chain: String, from: u64, to: u64 },
-    WhitelistRange { chain: String, from: u64, to: u64 },
-    XcmRange { chain: String, from: u64, to: u64 },
-    XcmCorrelate { chain: String, from: u64, to: u64 },
-    CoretimeRange { chain: String, from: u64, to: u64 },
-    SyncCoreConfig { chain: String, height: Option<u64> },
-    BrokerRange { chain: String, from: u64, to: u64 },
-    SyncBrokerConfig { chain: String, height: Option<u64> },
-    SyncChannels { chain: String, height: Option<u64> },
-    ChannelsRange { chain: String, from: u64, to: u64 },
+    VerifyLabels {
+        chain: String,
+    },
+    BalancesRange {
+        chain: String,
+        from: u64,
+        to: u64,
+    },
+    AnchorBalance {
+        chain: String,
+        account: String,
+        height: u64,
+    },
+    GovRange {
+        chain: String,
+        from: u64,
+        to: u64,
+    },
+    VotesRange {
+        chain: String,
+        from: u64,
+        to: u64,
+    },
+    TreasuryRange {
+        chain: String,
+        from: u64,
+        to: u64,
+    },
+    BountiesRange {
+        chain: String,
+        from: u64,
+        to: u64,
+    },
+    WhitelistRange {
+        chain: String,
+        from: u64,
+        to: u64,
+    },
+    XcmRange {
+        chain: String,
+        from: u64,
+        to: u64,
+    },
+    XcmCorrelate {
+        chain: String,
+        from: u64,
+        to: u64,
+    },
+    CoretimeRange {
+        chain: String,
+        from: u64,
+        to: u64,
+    },
+    SyncCoreConfig {
+        chain: String,
+        height: Option<u64>,
+    },
+    BrokerRange {
+        chain: String,
+        from: u64,
+        to: u64,
+    },
+    SyncBrokerConfig {
+        chain: String,
+        height: Option<u64>,
+    },
+    SyncChannels {
+        chain: String,
+        height: Option<u64>,
+    },
+    ChannelsRange {
+        chain: String,
+        from: u64,
+        to: u64,
+    },
     /// Per-module freshness for one chain. `behind_max` is the operator's
     /// staleness bound and has NO DEFAULT on purpose — see `run_status`.
-    Status { chain: String, behind_max: Option<u64> },
+    Status {
+        chain: String,
+        behind_max: Option<u64>,
+    },
     SyncBountyAccounts,
-    AnchorVoting { chain: String, account: String, track: u32, height: Option<u64> },
+    AnchorVoting {
+        chain: String,
+        account: String,
+        track: u32,
+        height: Option<u64>,
+    },
     SyncTracks,
-    SyncAssets { chain: String, height: Option<u64> },
+    SyncAssets {
+        chain: String,
+        height: Option<u64>,
+    },
     SyncTreasuryAccounts,
-    TreasuryHoldings { chain: String, height: Option<u64> },
-    FetchPreimage { chain: String, hash: String, len: u64, height: Option<u64> },
-    DecodePreimages { chain: String, height: Option<u64> },
+    TreasuryHoldings {
+        chain: String,
+        height: Option<u64>,
+    },
+    FetchPreimage {
+        chain: String,
+        hash: String,
+        len: u64,
+        height: Option<u64>,
+    },
+    DecodePreimages {
+        chain: String,
+        height: Option<u64>,
+    },
     SimulateCall {
         chain: String,
         call_hex: String,
@@ -397,7 +498,10 @@ enum Command {
         opts: SimOptions,
     },
     /// The read side of the Tier 2 queue.
-    SimJobs { chain: String, status: Option<String> },
+    SimJobs {
+        chain: String,
+        status: Option<String>,
+    },
     SimulateXcm {
         chain: String,
         origin_location: String,
@@ -536,7 +640,12 @@ fn parse_args() -> Result<Command> {
                 }
                 None => 1,
             };
-            Ok(Command::Backfill { chain, from, to, workers })
+            Ok(Command::Backfill {
+                chain,
+                from,
+                to,
+                workers,
+            })
         }
         Some("decode-range") => {
             let (chain, from, to) = range("usage: dotlens-node decode-range <chain> <from> <to>")?;
@@ -563,7 +672,8 @@ fn parse_args() -> Result<Command> {
             Ok(Command::VerifyLabels { chain })
         }
         Some("balances-range") => {
-            let (chain, from, to) = range("usage: dotlens-node balances-range <chain> <from> <to>")?;
+            let (chain, from, to) =
+                range("usage: dotlens-node balances-range <chain> <from> <to>")?;
             Ok(Command::BalancesRange { chain, from, to })
         }
         Some("gov-range") => {
@@ -594,8 +704,7 @@ fn parse_args() -> Result<Command> {
             Ok(Command::XcmRange { chain, from, to })
         }
         Some("xcm-correlate") => {
-            let (chain, from, to) =
-                range("usage: dotlens-node xcm-correlate <chain> <from> <to>")?;
+            let (chain, from, to) = range("usage: dotlens-node xcm-correlate <chain> <from> <to>")?;
             Ok(Command::XcmCorrelate { chain, from, to })
         }
         Some("coretime-range") => {
@@ -659,7 +768,12 @@ fn parse_args() -> Result<Command> {
                 Some(h) => Some(h.parse::<u64>().context(usage)?),
                 None => None,
             };
-            Ok(Command::AnchorVoting { chain, account, track, height })
+            Ok(Command::AnchorVoting {
+                chain,
+                account,
+                track,
+                height,
+            })
         }
         Some("sync-tracks") => Ok(Command::SyncTracks),
         Some("sync-treasury-accounts") => Ok(Command::SyncTreasuryAccounts),
@@ -690,7 +804,12 @@ fn parse_args() -> Result<Command> {
                 Some(h) => Some(h.parse::<u64>().context(usage)?),
                 None => None,
             };
-            Ok(Command::FetchPreimage { chain, hash, len, height })
+            Ok(Command::FetchPreimage {
+                chain,
+                hash,
+                len,
+                height,
+            })
         }
         Some("decode-preimages") => {
             let usage = "usage: dotlens-node decode-preimages <chain> [height]";
@@ -712,7 +831,13 @@ fn parse_args() -> Result<Command> {
                 Some(h) => Some(h.parse::<u64>().context(usage)?),
                 None => None,
             };
-            Ok(Command::SimulateCall { chain, call_hex, origin, height, opts })
+            Ok(Command::SimulateCall {
+                chain,
+                call_hex,
+                origin,
+                height,
+                opts,
+            })
         }
         Some("simulate-referendum") => {
             let usage =
@@ -726,7 +851,14 @@ fn parse_args() -> Result<Command> {
                 Some(h) => Some(h.parse::<u64>().context(usage)?),
                 None => None,
             };
-            Ok(Command::SimulateReferendum { chain, class, referendum_id, origin, height, opts })
+            Ok(Command::SimulateReferendum {
+                chain,
+                class,
+                referendum_id,
+                origin,
+                height,
+                opts,
+            })
         }
         Some("simulate-xcm") => {
             let usage =
@@ -740,7 +872,12 @@ fn parse_args() -> Result<Command> {
                 Some(h) => Some(h.parse::<u64>().context(usage)?),
                 None => None,
             };
-            Ok(Command::SimulateXcm { chain, origin_location, program_hex, height })
+            Ok(Command::SimulateXcm {
+                chain,
+                origin_location,
+                program_hex,
+                height,
+            })
         }
         Some("simulate-forwarded") => {
             // BOTH coordinates are required, and that is not verbosity. A
@@ -758,19 +895,31 @@ fn parse_args() -> Result<Command> {
                 Some(h) => Some(h.parse::<u64>().context(usage)?),
                 None => None,
             };
-            Ok(Command::SimulateForwarded { chain, at_block_hash, input_hash, height })
+            Ok(Command::SimulateForwarded {
+                chain,
+                at_block_hash,
+                input_hash,
+                height,
+            })
         }
         Some("sim-jobs") => {
             let usage = "usage: dotlens-node sim-jobs <chain> [status]";
             let chain = args.get(1).context(usage)?.clone();
-            Ok(Command::SimJobs { chain, status: args.get(2).cloned() })
+            Ok(Command::SimJobs {
+                chain,
+                status: args.get(2).cloned(),
+            })
         }
         Some("anchor-balance") => {
             let usage = "usage: dotlens-node anchor-balance <chain> <account> <height>";
             let chain = args.get(1).context(usage)?.clone();
             let account = args.get(2).context(usage)?.clone();
             let height: u64 = args.get(3).context(usage)?.parse().context(usage)?;
-            Ok(Command::AnchorBalance { chain, account, height })
+            Ok(Command::AnchorBalance {
+                chain,
+                account,
+                height,
+            })
         }
         Some(other) => anyhow::bail!("unknown command: {other}"),
     }
@@ -781,8 +930,7 @@ async fn main() -> Result<()> {
     let _ = dotenvy::dotenv(); // load .env if present; real env always wins
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .init();
 
@@ -858,7 +1006,13 @@ async fn main() -> Result<()> {
     ));
 
     // -- one-shot subcommands: run, report, exit ------------------------------
-    if let Command::Backfill { chain, from, to, workers } = &command {
+    if let Command::Backfill {
+        chain,
+        from,
+        to,
+        workers,
+    } = &command
+    {
         anyhow::ensure!(
             backends.persistent,
             "backfill requires DATABASE_URL (raw receipts + checkpoints must persist)"
@@ -879,15 +1033,27 @@ async fn main() -> Result<()> {
         let plain = FsRawStore::new(&raw_root);
         let level: i32 = env_or("RAW_ZSTD_LEVEL", "3").parse().unwrap_or(3);
         let report = dotlens_node::compact::compact_range(
-            &plain, &dotlens_node::compact::NoopReceipts, chain, *from, *to, bucket_blocks, level,
+            &plain,
+            &dotlens_node::compact::NoopReceipts,
+            chain,
+            *from,
+            *to,
+            bucket_blocks,
+            level,
         )
         .await?;
         println!(
             "compact {chain} {from}..={to}: buckets_written={} already_present={} \
 heights_packed={} members={} absent={} unpacked={} raw_bytes={} stored_bytes={} ratio={:.1}x",
-            report.buckets_written, report.buckets_already_present, report.heights_packed,
-            report.members_packed, report.heights_absent.len(), report.heights_unpacked.len(),
-            report.raw_bytes, report.stored_bytes, report.ratio()
+            report.buckets_written,
+            report.buckets_already_present,
+            report.heights_packed,
+            report.members_packed,
+            report.heights_absent.len(),
+            report.heights_unpacked.len(),
+            report.raw_bytes,
+            report.stored_bytes,
+            report.ratio()
         );
         if !report.heights_absent.is_empty() {
             println!(
@@ -913,11 +1079,17 @@ a gap in the raw store, not something compaction may close over",
         println!(
             "verify {chain} {from}..={to}: buckets_checked={} missing={} members_verified={} \
 mismatched={} retirable_heights={}",
-            report.buckets_checked, report.buckets_missing, report.members_verified,
-            report.mismatched.len(), report.retirable_heights
+            report.buckets_checked,
+            report.buckets_missing,
+            report.members_verified,
+            report.mismatched.len(),
+            report.retirable_heights
         );
         if !report.mismatched.is_empty() {
-            println!("  MISMATCHED (do NOT retire these): {:?}", report.mismatched);
+            println!(
+                "  MISMATCHED (do NOT retire these): {:?}",
+                report.mismatched
+            );
             anyhow::bail!("bucket contents disagree with their per-object copies");
         }
         return Ok(());
@@ -945,7 +1117,12 @@ mismatched={} retirable_heights={}",
         );
         return run_balances_range(&registry, &backends, chain, *from, *to).await;
     }
-    if let Command::AnchorBalance { chain, account, height } = &command {
+    if let Command::AnchorBalance {
+        chain,
+        account,
+        height,
+    } = &command
+    {
         return run_anchor_balance(&registry, &backends, raw.as_ref(), chain, account, *height)
             .await;
     }
@@ -1041,9 +1218,21 @@ mismatched={} retirable_heights={}",
         }
         anyhow::bail!("sync-bounty-accounts requires the `pg` feature and DATABASE_URL");
     }
-    if let Command::AnchorVoting { chain, account, track, height } = &command {
+    if let Command::AnchorVoting {
+        chain,
+        account,
+        track,
+        height,
+    } = &command
+    {
         return run_anchor_voting(
-            &registry, &backends, raw.as_ref(), chain, account, *track, *height,
+            &registry,
+            &backends,
+            raw.as_ref(),
+            chain,
+            account,
+            *track,
+            *height,
         )
         .await;
     }
@@ -1077,26 +1266,67 @@ mismatched={} retirable_heights={}",
     if let Command::TreasuryHoldings { chain, height } = &command {
         return run_treasury_holdings(&registry, &backends, raw.as_ref(), chain, *height).await;
     }
-    if let Command::FetchPreimage { chain, hash, len, height } = &command {
-        return run_fetch_preimage(&registry, &backends, raw.as_ref(), chain, hash, *len, *height)
-            .await;
+    if let Command::FetchPreimage {
+        chain,
+        hash,
+        len,
+        height,
+    } = &command
+    {
+        return run_fetch_preimage(
+            &registry,
+            &backends,
+            raw.as_ref(),
+            chain,
+            hash,
+            *len,
+            *height,
+        )
+        .await;
     }
     if let Command::DecodePreimages { chain, height } = &command {
         return run_decode_preimages(&registry, &backends, raw.as_ref(), chain, *height).await;
     }
-    if let Command::SimulateCall { chain, call_hex, origin, height, opts } = &command {
+    if let Command::SimulateCall {
+        chain,
+        call_hex,
+        origin,
+        height,
+        opts,
+    } = &command
+    {
         let bytes = decode_scale_hex(call_hex, "call")?;
         return run_simulate(
-            &registry, &backends, raw.as_ref(), chain, bytes, origin, *height, None, opts,
+            &registry,
+            &backends,
+            raw.as_ref(),
+            chain,
+            bytes,
+            origin,
+            *height,
+            None,
+            opts,
         )
         .await;
     }
     if let Command::SimulateReferendum {
-        chain, class, referendum_id, origin, height, opts,
+        chain,
+        class,
+        referendum_id,
+        origin,
+        height,
+        opts,
     } = &command
     {
         return run_simulate_referendum(
-            &registry, &backends, raw.as_ref(), chain, class, *referendum_id, origin, *height,
+            &registry,
+            &backends,
+            raw.as_ref(),
+            chain,
+            class,
+            *referendum_id,
+            origin,
+            *height,
             opts,
         )
         .await;
@@ -1104,16 +1334,41 @@ mismatched={} retirable_heights={}",
     if let Command::SimJobs { chain, status } = &command {
         return run_sim_jobs(&backends, chain, status.as_deref()).await;
     }
-    if let Command::SimulateXcm { chain, origin_location, program_hex, height } = &command {
+    if let Command::SimulateXcm {
+        chain,
+        origin_location,
+        program_hex,
+        height,
+    } = &command
+    {
         let bytes = decode_scale_hex(program_hex, "program")?;
         return run_simulate_xcm(
-            &registry, &backends, raw.as_ref(), chain, origin_location, bytes, *height, None,
+            &registry,
+            &backends,
+            raw.as_ref(),
+            chain,
+            origin_location,
+            bytes,
+            *height,
+            None,
         )
         .await;
     }
-    if let Command::SimulateForwarded { chain, at_block_hash, input_hash, height } = &command {
+    if let Command::SimulateForwarded {
+        chain,
+        at_block_hash,
+        input_hash,
+        height,
+    } = &command
+    {
         return run_simulate_forwarded(
-            &registry, &backends, raw.as_ref(), chain, at_block_hash, input_hash, *height,
+            &registry,
+            &backends,
+            raw.as_ref(),
+            chain,
+            at_block_hash,
+            input_hash,
+            *height,
         )
         .await;
     }
@@ -1140,12 +1395,9 @@ mismatched={} retirable_heights={}",
         // the treasury ACCOUNT list, derived from the same metadata the labels
         // came from — so a chain that gains a treasury pallet contributes its
         // pot on the next start, with nothing typed by hand
-        let ta = dotlens_node::assets_pg::sync_treasury_accounts(
-            pool,
-            registry.as_ref(),
-            raw.as_ref(),
-        )
-        .await?;
+        let ta =
+            dotlens_node::assets_pg::sync_treasury_accounts(pool, registry.as_ref(), raw.as_ref())
+                .await?;
         tracing::info!(
             pots = ta.pots,
             seeded = ta.seeded,
@@ -1156,12 +1408,9 @@ mismatched={} retirable_heights={}",
         // is where bounty money actually sits. Runs here rather than only on
         // demand because the list has to grow as bounties are created, and
         // because holdings sweeps read whatever is in the table.
-        let ba = dotlens_node::bounties_pg::sync_bounty_accounts(
-            pool,
-            registry.as_ref(),
-            raw.as_ref(),
-        )
-        .await?;
+        let ba =
+            dotlens_node::bounties_pg::sync_bounty_accounts(pool, registry.as_ref(), raw.as_ref())
+                .await?;
         tracing::info!(
             accounts = ba.accounts,
             deactivated = ba.deactivated,
@@ -1186,7 +1435,11 @@ mismatched={} retirable_heights={}",
     .await?;
     tracing::info!(
         processed,
-        indexed = backends.blocks.count().await.map_err(|e| anyhow::anyhow!(e))?,
+        indexed = backends
+            .blocks
+            .count()
+            .await
+            .map_err(|e| anyhow::anyhow!(e))?,
         "fixture ingestion complete"
     );
 
@@ -1269,9 +1522,8 @@ fn spawn_live_followers(
         tracing::warn!("LIVE_INGEST=1 but no DATABASE_URL — refusing to live-ingest into memory");
         return;
     }
-    let poll = std::time::Duration::from_secs(
-        env_or("POLL_INTERVAL_SECS", "6").parse().unwrap_or(6),
-    );
+    let poll =
+        std::time::Duration::from_secs(env_or("POLL_INTERVAL_SECS", "6").parse().unwrap_or(6));
     let now = chrono::Utc::now();
     for chain in registry.chains() {
         let live = chain.status_at(now) == Some(registry::LifecycleStatus::Live);
@@ -1416,9 +1668,8 @@ fn spawn_decode_followers(
         tracing::warn!("DECODE_FOLLOW=1 but no DATABASE_URL — refusing to decode into memory");
         return;
     }
-    let poll = std::time::Duration::from_secs(
-        env_or("POLL_INTERVAL_SECS", "6").parse().unwrap_or(6),
-    );
+    let poll =
+        std::time::Duration::from_secs(env_or("POLL_INTERVAL_SECS", "6").parse().unwrap_or(6));
     for chain in registry.chains() {
         if !chain.has_module("blocks") {
             continue;
@@ -1478,10 +1729,16 @@ async fn run_capture_fixture(registry: &Registry, chain: &str, height: u64) -> R
     let cfg = registry
         .chain(chain)
         .with_context(|| format!("unknown chain: {chain}"))?;
-    let source = SubstrateSource::new(&cfg.id, cfg.endpoints.rpc.clone())
+    let source =
+        SubstrateSource::new(&cfg.id, cfg.endpoints.rpc.clone()).map_err(|e| anyhow::anyhow!(e))?;
+    let fetched = source
+        .fetch_block(height)
+        .await
         .map_err(|e| anyhow::anyhow!(e))?;
-    let fetched = source.fetch_block(height).await.map_err(|e| anyhow::anyhow!(e))?;
-    let metadata = source.metadata_at(height).await.map_err(|e| anyhow::anyhow!(e))?;
+    let metadata = source
+        .metadata_at(height)
+        .await
+        .map_err(|e| anyhow::anyhow!(e))?;
 
     let dir = std::path::PathBuf::from(env_or("FIXTURES_REAL_PATH", "fixtures/real"))
         .join(format!("{}-{height}", cfg.id));
@@ -1522,14 +1779,17 @@ async fn run_verify_labels(registry: &Registry, backends: &Backends, chain: &str
     let cfg = registry
         .chain(chain)
         .with_context(|| format!("unknown chain: {chain}"))?;
-    let source = SubstrateSource::new(&cfg.id, cfg.endpoints.rpc.clone())
-        .map_err(|e| anyhow::anyhow!(e))?;
+    let source =
+        SubstrateSource::new(&cfg.id, cfg.endpoints.rpc.clone()).map_err(|e| anyhow::anyhow!(e))?;
     let height = source
         .finalized_height()
         .await
         .map_err(|e| anyhow::anyhow!(e))?;
     // one hash for the whole probe batch (avoid N+1 chain_getBlockHash)
-    let at_hash = source.block_hash(height).await.map_err(|e| anyhow::anyhow!(e))?;
+    let at_hash = source
+        .block_hash(height)
+        .await
+        .map_err(|e| anyhow::anyhow!(e))?;
 
     let rows = dotlens_node::labels::labels_for_chain(pool, &cfg.id).await?;
     anyhow::ensure!(
@@ -1588,9 +1848,8 @@ fn spawn_tip_followers(
         tracing::warn!("TIP_FOLLOW=1 but no DATABASE_URL — refusing to track tips in memory");
         return;
     }
-    let poll = std::time::Duration::from_secs(
-        env_or("TIP_POLL_INTERVAL_SECS", "3").parse().unwrap_or(3),
-    );
+    let poll =
+        std::time::Duration::from_secs(env_or("TIP_POLL_INTERVAL_SECS", "3").parse().unwrap_or(3));
     let now = chrono::Utc::now();
     for chain in registry.chains() {
         let live = chain.status_at(now) == Some(registry::LifecycleStatus::Live);
@@ -1605,7 +1864,9 @@ fn spawn_tip_followers(
             }
         };
         let decoder = SubstrateFrameDecoder::new(chain.ss58_prefix.unwrap_or(42));
-        let Some(pool) = backends.pool.clone() else { continue };
+        let Some(pool) = backends.pool.clone() else {
+            continue;
+        };
         let chain_id = chain.id.clone();
         let backends = backends.clone();
         let raw = raw.clone();
@@ -1660,9 +1921,8 @@ fn spawn_balances_followers(registry: &Arc<Registry>, backends: &Arc<Backends>) 
     {
         use adapter_substrate::balances::SubstrateDeltaMapper;
 
-        let poll = std::time::Duration::from_secs(
-            env_or("POLL_INTERVAL_SECS", "6").parse().unwrap_or(6),
-        );
+        let poll =
+            std::time::Duration::from_secs(env_or("POLL_INTERVAL_SECS", "6").parse().unwrap_or(6));
         for chain in registry.chains() {
             if !chain.has_module("balances") {
                 continue;
@@ -1671,7 +1931,9 @@ fn spawn_balances_followers(registry: &Arc<Registry>, backends: &Arc<Backends>) 
                 tracing::debug!(chain = %chain.id, "no delta mapper for this family — skipped");
                 continue;
             }
-            let Some(pool) = backends.pool.clone() else { continue };
+            let Some(pool) = backends.pool.clone() else {
+                continue;
+            };
             let chain_id = chain.id.clone();
             let backends = backends.clone();
             tokio::spawn(async move {
@@ -1710,9 +1972,8 @@ fn spawn_gov_followers(registry: &Arc<Registry>, backends: &Arc<Backends>) {
     {
         use adapter_substrate::gov::SubstrateGovMapper;
 
-        let poll = std::time::Duration::from_secs(
-            env_or("POLL_INTERVAL_SECS", "6").parse().unwrap_or(6),
-        );
+        let poll =
+            std::time::Duration::from_secs(env_or("POLL_INTERVAL_SECS", "6").parse().unwrap_or(6));
         for chain in registry.chains() {
             if !chain.has_module("governance") {
                 continue;
@@ -1721,7 +1982,9 @@ fn spawn_gov_followers(registry: &Arc<Registry>, backends: &Arc<Backends>) {
                 tracing::debug!(chain = %chain.id, "no gov mapper for this family — skipped");
                 continue;
             }
-            let Some(pool) = backends.pool.clone() else { continue };
+            let Some(pool) = backends.pool.clone() else {
+                continue;
+            };
             let chain_id = chain.id.clone();
             let backends = backends.clone();
             tokio::spawn(async move {
@@ -1757,7 +2020,10 @@ async fn run_gov_range(
         "no gov mapper for family {:?}",
         cfg.family
     );
-    let pool = backends.pool.as_ref().context("gov-range requires DATABASE_URL")?;
+    let pool = backends
+        .pool
+        .as_ref()
+        .context("gov-range requires DATABASE_URL")?;
     let source = dotlens_node::balances_pg::PgEventSource::new(pool.clone());
     let sink = dotlens_node::gov_pg::PgTimelineSink::new(pool.clone());
     let deps = ingest::gov::GovDeps {
@@ -1798,9 +2064,8 @@ fn spawn_votes_followers(registry: &Arc<Registry>, backends: &Arc<Backends>) {
     {
         use adapter_substrate::votes::SubstrateVoteMapper;
 
-        let poll = std::time::Duration::from_secs(
-            env_or("POLL_INTERVAL_SECS", "6").parse().unwrap_or(6),
-        );
+        let poll =
+            std::time::Duration::from_secs(env_or("POLL_INTERVAL_SECS", "6").parse().unwrap_or(6));
         for chain in registry.chains() {
             if !chain.has_module("governance") {
                 continue;
@@ -1809,7 +2074,9 @@ fn spawn_votes_followers(registry: &Arc<Registry>, backends: &Arc<Backends>) {
                 tracing::debug!(chain = %chain.id, "no votes mapper for this family — skipped");
                 continue;
             }
-            let Some(pool) = backends.pool.clone() else { continue };
+            let Some(pool) = backends.pool.clone() else {
+                continue;
+            };
             let chain_id = chain.id.clone();
             let backends = backends.clone();
             tokio::spawn(async move {
@@ -1845,7 +2112,10 @@ async fn run_votes_range(
         "no votes mapper for family {:?}",
         cfg.family
     );
-    let pool = backends.pool.as_ref().context("votes-range requires DATABASE_URL")?;
+    let pool = backends
+        .pool
+        .as_ref()
+        .context("votes-range requires DATABASE_URL")?;
     let source = dotlens_node::balances_pg::PgEventSource::new(pool.clone());
     let sink = dotlens_node::votes_pg::PgVoteSink::new(pool.clone());
     let deps = ingest::votes::VotesDeps {
@@ -1895,14 +2165,20 @@ async fn run_anchor_voting(
     let account_id = accounts::parse_account(account)
         .map_err(|e| anyhow::anyhow!("bad account '{account}': {e}"))?;
     let track_u16 = u16::try_from(track).context("track id must fit in u16")?;
-    let source = SubstrateSource::new(&cfg.id, cfg.endpoints.rpc.clone())
-        .map_err(|e| anyhow::anyhow!(e))?;
+    let source =
+        SubstrateSource::new(&cfg.id, cfg.endpoints.rpc.clone()).map_err(|e| anyhow::anyhow!(e))?;
 
     let height = match height {
         Some(h) => h,
-        None => source.finalized_height().await.map_err(|e| anyhow::anyhow!(e))?,
+        None => source
+            .finalized_height()
+            .await
+            .map_err(|e| anyhow::anyhow!(e))?,
     };
-    let hash = source.block_hash(height).await.map_err(|e| anyhow::anyhow!(e))?;
+    let hash = source
+        .block_hash(height)
+        .await
+        .map_err(|e| anyhow::anyhow!(e))?;
     let spec = source
         .runtime_version_at(hash)
         .await
@@ -1914,7 +2190,10 @@ async fn run_anchor_voting(
     let metadata = match raw.get(&meta_key) {
         Ok(blob) => blob,
         Err(raw_store::RawStoreError::NotFound(_)) => {
-            let blob = source.metadata_at(height).await.map_err(|e| anyhow::anyhow!(e))?;
+            let blob = source
+                .metadata_at(height)
+                .await
+                .map_err(|e| anyhow::anyhow!(e))?;
             raw.put(&meta_key, &blob, "anchor-voting")?;
             tracing::info!(chain = %cfg.id, spec, "metadata archived while anchoring votes");
             blob
@@ -1996,9 +2275,8 @@ fn spawn_treasury_followers(registry: &Arc<Registry>, backends: &Arc<Backends>) 
     {
         use adapter_substrate::treasury::SubstrateTreasuryMapper;
 
-        let poll = std::time::Duration::from_secs(
-            env_or("POLL_INTERVAL_SECS", "6").parse().unwrap_or(6),
-        );
+        let poll =
+            std::time::Duration::from_secs(env_or("POLL_INTERVAL_SECS", "6").parse().unwrap_or(6));
         for chain in registry.chains() {
             if !chain.has_module("treasury") {
                 continue;
@@ -2007,7 +2285,9 @@ fn spawn_treasury_followers(registry: &Arc<Registry>, backends: &Arc<Backends>) 
                 tracing::debug!(chain = %chain.id, "no treasury mapper for this family — skipped");
                 continue;
             }
-            let Some(pool) = backends.pool.clone() else { continue };
+            let Some(pool) = backends.pool.clone() else {
+                continue;
+            };
             let chain_id = chain.id.clone();
             let backends = backends.clone();
             tokio::spawn(async move {
@@ -2095,9 +2375,8 @@ fn spawn_bounties_followers(
     {
         use adapter_substrate::bounties::SubstrateBountyMapper;
 
-        let poll = std::time::Duration::from_secs(
-            env_or("POLL_INTERVAL_SECS", "6").parse().unwrap_or(6),
-        );
+        let poll =
+            std::time::Duration::from_secs(env_or("POLL_INTERVAL_SECS", "6").parse().unwrap_or(6));
         for chain in registry.chains() {
             if !chain.has_module("treasury") {
                 continue;
@@ -2106,7 +2385,9 @@ fn spawn_bounties_followers(
                 tracing::debug!(chain = %chain.id, "no bounty mapper for this family — skipped");
                 continue;
             }
-            let Some(pool) = backends.pool.clone() else { continue };
+            let Some(pool) = backends.pool.clone() else {
+                continue;
+            };
             let chain_id = chain.id.clone();
             let backends = backends.clone();
             let raw = raw.clone();
@@ -2230,9 +2511,8 @@ fn spawn_whitelist_followers(registry: &Arc<Registry>, backends: &Arc<Backends>)
     {
         use adapter_substrate::whitelist::SubstrateWhitelistMapper;
 
-        let poll = std::time::Duration::from_secs(
-            env_or("POLL_INTERVAL_SECS", "6").parse().unwrap_or(6),
-        );
+        let poll =
+            std::time::Duration::from_secs(env_or("POLL_INTERVAL_SECS", "6").parse().unwrap_or(6));
         for chain in registry.chains() {
             if !chain.has_module("governance") {
                 continue;
@@ -2241,7 +2521,9 @@ fn spawn_whitelist_followers(registry: &Arc<Registry>, backends: &Arc<Backends>)
                 tracing::debug!(chain = %chain.id, "no whitelist mapper for this family — skipped");
                 continue;
             }
-            let Some(pool) = backends.pool.clone() else { continue };
+            let Some(pool) = backends.pool.clone() else {
+                continue;
+            };
             let chain_id = chain.id.clone();
             let backends = backends.clone();
             tokio::spawn(async move {
@@ -2283,9 +2565,8 @@ fn spawn_xcm_followers(registry: &Arc<Registry>, backends: &Arc<Backends>) {
     {
         use adapter_substrate::xcm::SubstrateXcmMapper;
 
-        let poll = std::time::Duration::from_secs(
-            env_or("POLL_INTERVAL_SECS", "6").parse().unwrap_or(6),
-        );
+        let poll =
+            std::time::Duration::from_secs(env_or("POLL_INTERVAL_SECS", "6").parse().unwrap_or(6));
         for chain in registry.chains() {
             if !chain.has_module("xcm") {
                 continue;
@@ -2294,7 +2575,9 @@ fn spawn_xcm_followers(registry: &Arc<Registry>, backends: &Arc<Backends>) {
                 tracing::debug!(chain = %chain.id, "no xcm mapper for this family — skipped");
                 continue;
             }
-            let Some(pool) = backends.pool.clone() else { continue };
+            let Some(pool) = backends.pool.clone() else {
+                continue;
+            };
             let chain_id = chain.id.clone();
             let backends = backends.clone();
             tokio::spawn(async move {
@@ -2339,9 +2622,8 @@ fn spawn_coretime_followers(registry: &Arc<Registry>, backends: &Arc<Backends>) 
     {
         use adapter_substrate::coretime::SubstrateOccupancyMapper;
 
-        let poll = std::time::Duration::from_secs(
-            env_or("POLL_INTERVAL_SECS", "6").parse().unwrap_or(6),
-        );
+        let poll =
+            std::time::Duration::from_secs(env_or("POLL_INTERVAL_SECS", "6").parse().unwrap_or(6));
         for chain in registry.chains() {
             if !chain.has_module("coretime") {
                 continue;
@@ -2350,7 +2632,9 @@ fn spawn_coretime_followers(registry: &Arc<Registry>, backends: &Arc<Backends>) 
                 tracing::debug!(chain = %chain.id, "no coretime mapper for this family — skipped");
                 continue;
             }
-            let Some(pool) = backends.pool.clone() else { continue };
+            let Some(pool) = backends.pool.clone() else {
+                continue;
+            };
             let chain_id = chain.id.clone();
             let backends = backends.clone();
             tokio::spawn(async move {
@@ -2402,9 +2686,8 @@ fn spawn_broker_followers(registry: &Arc<Registry>, backends: &Arc<Backends>) {
     {
         use adapter_substrate::broker::SubstrateBrokerMapper;
 
-        let poll = std::time::Duration::from_secs(
-            env_or("POLL_INTERVAL_SECS", "6").parse().unwrap_or(6),
-        );
+        let poll =
+            std::time::Duration::from_secs(env_or("POLL_INTERVAL_SECS", "6").parse().unwrap_or(6));
         for chain in registry.chains() {
             if !chain.has_module("broker") {
                 continue;
@@ -2413,7 +2696,9 @@ fn spawn_broker_followers(registry: &Arc<Registry>, backends: &Arc<Backends>) {
                 tracing::debug!(chain = %chain.id, "no broker mapper for this family — skipped");
                 continue;
             }
-            let Some(pool) = backends.pool.clone() else { continue };
+            let Some(pool) = backends.pool.clone() else {
+                continue;
+            };
             let chain_id = chain.id.clone();
             let backends = backends.clone();
             tokio::spawn(async move {
@@ -2441,9 +2726,7 @@ fn spawn_broker_followers(registry: &Arc<Registry>, backends: &Arc<Backends>) {
 #[cfg_attr(not(feature = "pg"), allow(unused_variables))]
 fn spawn_xcm_correlate_followers(registry: &Arc<Registry>, backends: &Arc<Backends>) {
     if !env_flag("XCM_CORRELATE_FOLLOW") {
-        tracing::info!(
-            "xcm correlate follower disabled (set XCM_CORRELATE_FOLLOW=1 to enable)"
-        );
+        tracing::info!("xcm correlate follower disabled (set XCM_CORRELATE_FOLLOW=1 to enable)");
         return;
     }
     if !backends.persistent {
@@ -2454,9 +2737,8 @@ fn spawn_xcm_correlate_followers(registry: &Arc<Registry>, backends: &Arc<Backen
     {
         use adapter_substrate::xcm_correlate::SubstrateXcmCorrelator;
 
-        let poll = std::time::Duration::from_secs(
-            env_or("POLL_INTERVAL_SECS", "6").parse().unwrap_or(6),
-        );
+        let poll =
+            std::time::Duration::from_secs(env_or("POLL_INTERVAL_SECS", "6").parse().unwrap_or(6));
         for chain in registry.chains() {
             if !chain.has_module("xcm") {
                 continue;
@@ -2465,7 +2747,9 @@ fn spawn_xcm_correlate_followers(registry: &Arc<Registry>, backends: &Arc<Backen
                 tracing::debug!(chain = %chain.id, "no xcm correlator for this family — skipped");
                 continue;
             }
-            let Some(pool) = backends.pool.clone() else { continue };
+            let Some(pool) = backends.pool.clone() else {
+                continue;
+            };
             let chain_id = chain.id.clone();
             let backends = backends.clone();
             tokio::spawn(async move {
@@ -2555,7 +2839,10 @@ async fn run_xcm_range(
         "no xcm mapper for family {:?}",
         cfg.family
     );
-    let pool = backends.pool.as_ref().context("xcm-range requires DATABASE_URL")?;
+    let pool = backends
+        .pool
+        .as_ref()
+        .context("xcm-range requires DATABASE_URL")?;
     let source = dotlens_node::balances_pg::PgEventSource::new(pool.clone());
     let sink = dotlens_node::xcm_pg::PgXcmSink::new(pool.clone());
     let deps = ingest::xcm::XcmDeps {
@@ -2665,13 +2952,19 @@ async fn run_sync_core_config(
         "{chain} does not declare the `coretime` module — the scheduler's core count is relay \
          host configuration and a parachain has none"
     );
-    let source = SubstrateSource::new(&cfg.id, cfg.endpoints.rpc.clone())
-        .map_err(|e| anyhow::anyhow!(e))?;
+    let source =
+        SubstrateSource::new(&cfg.id, cfg.endpoints.rpc.clone()).map_err(|e| anyhow::anyhow!(e))?;
     let height = match height {
         Some(h) => h,
-        None => source.finalized_height().await.map_err(|e| anyhow::anyhow!(e))?,
+        None => source
+            .finalized_height()
+            .await
+            .map_err(|e| anyhow::anyhow!(e))?,
     };
-    let hash = source.block_hash(height).await.map_err(|e| anyhow::anyhow!(e))?;
+    let hash = source
+        .block_hash(height)
+        .await
+        .map_err(|e| anyhow::anyhow!(e))?;
     let spec = source
         .runtime_version_at(hash)
         .await
@@ -2683,7 +2976,10 @@ async fn run_sync_core_config(
     let metadata = match raw.get(&meta_key) {
         Ok(blob) => blob,
         Err(raw_store::RawStoreError::NotFound(_)) => {
-            let blob = source.metadata_at(height).await.map_err(|e| anyhow::anyhow!(e))?;
+            let blob = source
+                .metadata_at(height)
+                .await
+                .map_err(|e| anyhow::anyhow!(e))?;
             raw.put(&meta_key, &blob, "sync-core-config")?;
             tracing::info!(chain = %cfg.id, spec, "metadata archived while reading core config");
             blob
@@ -2830,13 +3126,19 @@ async fn run_sync_broker_config(
         "{chain} does not declare the `broker` module — `Broker.Status` is the coretime market's \
          own state and no other chain has one"
     );
-    let source = SubstrateSource::new(&cfg.id, cfg.endpoints.rpc.clone())
-        .map_err(|e| anyhow::anyhow!(e))?;
+    let source =
+        SubstrateSource::new(&cfg.id, cfg.endpoints.rpc.clone()).map_err(|e| anyhow::anyhow!(e))?;
     let height = match height {
         Some(h) => h,
-        None => source.finalized_height().await.map_err(|e| anyhow::anyhow!(e))?,
+        None => source
+            .finalized_height()
+            .await
+            .map_err(|e| anyhow::anyhow!(e))?,
     };
-    let hash = source.block_hash(height).await.map_err(|e| anyhow::anyhow!(e))?;
+    let hash = source
+        .block_hash(height)
+        .await
+        .map_err(|e| anyhow::anyhow!(e))?;
     let spec = source
         .runtime_version_at(hash)
         .await
@@ -2849,7 +3151,10 @@ async fn run_sync_broker_config(
     let metadata = match raw.get(&meta_key) {
         Ok(blob) => blob,
         Err(raw_store::RawStoreError::NotFound(_)) => {
-            let blob = source.metadata_at(height).await.map_err(|e| anyhow::anyhow!(e))?;
+            let blob = source
+                .metadata_at(height)
+                .await
+                .map_err(|e| anyhow::anyhow!(e))?;
             raw.put(&meta_key, &blob, "sync-broker-config")?;
             tracing::info!(chain = %cfg.id, spec, "metadata archived while reading broker config");
             blob
@@ -3200,7 +3505,11 @@ async fn run_sync_channels(
     println!(
         "channel graph {chain} @#{height} (session {session_index}, spec {spec}): \
          {open} open channel(s), {pending} pending request(s), digest {digest}{}",
-        if recorded { "" } else { "  [already on record]" }
+        if recorded {
+            ""
+        } else {
+            "  [already on record]"
+        }
     );
     println!(
         "  The reading DATES the graph. Channel existence changes only at session boundaries, so \
@@ -3364,11 +3673,11 @@ async fn run_channels_range(
             .runtime_version_at(hash)
             .await
             .map_err(|e| anyhow::anyhow!(e))?;
-        if !indexes.contains_key(&spec) {
+        if let std::collections::hash_map::Entry::Vacant(e) = indexes.entry(spec) {
             let blob =
                 channel_metadata(&source, raw, &cfg.id, spec, height, "channels-range").await?;
             let idx = ah::key_index(&blob).map_err(|e| anyhow::anyhow!(e))?;
-            indexes.insert(spec, idx);
+            e.insert(idx);
         }
         let key_index = indexes.get(&spec).expect("just inserted");
 
@@ -3555,9 +3864,15 @@ async fn preimage_ctx(
 
     let height = match height {
         Some(h) => h,
-        None => source.finalized_height().await.map_err(|e| anyhow::anyhow!(e))?,
+        None => source
+            .finalized_height()
+            .await
+            .map_err(|e| anyhow::anyhow!(e))?,
     };
-    let block_hash = source.block_hash(height).await.map_err(|e| anyhow::anyhow!(e))?;
+    let block_hash = source
+        .block_hash(height)
+        .await
+        .map_err(|e| anyhow::anyhow!(e))?;
     let spec = source
         .runtime_version_at(block_hash)
         .await
@@ -3568,14 +3883,22 @@ async fn preimage_ctx(
     let metadata = match raw.get(&meta_key) {
         Ok(blob) => blob,
         Err(raw_store::RawStoreError::NotFound(_)) => {
-            let blob = source.metadata_at(height).await.map_err(|e| anyhow::anyhow!(e))?;
+            let blob = source
+                .metadata_at(height)
+                .await
+                .map_err(|e| anyhow::anyhow!(e))?;
             raw.put(&meta_key, &blob, "preimage-decode")?;
             tracing::info!(chain = %chain_id, spec, "metadata archived while decoding preimages");
             blob
         }
         Err(e) => return Err(e.into()),
     };
-    Ok(PreimageCtx { metadata, spec, block_hash, height })
+    Ok(PreimageCtx {
+        metadata,
+        spec,
+        block_hash,
+        height,
+    })
 }
 
 /// Fetch one preimage from state, archive the raw value, verify the hash,
@@ -3651,8 +3974,12 @@ async fn fetch_and_record_preimage(
 
     match calls::decode_call(&ctx.metadata, &call_bytes) {
         Ok(d) => {
-            upsert_preimage(pool, chain_id, &record("decoded", Some(raw_key), Some(d), None))
-                .await?;
+            upsert_preimage(
+                pool,
+                chain_id,
+                &record("decoded", Some(raw_key), Some(d), None),
+            )
+            .await?;
             Ok("decoded".into())
         }
         Err(e) => {
@@ -3680,16 +4007,26 @@ async fn run_fetch_preimage(
 ) -> Result<()> {
     use adapter_substrate::source::SubstrateSource;
 
-    let pool = backends.pool.as_ref().context("fetch-preimage requires DATABASE_URL")?;
+    let pool = backends
+        .pool
+        .as_ref()
+        .context("fetch-preimage requires DATABASE_URL")?;
     let cfg = registry
         .chain(chain)
         .with_context(|| format!("unknown chain: {chain}"))?;
     let hash32 = parse_h256(hash)?;
-    let source = SubstrateSource::new(&cfg.id, cfg.endpoints.rpc.clone())
-        .map_err(|e| anyhow::anyhow!(e))?;
+    let source =
+        SubstrateSource::new(&cfg.id, cfg.endpoints.rpc.clone()).map_err(|e| anyhow::anyhow!(e))?;
     let ctx = preimage_ctx(&source, raw, &cfg.id, height).await?;
     let status = fetch_and_record_preimage(
-        pool, backends.receipts.as_ref(), &source, raw, &cfg.id, &ctx, &hash32, len,
+        pool,
+        backends.receipts.as_ref(),
+        &source,
+        raw,
+        &cfg.id,
+        &ctx,
+        &hash32,
+        len,
     )
     .await?;
     println!(
@@ -3716,12 +4053,15 @@ async fn run_decode_preimages(
         fill_inline_proposal_hash, referenda_needing_preimages, upsert_preimage, PreimageRecord,
     };
 
-    let pool = backends.pool.as_ref().context("decode-preimages requires DATABASE_URL")?;
+    let pool = backends
+        .pool
+        .as_ref()
+        .context("decode-preimages requires DATABASE_URL")?;
     let cfg = registry
         .chain(chain)
         .with_context(|| format!("unknown chain: {chain}"))?;
-    let source = SubstrateSource::new(&cfg.id, cfg.endpoints.rpc.clone())
-        .map_err(|e| anyhow::anyhow!(e))?;
+    let source =
+        SubstrateSource::new(&cfg.id, cfg.endpoints.rpc.clone()).map_err(|e| anyhow::anyhow!(e))?;
     let ctx = preimage_ctx(&source, raw, &cfg.id, height).await?;
 
     let rows = referenda_needing_preimages(pool, &cfg.id).await?;
@@ -3767,22 +4107,25 @@ async fn run_decode_preimages(
                     ("undecodable", None, Some(e))
                 }
             };
-            upsert_preimage(pool, &cfg.id, &PreimageRecord {
-                proposal_hash: hash_hex.clone(),
-                len,
-                bytes_location: None, // bytes live in gov.referenda.proposal (canonical)
-                call_summary: d.as_ref().map(|d| d.summary.clone()),
-                decoded_call: d.map(|d| d.tree),
-                decode_status: status.to_string(),
-                source: "inline".to_string(),
-                note,
-                spec_version: Some(ref_ctx.spec),
-                decoder_version: calls::CALL_DECODER_VERSION,
-                fetched_at_height: None,
-            })
+            upsert_preimage(
+                pool,
+                &cfg.id,
+                &PreimageRecord {
+                    proposal_hash: hash_hex.clone(),
+                    len,
+                    bytes_location: None, // bytes live in gov.referenda.proposal (canonical)
+                    call_summary: d.as_ref().map(|d| d.summary.clone()),
+                    decoded_call: d.map(|d| d.tree),
+                    decode_status: status.to_string(),
+                    source: "inline".to_string(),
+                    note,
+                    spec_version: Some(ref_ctx.spec),
+                    decoder_version: calls::CALL_DECODER_VERSION,
+                    fetched_at_height: None,
+                },
+            )
             .await?;
-            fill_inline_proposal_hash(pool, &cfg.id, class, *referendum_id, &hash_hex, len)
-                .await?;
+            fill_inline_proposal_hash(pool, &cfg.id, class, *referendum_id, &hash_hex, len).await?;
         } else if proposal.get("Legacy").is_some() {
             // democracy-era: preimageFor is keyed (hash, len) and Legacy carries
             // no length — record honest 'missing' (len 0 sentinel; excluded from
@@ -3792,19 +4135,23 @@ async fn run_decode_preimages(
                     "Legacy proposal without hash — skipped");
                 continue;
             };
-            upsert_preimage(pool, &cfg.id, &PreimageRecord {
-                proposal_hash: hash_hex.clone(),
-                len: 0,
-                bytes_location: None,
-                call_summary: None,
-                decoded_call: None,
-                decode_status: "missing".to_string(),
-                source: "state".to_string(),
-                note: Some("legacy proposal: length unknown, democracy-era preimage".into()),
-                spec_version: Some(ctx.spec),
-                decoder_version: calls::CALL_DECODER_VERSION,
-                fetched_at_height: Some(ctx.height),
-            })
+            upsert_preimage(
+                pool,
+                &cfg.id,
+                &PreimageRecord {
+                    proposal_hash: hash_hex.clone(),
+                    len: 0,
+                    bytes_location: None,
+                    call_summary: None,
+                    decoded_call: None,
+                    decode_status: "missing".to_string(),
+                    source: "state".to_string(),
+                    note: Some("legacy proposal: length unknown, democracy-era preimage".into()),
+                    spec_version: Some(ctx.spec),
+                    decoder_version: calls::CALL_DECODER_VERSION,
+                    fetched_at_height: Some(ctx.height),
+                },
+            )
             .await?;
             legacy += 1;
         } else {
@@ -3815,8 +4162,14 @@ async fn run_decode_preimages(
             };
             let hash32 = parse_h256(hash_hex)?;
             let status = fetch_and_record_preimage(
-                pool, backends.receipts.as_ref(), &source, raw, &cfg.id, &ctx,
-                &hash32, *plen as u64,
+                pool,
+                backends.receipts.as_ref(),
+                &source,
+                raw,
+                &cfg.id,
+                &ctx,
+                &hash32,
+                *plen as u64,
             )
             .await?;
             match status.as_str() {
@@ -3830,7 +4183,9 @@ async fn run_decode_preimages(
         "decode-preimages {chain} at #{} (spec {}): {} pending → \
          {decoded} fetched+decoded, {inline} inline decoded, {missing} missing, \
          {undecodable} undecodable, {legacy} legacy skipped",
-        ctx.height, ctx.spec, rows.len()
+        ctx.height,
+        ctx.spec,
+        rows.len()
     );
     Ok(())
 }
@@ -3898,12 +4253,23 @@ async fn run_simulate(
 
     if opts.tier.as_deref() == Some(sim::TIER_FORK) {
         return run_simulate_fork(
-            registry, backends, raw, chain, call_bytes, origin_spec, height, referendum, opts,
+            registry,
+            backends,
+            raw,
+            chain,
+            call_bytes,
+            origin_spec,
+            height,
+            referendum,
+            opts,
         )
         .await;
     }
 
-    let pool = backends.pool.as_ref().context("simulate requires DATABASE_URL")?;
+    let pool = backends
+        .pool
+        .as_ref()
+        .context("simulate requires DATABASE_URL")?;
     let cfg = registry
         .chain(chain)
         .with_context(|| format!("unknown chain: {chain}"))?;
@@ -3916,8 +4282,8 @@ async fn run_simulate(
         .parse()
         .context("SIM_XCM_VERSION must be a number")?;
 
-    let source = SubstrateSource::new(&cfg.id, cfg.endpoints.rpc.clone())
-        .map_err(|e| anyhow::anyhow!(e))?;
+    let source =
+        SubstrateSource::new(&cfg.id, cfg.endpoints.rpc.clone()).map_err(|e| anyhow::anyhow!(e))?;
     let runner = SubstrateDryRunner::new(&cfg.id, &source, raw, backends.receipts.as_ref());
     let store = PgSimStore::new(pool.clone());
 
@@ -3944,14 +4310,21 @@ async fn run_simulate(
         r.api_version
             .map(|v| v.to_string())
             .unwrap_or_else(|| "-".into()),
-        if run.cached { " [recorded earlier]" } else { "" }
+        if run.cached {
+            " [recorded earlier]"
+        } else {
+            ""
+        }
     );
     println!(
         "  call     {} ({})",
         r.call_summary.as_deref().unwrap_or("?"),
         r.call_hash
     );
-    println!("  origin   {} → {}", r.origin_spec, r.origin_json["resolved"]);
+    println!(
+        "  origin   {} → {}",
+        r.origin_spec, r.origin_json["resolved"]
+    );
     println!("  status   {}", r.status);
     if let Some(e) = &r.dispatch_error {
         println!("  error    {}", e["error"]);
@@ -3966,7 +4339,8 @@ async fn run_simulate(
         .and_then(|f| f.as_array())
         .map(Vec::len)
         .unwrap_or(0);
-    println!("  xcm      local {} · forwarded to {} destination(s)",
+    println!(
+        "  xcm      local {} · forwarded to {} destination(s)",
         if r.local_xcm.is_some() { "yes" } else { "none" },
         forwarded
     );
@@ -4012,17 +4386,13 @@ async fn run_simulate_referendum(
 
     let call_bytes = match (&proposal, &proposal_hash, proposal_len) {
         // Inline: the bytes are in the referendum itself.
-        (Some(p), _, _) if p.get("Inline").is_some() => calls::json_bytes(
-            p.get("Inline").expect("checked"),
-        )
-        .context("this referendum's Inline proposal is not a byte sequence")?,
+        (Some(p), _, _) if p.get("Inline").is_some() => {
+            calls::json_bytes(p.get("Inline").expect("checked"))
+                .context("this referendum's Inline proposal is not a byte sequence")?
+        }
         // Lookup: the archived preimage value (compact length prefix + call).
         (_, Some(hash), Some(len)) => {
-            let key = raw_store::keys::preimage(
-                &cfg.id,
-                hash.trim_start_matches("0x"),
-                len as u64,
-            );
+            let key = raw_store::keys::preimage(&cfg.id, hash.trim_start_matches("0x"), len as u64);
             let stored = raw.get(&key).with_context(|| {
                 format!(
                     "no archived preimage at {key} — run `decode-preimages {chain}` first \
@@ -4063,7 +4433,6 @@ async fn run_simulate_referendum(
     )
     .await
 }
-
 
 /// simulate-call/-referendum `--tier fork`: one Tier 2 run.
 ///
@@ -4170,14 +4539,21 @@ async fn run_simulate_fork(
         r.at_height,
         r.spec_version,
         r.metadata_version,
-        if run.cached { " [recorded earlier]" } else { "" }
+        if run.cached {
+            " [recorded earlier]"
+        } else {
+            ""
+        }
     );
     println!(
         "  call     {} ({})",
         r.call_summary.as_deref().unwrap_or("?"),
         r.call_hash
     );
-    println!("  origin   {} → {}", r.origin_spec, r.origin_json["resolved"]);
+    println!(
+        "  origin   {} → {}",
+        r.origin_spec, r.origin_json["resolved"]
+    );
     if let Some(overrides) = r.overrides.as_ref().and_then(|o| o.as_array()) {
         println!(
             "  COUNTERFACTUAL — {} storage key(s) injected; this is NOT what the chain did",
@@ -4207,9 +4583,19 @@ async fn run_simulate_fork(
         "  diff     {} ({} entr{})",
         r.diff_status.as_deref().unwrap_or("?"),
         r.storage_diff_count.unwrap_or(0),
-        if r.storage_diff_count == Some(1) { "y" } else { "ies" }
+        if r.storage_diff_count == Some(1) {
+            "y"
+        } else {
+            "ies"
+        }
     );
-    for e in r.storage_diff.as_ref().and_then(|d| d.as_array()).into_iter().flatten() {
+    for e in r
+        .storage_diff
+        .as_ref()
+        .and_then(|d| d.as_array())
+        .into_iter()
+        .flatten()
+    {
         println!(
             "    {} [{}]{}",
             e["readable"].as_str().unwrap_or("?"),
@@ -4275,8 +4661,8 @@ async fn run_one_fork_job(
     })
     .map_err(|e| anyhow::anyhow!(e))?;
 
-    let source = SubstrateSource::new(&cfg.id, cfg.endpoints.rpc.clone())
-        .map_err(|e| anyhow::anyhow!(e))?;
+    let source =
+        SubstrateSource::new(&cfg.id, cfg.endpoints.rpc.clone()).map_err(|e| anyhow::anyhow!(e))?;
     let runner = SubstrateForkRunner::new(
         &cfg.id,
         &source,
@@ -4307,10 +4693,13 @@ async fn run_sim_jobs(backends: &Backends, chain: &str, status: Option<&str>) ->
         .context("sim-jobs requires DATABASE_URL")?;
     let jobs = dotlens_node::sim_pg::list_jobs(pool, chain, status, 50).await?;
     if jobs.is_empty() {
-        println!("no simulation jobs on {chain}{}", match status {
-            Some(s) => format!(" with status '{s}'"),
-            None => String::new(),
-        });
+        println!(
+            "no simulation jobs on {chain}{}",
+            match status {
+                Some(s) => format!(" with status '{s}'"),
+                None => String::new(),
+            }
+        );
         return Ok(());
     }
     for j in &jobs {
@@ -4324,14 +4713,20 @@ async fn run_sim_jobs(backends: &Backends, chain: &str, status: Option<&str>) ->
             if j.override_specs.is_empty() {
                 String::new()
             } else {
-                format!("  [{} override(s) — COUNTERFACTUAL]", j.override_specs.len())
+                format!(
+                    "  [{} override(s) — COUNTERFACTUAL]",
+                    j.override_specs.len()
+                )
             }
         );
         if let Some(e) = &j.error {
             println!("        error: {e}");
         }
         if let (Some(h), Some(i)) = (&j.result_at_block_hash, &j.result_input_hash) {
-            println!("        result: /v1/sim/{chain}/calls/{} ({h} {i})", j.call_hash);
+            println!(
+                "        result: /v1/sim/{chain}/calls/{} ({h} {i})",
+                j.call_hash
+            );
         }
     }
     Ok(())
@@ -4346,7 +4741,11 @@ async fn run_sim_jobs(backends: &Backends, chain: &str, status: Option<&str>) ->
 /// worker that made those decisions itself would be a second policy beside the
 /// one in the table.
 #[cfg(all(feature = "pg", feature = "live"))]
-fn spawn_fork_job_worker(registry: &Arc<Registry>, backends: &Arc<Backends>, raw: &Arc<dyn RawStore>) {
+fn spawn_fork_job_worker(
+    registry: &Arc<Registry>,
+    backends: &Arc<Backends>,
+    raw: &Arc<dyn RawStore>,
+) {
     if !env_flag("FORK_JOBS") {
         tracing::info!("fork job worker disabled (set FORK_JOBS=1 to enable)");
         return;
@@ -4358,12 +4757,10 @@ fn spawn_fork_job_worker(registry: &Arc<Registry>, backends: &Arc<Backends>, raw
     let registry = registry.clone();
     let backends = backends.clone();
     let raw = raw.clone();
-    let poll = env_or("POLL_INTERVAL_SECS", "6").parse::<u64>().unwrap_or(6);
-    let worker = format!(
-        "{}#{}",
-        hostname_or("node"),
-        std::process::id()
-    );
+    let poll = env_or("POLL_INTERVAL_SECS", "6")
+        .parse::<u64>()
+        .unwrap_or(6);
+    let worker = format!("{}#{}", hostname_or("node"), std::process::id());
     tokio::spawn(async move {
         use dotlens_node::sim_pg::{PgJobStore, PgSimStore};
         use sim::JobStore;
@@ -4403,7 +4800,11 @@ fn spawn_fork_job_worker(registry: &Arc<Registry>, backends: &Arc<Backends>, raw
 }
 
 #[cfg(not(all(feature = "pg", feature = "live")))]
-fn spawn_fork_job_worker(_registry: &Arc<Registry>, _backends: &Arc<Backends>, _raw: &Arc<dyn RawStore>) {
+fn spawn_fork_job_worker(
+    _registry: &Arc<Registry>,
+    _backends: &Arc<Backends>,
+    _raw: &Arc<dyn RawStore>,
+) {
     if env_flag("FORK_JOBS") {
         tracing::warn!("built without `pg`+`live` — FORK_JOBS is IGNORED");
     }
@@ -4450,8 +4851,8 @@ async fn run_simulate_xcm(
         .with_context(|| format!("unknown chain: {chain}"))?;
     let origin = sim::LocationSpec::parse(origin_location).map_err(|e| anyhow::anyhow!(e))?;
 
-    let source_chain = SubstrateSource::new(&cfg.id, cfg.endpoints.rpc.clone())
-        .map_err(|e| anyhow::anyhow!(e))?;
+    let source_chain =
+        SubstrateSource::new(&cfg.id, cfg.endpoints.rpc.clone()).map_err(|e| anyhow::anyhow!(e))?;
     let runner = SubstrateDryRunner::new(&cfg.id, &source_chain, raw, backends.receipts.as_ref());
     let store = PgXcmSimStore::new(pool.clone());
 
@@ -4478,7 +4879,11 @@ fn print_xcm_run(run: &sim::XcmSimRun) {
         r.at_height,
         r.spec_version,
         r.api_version,
-        if run.cached { " [recorded earlier]" } else { "" }
+        if run.cached {
+            " [recorded earlier]"
+        } else {
+            ""
+        }
     );
     println!(
         "  program  {} ({})",
@@ -4605,11 +5010,9 @@ async fn run_simulate_forwarded(
             subject.raw_location
         )
     })?;
-    let source_rpc = adapter_substrate::source::SubstrateSource::new(
-        &cfg.id,
-        cfg.endpoints.rpc.clone(),
-    )
-    .map_err(|e| anyhow::anyhow!(e))?;
+    let source_rpc =
+        adapter_substrate::source::SubstrateSource::new(&cfg.id, cfg.endpoints.rpc.clone())
+            .map_err(|e| anyhow::anyhow!(e))?;
     let source_runner =
         SubstrateDryRunner::new(&cfg.id, &source_rpc, raw, backends.receipts.as_ref());
     let ctx = source_runner
@@ -4638,7 +5041,11 @@ async fn run_simulate_forwarded(
 
         for message in &destination.messages {
             let lifted = ctx
-                .forwarded_program(&response, destination.destination_index, message.message_index)
+                .forwarded_program(
+                    &response,
+                    destination.destination_index,
+                    message.message_index,
+                )
                 .map_err(|e| anyhow::anyhow!(e))?;
             println!(
                 "  ↦ {} (as {}) · destination {} message {}",
@@ -4672,8 +5079,15 @@ async fn run_simulate_forwarded(
 #[cfg(not(all(feature = "pg", feature = "live")))]
 #[allow(clippy::too_many_arguments)]
 async fn run_simulate(
-    _: &Registry, _: &Backends, _: &dyn RawStore, _: &str, _: Vec<u8>, _: &str, _: Option<u64>,
-    _: Option<(String, i64)>, _: &SimOptions,
+    _: &Registry,
+    _: &Backends,
+    _: &dyn RawStore,
+    _: &str,
+    _: Vec<u8>,
+    _: &str,
+    _: Option<u64>,
+    _: Option<(String, i64)>,
+    _: &SimOptions,
 ) -> Result<()> {
     anyhow::bail!("simulate-call requires the `pg` and `live` features")
 }
@@ -4681,7 +5095,13 @@ async fn run_simulate(
 #[cfg(not(all(feature = "pg", feature = "live")))]
 #[allow(clippy::too_many_arguments)]
 async fn run_simulate_xcm(
-    _: &Registry, _: &Backends, _: &dyn RawStore, _: &str, _: &str, _: Vec<u8>, _: Option<u64>,
+    _: &Registry,
+    _: &Backends,
+    _: &dyn RawStore,
+    _: &str,
+    _: &str,
+    _: Vec<u8>,
+    _: Option<u64>,
     _: Option<sim::ProgramSource>,
 ) -> Result<()> {
     anyhow::bail!("simulate-xcm requires the `pg` and `live` features")
@@ -4689,7 +5109,13 @@ async fn run_simulate_xcm(
 
 #[cfg(not(all(feature = "pg", feature = "live")))]
 async fn run_simulate_forwarded(
-    _: &Registry, _: &Backends, _: &dyn RawStore, _: &str, _: &str, _: &str, _: Option<u64>,
+    _: &Registry,
+    _: &Backends,
+    _: &dyn RawStore,
+    _: &str,
+    _: &str,
+    _: &str,
+    _: Option<u64>,
 ) -> Result<()> {
     anyhow::bail!("simulate-forwarded requires the `pg` and `live` features")
 }
@@ -4697,22 +5123,39 @@ async fn run_simulate_forwarded(
 #[cfg(not(all(feature = "pg", feature = "live")))]
 #[allow(clippy::too_many_arguments)]
 async fn run_simulate_referendum(
-    _: &Registry, _: &Backends, _: &dyn RawStore, _: &str, _: &str, _: i64, _: &str,
-    _: Option<u64>, _: &SimOptions,
+    _: &Registry,
+    _: &Backends,
+    _: &dyn RawStore,
+    _: &str,
+    _: &str,
+    _: i64,
+    _: &str,
+    _: Option<u64>,
+    _: &SimOptions,
 ) -> Result<()> {
     anyhow::bail!("simulate-referendum requires the `pg` and `live` features")
 }
 
 #[cfg(not(all(feature = "pg", feature = "live")))]
 async fn run_fetch_preimage(
-    _: &Registry, _: &Backends, _: &dyn RawStore, _: &str, _: &str, _: u64, _: Option<u64>,
+    _: &Registry,
+    _: &Backends,
+    _: &dyn RawStore,
+    _: &str,
+    _: &str,
+    _: u64,
+    _: Option<u64>,
 ) -> Result<()> {
     anyhow::bail!("fetch-preimage requires the `pg` and `live` features")
 }
 
 #[cfg(not(all(feature = "pg", feature = "live")))]
 async fn run_decode_preimages(
-    _: &Registry, _: &Backends, _: &dyn RawStore, _: &str, _: Option<u64>,
+    _: &Registry,
+    _: &Backends,
+    _: &dyn RawStore,
+    _: &str,
+    _: Option<u64>,
 ) -> Result<()> {
     anyhow::bail!("decode-preimages requires the `pg` and `live` features")
 }
@@ -4735,7 +5178,10 @@ async fn run_balances_range(
         "no delta mapper for family {:?}",
         cfg.family
     );
-    let pool = backends.pool.as_ref().context("balances-range requires DATABASE_URL")?;
+    let pool = backends
+        .pool
+        .as_ref()
+        .context("balances-range requires DATABASE_URL")?;
     let source = dotlens_node::balances_pg::PgEventSource::new(pool.clone());
     let sink = dotlens_node::balances_pg::PgDeltaSink::new(pool.clone());
     let deps = ingest::balances::BalancesDeps {
@@ -4781,9 +5227,12 @@ async fn run_anchor_balance(
         .with_context(|| format!("unknown chain: {chain}"))?;
     let account_id = accounts::parse_account(account)
         .map_err(|e| anyhow::anyhow!("bad account '{account}': {e}"))?;
-    let source = SubstrateSource::new(&cfg.id, cfg.endpoints.rpc.clone())
+    let source =
+        SubstrateSource::new(&cfg.id, cfg.endpoints.rpc.clone()).map_err(|e| anyhow::anyhow!(e))?;
+    let hash = source
+        .block_hash(height)
+        .await
         .map_err(|e| anyhow::anyhow!(e))?;
-    let hash = source.block_hash(height).await.map_err(|e| anyhow::anyhow!(e))?;
     let spec = source
         .runtime_version_at(hash)
         .await
@@ -4795,7 +5244,10 @@ async fn run_anchor_balance(
     let metadata = match raw.get(&meta_key) {
         Ok(blob) => blob,
         Err(raw_store::RawStoreError::NotFound(_)) => {
-            let blob = source.metadata_at(height).await.map_err(|e| anyhow::anyhow!(e))?;
+            let blob = source
+                .metadata_at(height)
+                .await
+                .map_err(|e| anyhow::anyhow!(e))?;
             raw.put(&meta_key, &blob, "anchor-balance")?;
             tracing::info!(chain = %cfg.id, spec, "metadata archived while anchoring");
             blob
@@ -4815,7 +5267,11 @@ async fn run_anchor_balance(
         ),
         None => (
             // absent from state = balance zero; recorded honestly as such
-            ab::AccountBalances { free: 0, reserved: 0, frozen: None },
+            ab::AccountBalances {
+                free: 0,
+                reserved: 0,
+                frozen: None,
+            },
             Some("absent"),
         ),
     };
@@ -4873,8 +5329,8 @@ async fn run_sync_assets(
     let cfg = registry
         .chain(chain)
         .with_context(|| format!("unknown chain: {chain}"))?;
-    let source = SubstrateSource::new(&cfg.id, cfg.endpoints.rpc.clone())
-        .map_err(|e| anyhow::anyhow!(e))?;
+    let source =
+        SubstrateSource::new(&cfg.id, cfg.endpoints.rpc.clone()).map_err(|e| anyhow::anyhow!(e))?;
     let report = dotlens_node::assets_pg::sync_assets(pool, raw, &source, cfg, height).await?;
     println!(
         "asset sync {chain} @#{} (spec {}): {} assets {:?}{}{}",
@@ -4952,8 +5408,8 @@ async fn run_treasury_holdings(
     let cfg = registry
         .chain(chain)
         .with_context(|| format!("unknown chain: {chain}"))?;
-    let source = SubstrateSource::new(&cfg.id, cfg.endpoints.rpc.clone())
-        .map_err(|e| anyhow::anyhow!(e))?;
+    let source =
+        SubstrateSource::new(&cfg.id, cfg.endpoints.rpc.clone()).map_err(|e| anyhow::anyhow!(e))?;
     let report =
         dotlens_node::assets_pg::snapshot_holdings(pool, raw, &source, cfg, height).await?;
     println!(

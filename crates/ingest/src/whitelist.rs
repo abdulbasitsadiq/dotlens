@@ -257,12 +257,18 @@ mod tests {
     #[tokio::test]
     async fn range_maps_events_skips_gaps_and_advances() {
         let mut src = HashMap::new();
-        src.insert(1, vec![ev(0, "mock.White", serde_json::json!({"hash": "0xaa"}))]);
+        src.insert(
+            1,
+            vec![ev(0, "mock.White", serde_json::json!({"hash": "0xaa"}))],
+        );
         // height 2 is a decode gap
-        src.insert(3, vec![
-            ev(0, "mock.Other", serde_json::json!({})),
-            ev(1, "mock.White", serde_json::json!({"hash": "0xbb"})),
-        ]);
+        src.insert(
+            3,
+            vec![
+                ev(0, "mock.Other", serde_json::json!({})),
+                ev(1, "mock.White", serde_json::json!({"hash": "0xbb"})),
+            ],
+        );
         let checkpoints = MemoryCheckpointStore::new();
         let sink = MemSink::default();
         let deps = WhitelistDeps {
@@ -270,21 +276,33 @@ mod tests {
             source: &MemSource(src),
             sink: &sink,
         };
-        let n = whitelist_range("mock", &MockMapper, &deps, 1, 3).await.unwrap();
+        let n = whitelist_range("mock", &MockMapper, &deps, 1, 3)
+            .await
+            .unwrap();
         assert_eq!(n, 2, "two decoded heights, one gap skipped");
         let rows = sink.0.lock().unwrap();
         assert_eq!(rows.len(), 2);
         assert_eq!((rows[0].0, rows[0].2.call_hash.as_str()), (1, "0xaa"));
-        assert_eq!((rows[1].0, rows[1].1, rows[1].2.call_hash.as_str()), (3, 1, "0xbb"));
+        assert_eq!(
+            (rows[1].0, rows[1].1, rows[1].2.call_hash.as_str()),
+            (3, 1, "0xbb")
+        );
         drop(rows);
-        let cp = checkpoints.get("mock", MODULE_WHITELIST).await.unwrap().unwrap();
+        let cp = checkpoints
+            .get("mock", MODULE_WHITELIST)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(cp.last_height, 3);
     }
 
     #[tokio::test]
     async fn rerun_behind_frontier_rewrites_without_moving_checkpoint() {
         let mut src = HashMap::new();
-        src.insert(1, vec![ev(0, "mock.White", serde_json::json!({"hash": "0xaa"}))]);
+        src.insert(
+            1,
+            vec![ev(0, "mock.White", serde_json::json!({"hash": "0xaa"}))],
+        );
         src.insert(2, vec![]);
         let checkpoints = MemoryCheckpointStore::new();
         let sink = MemSink::default();
@@ -293,10 +311,21 @@ mod tests {
             source: &MemSource(src),
             sink: &sink,
         };
-        whitelist_range("mock", &MockMapper, &deps, 1, 2).await.unwrap();
-        let n = whitelist_range("mock", &MockMapper, &deps, 1, 1).await.unwrap();
-        assert_eq!(n, 1, "behind-frontier reprocess is allowed (sink converges)");
-        let cp = checkpoints.get("mock", MODULE_WHITELIST).await.unwrap().unwrap();
+        whitelist_range("mock", &MockMapper, &deps, 1, 2)
+            .await
+            .unwrap();
+        let n = whitelist_range("mock", &MockMapper, &deps, 1, 1)
+            .await
+            .unwrap();
+        assert_eq!(
+            n, 1,
+            "behind-frontier reprocess is allowed (sink converges)"
+        );
+        let cp = checkpoints
+            .get("mock", MODULE_WHITELIST)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(cp.last_height, 2, "frontier untouched by reprocess");
     }
 
@@ -311,17 +340,29 @@ mod tests {
             source: &MemSource(src),
             sink: &sink,
         };
-        let err = whitelist_range("mock", &MockMapper, &deps, 1, 1).await.unwrap_err();
-        assert!(matches!(err, WhitelistWorkerError::Mapper { height: 1, .. }));
+        let err = whitelist_range("mock", &MockMapper, &deps, 1, 1)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            WhitelistWorkerError::Mapper { height: 1, .. }
+        ));
         assert!(sink.0.lock().unwrap().is_empty());
-        assert!(checkpoints.get("mock", MODULE_WHITELIST).await.unwrap().is_none());
+        assert!(checkpoints
+            .get("mock", MODULE_WHITELIST)
+            .await
+            .unwrap()
+            .is_none());
     }
 
     #[tokio::test]
     async fn tick_chases_the_decode_checkpoint() {
         let mut src = HashMap::new();
         for h in 5..=9 {
-            src.insert(h, vec![ev(0, "mock.White", serde_json::json!({"hash": "0xaa"}))]);
+            src.insert(
+                h,
+                vec![ev(0, "mock.White", serde_json::json!({"hash": "0xaa"}))],
+            );
         }
         let checkpoints = MemoryCheckpointStore::new();
         let sink = MemSink::default();
@@ -343,7 +384,11 @@ mod tests {
         assert_eq!(whitelist_tick("mock", &MockMapper, &deps).await.unwrap(), 1);
         checkpoints.advance(decode_cp(9)).await.unwrap();
         assert_eq!(whitelist_tick("mock", &MockMapper, &deps).await.unwrap(), 2);
-        let cp = checkpoints.get("mock", MODULE_WHITELIST).await.unwrap().unwrap();
+        let cp = checkpoints
+            .get("mock", MODULE_WHITELIST)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(cp.last_height, 9);
         assert_eq!(whitelist_tick("mock", &MockMapper, &deps).await.unwrap(), 0);
     }

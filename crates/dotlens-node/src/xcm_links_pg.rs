@@ -134,9 +134,7 @@ pub async fn write_links(
         .bind(correlator_version as i32)
         .execute(&mut *tx)
         .await
-        .with_context(|| {
-            format!("inserting xcm link {chain_id}/{height}/{wire_event_index}")
-        })?;
+        .with_context(|| format!("inserting xcm link {chain_id}/{height}/{wire_event_index}"))?;
     }
     tx.commit().await.context("commit xcm link tx")?;
     Ok(())

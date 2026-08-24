@@ -69,7 +69,9 @@ impl FrameDecoder {
             RuntimeMetadata::V14(m) => (m.types.clone(), find_events_type_v14(m)),
             RuntimeMetadata::V15(m) => (m.types.clone(), find_events_type_v15(m)),
             other => {
-                return Err(FrameDecodeError::UnsupportedMetadata(runtime_metadata_version(other)))
+                return Err(FrameDecodeError::UnsupportedMetadata(
+                    runtime_metadata_version(other),
+                ))
             }
         };
         Ok(Self {
@@ -106,7 +108,8 @@ impl FrameDecoder {
             Some(bytes) => self.decode_events(bytes)?,
             None => Vec::new(),
         };
-        let mut success_by_tx: std::collections::HashMap<u32, bool> = std::collections::HashMap::new();
+        let mut success_by_tx: std::collections::HashMap<u32, bool> =
+            std::collections::HashMap::new();
         for ev in &decoded_events {
             if let Some(tx) = ev.transaction_index {
                 match ev.name.as_str() {
@@ -178,7 +181,10 @@ impl FrameDecoder {
                     let value =
                         scale_value::scale::decode_as_type(&mut cursor, *arg.ty(), &self.types)
                             .map_err(|e| format!("arg {}: {e}", arg.name()))?;
-                    args.insert(arg.name().to_string(), value_to_json(&value.remove_context()));
+                    args.insert(
+                        arg.name().to_string(),
+                        value_to_json(&value.remove_context()),
+                    );
                 }
 
                 // signer: only for signed extrinsics; MultiAddress::Id → SS58
@@ -347,12 +353,16 @@ fn phase_to_tx_index(phase: &Value) -> Option<u32> {
 /// RuntimeEvent::Pallet(pallet::Event::Variant { fields }) →
 /// ("pallet.Variant", fields as JSON).
 fn event_name_and_fields(event: &Value) -> Option<(String, serde_json::Value)> {
-    let ValueDef::Variant(pallet_variant) = &event.value else { return None };
+    let ValueDef::Variant(pallet_variant) = &event.value else {
+        return None;
+    };
     let inner = match &pallet_variant.values {
         Composite::Unnamed(items) => items.first(),
         Composite::Named(items) => items.first().map(|(_, v)| v),
     }?;
-    let ValueDef::Variant(event_variant) = &inner.value else { return None };
+    let ValueDef::Variant(event_variant) = &inner.value else {
+        return None;
+    };
     let name = format!(
         "{}.{}",
         pallet_variant.name.to_lowercase(),
@@ -383,7 +393,10 @@ pub(crate) fn value_to_json(v: &Value) -> serde_json::Value {
 fn composite_to_json(c: &Composite<()>) -> serde_json::Value {
     match c {
         Composite::Named(fields) => serde_json::Value::Object(
-            fields.iter().map(|(n, v)| (n.clone(), value_to_json(v))).collect(),
+            fields
+                .iter()
+                .map(|(n, v)| (n.clone(), value_to_json(v)))
+                .collect(),
         ),
         Composite::Unnamed(items) => {
             serde_json::Value::Array(items.iter().map(value_to_json).collect())
@@ -431,12 +444,8 @@ fn collect_bytes(c: &Composite<()>) -> Option<Vec<u8>> {
                 out.push(*n as u8);
                 true
             }
-            ValueDef::Composite(Composite::Unnamed(items)) => {
-                items.iter().all(|i| walk(i, out))
-            }
-            ValueDef::Composite(Composite::Named(items)) => {
-                items.iter().all(|(_, i)| walk(i, out))
-            }
+            ValueDef::Composite(Composite::Unnamed(items)) => items.iter().all(|i| walk(i, out)),
+            ValueDef::Composite(Composite::Named(items)) => items.iter().all(|(_, i)| walk(i, out)),
             _ => false,
         }
     }
@@ -453,7 +462,6 @@ fn json_as_u64(v: &serde_json::Value) -> Option<u64> {
 }
 
 // ------------------------------------------------------------------- helpers
-
 
 /// Extrinsic hash: blake2b-256 of the full encoded extrinsic (standard).
 fn extrinsic_hash(bytes: &[u8]) -> String {
@@ -566,10 +574,7 @@ mod tests {
     #[test]
     fn event_walking_handles_the_standard_shapes() {
         // phase: ApplyExtrinsic(2)
-        let phase = Value::variant(
-            "ApplyExtrinsic",
-            Composite::Unnamed(vec![Value::u128(2)]),
-        );
+        let phase = Value::variant("ApplyExtrinsic", Composite::Unnamed(vec![Value::u128(2)]));
         assert_eq!(phase_to_tx_index(&phase), Some(2));
         let fin = Value::variant("Finalization", Composite::Unnamed(vec![]));
         assert_eq!(phase_to_tx_index(&fin), None);
@@ -604,7 +609,10 @@ mod tests {
     fn big_numbers_become_strings_never_lossy_floats() {
         use scale_value::Primitive;
         // fits u64 → JSON number
-        assert_eq!(primitive_to_json(&Primitive::U128(42)), serde_json::json!(42));
+        assert_eq!(
+            primitive_to_json(&Primitive::U128(42)),
+            serde_json::json!(42)
+        );
         // total-issuance-scale plancks exceed u64 → decimal string, exact
         let big = u64::MAX as u128 + 5;
         assert_eq!(
@@ -620,7 +628,11 @@ mod tests {
     #[test]
     fn account_bytes_collect_through_nesting() {
         // AccountId32 decodes as variant Id(composite(composite([u8;32])))
-        let inner = Value::unnamed_composite((0u8..32).map(|b| Value::u128(b as u128)).collect::<Vec<_>>());
+        let inner = Value::unnamed_composite(
+            (0u8..32)
+                .map(|b| Value::u128(b as u128))
+                .collect::<Vec<_>>(),
+        );
         let wrapped = Composite::Unnamed(vec![Value::unnamed_composite(vec![inner])]);
         let bytes = collect_bytes(&wrapped).unwrap();
         assert_eq!(bytes.len(), 32);
@@ -634,7 +646,9 @@ mod tests {
     fn real_fixtures_decode_end_to_end() {
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/real");
         let Ok(entries) = std::fs::read_dir(&dir) else {
-            eprintln!("SKIP: no fixtures/real directory — run `dotlens-node capture-fixture` first");
+            eprintln!(
+                "SKIP: no fixtures/real directory — run `dotlens-node capture-fixture` first"
+            );
             return;
         };
         let mut checked = 0;
@@ -650,22 +664,35 @@ mod tests {
             let spec = peek["spec_version"].as_u64().unwrap() as u32;
             let chain = peek["chain_id"].as_str().unwrap_or("unknown");
 
-            let decoder = FrameDecoder::from_metadata_bytes(spec, 0, &metadata)
-                .expect("metadata parses");
+            let decoder =
+                FrameDecoder::from_metadata_bytes(spec, 0, &metadata).expect("metadata parses");
             let block = decoder
                 .decode_block(chain, &envelope, events.as_deref(), "raw/test")
                 .expect("block decodes");
 
-            assert!(!block.transactions.is_empty(), "{}: no extrinsics decoded", chain);
+            assert!(
+                !block.transactions.is_empty(),
+                "{}: no extrinsics decoded",
+                chain
+            );
             assert!(
                 block.transactions.iter().any(|t| t.call == "timestamp.set"),
-                "{}: timestamp inherent missing", chain
+                "{}: timestamp inherent missing",
+                chain
             );
-            assert!(block.timestamp.is_some(), "{}: timestamp not extracted", chain);
+            assert!(
+                block.timestamp.is_some(),
+                "{}: timestamp not extracted",
+                chain
+            );
             assert_eq!(block.lineage.decoder_version, DECODER_VERSION_FRAME);
             assert_eq!(block.lineage.runtime_version, spec);
             if events.is_some() {
-                assert!(!block.events.is_empty(), "{}: events present but none decoded", chain);
+                assert!(
+                    !block.events.is_empty(),
+                    "{}: events present but none decoded",
+                    chain
+                );
                 // every ApplyExtrinsic event must point at a real extrinsic
                 for ev in &block.events {
                     if let Some(tx) = ev.transaction_index {

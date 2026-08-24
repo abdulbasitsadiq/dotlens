@@ -7,6 +7,8 @@
 
 pub mod balances;
 pub mod bounties;
+pub mod broker;
+pub mod coretime;
 pub mod decode;
 pub mod gov;
 pub mod live;
@@ -15,8 +17,6 @@ pub mod tip;
 pub mod treasury;
 pub mod votes;
 pub mod whitelist;
-pub mod broker;
-pub mod coretime;
 pub mod xcm;
 pub mod xcm_correlate;
 
@@ -62,8 +62,11 @@ pub enum IngestOutcome {
 
 #[async_trait]
 pub trait CheckpointStore: Send + Sync {
-    async fn get(&self, chain_id: &str, module: &str)
-        -> Result<Option<Checkpoint>, CheckpointError>;
+    async fn get(
+        &self,
+        chain_id: &str,
+        module: &str,
+    ) -> Result<Option<Checkpoint>, CheckpointError>;
     /// Advance the checkpoint. Never moves backwards (returns `Regression`);
     /// explicit rollback (reorg handling, later in Phase 1) will be a separate
     /// operation.
@@ -183,12 +186,20 @@ impl CheckpointStore for MemoryCheckpointStore {
         chain_id: &str,
         module: &str,
     ) -> Result<Option<Checkpoint>, CheckpointError> {
-        let map = self.inner.lock().map_err(|e| CheckpointError::Storage(e.to_string()))?;
-        Ok(map.get(&(chain_id.to_string(), module.to_string())).cloned())
+        let map = self
+            .inner
+            .lock()
+            .map_err(|e| CheckpointError::Storage(e.to_string()))?;
+        Ok(map
+            .get(&(chain_id.to_string(), module.to_string()))
+            .cloned())
     }
 
     async fn advance(&self, cp: Checkpoint) -> Result<(), CheckpointError> {
-        let mut map = self.inner.lock().map_err(|e| CheckpointError::Storage(e.to_string()))?;
+        let mut map = self
+            .inner
+            .lock()
+            .map_err(|e| CheckpointError::Storage(e.to_string()))?;
         let key = (cp.chain_id.clone(), cp.module.clone());
         if let Some(existing) = map.get(&key) {
             if cp.last_height <= existing.last_height {
@@ -270,13 +281,15 @@ pub mod pg {
             .fetch_optional(&self.pool)
             .await
             .map_err(|e| CheckpointError::Storage(e.to_string()))?;
-            Ok(row.map(|(chain_id, module, h, last_hash, updated_at)| Checkpoint {
-                chain_id,
-                module,
-                last_height: h as u64,
-                last_hash,
-                updated_at,
-            }))
+            Ok(
+                row.map(|(chain_id, module, h, last_hash, updated_at)| Checkpoint {
+                    chain_id,
+                    module,
+                    last_height: h as u64,
+                    last_hash,
+                    updated_at,
+                }),
+            )
         }
 
         /// Upsert on the halt's own coordinates (migration 0028).
@@ -291,10 +304,7 @@ pub mod pg {
         /// newest observation rather than frozen at first sight: a runtime
         /// upgrade can change the variant name or the mapper's sentence at the
         /// same coordinates, and the CURRENT reason is the one that helps.
-        async fn record_halt(
-            &self,
-            halt: &crate::module::Halt<'_>,
-        ) -> Result<(), CheckpointError> {
+        async fn record_halt(&self, halt: &crate::module::Halt<'_>) -> Result<(), CheckpointError> {
             sqlx::query(
                 "insert into core.module_halts \
                  (chain_id, module, height, event_index, event, reason, \
@@ -409,18 +419,27 @@ mod tests {
     async fn fresh_chain_processes_then_skips_duplicates() {
         let store = MemoryCheckpointStore::new();
         assert_eq!(
-            should_process(&store, "polkadot-asset-hub", "blocks", 100).await.unwrap(),
+            should_process(&store, "polkadot-asset-hub", "blocks", 100)
+                .await
+                .unwrap(),
             IngestOutcome::Processed
         );
-        store.advance(cp("polkadot-asset-hub", "blocks", 100)).await.unwrap();
+        store
+            .advance(cp("polkadot-asset-hub", "blocks", 100))
+            .await
+            .unwrap();
         // same block again → idempotent skip
         assert_eq!(
-            should_process(&store, "polkadot-asset-hub", "blocks", 100).await.unwrap(),
+            should_process(&store, "polkadot-asset-hub", "blocks", 100)
+                .await
+                .unwrap(),
             IngestOutcome::AlreadyProcessed
         );
         // next block → processed
         assert_eq!(
-            should_process(&store, "polkadot-asset-hub", "blocks", 101).await.unwrap(),
+            should_process(&store, "polkadot-asset-hub", "blocks", 101)
+                .await
+                .unwrap(),
             IngestOutcome::Processed
         );
     }
@@ -428,13 +447,20 @@ mod tests {
     #[tokio::test]
     async fn checkpoints_are_per_module_and_per_chain() {
         let store = MemoryCheckpointStore::new();
-        store.advance(cp("polkadot-asset-hub", "blocks", 500)).await.unwrap();
+        store
+            .advance(cp("polkadot-asset-hub", "blocks", 500))
+            .await
+            .unwrap();
         assert_eq!(
-            should_process(&store, "polkadot-asset-hub", "governance", 100).await.unwrap(),
+            should_process(&store, "polkadot-asset-hub", "governance", 100)
+                .await
+                .unwrap(),
             IngestOutcome::Processed
         );
         assert_eq!(
-            should_process(&store, "polkadot", "blocks", 100).await.unwrap(),
+            should_process(&store, "polkadot", "blocks", 100)
+                .await
+                .unwrap(),
             IngestOutcome::Processed
         );
     }
@@ -457,7 +483,9 @@ mod tests {
     async fn restart_resumes_from_checkpoint() {
         let store = MemoryCheckpointStore::new();
         for h in 1..=50u64 {
-            if should_process(&store, "polkadot", "blocks", h).await.unwrap()
+            if should_process(&store, "polkadot", "blocks", h)
+                .await
+                .unwrap()
                 == IngestOutcome::Processed
             {
                 store.advance(cp("polkadot", "blocks", h)).await.unwrap();
@@ -466,7 +494,9 @@ mod tests {
         // "restart": re-offer the whole range; only new heights process
         let mut processed_again = 0;
         for h in 1..=60u64 {
-            if should_process(&store, "polkadot", "blocks", h).await.unwrap()
+            if should_process(&store, "polkadot", "blocks", h)
+                .await
+                .unwrap()
                 == IngestOutcome::Processed
             {
                 store.advance(cp("polkadot", "blocks", h)).await.unwrap();

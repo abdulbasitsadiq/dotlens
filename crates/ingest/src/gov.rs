@@ -254,10 +254,13 @@ mod tests {
         let mut src = HashMap::new();
         src.insert(1, vec![ev(0, "mock.Ref", serde_json::json!({"index": 42}))]);
         // height 2 is a decode gap
-        src.insert(3, vec![
-            ev(0, "mock.Other", serde_json::json!({})),
-            ev(1, "mock.Ref", serde_json::json!({"index": 43})),
-        ]);
+        src.insert(
+            3,
+            vec![
+                ev(0, "mock.Other", serde_json::json!({})),
+                ev(1, "mock.Ref", serde_json::json!({"index": 43})),
+            ],
+        );
         let checkpoints = MemoryCheckpointStore::new();
         let sink = MemSink::default();
         let deps = GovDeps {
@@ -291,7 +294,10 @@ mod tests {
         };
         gov_range("mock", &MockMapper, &deps, 1, 2).await.unwrap();
         let n = gov_range("mock", &MockMapper, &deps, 1, 1).await.unwrap();
-        assert_eq!(n, 1, "behind-frontier reprocess is allowed (sink converges)");
+        assert_eq!(
+            n, 1,
+            "behind-frontier reprocess is allowed (sink converges)"
+        );
         let cp = checkpoints.get("mock", MODULE_GOV).await.unwrap().unwrap();
         assert_eq!(cp.last_height, 2, "frontier untouched by reprocess");
     }
@@ -307,7 +313,9 @@ mod tests {
             source: &MemSource(src),
             sink: &sink,
         };
-        let err = gov_range("mock", &MockMapper, &deps, 1, 1).await.unwrap_err();
+        let err = gov_range("mock", &MockMapper, &deps, 1, 1)
+            .await
+            .unwrap_err();
         assert!(matches!(err, GovWorkerError::Mapper { height: 1, .. }));
         assert!(sink.0.lock().unwrap().is_empty());
         assert!(checkpoints.get("mock", MODULE_GOV).await.unwrap().is_none());

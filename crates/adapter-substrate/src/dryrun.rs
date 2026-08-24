@@ -155,7 +155,9 @@ pub fn declared_api_version(apis: &serde_json::Value, trait_name: &str) -> Optio
         // one odd element anywhere in the list into "this chain does not
         // implement the API", which is a confident false statement about a
         // chain rather than the honest refusal `SimError::Unsupported` claims.
-        let Some(pair) = entry.as_array() else { continue };
+        let Some(pair) = entry.as_array() else {
+            continue;
+        };
         let (Some(id), Some(version)) = (pair.first(), pair.get(1)) else {
             continue;
         };
@@ -263,7 +265,13 @@ macro_rules! dry_run_method {
         let pallets: Vec<(u8, String, Option<u32>)> = m
             .pallets
             .iter()
-            .map(|p| (p.index, p.name.to_string(), p.error.as_ref().map(|e| e.ty.id)))
+            .map(|p| {
+                (
+                    p.index,
+                    p.name.to_string(),
+                    p.error.as_ref().map(|e| e.ty.id),
+                )
+            })
             .collect();
         (m.types.clone(), pallets, inputs, method.output.id, xcm)
     }};
@@ -698,7 +706,9 @@ impl DryRunContext {
 
         let junction = Value::variant(
             "Parachain",
-            Composite::Unnamed(vec![Value::u128(spec.para_id().unwrap_or_default() as u128)]),
+            Composite::Unnamed(vec![
+                Value::u128(spec.para_id().unwrap_or_default() as u128),
+            ]),
         );
         let interior = match spec.para_id() {
             // X1's PAYLOAD IS ITS OWN LAYER, and getting that wrong does not
@@ -739,8 +749,9 @@ impl DryRunContext {
         // that do not read as a location are refused here rather than sent, and
         // what the row records is the runtime's own shape.
         let mut cursor = &bytes[..];
-        let value = scale_value::scale::decode_as_type(&mut cursor, m.origin_location_ty, &self.types)
-            .map_err(|e| format!("the origin location we encoded does not decode back: {e}"))?;
+        let value =
+            scale_value::scale::decode_as_type(&mut cursor, m.origin_location_ty, &self.types)
+                .map_err(|e| format!("the origin location we encoded does not decode back: {e}"))?;
         if !cursor.is_empty() {
             return Err(format!(
                 "{} trailing bytes after re-reading the origin location we built",
@@ -936,8 +947,9 @@ impl DryRunContext {
         // `context` IS the type id this node was decoded against.
         let program_ty = message.context;
         let mut bytes = Vec::new();
-        scale_value::scale::encode_as_type(message, program_ty, &self.types, &mut bytes)
-            .map_err(|e| format!("re-encoding forwarded message {destination_index}/{message_index}: {e}"))?;
+        scale_value::scale::encode_as_type(message, program_ty, &self.types, &mut bytes).map_err(
+            |e| format!("re-encoding forwarded message {destination_index}/{message_index}: {e}"),
+        )?;
 
         let mut check = &bytes[..];
         let round_trip = scale_value::scale::decode_as_type(&mut check, program_ty, &self.types)
@@ -1068,8 +1080,8 @@ impl DryRunContext {
                         .map(json_of),
                 };
 
-                let events_value =
-                    named(effects, "emitted_events").ok_or("effects has no emitted_events field")?;
+                let events_value = named(effects, "emitted_events")
+                    .ok_or("effects has no emitted_events field")?;
                 let events = self.read_events(events_value)?;
                 let forwarded = named(effects, "forwarded_xcms")
                     .ok_or("effects has no forwarded_xcms field")?;
@@ -1155,8 +1167,8 @@ impl DryRunContext {
                 })
             }
             "Ok" => {
-                let effects = variant_inner(outer)
-                    .ok_or("dry-run Ok carries no effects payload")?;
+                let effects =
+                    variant_inner(outer).ok_or("dry-run Ok carries no effects payload")?;
 
                 let execution = named(effects, "execution_result")
                     .ok_or("effects has no execution_result field")?;
@@ -1180,11 +1192,15 @@ impl DryRunContext {
                             Some(self.describe_dispatch_error(&err)),
                         )
                     }
-                    other => return Err(format!("execution_result variant '{other}' is neither Ok nor Err")),
+                    other => {
+                        return Err(format!(
+                            "execution_result variant '{other}' is neither Ok nor Err"
+                        ))
+                    }
                 };
 
-                let events_value =
-                    named(effects, "emitted_events").ok_or("effects has no emitted_events field")?;
+                let events_value = named(effects, "emitted_events")
+                    .ok_or("effects has no emitted_events field")?;
                 let events = self.read_events(events_value)?;
 
                 // Option<VersionedXcm> — Some/None, not a nullable field.
@@ -1214,16 +1230,15 @@ impl DryRunContext {
                     .map(|e| e.name.as_str())
                     .filter(|n| *n == "utility.BatchInterrupted" || *n == "utility.ItemFailed")
                     .collect();
-                let note = (status == SimStatus::Executed && !inner_failures.is_empty()).then(
-                    || {
+                let note =
+                    (status == SimStatus::Executed && !inner_failures.is_empty()).then(|| {
                         format!(
                             "the call dispatched successfully but an INNER call did not — {} \
                              present. utility.batch returns Ok when it stops early, so the \
                              status is about the outer call only; read emitted_events",
                             inner_failures.join(" + ")
                         )
-                    },
-                );
+                    });
 
                 Ok(SimOutcome {
                     status,
@@ -1262,7 +1277,10 @@ impl DryRunContext {
                 let inner = variant_inner(pallet)
                     .ok_or_else(|| format!("event pallet {} carries no event", pallet.name))?;
                 let ValueDef::Variant(event) = &inner.value else {
-                    return Err(format!("{}: inner value is not an event variant", pallet.name));
+                    return Err(format!(
+                        "{}: inner value is not an event variant",
+                        pallet.name
+                    ));
                 };
                 Ok(SimEvent {
                     name: format!("{}.{}", pallet.name.to_lowercase(), event.name),
@@ -1288,9 +1306,7 @@ impl DryRunContext {
                     .and_then(|inner| named(inner, "error"))
                     .and_then(first_byte);
                 match (index, error_byte) {
-                    (Some(i), Some(e)) if i <= u8::MAX as u64 => {
-                        self.module_error_name(i as u8, e)
-                    }
+                    (Some(i), Some(e)) if i <= u8::MAX as u64 => self.module_error_name(i as u8, e),
                     _ => None,
                 }
             }
@@ -1560,9 +1576,10 @@ fn value_as_u64(v: &Value<u32>) -> Option<u64> {
 fn first_byte(v: &Value<u32>) -> Option<u8> {
     match &v.value {
         ValueDef::Primitive(scale_value::Primitive::U128(n)) => u8::try_from(*n).ok(),
-        ValueDef::Composite(Composite::Unnamed(items)) => {
-            items.first().and_then(value_as_u64).and_then(|n| u8::try_from(n).ok())
-        }
+        ValueDef::Composite(Composite::Unnamed(items)) => items
+            .first()
+            .and_then(value_as_u64)
+            .and_then(|n| u8::try_from(n).ok()),
         _ => None,
     }
 }
@@ -1889,9 +1906,7 @@ mod tests {
         let assets_error = registry.register_type(&MetaType::new::<TAssetsError>()).id;
         let location = registry.register_type(&MetaType::new::<TVersionedLoc>()).id;
         let program = registry.register_type(&MetaType::new::<TProgram>()).id;
-        let xcm_output = registry
-            .register_type(&MetaType::new::<TXcmOutput<O>>())
-            .id;
+        let xcm_output = registry.register_type(&MetaType::new::<TXcmOutput<O>>()).id;
         let types: PortableRegistry = registry.into();
         DryRunContext::from_parts(
             types,
@@ -2026,7 +2041,10 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("MassiveSpender"), "{err}");
-        assert!(err.contains("MediumSpender") && err.contains("Treasurer"), "{err}");
+        assert!(
+            err.contains("MediumSpender") && err.contains("Treasurer"),
+            "{err}"
+        );
 
         let err = ctx
             .encode_origin(&OriginSpec::Variant {
@@ -2035,7 +2053,10 @@ mod tests {
             })
             .unwrap_err()
             .to_string();
-        assert!(err.contains("no origin 'Council'") && err.contains("Origins"), "{err}");
+        assert!(
+            err.contains("no origin 'Council'") && err.contains("Origins"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -2063,7 +2084,11 @@ mod tests {
             variant: "Root".into(),
         };
 
-        assert_eq!(ctx.arity(), 3, "the registered method takes result_xcms_version");
+        assert_eq!(
+            ctx.arity(),
+            3,
+            "the registered method takes result_xcms_version"
+        );
         let (params, _) = ctx.encode_params(&origin, &call, 4).unwrap();
         let mut expected = vec![0u8, 0u8];
         expected.extend_from_slice(&call);
@@ -2150,7 +2175,11 @@ mod tests {
         assert_eq!(outcome.dispatch_ok, Some(true));
         assert!(outcome.dispatch_error.is_none());
 
-        assert_eq!(outcome.events.len(), 2, "a one-element Vec is not a newtype");
+        assert_eq!(
+            outcome.events.len(),
+            2,
+            "a one-element Vec is not a newtype"
+        );
         assert_eq!(outcome.events[0].name, "system.ExtrinsicSuccess");
         assert_eq!(outcome.events[1].name, "balances.Transfer");
         assert_eq!(
@@ -2342,7 +2371,9 @@ mod tests {
             })
         );
 
-        let (bytes, _) = ctx.encode_location(&LocationSpec::Here).expect("here encodes");
+        let (bytes, _) = ctx
+            .encode_location(&LocationSpec::Here)
+            .expect("here encodes");
         assert_eq!(
             TVersionedLoc::decode(&mut &bytes[..]).unwrap(),
             TVersionedLoc::V5(TLocation {
@@ -2377,7 +2408,9 @@ mod tests {
         // NAMED VERSION, because dry_run_xcm answers in the version it was
         // asked in, and a baseline at another version cannot be differenced
         // against its subject.
-        let empty = ctx.encode_empty_program(5).expect("the empty program builds");
+        let empty = ctx
+            .encode_empty_program(5)
+            .expect("the empty program builds");
         assert_eq!(empty, TProgram::V5(TXcm(vec![])).encode());
         assert_eq!(
             program_summary(&ctx.decode_program(&empty).unwrap()),
@@ -2492,7 +2525,11 @@ mod tests {
         // And a response that does not fit the declared output is loud.
         let mut bad = effects(TOutcomeV5::Complete { used: weight() });
         bad.push(0xff);
-        assert!(ctx.interpret_xcm(&bad).unwrap_err().to_string().contains("trailing"));
+        assert!(ctx
+            .interpret_xcm(&bad)
+            .unwrap_err()
+            .to_string()
+            .contains("trailing"));
     }
 
     #[test]
@@ -2569,9 +2606,15 @@ mod tests {
 
         // Indices that do not exist are refused with the counts, never with an
         // empty program.
-        let err = ctx.forwarded_program(&response, 3, 0).unwrap_err().to_string();
+        let err = ctx
+            .forwarded_program(&response, 3, 0)
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("1 destination"), "{err}");
-        let err = ctx.forwarded_program(&response, 0, 5).unwrap_err().to_string();
+        let err = ctx
+            .forwarded_program(&response, 0, 5)
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("1 message"), "{err}");
     }
 
@@ -2602,7 +2645,10 @@ mod tests {
             program_summary(&serde_json::json!({"V5": [[[]]]})),
             "(empty program)"
         );
-        assert_eq!(program_summary(&serde_json::json!("nonsense")), "(unreadable program)");
+        assert_eq!(
+            program_summary(&serde_json::json!("nonsense")),
+            "(unreadable program)"
+        );
 
         // Bytes that are not a program at all are refused rather than summarised.
         assert!(ctx.decode_program(&[0xff, 0xff]).is_err());

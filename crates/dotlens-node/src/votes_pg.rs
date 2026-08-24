@@ -78,12 +78,20 @@ impl VoteSink for PgVoteSink {
         // otherwise deadlock on the DO UPDATE row locks — the same review
         // catch as the gov timeline sink. Borrowing comparators, no clones.
         votes.sort_by(|(ai, a), (bi, b)| {
-            (&a.class, a.referendum_id.unwrap_or(u64::MAX), &a.voter, ai)
-                .cmp(&(&b.class, b.referendum_id.unwrap_or(u64::MAX), &b.voter, bi))
+            (&a.class, a.referendum_id.unwrap_or(u64::MAX), &a.voter, ai).cmp(&(
+                &b.class,
+                b.referendum_id.unwrap_or(u64::MAX),
+                &b.voter,
+                bi,
+            ))
         });
         delegations.sort_by(|(ai, a), (bi, b)| {
-            (&a.class, a.track_id.unwrap_or(u32::MAX), &a.delegator, ai)
-                .cmp(&(&b.class, b.track_id.unwrap_or(u32::MAX), &b.delegator, bi))
+            (&a.class, a.track_id.unwrap_or(u32::MAX), &a.delegator, ai).cmp(&(
+                &b.class,
+                b.track_id.unwrap_or(u32::MAX),
+                &b.delegator,
+                bi,
+            ))
         });
 
         let mut tx = self.pool.begin().await.map_err(|e| e.to_string())?;

@@ -58,7 +58,10 @@ pub async fn insert_channel_reading(pool: &PgPool, reading: ChannelReading<'_>) 
     let channel_count = edges.iter().filter(|e| e.is_open()).count();
     let open_request_count = edges.len() - channel_count;
 
-    let mut tx = pool.begin().await.context("opening the channel-reading transaction")?;
+    let mut tx = pool
+        .begin()
+        .await
+        .context("opening the channel-reading transaction")?;
 
     let header = sqlx::query(
         "insert into xcm.channel_readings \
@@ -102,7 +105,9 @@ pub async fn insert_channel_reading(pool: &PgPool, reading: ChannelReading<'_>) 
         .bind(block_height as i64)
         .fetch_optional(&mut *tx)
         .await
-        .with_context(|| format!("re-reading the recorded channel reading {chain_id}@{block_height}"))?;
+        .with_context(|| {
+            format!("re-reading the recorded channel reading {chain_id}@{block_height}")
+        })?;
         tx.rollback().await.ok();
 
         if let Some((had_digest, had_channels, had_requests)) = existing {
@@ -161,7 +166,9 @@ pub async fn insert_channel_reading(pool: &PgPool, reading: ChannelReading<'_>) 
         })?;
     }
 
-    tx.commit().await.context("committing the channel reading")?;
+    tx.commit()
+        .await
+        .context("committing the channel reading")?;
     Ok(true)
 }
 

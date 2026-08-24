@@ -84,7 +84,10 @@ impl DeltaMapper for SubstrateDeltaMapper {
 /// The pure mapping. Non-balances events map to ∅; malformed balances events
 /// are ERRORS (money must never silently drop).
 pub fn deltas_for_event(event: &CanonicalEvent) -> Result<Vec<BalanceDelta>, String> {
-    let d = |account: [u8; 32], magnitude: u128, negative: bool, reason: &str,
+    let d = |account: [u8; 32],
+             magnitude: u128,
+             negative: bool,
+             reason: &str,
              counterparty: Option<[u8; 32]>| BalanceDelta {
         account: account.to_vec(),
         magnitude,
@@ -164,8 +167,7 @@ pub fn deltas_for_event(event: &CanonicalEvent) -> Result<Vec<BalanceDelta>, Str
             }
         }
         "balances.Deposit" | "balances.Minted" | "balances.Withdraw" | "balances.Burned"
-        | "balances.Slashed" | "balances.DustLost" | "balances.Suspended"
-        | "balances.Restored" => {
+        | "balances.Slashed" | "balances.DustLost" | "balances.Suspended" | "balances.Restored" => {
             // single-account events: {who|account, amount}
             let who = field_account(data, "who", 0)
                 .or_else(|| field_account(data, "account", 0))
@@ -209,16 +211,28 @@ pub fn deltas_for_event(event: &CanonicalEvent) -> Result<Vec<BalanceDelta>, Str
         // update_locks/update_freezes when an invariant fails). It moves no
         // money, so it maps to ∅ here — but its presence in a block is a
         // runtime-level anomaly worth surfacing when a slice exists to do so.
-        "balances.Endowed" | "balances.Reserved" | "balances.Unreserved"
-        | "balances.Held" | "balances.Released"
-        | "balances.Locked" | "balances.Unlocked" | "balances.Frozen"
-        | "balances.Thawed" | "balances.Issued" | "balances.Rescinded"
-        | "balances.MintedCredit" | "balances.BurnedDebt" | "balances.Unexpected"
-        | "balances.Upgraded" | "balances.TotalIssuanceForced" => vec![],
+        "balances.Endowed"
+        | "balances.Reserved"
+        | "balances.Unreserved"
+        | "balances.Held"
+        | "balances.Released"
+        | "balances.Locked"
+        | "balances.Unlocked"
+        | "balances.Frozen"
+        | "balances.Thawed"
+        | "balances.Issued"
+        | "balances.Rescinded"
+        | "balances.MintedCredit"
+        | "balances.BurnedDebt"
+        | "balances.Unexpected"
+        | "balances.Upgraded"
+        | "balances.TotalIssuanceForced" => vec![],
         // an UNKNOWN balances event is a mapper gap, never silently ∅ — a
         // runtime upgrade adding a total-moving event must halt us loudly
         name if name.starts_with("balances.") => {
-            return Err(format!("unknown balances event {name} — mapper update required"))
+            return Err(format!(
+                "unknown balances event {name} — mapper update required"
+            ))
         }
         // The ASSETS pallets are the same fact about a different asset, so
         // they go through the same worker, the same tables and the same
@@ -238,7 +252,11 @@ pub fn deltas_for_event(event: &CanonicalEvent) -> Result<Vec<BalanceDelta>, Str
 // (decoder v2) or SS58 strings (decoder v1 fixtures); u128 amounts as numbers
 // when small, decimal strings when big.
 
-pub(crate) fn field<'a>(data: &'a serde_json::Value, name: &str, index: usize) -> Option<&'a serde_json::Value> {
+pub(crate) fn field<'a>(
+    data: &'a serde_json::Value,
+    name: &str,
+    index: usize,
+) -> Option<&'a serde_json::Value> {
     match data {
         serde_json::Value::Object(map) => map.get(name),
         serde_json::Value::Array(items) => items.get(index),
@@ -296,7 +314,11 @@ pub(crate) fn json_u128(v: &serde_json::Value) -> Option<u128> {
     }
 }
 
-pub(crate) fn field_account(data: &serde_json::Value, name: &str, index: usize) -> Option<[u8; 32]> {
+pub(crate) fn field_account(
+    data: &serde_json::Value,
+    name: &str,
+    index: usize,
+) -> Option<[u8; 32]> {
     field(data, name, index).and_then(json_account_bytes)
 }
 
@@ -373,7 +395,10 @@ pub fn decode_account_info(
     let reserved = named_u128(data, "reserved").ok_or("AccountData has no `reserved`")?;
     let frozen = named_u128(data, "frozen").or_else(|| {
         // pre-balances-v2 runtimes: misc_frozen + fee_frozen
-        match (named_u128(data, "misc_frozen"), named_u128(data, "fee_frozen")) {
+        match (
+            named_u128(data, "misc_frozen"),
+            named_u128(data, "fee_frozen"),
+        ) {
             (Some(m), Some(f)) => Some(m + f),
             _ => None,
         }
@@ -485,8 +510,14 @@ mod tests {
             "balances.Upgraded",
             "system.ExtrinsicSuccess",
         ] {
-            let e = ev(name, serde_json::json!({"who": acct_json(&who), "amount": 1}));
-            assert!(deltas_for_event(&e).unwrap().is_empty(), "{name} must map to ∅");
+            let e = ev(
+                name,
+                serde_json::json!({"who": acct_json(&who), "amount": 1}),
+            );
+            assert!(
+                deltas_for_event(&e).unwrap().is_empty(),
+                "{name} must map to ∅"
+            );
         }
         // unknown balances events halt loudly (mapper gap, not silent ∅)
         let unknown = ev(
@@ -500,7 +531,10 @@ mod tests {
             serde_json::json!({"who": acct_json(&who), "free": 123}),
         );
         let ds = deltas_for_event(&set).unwrap();
-        assert_eq!((ds[0].magnitude, ds[0].reason.as_str()), (0, "balance_set_unquantified"));
+        assert_eq!(
+            (ds[0].magnitude, ds[0].reason.as_str()),
+            (0, "balance_set_unquantified")
+        );
     }
 
     #[test]
@@ -512,7 +546,10 @@ mod tests {
                 name,
                 serde_json::json!({"who": acct_json(&who), "amount": 0, "reason": {"Revive": [{"AddressMapping": []}]}}),
             );
-            assert!(deltas_for_event(&e).unwrap().is_empty(), "{name} must map to ∅");
+            assert!(
+                deltas_for_event(&e).unwrap().is_empty(),
+                "{name} must map to ∅"
+            );
         }
     }
 
@@ -534,7 +571,10 @@ mod tests {
         assert_eq!(ds.len(), 1);
         assert_eq!(ds[0].account, a.to_vec());
         assert_eq!(ds[0].magnitude, 700);
-        assert!(ds[0].negative, "burning held funds shrinks reserved, so total");
+        assert!(
+            ds[0].negative,
+            "burning held funds shrinks reserved, so total"
+        );
         assert_eq!(ds[0].reason, "burned_held");
 
         // positional form, reason at 0 — source/dest/amount at 1/2/3
@@ -544,8 +584,14 @@ mod tests {
         );
         let ds = deltas_for_event(&on_hold).unwrap();
         assert_eq!(ds.len(), 2);
-        assert_eq!((ds[0].account.clone(), ds[0].negative, ds[0].magnitude), (a.to_vec(), true, 900));
-        assert_eq!((ds[1].account.clone(), ds[1].negative, ds[1].magnitude), (b.to_vec(), false, 900));
+        assert_eq!(
+            (ds[0].account.clone(), ds[0].negative, ds[0].magnitude),
+            (a.to_vec(), true, 900)
+        );
+        assert_eq!(
+            (ds[1].account.clone(), ds[1].negative, ds[1].magnitude),
+            (b.to_vec(), false, 900)
+        );
         assert_eq!(ds[0].counterparty.as_deref(), Some(&b[..]));
 
         // TransferAndHold carries the amount under a DIFFERENT name
@@ -578,20 +624,32 @@ mod tests {
             "balances.DustLost",
             serde_json::json!({"account": acct_json(&who), "amount": 10_000_000u64}),
         );
-        let debt = ev("balances.BurnedDebt", serde_json::json!({"amount": 10_000_000u64}));
+        let debt = ev(
+            "balances.BurnedDebt",
+            serde_json::json!({"amount": 10_000_000u64}),
+        );
         let total: u128 = [dust, debt]
             .iter()
             .flat_map(|e| deltas_for_event(e).unwrap())
             .map(|d| d.magnitude)
             .sum();
-        assert_eq!(total, 10_000_000, "the dust must be counted once, not twice");
+        assert_eq!(
+            total, 10_000_000,
+            "the dust must be counted once, not twice"
+        );
 
         for name in ["balances.MintedCredit", "balances.BurnedDebt"] {
             let e = ev(name, serde_json::json!({"amount": 5}));
-            assert!(deltas_for_event(&e).unwrap().is_empty(), "{name} must map to ∅");
+            assert!(
+                deltas_for_event(&e).unwrap().is_empty(),
+                "{name} must map to ∅"
+            );
         }
         // the defensive variant is a newtype over UnexpectedKind, not a balance
-        let e = ev("balances.Unexpected", serde_json::json!([{"Underflow": []}]));
+        let e = ev(
+            "balances.Unexpected",
+            serde_json::json!([{"Underflow": []}]),
+        );
         assert!(deltas_for_event(&e).unwrap().is_empty());
     }
 
@@ -611,9 +669,15 @@ mod tests {
 
     #[test]
     fn malformed_balances_events_are_loud_errors() {
-        let e = ev("balances.Transfer", serde_json::json!({"from": [[1,2]], "amount": 5}));
+        let e = ev(
+            "balances.Transfer",
+            serde_json::json!({"from": [[1,2]], "amount": 5}),
+        );
         assert!(deltas_for_event(&e).is_err());
-        let e2 = ev("balances.Deposit", serde_json::json!({"who": "not-bytes", "amount": 5}));
+        let e2 = ev(
+            "balances.Deposit",
+            serde_json::json!({"who": "not-bytes", "amount": 5}),
+        );
         assert!(deltas_for_event(&e2).is_err());
     }
 
@@ -637,7 +701,10 @@ mod tests {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../fixtures/real/polkadot-asset-hub-19498783/metadata.scale");
         let Ok(blob) = std::fs::read(&path) else {
-            eprintln!("SKIP: real fixture metadata not present at {}", path.display());
+            eprintln!(
+                "SKIP: real fixture metadata not present at {}",
+                path.display()
+            );
             return;
         };
         let mut bytes = Vec::new();

@@ -32,8 +32,9 @@
 //! block. The pairing RULE is tested where it lives, in
 //! `adapter_substrate::xcm_correlate`.
 
-use crate::module::{self, impl_module_error, BlockMapError, EventSource, FactWriter, Mapping,
-                    ModuleRun};
+use crate::module::{
+    self, impl_module_error, BlockMapError, EventSource, FactWriter, Mapping, ModuleRun,
+};
 use crate::{CheckpointError, CheckpointStore};
 use async_trait::async_trait;
 use canonical::CanonicalEvent;
@@ -293,7 +294,10 @@ mod tests {
     #[tokio::test]
     async fn a_block_level_mapper_keys_its_rows_by_the_index_it_chose() {
         let mut src = HashMap::new();
-        src.insert(7, vec![ev(3, "mock.Wire"), ev(4, "mock.Sent"), ev(5, "mock.Other")]);
+        src.insert(
+            7,
+            vec![ev(3, "mock.Wire"), ev(4, "mock.Sent"), ev(5, "mock.Other")],
+        );
         let checkpoints = MemoryCheckpointStore::new();
         let sink = MemSink::default();
         let deps = XcmCorrelateDeps {
@@ -307,7 +311,11 @@ mod tests {
         assert_eq!(n, 1);
         let rows = sink.0.lock().unwrap();
         assert_eq!(rows.len(), 1, "one link from three events");
-        assert_eq!((rows[0].0, rows[0].1), (7, 3), "keyed by the WIRE event, not by 0");
+        assert_eq!(
+            (rows[0].0, rows[0].1),
+            (7, 3),
+            "keyed by the WIRE event, not by 0"
+        );
         assert_eq!(rows[0].2.topic_event_index, 4);
     }
 

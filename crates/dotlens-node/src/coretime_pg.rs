@@ -172,13 +172,14 @@ async fn resolve_relay_parents(
     if hashes.is_empty() {
         return Ok(HashMap::new());
     }
-    let found: Vec<(String, i64)> =
-        sqlx::query_as("select hash, height from core.blocks where chain_id = $1 and hash = any($2)")
-            .bind(chain_id)
-            .bind(&hashes[..])
-            .fetch_all(pool)
-            .await
-            .context("resolving relay parents against core.blocks")?;
+    let found: Vec<(String, i64)> = sqlx::query_as(
+        "select hash, height from core.blocks where chain_id = $1 and hash = any($2)",
+    )
+    .bind(chain_id)
+    .bind(&hashes[..])
+    .fetch_all(pool)
+    .await
+    .context("resolving relay parents against core.blocks")?;
     Ok(found.into_iter().map(|(h, n)| (h, n as u64)).collect())
 }
 
@@ -230,8 +231,9 @@ fn invariant_violation(
             );
         }
     }
-    anyhow::Error::new(e)
-        .context(format!("inserting occupancy fact {chain_id}/{height}/{event_index}"))
+    anyhow::Error::new(e).context(format!(
+        "inserting occupancy fact {chain_id}/{height}/{event_index}"
+    ))
 }
 
 // ------------------------------------------------------------- the denominator

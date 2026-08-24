@@ -192,10 +192,7 @@ impl<'a> SubstrateDryRunner<'a> {
     /// Resolve the state a request names, and everything the runtime says about
     /// itself there. Shared by both `prepare` paths, which ask the same four
     /// questions in the same order.
-    async fn resolve_state(
-        &self,
-        at_height: Option<u64>,
-    ) -> Result<ResolvedState, SimError> {
+    async fn resolve_state(&self, at_height: Option<u64>) -> Result<ResolvedState, SimError> {
         let height = match at_height {
             Some(h) => h,
             None => self
@@ -584,9 +581,8 @@ fn unversioned(v: &serde_json::Value) -> &serde_json::Value {
         return v;
     }
     let (key, inner) = map.iter().next().expect("checked len == 1");
-    let versioned = key.len() > 1
-        && key.starts_with('V')
-        && key[1..].chars().all(|c| c.is_ascii_digit());
+    let versioned =
+        key.len() > 1 && key.starts_with('V') && key[1..].chars().all(|c| c.is_ascii_digit());
     if !versioned {
         return v;
     }
@@ -672,7 +668,9 @@ mod tests {
         // it is not peeled — there is no Parachain junction to find recursively,
         // so `parents` has to be readable.
         assert_eq!(
-            resolve_destination(&reg, ah, &versioned(1, None)).unwrap().id,
+            resolve_destination(&reg, ah, &versioned(1, None))
+                .unwrap()
+                .id,
             "polkadot"
         );
         // downward: the relay → one of its children
@@ -715,7 +713,10 @@ mod tests {
 
         // A parachain nobody registered is a boundary too, named by its id.
         let err = resolve_destination(&reg, ah, &versioned(1, Some(2999))).unwrap_err();
-        assert!(err.contains("2999") && err.contains("not registered"), "{err}");
+        assert!(
+            err.contains("2999") && err.contains("not registered"),
+            "{err}"
+        );
     }
 
     #[test]

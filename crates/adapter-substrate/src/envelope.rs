@@ -211,9 +211,7 @@ fn decode_v1(bytes: &[u8]) -> Result<BlockEnvelope, EnvelopeError> {
     let mut extrinsics = Vec::with_capacity(v.extrinsics.len());
     for (i, x) in v.extrinsics.iter().enumerate() {
         let t = x.strip_prefix("0x").unwrap_or(x);
-        extrinsics.push(
-            hex::decode(t).map_err(|e| EnvelopeError(format!("extrinsic {i}: {e}")))?,
-        );
+        extrinsics.push(hex::decode(t).map_err(|e| EnvelopeError(format!("extrinsic {i}: {e}")))?);
     }
     Ok(BlockEnvelope {
         chain_id: v.chain_id,
@@ -301,7 +299,11 @@ mod tests {
             "height": 1, "hash": format!("0x{}", "00".repeat(32)),
             "parent_hash": format!("0x{}", "00".repeat(32)),
             "spec_version": 1, "extrinsics": [] });
-        assert!(decode_any(&serde_json::to_vec(&j).unwrap()).unwrap().finalized);
+        assert!(
+            decode_any(&serde_json::to_vec(&j).unwrap())
+                .unwrap()
+                .finalized
+        );
         // v2: a byte that is neither 0 nor 1 halts rather than becoming `true`
         let mut b = encode_v2(&sample()).unwrap();
         let pos = 7 + 1 + 4 + "polkadot-asset-hub".len() + 8 + 128 + 4;
@@ -313,7 +315,9 @@ mod tests {
     #[test]
     fn truncation_trailing_bytes_and_foreign_formats_are_all_refused_by_name() {
         let full = encode_v2(&sample()).unwrap();
-        assert!(format!("{}", decode_any(&full[..full.len() - 5]).unwrap_err()).contains("truncated"));
+        assert!(
+            format!("{}", decode_any(&full[..full.len() - 5]).unwrap_err()).contains("truncated")
+        );
         let mut extra = full.clone();
         extra.push(0);
         assert!(format!("{}", decode_any(&extra).unwrap_err()).contains("trailing"));

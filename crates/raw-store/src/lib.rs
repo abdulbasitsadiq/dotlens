@@ -133,7 +133,12 @@ pub mod keys {
     /// `.response.scale` (what came back) — because Tier 2 and `dry_run_xcm`
     /// will file artifacts in this same directory, and bytes whose meaning
     /// depends on knowing which call produced them are not evidence.
-    pub fn simulation(chain: &str, block_hash_hex: &str, input_hash_hex: &str, item: &str) -> String {
+    pub fn simulation(
+        chain: &str,
+        block_hash_hex: &str,
+        input_hash_hex: &str,
+        item: &str,
+    ) -> String {
         format!("raw/{chain}/sim/{block_hash_hex}/{input_hash_hex}/{item}")
     }
     /// Unfinalized blocks are HASH-KEYED: forks at one height coexist under
@@ -160,7 +165,9 @@ impl FsRawStore {
     fn path_for(&self, key: &str) -> Result<PathBuf, RawStoreError> {
         let bad = key.is_empty()
             || key.starts_with('/')
-            || key.split('/').any(|seg| seg.is_empty() || seg == "." || seg == "..");
+            || key
+                .split('/')
+                .any(|seg| seg.is_empty() || seg == "." || seg == "..");
         if bad {
             return Err(RawStoreError::InvalidKey(key.to_string()));
         }
@@ -262,7 +269,11 @@ pub struct BucketedStore<S: RawStore> {
 impl<S: RawStore> BucketedStore<S> {
     pub fn new(inner: S, bucket_blocks: u64) -> Self {
         assert!(bucket_blocks > 0, "bucket_blocks must be positive");
-        Self { inner, bucket_blocks, cache: Mutex::new(None) }
+        Self {
+            inner,
+            bucket_blocks,
+            cache: Mutex::new(None),
+        }
     }
 
     pub fn with_default_bucket(inner: S) -> Self {
@@ -373,10 +384,8 @@ mod tests {
     fn tmp_store(tag: &str) -> (FsRawStore, PathBuf) {
         static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!(
-            "dotlens-rawstore-{}-{tag}-{n}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("dotlens-rawstore-{}-{tag}-{n}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         (FsRawStore::new(&dir), dir)
     }
@@ -415,7 +424,14 @@ mod tests {
     #[test]
     fn traversal_and_absolute_keys_are_rejected() {
         let (store, dir) = tmp_store("badkeys");
-        for key in ["../escape", "raw/../../etc/passwd", "/abs", "", "raw//x", "raw/./x"] {
+        for key in [
+            "../escape",
+            "raw/../../etc/passwd",
+            "/abs",
+            "",
+            "raw//x",
+            "raw/./x",
+        ] {
             assert!(
                 matches!(store.put(key, b"x", "t"), Err(RawStoreError::InvalidKey(_))),
                 "key should be rejected: {key}"
@@ -431,9 +447,18 @@ mod tests {
     /// `exists()` into a directory scan.
     #[test]
     fn bucket_bounds_are_aligned_and_need_no_listing() {
-        assert_eq!(keys::bucket_bounds(19_410_000, 1000), (19_410_000, 19_410_999));
-        assert_eq!(keys::bucket_bounds(19_410_999, 1000), (19_410_000, 19_410_999));
-        assert_eq!(keys::bucket_bounds(19_411_000, 1000), (19_411_000, 19_411_999));
+        assert_eq!(
+            keys::bucket_bounds(19_410_000, 1000),
+            (19_410_000, 19_410_999)
+        );
+        assert_eq!(
+            keys::bucket_bounds(19_410_999, 1000),
+            (19_410_000, 19_410_999)
+        );
+        assert_eq!(
+            keys::bucket_bounds(19_411_000, 1000),
+            (19_411_000, 19_411_999)
+        );
         assert_eq!(keys::bucket_bounds(0, 1000), (0, 999));
         // and the bucket object nests inside the existing height/10_000 directory
         assert_eq!(
@@ -504,8 +529,13 @@ mod tests {
 
         let mlen = u32::from_le_bytes(packed[8..12].try_into().unwrap()) as usize;
         let prefix = &packed[..12 + mlen];
-        assert!(prefix.len() < packed.len(), "prefix must be shorter than the object");
-        let m = bucket::read_manifest(prefix).unwrap().expect("manifest from prefix");
+        assert!(
+            prefix.len() < packed.len(),
+            "prefix must be shorter than the object"
+        );
+        let m = bucket::read_manifest(prefix)
+            .unwrap()
+            .expect("manifest from prefix");
         assert_eq!(m.members.len(), 50);
         assert_eq!(m.heights().len(), 50);
         // and every member's hash is the SAME hash a per-object receipt holds,
@@ -562,19 +592,27 @@ mod tests {
         )
         .unwrap();
         let (from, to) = keys::bucket_bounds(2_000_007, 1000);
-        bucketed.put(&keys::bucket("mock", from, to), &packed, "compact").unwrap();
+        bucketed
+            .put(&keys::bucket("mock", from, to), &packed, "compact")
+            .unwrap();
         assert_eq!(bucketed.get(&per_object).unwrap(), b"the-block-bytes");
 
         // 3. RETIREMENT: delete the per-object copy; the bucket still answers
         std::fs::remove_file(dir.join(&per_object)).unwrap();
         assert!(!bucketed.inner().exists(&per_object).unwrap());
-        assert!(bucketed.exists(&per_object).unwrap(), "bucket must answer exists()");
+        assert!(
+            bucketed.exists(&per_object).unwrap(),
+            "bucket must answer exists()"
+        );
         assert_eq!(bucketed.get(&per_object).unwrap(), b"the-block-bytes");
 
         // 4. a height with neither copy is honestly absent
         let missing = keys::block("mock", 2_000_008, "block.bin");
         assert!(!bucketed.exists(&missing).unwrap());
-        assert!(matches!(bucketed.get(&missing), Err(RawStoreError::NotFound(_))));
+        assert!(matches!(
+            bucketed.get(&missing),
+            Err(RawStoreError::NotFound(_))
+        ));
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -594,7 +632,9 @@ mod tests {
             })
             .collect();
         let packed = bucket::pack("mock", &members, 3).unwrap();
-        store.put(&keys::bucket("mock", 5000, 5999), &packed, "t").unwrap();
+        store
+            .put(&keys::bucket("mock", 5000, 5999), &packed, "t")
+            .unwrap();
 
         // CountingStore records how many times the bucket object is fetched
         struct Counting {
@@ -613,7 +653,10 @@ mod tests {
                 self.inner.exists(k)
             }
         }
-        let counting = Counting { inner: store, gets: Default::default() };
+        let counting = Counting {
+            inner: store,
+            gets: Default::default(),
+        };
         let bucketed = BucketedStore::new(counting, 1000);
         for i in 0..200u64 {
             for item in ["block.bin", "events.scale"] {

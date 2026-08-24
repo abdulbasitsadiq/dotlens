@@ -259,14 +259,24 @@ pub fn broker_fact_for_event(event: &CanonicalEvent) -> Result<Option<BrokerFact
     let core_index = match core_from {
         CoreFrom::None => None,
         CoreFrom::Field => Some(read_u32(event, variant, "core", &["core"])?),
-        CoreFrom::RegionId => Some(read_u32(event, variant, "region_id.core", &["region_id", "core"])?),
+        CoreFrom::RegionId => Some(read_u32(
+            event,
+            variant,
+            "region_id.core",
+            &["region_id", "core"],
+        )?),
         CoreFrom::OldRegionId => Some(read_u32(
             event,
             variant,
             "old_region_id.core",
             &["old_region_id", "core"],
         )?),
-        CoreFrom::Region => Some(read_u32(event, variant, "region.core", &["region", "core"])?),
+        CoreFrom::Region => Some(read_u32(
+            event,
+            variant,
+            "region.core",
+            &["region", "core"],
+        )?),
     };
 
     let task_id = match task_from {
@@ -301,7 +311,10 @@ pub fn broker_fact_for_event(event: &CanonicalEvent) -> Result<Option<BrokerFact
 /// vector, and the day one region interlaces, a reader that took the first
 /// element would silently report one of two entitlements on that core and drop
 /// the other permanently.
-fn assignments_from(event: &CanonicalEvent, core_index: u32) -> Result<Vec<CoreAssignmentFact>, String> {
+fn assignments_from(
+    event: &CanonicalEvent,
+    core_index: u32,
+) -> Result<Vec<CoreAssignmentFact>, String> {
     let relay_block = read_u64(event, CORE_ASSIGNED, "when", &["when"])?;
 
     let vector = field(&event.data, &["assignment"]).ok_or_else(|| {
@@ -361,7 +374,10 @@ fn assignments_from(event: &CanonicalEvent, core_index: u32) -> Result<Vec<CoreA
 /// decision rather than a stylistic one: an `Idle` core is unsold, a `Pool` core
 /// was sold and donated to the instantaneous market, and folding them together
 /// would turn 43,000 pool slots into waste they are not part of.
-fn assignment_kind(value: &serde_json::Value, i: usize) -> Result<(&'static str, Option<u32>), String> {
+fn assignment_kind(
+    value: &serde_json::Value,
+    i: usize,
+) -> Result<(&'static str, Option<u32>), String> {
     let obj = value.as_object().ok_or_else(|| {
         format!(
             "{BROKER_PALLET}.{CORE_ASSIGNED}.assignment[{i}] kind is {} rather than an enum \
@@ -385,7 +401,12 @@ fn assignment_kind(value: &serde_json::Value, i: usize) -> Result<(&'static str,
         "Pool" => Ok((ASSIGNMENT_POOL, None)),
         "Task" => {
             let id = bare_u64(payload)
-                .or_else(|| payload.as_array().and_then(|a| a.first()).and_then(bare_u64))
+                .or_else(|| {
+                    payload
+                        .as_array()
+                        .and_then(|a| a.first())
+                        .and_then(bare_u64)
+                })
                 .ok_or_else(|| {
                     format!(
                         "{BROKER_PALLET}.{CORE_ASSIGNED}.assignment[{i}] Task payload is not a \
@@ -432,7 +453,12 @@ fn bare_u64(value: &serde_json::Value) -> Option<u64> {
     value.as_str().and_then(|s| s.parse::<u64>().ok())
 }
 
-fn read_u64(event: &CanonicalEvent, variant: &str, label: &str, path: &[&str]) -> Result<u64, String> {
+fn read_u64(
+    event: &CanonicalEvent,
+    variant: &str,
+    label: &str,
+    path: &[&str],
+) -> Result<u64, String> {
     let node = field(&event.data, path).ok_or_else(|| {
         format!(
             "{BROKER_PALLET}.{variant} carries no `{label}`: {}",
@@ -448,11 +474,15 @@ fn read_u64(event: &CanonicalEvent, variant: &str, label: &str, path: &[&str]) -
     })
 }
 
-fn read_u32(event: &CanonicalEvent, variant: &str, label: &str, path: &[&str]) -> Result<u32, String> {
+fn read_u32(
+    event: &CanonicalEvent,
+    variant: &str,
+    label: &str,
+    path: &[&str],
+) -> Result<u32, String> {
     let raw = read_u64(event, variant, label, path)?;
-    u32::try_from(raw).map_err(|_| {
-        format!("{BROKER_PALLET}.{variant} `{label}` does not fit in u32: {raw}")
-    })
+    u32::try_from(raw)
+        .map_err(|_| format!("{BROKER_PALLET}.{variant} `{label}` does not fit in u32: {raw}"))
 }
 
 fn shape_of(value: &serde_json::Value) -> &'static str {
@@ -614,16 +644,13 @@ pub fn decode_broker_config(
         None => None,
     };
 
-    let core_count = status
-        .get("core_count")
-        .and_then(bare_u64)
-        .ok_or_else(|| {
-            format!(
-                "{BROKER_STORAGE_PALLET}.{STATUS_ENTRY} carries no readable `core_count`: {status}. \
+    let core_count = status.get("core_count").and_then(bare_u64).ok_or_else(|| {
+        format!(
+            "{BROKER_STORAGE_PALLET}.{STATUS_ENTRY} carries no readable `core_count`: {status}. \
                  It is the entitlement half's denominator and there is no other source for it — a \
                  ratio computed without it would be divided by a number nobody can date"
-            )
-        })? as u32;
+        )
+    })? as u32;
 
     Ok(BrokerConfigView {
         core_count,
@@ -689,12 +716,15 @@ mod tests {
         // Rust array-repeat expression in array position — it fails with "no
         // rules expected `7u8`" and the crate does not build. This project has
         // now hit that in six separate slices; the `vec!` form is the fix.
-        let f = fact("broker.Purchased", json!({
-            "who": [vec![7u8; 32]],
-            "region_id": {"begin": 322663, "core": 61, "mask": [vec![255u8; 10]]},
-            "price": "12345678901234567890",
-            "duration": 5040
-        }));
+        let f = fact(
+            "broker.Purchased",
+            json!({
+                "who": [vec![7u8; 32]],
+                "region_id": {"begin": 322663, "core": 61, "mask": [vec![255u8; 10]]},
+                "price": "12345678901234567890",
+                "duration": 5040
+            }),
+        );
         assert_eq!(f.variant, "Purchased");
         assert_eq!(f.core_index, Some(61), "core comes from region_id.core");
         assert_eq!(f.task_id, None);
@@ -712,13 +742,19 @@ mod tests {
         for (name, data) in [
             ("broker.CoreCountRequested", json!({"core_count": 100})),
             ("broker.CoreCountChanged", json!({"core_count": 100})),
-            ("broker.SalesStarted", json!({"price": "1", "core_count": 100})),
+            (
+                "broker.SalesStarted",
+                json!({"price": "1", "core_count": 100}),
+            ),
         ] {
             let f = fact(name, data);
             assert_eq!(f.core_index, None, "{name} names a COUNT, not a core");
         }
         // And the reservation index is not a core index either.
-        let f = fact("broker.ReservationMade", json!({"index": 3, "workload": []}));
+        let f = fact(
+            "broker.ReservationMade",
+            json!({"index": 3, "workload": []}),
+        );
         assert_eq!(f.core_index, None);
     }
 
@@ -727,10 +763,13 @@ mod tests {
     /// and the row would lose its core silently.
     #[test]
     fn the_one_variant_that_spells_it_region_still_finds_its_core() {
-        let f = fact("broker.RevenueClaimBegun", json!({
-            "region": {"begin": 318007, "core": 12, "mask": [vec![255u8; 10]]},
-            "max_timeslices": 10
-        }));
+        let f = fact(
+            "broker.RevenueClaimBegun",
+            json!({
+                "region": {"begin": 318007, "core": 12, "mask": [vec![255u8; 10]]},
+                "max_timeslices": 10
+            }),
+        );
         assert_eq!(f.core_index, Some(12));
     }
 
@@ -740,15 +779,18 @@ mod tests {
     /// would key every renewal to the tenant's previous slot.
     #[test]
     fn a_renewal_takes_the_new_core_and_leaves_the_old_one_in_data() {
-        let f = fact("broker.Renewed", json!({
-            "who": [vec![9u8; 32]],
-            "price": "1000",
-            "old_core": 35,
-            "core": 43,
-            "begin": 322663,
-            "duration": 5040,
-            "workload": []
-        }));
+        let f = fact(
+            "broker.Renewed",
+            json!({
+                "who": [vec![9u8; 32]],
+                "price": "1000",
+                "old_core": 35,
+                "core": 43,
+                "begin": 322663,
+                "duration": 5040,
+                "workload": []
+            }),
+        );
         assert_eq!(f.core_index, Some(43), "the NEW core, never old_core");
     }
 
@@ -757,11 +799,14 @@ mod tests {
     /// variant one array layer deep.
     #[test]
     fn core_assigned_expands_into_the_seam_with_its_relay_block() {
-        let f = fact("broker.CoreAssigned", json!({
-            "core": 47,
-            "when": 29053200u64,
-            "assignment": [[{"Task": [3428]}, 57600]]
-        }));
+        let f = fact(
+            "broker.CoreAssigned",
+            json!({
+                "core": 47,
+                "when": 29053200u64,
+                "assignment": [[{"Task": [3428]}, 57600]]
+            }),
+        );
         assert_eq!(f.core_index, Some(47));
         assert_eq!(f.assignments.len(), 1);
         let a = &f.assignments[0];
@@ -781,15 +826,21 @@ mod tests {
     /// time as waste would invent 43,000 wasted slots that nobody bought.
     #[test]
     fn pool_and_idle_are_distinct_kinds_and_name_no_task() {
-        let pool = fact("broker.CoreAssigned", json!({
-            "core": 3, "when": 29053200u64, "assignment": [[{"Pool": []}, 57600]]
-        }));
+        let pool = fact(
+            "broker.CoreAssigned",
+            json!({
+                "core": 3, "when": 29053200u64, "assignment": [[{"Pool": []}, 57600]]
+            }),
+        );
         assert_eq!(pool.assignments[0].kind, ASSIGNMENT_POOL);
         assert_eq!(pool.assignments[0].task_id, None);
 
-        let idle = fact("broker.CoreAssigned", json!({
-            "core": 4, "when": 29053200u64, "assignment": [[{"Idle": []}, 57600]]
-        }));
+        let idle = fact(
+            "broker.CoreAssigned",
+            json!({
+                "core": 4, "when": 29053200u64, "assignment": [[{"Idle": []}, 57600]]
+            }),
+        );
         assert_eq!(idle.assignments[0].kind, ASSIGNMENT_IDLE);
         assert_ne!(idle.assignments[0].kind, pool.assignments[0].kind);
     }
@@ -801,11 +852,14 @@ mod tests {
     /// `CandidateTimedOut`.
     #[test]
     fn an_interlaced_core_keeps_both_entitlements() {
-        let f = fact("broker.CoreAssigned", json!({
-            "core": 61,
-            "when": 29053200u64,
-            "assignment": [[{"Task": [2034]}, 28800], [{"Task": [2000]}, 28800]]
-        }));
+        let f = fact(
+            "broker.CoreAssigned",
+            json!({
+                "core": 61,
+                "when": 29053200u64,
+                "assignment": [[{"Task": [2034]}, 28800], [{"Task": [2000]}, 28800]]
+            }),
+        );
         assert_eq!(f.assignments.len(), 2);
         assert_eq!(f.assignments[0].assignment_index, 0);
         assert_eq!(f.assignments[1].assignment_index, 1);
@@ -921,14 +975,24 @@ mod tests {
     #[test]
     fn the_mapper_emits_at_most_one_row_per_event() {
         let rows = SubstrateBrokerMapper
-            .facts(&ev("broker.CoreAssigned", json!({
-                "core": 1, "when": 80u64,
-                "assignment": [[{"Task": [2000]}, 28800], [{"Pool": []}, 28800]]
-            })))
+            .facts(&ev(
+                "broker.CoreAssigned",
+                json!({
+                    "core": 1, "when": 80u64,
+                    "assignment": [[{"Task": [2000]}, 28800], [{"Pool": []}, 28800]]
+                }),
+            ))
             .expect("mapper halted");
         assert_eq!(rows.len(), 1, "one event is one broker_events row");
-        assert_eq!(rows[0].assignments.len(), 2, "the expansion rides inside it");
-        assert_eq!(SubstrateBrokerMapper.mapper_version(), BROKER_MAPPER_VERSION);
+        assert_eq!(
+            rows[0].assignments.len(),
+            2,
+            "the expansion rides inside it"
+        );
+        assert_eq!(
+            SubstrateBrokerMapper.mapper_version(),
+            BROKER_MAPPER_VERSION
+        );
     }
 }
 

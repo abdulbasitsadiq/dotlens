@@ -357,10 +357,7 @@ mod tests {
         // two readings ten sessions apart date it to a ten-boundary window. If
         // these two rendered the same way, the history would be claiming a
         // precision it does not have.
-        let exact = derive_history(&[
-            obs(100, 10, None),
-            obs(2500, 11, Some("open")),
-        ]);
+        let exact = derive_history(&[obs(100, 10, None), obs(2500, 11, Some("open"))]);
         assert_eq!(exact.transitions.len(), 1);
         assert!(exact.transitions[0].exact);
         assert_eq!(exact.transitions[0].candidate_boundaries, 1);
@@ -369,10 +366,16 @@ mod tests {
 
         let vague = derive_history(&[obs(100, 10, None), obs(30000, 20, Some("open"))]);
         assert_eq!(vague.transitions.len(), 1);
-        assert!(!vague.transitions[0].exact, "ten sessions apart is not an exact date");
+        assert!(
+            !vague.transitions[0].exact,
+            "ten sessions apart is not an exact date"
+        );
         assert_eq!(vague.transitions[0].candidate_boundaries, 10);
         assert_eq!(vague.unread.len(), 1);
-        assert_eq!(vague.unread[0].sessions, 9, "sessions 11..=19 were never read");
+        assert_eq!(
+            vague.unread[0].sessions, 9,
+            "sessions 11..=19 were never read"
+        );
         assert!(
             vague.reads_as.contains("opened AND CLOSED"),
             "a gap must warn that a whole channel lifetime can hide in it: {}",
@@ -391,20 +394,33 @@ mod tests {
         // and it was not there. Slice 14's blocker 3 in mirror image.
         let never_read = derive_history(&[]);
         assert_eq!(never_read.readings, 0);
-        assert!(never_read.reads_as.contains("NO READING"), "{}", never_read.reads_as);
+        assert!(
+            never_read.reads_as.contains("NO READING"),
+            "{}",
+            never_read.reads_as
+        );
         assert!(
             never_read.reads_as.contains("OUR INDEX"),
             "it must name itself as a statement about the index: {}",
             never_read.reads_as
         );
-        assert!(never_read.reads_as.contains("channels-range"), "and say what to run");
+        assert!(
+            never_read.reads_as.contains("channels-range"),
+            "and say what to run"
+        );
 
         let read_and_absent = derive_history(&[obs(100, 10, None), obs(2500, 11, None)]);
         assert_eq!(read_and_absent.readings, 2);
         assert_eq!(read_and_absent.readings_present, 0);
-        assert!(read_and_absent.reads_as.contains("ABSENT"), "{}", read_and_absent.reads_as);
         assert!(
-            read_and_absent.reads_as.contains("statement about the chain"),
+            read_and_absent.reads_as.contains("ABSENT"),
+            "{}",
+            read_and_absent.reads_as
+        );
+        assert!(
+            read_and_absent
+                .reads_as
+                .contains("statement about the chain"),
             "this one IS about the chain: {}",
             read_and_absent.reads_as
         );
@@ -422,7 +438,11 @@ mod tests {
         let h = derive_history(&[obs(100, 10, Some("open")), obs(2500, 11, Some("open"))]);
         assert!(h.transitions.is_empty());
         assert_eq!(h.state_at_last_reading, Some("open".into()));
-        assert!(h.reads_as.contains("EARLIER than the first reading"), "{}", h.reads_as);
+        assert!(
+            h.reads_as.contains("EARLIER than the first reading"),
+            "{}",
+            h.reads_as
+        );
     }
 
     #[test]
@@ -452,7 +472,11 @@ mod tests {
 
         // …while an edge that really was OPEN throughout keeps that wording.
         let open = derive_history(&[obs(100, 10, Some("open")), obs(2500, 11, Some("open"))]);
-        assert!(open.reads_as.contains("Its opening is EARLIER"), "{}", open.reads_as);
+        assert!(
+            open.reads_as.contains("Its opening is EARLIER"),
+            "{}",
+            open.reads_as
+        );
         assert!(!open.reads_as.contains("PENDING REQUEST"));
     }
 
@@ -479,7 +503,10 @@ mod tests {
                 (Some("open".into()), None),
             ]
         );
-        assert!(h.transitions.iter().all(|t| t.exact), "all four readings are adjacent");
+        assert!(
+            h.transitions.iter().all(|t| t.exact),
+            "all four readings are adjacent"
+        );
         assert!(h.unread.is_empty());
         assert_eq!(h.state_at_last_reading, None, "closed by the last reading");
     }
@@ -499,7 +526,10 @@ mod tests {
         assert_eq!(h.transitions.len(), 1);
         let t = &h.transitions[0];
         assert!(t.mid_session, "a same-session change must be flagged");
-        assert!(!t.exact, "zero boundaries is not an exact date, it is an impossible one");
+        assert!(
+            !t.exact,
+            "zero boundaries is not an exact date, it is an impossible one"
+        );
         assert_eq!(t.candidate_boundaries, 0);
         assert!(h.unread.is_empty(), "one session spans no unread sessions");
 
@@ -517,7 +547,11 @@ mod tests {
         // An ordinary adjacent change must NOT carry any of that.
         let ordinary = derive_history(&[obs(2400, 11, Some("open")), obs(4800, 12, None)]);
         assert!(!ordinary.transitions[0].mid_session);
-        assert!(!ordinary.reads_as.contains("UNUSUAL"), "{}", ordinary.reads_as);
+        assert!(
+            !ordinary.reads_as.contains("UNUSUAL"),
+            "{}",
+            ordinary.reads_as
+        );
     }
 
     #[test]
@@ -527,8 +561,14 @@ mod tests {
         assert!(unread_intervals(&[(100, 10), (200, 10)]).is_empty());
         assert!(unread_intervals(&[(100, 10), (2500, 11)]).is_empty());
         assert_eq!(unread_intervals(&[(100, 10), (2500, 13)])[0].sessions, 2);
-        assert!(unread_intervals(&[]).is_empty(), "no readings is not a gap, it is an absence");
-        assert!(unread_intervals(&[(100, 10)]).is_empty(), "one reading spans nothing");
+        assert!(
+            unread_intervals(&[]).is_empty(),
+            "no readings is not a gap, it is an absence"
+        );
+        assert!(
+            unread_intervals(&[(100, 10)]).is_empty(),
+            "one reading spans nothing"
+        );
     }
 
     #[test]
@@ -537,12 +577,18 @@ mod tests {
         let all = lines.join(" ");
         // The four claims that must survive any rewording of this list, because
         // each is a thing a reader would otherwise assume the opposite of.
-        assert!(all.contains("ChannelManager"), "the mid-session bound must be named");
+        assert!(
+            all.contains("ChannelManager"),
+            "the mid-session bound must be named"
+        );
         assert!(
             all.contains("no live instance"),
             "…and stated as unobserved rather than impossible"
         );
-        assert!(all.contains("mqc_head"), "the omitted counters must be named");
+        assert!(
+            all.contains("mqc_head"),
+            "the omitted counters must be named"
+        );
         assert!(all.contains("DIRECTIONAL"), "direction must be stated");
         assert!(
             all.contains("RELAY PARENT NUMBER"),

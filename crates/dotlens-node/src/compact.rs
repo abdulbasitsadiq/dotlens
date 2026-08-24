@@ -169,8 +169,8 @@ pub async fn compact_range(
         members.sort_by(|a, b| (a.0, &a.1).cmp(&(b.0, &b.1)));
         let raw_bytes: u64 = members.iter().map(|m| m.2.len() as u64).sum();
 
-        let packed = bucket::pack(chain_id, &members, level)
-            .with_context(|| format!("packing {key}"))?;
+        let packed =
+            bucket::pack(chain_id, &members, level).with_context(|| format!("packing {key}"))?;
 
         // Read it back through the same reader the decode path uses, BEFORE the
         // object is recorded as a receipt: a bucket that cannot be reopened is a
@@ -238,9 +238,11 @@ pub async fn verify_range(
             bstart = b_to + 1;
             continue;
         }
-        let opened = bucket::OpenBucket::open(&raw.get(&key)?)
-            .with_context(|| format!("opening {key}"))?;
-        opened.verify().with_context(|| format!("verifying {key}"))?;
+        let opened =
+            bucket::OpenBucket::open(&raw.get(&key)?).with_context(|| format!("opening {key}"))?;
+        opened
+            .verify()
+            .with_context(|| format!("verifying {key}"))?;
         report.buckets_checked += 1;
         report.members_verified += opened.manifest.members.len() as u64;
 
@@ -298,8 +300,8 @@ mod tests {
     fn tmp(tag: &str) -> (FsRawStore, PathBuf) {
         static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let dir = std::env::temp_dir()
-            .join(format!("dotlens-compact-{}-{tag}-{n}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("dotlens-compact-{}-{tag}-{n}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         (FsRawStore::new(&dir), dir)
     }
@@ -321,19 +323,35 @@ mod tests {
     async fn compaction_packs_aligned_buckets_reports_holes_and_is_a_no_op_on_replay() {
         let (raw, dir) = tmp("pack");
         // 0..=24 with 10 and 11 deliberately MISSING
-        seed(&raw, "mock", (0..25).filter(|h| *h != 10 && *h != 11), keys::BLOCK_ITEM_V2);
+        seed(
+            &raw,
+            "mock",
+            (0..25).filter(|h| *h != 10 && *h != 11),
+            keys::BLOCK_ITEM_V2,
+        );
 
-        let r = compact_range(&raw, &NoopReceipts, "mock", 0, 24, 10, 3).await.unwrap();
+        let r = compact_range(&raw, &NoopReceipts, "mock", 0, 24, 10, 3)
+            .await
+            .unwrap();
         assert_eq!(r.buckets_written, 3, "0-9, 10-19, 20-24");
         assert_eq!(r.heights_packed, 23);
-        assert_eq!(r.heights_absent, vec![10, 11], "holes are reported, never closed over");
+        assert_eq!(
+            r.heights_absent,
+            vec![10, 11],
+            "holes are reported, never closed over"
+        );
         assert_eq!(r.members_packed, 46, "one envelope + one events per height");
 
         // every height is readable through the bucket layer
         let bucketed = raw_store::BucketedStore::new(raw, 10);
         for h in (0..25).filter(|h| *h != 10 && *h != 11) {
-            let got = bucketed.get(&keys::block("mock", h, keys::BLOCK_ITEM_V2)).unwrap();
-            assert_eq!(got, format!("{{\"height\":{h},\"spec_version\":1}}").as_bytes());
+            let got = bucketed
+                .get(&keys::block("mock", h, keys::BLOCK_ITEM_V2))
+                .unwrap();
+            assert_eq!(
+                got,
+                format!("{{\"height\":{h},\"spec_version\":1}}").as_bytes()
+            );
         }
 
         // replay writes nothing new — write-once, same as every range command
@@ -344,8 +362,15 @@ mod tests {
         assert_eq!(again.buckets_already_present, 3);
         // and a replay still reports the coverage of the range it was asked
         // about: an existing bucket must not turn a hole into silence.
-        assert_eq!(again.heights_absent, vec![10, 11], "replay still sees the holes");
-        assert!(again.heights_unpacked.is_empty(), "nothing arrived after packing");
+        assert_eq!(
+            again.heights_absent,
+            vec![10, 11],
+            "replay still sees the holes"
+        );
+        assert!(
+            again.heights_unpacked.is_empty(),
+            "nothing arrived after packing"
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -356,7 +381,9 @@ mod tests {
     async fn verify_compares_against_the_per_object_copy_and_survives_retirement() {
         let (raw, dir) = tmp("verify");
         seed(&raw, "mock", 100..110, keys::BLOCK_ITEM_V2);
-        compact_range(&raw, &NoopReceipts, "mock", 100, 109, 10, 3).await.unwrap();
+        compact_range(&raw, &NoopReceipts, "mock", 100, 109, 10, 3)
+            .await
+            .unwrap();
 
         let v = verify_range(&raw, "mock", 100, 109, 10).await.unwrap();
         assert_eq!(v.buckets_checked, 1);
@@ -380,7 +407,10 @@ mod tests {
         let v = verify_range(&raw, "mock", 0, 9, 10).await.unwrap();
         assert_eq!(v.buckets_missing, 1);
         assert_eq!(v.buckets_checked, 0);
-        assert_eq!(v.retirable_heights, 0, "nothing may be retired on the strength of a bucket that does not exist");
+        assert_eq!(
+            v.retirable_heights, 0,
+            "nothing may be retired on the strength of a bucket that does not exist"
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -395,16 +425,27 @@ mod tests {
         let (raw, dir) = tmp("undercover");
         // only the tail of bucket 0-9 has been backfilled so far
         seed(&raw, "mock", 5..10, keys::BLOCK_ITEM_V2);
-        let first = compact_range(&raw, &NoopReceipts, "mock", 0, 9, 10, 3).await.unwrap();
+        let first = compact_range(&raw, &NoopReceipts, "mock", 0, 9, 10, 3)
+            .await
+            .unwrap();
         assert_eq!(first.buckets_written, 1);
         assert_eq!(first.heights_packed, 5);
-        assert_eq!(first.heights_absent, vec![0, 1, 2, 3, 4], "not yet backfilled");
+        assert_eq!(
+            first.heights_absent,
+            vec![0, 1, 2, 3, 4],
+            "not yet backfilled"
+        );
 
         // the rest of the span arrives afterwards
         seed(&raw, "mock", 0..5, keys::BLOCK_ITEM_V2);
-        let after = compact_range(&raw, &NoopReceipts, "mock", 0, 9, 10, 3).await.unwrap();
+        let after = compact_range(&raw, &NoopReceipts, "mock", 0, 9, 10, 3)
+            .await
+            .unwrap();
 
-        assert_eq!(after.buckets_written, 0, "write-once: the bucket is not reopened");
+        assert_eq!(
+            after.buckets_written, 0,
+            "write-once: the bucket is not reopened"
+        );
         assert_eq!(after.buckets_already_present, 1);
         assert!(
             after.heights_absent.is_empty(),
@@ -419,19 +460,25 @@ mod tests {
 
         // and the retirement precondition never over-claims for them
         let v = verify_range(&raw, "mock", 0, 9, 10).await.unwrap();
-        assert_eq!(v.retirable_heights, 5, "only what the bucket actually holds");
+        assert_eq!(
+            v.retirable_heights, 5,
+            "only what the bucket actually holds"
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 
     #[tokio::test]
     async fn a_bucket_holds_both_envelope_generations() {
         let (raw, dir) = tmp("mixed");
-        seed(&raw, "mock", 0..5, keys::BLOCK_ITEM_V1);   // pre-format-slice
-        seed(&raw, "mock", 5..10, keys::BLOCK_ITEM_V2);  // post
-        let r = compact_range(&raw, &NoopReceipts, "mock", 0, 9, 10, 3).await.unwrap();
+        seed(&raw, "mock", 0..5, keys::BLOCK_ITEM_V1); // pre-format-slice
+        seed(&raw, "mock", 5..10, keys::BLOCK_ITEM_V2); // post
+        let r = compact_range(&raw, &NoopReceipts, "mock", 0, 9, 10, 3)
+            .await
+            .unwrap();
         assert_eq!(r.heights_packed, 10);
 
-        let opened = bucket::OpenBucket::open(&raw.get(&keys::bucket("mock", 0, 9)).unwrap()).unwrap();
+        let opened =
+            bucket::OpenBucket::open(&raw.get(&keys::bucket("mock", 0, 9)).unwrap()).unwrap();
         assert!(opened.contains(0, keys::BLOCK_ITEM_V1));
         assert!(opened.contains(9, keys::BLOCK_ITEM_V2));
         assert!(!opened.contains(0, keys::BLOCK_ITEM_V2));

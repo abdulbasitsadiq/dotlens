@@ -179,9 +179,8 @@ pub fn parse_account(s: &str) -> Result<[u8; 32], String> {
 /// First half matches SYSTEM_EVENTS_KEY (source.rs), verified live in slice 2;
 /// both halves re-verified against reference xxhash at authoring time.
 pub const SYSTEM_ACCOUNT_PREFIX: [u8; 32] = [
-    0x26, 0xaa, 0x39, 0x4e, 0xea, 0x56, 0x30, 0xe0, 0x7c, 0x48, 0xae, 0x0c, 0x95, 0x58, 0xce,
-    0xf7, 0xb9, 0x9d, 0x88, 0x0e, 0xc6, 0x81, 0x79, 0x9c, 0x0c, 0xf3, 0x0e, 0x88, 0x86, 0x37,
-    0x1d, 0xa9,
+    0x26, 0xaa, 0x39, 0x4e, 0xea, 0x56, 0x30, 0xe0, 0x7c, 0x48, 0xae, 0x0c, 0x95, 0x58, 0xce, 0xf7,
+    0xb9, 0x9d, 0x88, 0x0e, 0xc6, 0x81, 0x79, 0x9c, 0x0c, 0xf3, 0x0e, 0x88, 0x86, 0x37, 0x1d, 0xa9,
 ];
 
 /// Full System.Account storage key for one account: prefix ++
@@ -224,7 +223,9 @@ pub fn pallet_ids_from_metadata(blob: &[u8]) -> Result<Vec<PalletIdConstant>, St
             let mut out = Vec::new();
             for pallet in &$m.pallets {
                 for c in &pallet.constants {
-                    let Some(ty) = $m.types.resolve(c.ty.id) else { continue };
+                    let Some(ty) = $m.types.resolve(c.ty.id) else {
+                        continue;
+                    };
                     if ty.path.segments.last().map(String::as_str) != Some("PalletId") {
                         continue;
                     }
@@ -307,8 +308,8 @@ mod tests {
         assert_eq!(&bounty17[13..15], b"bt");
         assert_eq!(&bounty17[15..19], &17u32.to_le_bytes());
 
-        let child = sub_account(t, &[SubKey::Str("cb"), SubKey::Index(17), SubKey::Index(2)])
-            .unwrap();
+        let child =
+            sub_account(t, &[SubKey::Str("cb"), SubKey::Index(17), SubKey::Index(2)]).unwrap();
         assert_eq!(
             hexed(child),
             "0x6d6f646c70792f74727372790863621100000002000000000000000000000000"
@@ -324,8 +325,11 @@ mod tests {
             "0x6d6f646c70792f74727372796d62740100000000000000000000000000000000"
         );
         assert_eq!(&mab[12..15], b"mbt", "no compact prefix before a [u8; 3]");
-        let mab_child =
-            sub_account(t, &[SubKey::Bytes(b"mcb"), SubKey::Index(1), SubKey::Index(0)]).unwrap();
+        let mab_child = sub_account(
+            t,
+            &[SubKey::Bytes(b"mcb"), SubKey::Index(1), SubKey::Index(0)],
+        )
+        .unwrap();
         assert_ne!(mab_child, mab);
         // and the two GENERATIONS must not collide at the same index either
         assert_ne!(mab, bounty17);
@@ -435,7 +439,10 @@ mod tests {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../fixtures/real/polkadot-asset-hub-19498783/metadata.scale");
         let Ok(blob) = std::fs::read(&path) else {
-            eprintln!("SKIP: real fixture metadata not present at {}", path.display());
+            eprintln!(
+                "SKIP: real fixture metadata not present at {}",
+                path.display()
+            );
             return;
         };
         let ids = pallet_ids_from_metadata(&blob).expect("metadata walks");
@@ -444,6 +451,9 @@ mod tests {
             .iter()
             .find(|c| c.id == *b"py/trsry")
             .expect("treasury PalletId present on AH (post-migration home)");
-        assert_eq!(pallet_label(treasury), format!("{} (py/trsry)", treasury.pallet));
+        assert_eq!(
+            pallet_label(treasury),
+            format!("{} (py/trsry)", treasury.pallet)
+        );
     }
 }

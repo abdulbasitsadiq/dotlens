@@ -278,7 +278,9 @@ fn parse_vote_byte(v: &serde_json::Value) -> Result<(bool, u8), String> {
     let aye = byte & 0b1000_0000 != 0;
     let conviction = byte & 0b0111_1111;
     if conviction > 6 {
-        return Err(format!("invalid conviction {conviction} in vote byte {byte}"));
+        return Err(format!(
+            "invalid conviction {conviction} in vote byte {byte}"
+        ));
     }
     Ok((aye, conviction))
 }
@@ -332,11 +334,19 @@ fn ranked_facts(variant: &str, event: &CanonicalEvent) -> Result<Vec<VoteFact>, 
             let voter = field_account(data, "who", 0).ok_or_else(|| ctx("no who"))?;
             let poll = field_u64(data, "poll", 1).ok_or_else(|| ctx("no poll"))?;
             let vote = field(data, "vote", 2).ok_or_else(|| ctx("no vote"))?;
-            let obj = vote.as_object().ok_or_else(|| ctx("vote is not a variant"))?;
+            let obj = vote
+                .as_object()
+                .ok_or_else(|| ctx("vote is not a variant"))?;
             let (aye, votes) = if let Some(v) = obj.get("Aye") {
-                (true, json_single_number(v).ok_or_else(|| ctx("Aye has no weight"))?)
+                (
+                    true,
+                    json_single_number(v).ok_or_else(|| ctx("Aye has no weight"))?,
+                )
             } else if let Some(v) = obj.get("Nay") {
-                (false, json_single_number(v).ok_or_else(|| ctx("Nay has no weight"))?)
+                (
+                    false,
+                    json_single_number(v).ok_or_else(|| ctx("Nay has no weight"))?,
+                )
             } else {
                 return Err(ctx("VoteRecord is neither Aye nor Nay"));
             };
@@ -376,7 +386,11 @@ fn ranked_facts(variant: &str, event: &CanonicalEvent) -> Result<Vec<VoteFact>, 
 // byte arrays, or SS58 strings for decoder-v1 fixture rows; u128 as numbers
 // when small, decimal strings when big.
 
-fn field<'a>(data: &'a serde_json::Value, name: &str, index: usize) -> Option<&'a serde_json::Value> {
+fn field<'a>(
+    data: &'a serde_json::Value,
+    name: &str,
+    index: usize,
+) -> Option<&'a serde_json::Value> {
     match data {
         serde_json::Value::Object(map) => map.get(name),
         serde_json::Value::Array(items) => items.get(index),
@@ -571,9 +585,8 @@ pub const CONVICTION_VOTING_PALLET: &str = "ConvictionVoting";
 /// storage prefixes in this crate (`accounts::SYSTEM_ACCOUNT_PREFIX`,
 /// `gov::PREIMAGE_FOR_PREFIX`); the test below re-derives it from `twox_128`.
 pub const VOTING_FOR_PREFIX: [u8; 32] = [
-    0x07, 0x4b, 0x65, 0xe2, 0x62, 0xfc, 0xd5, 0xbd, 0x9c, 0x78, 0x5c, 0xaf, 0x7f, 0x42, 0xe0,
-    0x0a, 0x29, 0xf2, 0xdc, 0x2b, 0x64, 0xe3, 0x54, 0x00, 0x2f, 0xae, 0xf2, 0xa8, 0x1f, 0x1a,
-    0xa8, 0xbb,
+    0x07, 0x4b, 0x65, 0xe2, 0x62, 0xfc, 0xd5, 0xbd, 0x9c, 0x78, 0x5c, 0xaf, 0x7f, 0x42, 0xe0, 0x0a,
+    0x29, 0xf2, 0xdc, 0x2b, 0x64, 0xe3, 0x54, 0x00, 0x2f, 0xae, 0xf2, 0xa8, 0x1f, 0x1a, 0xa8, 0xbb,
 ];
 
 /// Full `ConvictionVoting.VotingFor(account, class)` storage key.
@@ -661,7 +674,10 @@ pub fn decode_voting_for(
                 .iter()
                 .find(|p| p.name == CONVICTION_VOTING_PALLET)
                 .ok_or("no ConvictionVoting pallet in metadata")?;
-            let storage = pallet.storage.as_ref().ok_or("ConvictionVoting has no storage")?;
+            let storage = pallet
+                .storage
+                .as_ref()
+                .ok_or("ConvictionVoting has no storage")?;
             let entry = storage
                 .entries
                 .iter()
@@ -718,7 +734,9 @@ fn voting_position_from_json(raw: serde_json::Value) -> Result<VotingPosition, S
     };
     let read_prior = |v: Option<&serde_json::Value>| match v {
         Some(p) => (
-            field(p, "0", 0).and_then(json_u128).and_then(|n| u64::try_from(n).ok()),
+            field(p, "0", 0)
+                .and_then(json_u128)
+                .and_then(|n| u64::try_from(n).ok()),
             field(p, "1", 1).and_then(json_u128),
         ),
         None => (None, None),
@@ -860,7 +878,10 @@ mod tests {
         assert_eq!(v.conviction, Some(0));
         assert_eq!(v.nay_balance, Some(1005));
         assert_eq!(v.aye_balance, None);
-        assert_eq!(v.nay_votes, 100, "integer division, exactly like the pallet");
+        assert_eq!(
+            v.nay_votes, 100,
+            "integer division, exactly like the pallet"
+        );
         assert_eq!(v.aye_votes, 0);
         assert_eq!(v.support, 0, "nays never add support");
     }
@@ -953,7 +974,10 @@ mod tests {
         assert_eq!(d.track_id, None);
         assert_eq!(d.attribution, "unattributed");
 
-        let undel = ev("convictionvoting.Undelegated", serde_json::json!([acct_json(&who), 34]));
+        let undel = ev(
+            "convictionvoting.Undelegated",
+            serde_json::json!([acct_json(&who), 34]),
+        );
         let d = one_delegation(facts_for_event(&undel).unwrap());
         assert_eq!(d.kind, "undelegated");
         assert_eq!(d.target, None);
@@ -985,16 +1009,27 @@ mod tests {
         let v = one_vote(facts_for_event(&e).unwrap());
         assert_eq!(v.class, "fellowship_referenda");
         assert_eq!(v.vote_type, "ranked");
-        assert_eq!((v.referendum_id, v.aye_votes, v.nay_votes), (Some(300), 9, 0));
+        assert_eq!(
+            (v.referendum_id, v.aye_votes, v.nay_votes),
+            (Some(300), 9, 0)
+        );
         assert_eq!(v.aye_balance, None, "rank-weighted votes have no capital");
 
         // membership events are not votes
-        for name in ["MemberAdded", "MemberRemoved", "RankChanged", "MemberExchanged"] {
+        for name in [
+            "MemberAdded",
+            "MemberRemoved",
+            "RankChanged",
+            "MemberExchanged",
+        ] {
             let m = ev(
                 &format!("fellowshipcollective.{name}"),
                 serde_json::json!({"who": acct_json(&who), "rank": 3}),
             );
-            assert!(facts_for_event(&m).unwrap().is_empty(), "{name} must map to ∅");
+            assert!(
+                facts_for_event(&m).unwrap().is_empty(),
+                "{name} must map to ∅"
+            );
         }
     }
 
@@ -1011,11 +1046,20 @@ mod tests {
             "ambassadorcollective.Voted",
         ] {
             let e = ev(name, serde_json::json!({"index": 1}));
-            assert!(facts_for_event(&e).unwrap().is_empty(), "{name} must map to ∅");
+            assert!(
+                facts_for_event(&e).unwrap().is_empty(),
+                "{name} must map to ∅"
+            );
         }
-        let unknown = ev("convictionvoting.SomeFutureEvent", serde_json::json!({"who": 1}));
+        let unknown = ev(
+            "convictionvoting.SomeFutureEvent",
+            serde_json::json!({"who": 1}),
+        );
         assert!(facts_for_event(&unknown).is_err());
-        let unknown_ranked = ev("fellowshipcollective.SomeFutureEvent", serde_json::json!({}));
+        let unknown_ranked = ev(
+            "fellowshipcollective.SomeFutureEvent",
+            serde_json::json!({}),
+        );
         assert!(facts_for_event(&unknown_ranked).is_err());
     }
 
@@ -1023,7 +1067,10 @@ mod tests {
     fn malformed_voting_events_are_loud_errors() {
         let who = para_sovereign(1000);
         // no vote field
-        let e = ev("convictionvoting.Voted", serde_json::json!({"who": acct_json(&who)}));
+        let e = ev(
+            "convictionvoting.Voted",
+            serde_json::json!({"who": acct_json(&who)}),
+        );
         assert!(facts_for_event(&e).is_err());
         // unknown AccountVote variant
         let e = ev(
@@ -1042,7 +1089,10 @@ mod tests {
         );
         assert!(facts_for_event(&e).is_err());
         // delegation with no target
-        let e = ev("convictionvoting.Delegated", serde_json::json!([acct_json(&who)]));
+        let e = ev(
+            "convictionvoting.Delegated",
+            serde_json::json!([acct_json(&who)]),
+        );
         assert!(facts_for_event(&e).is_err());
     }
 
@@ -1109,7 +1159,11 @@ mod tests {
         }]});
         let p = voting_position_from_json(casting).unwrap();
         assert_eq!(p.mode, "casting");
-        assert_eq!(p.casting_vote_count, Some(2), "count the VOTES, not the BoundedVec");
+        assert_eq!(
+            p.casting_vote_count,
+            Some(2),
+            "count the VOTES, not the BoundedVec"
+        );
         assert_eq!(p.delegations_votes, Some(36_893_488_147_419_103_232));
         assert_eq!(p.delegations_capital, Some(7));
         assert_eq!(p.prior_until, Some(19_500_000));
@@ -1154,7 +1208,10 @@ mod tests {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../fixtures/real/polkadot-asset-hub-19498783/metadata.scale");
         let Ok(blob) = std::fs::read(&path) else {
-            eprintln!("SKIP: real fixture metadata not present at {}", path.display());
+            eprintln!(
+                "SKIP: real fixture metadata not present at {}",
+                path.display()
+            );
             return;
         };
         let target = [0x11u8; 32];

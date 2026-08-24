@@ -298,9 +298,7 @@ pub fn facts_for_event(event: &CanonicalEvent) -> Result<Vec<BountyFact>, String
                     ..base("awarded", Some("awarded"))
                 },
                 "Claimed" => BountyFact {
-                    amount: Some(
-                        field_amount(data, "payout", 2).ok_or_else(|| ctx("no payout"))?,
-                    ),
+                    amount: Some(field_amount(data, "payout", 2).ok_or_else(|| ctx("no payout"))?),
                     figure_kind: Some("flow".into()),
                     beneficiary: field_account(data, "beneficiary", 3).map(|a| a.to_vec()),
                     ..base("claimed", Some("claimed"))
@@ -436,7 +434,9 @@ pub fn facts_for_event(event: &CanonicalEvent) -> Result<Vec<BountyFact>, String
 // ------------------------------------------------------------- field plumbing
 
 fn field_u64(data: &serde_json::Value, name: &str, index: usize) -> Option<u64> {
-    field(data, name, index).and_then(json_u128).and_then(|v| u64::try_from(v).ok())
+    field(data, name, index)
+        .and_then(json_u128)
+        .and_then(|v| u64::try_from(v).ok())
 }
 
 /// An `Option<BountyIndex>` field. Our decoder renders `Option` as an enum
@@ -446,11 +446,7 @@ fn field_u64(data: &serde_json::Value, name: &str, index: usize) -> Option<u64> 
 ///
 /// `index` is itself optional, because some variants carry no `child_index` at
 /// all and there is no position to fall back to (see the caller).
-fn field_optional_u64(
-    data: &serde_json::Value,
-    name: &str,
-    index: Option<usize>,
-) -> Option<u64> {
+fn field_optional_u64(data: &serde_json::Value, name: &str, index: Option<usize>) -> Option<u64> {
     let v = match data {
         serde_json::Value::Object(map) => map.get(name)?,
         serde_json::Value::Array(items) => items.get(index?)?,
@@ -515,8 +511,14 @@ mod tests {
 
     #[test]
     fn the_hook_event_is_the_outflow_no_treasury_table_can_see() {
-        let f = one(&ev("bounties.BountyBecameActive", serde_json::json!({"index": 17})));
-        assert_eq!((f.instance.as_str(), f.bounty_id, f.child_id), ("bounties", 17, None));
+        let f = one(&ev(
+            "bounties.BountyBecameActive",
+            serde_json::json!({"index": 17}),
+        ));
+        assert_eq!(
+            (f.instance.as_str(), f.bounty_id, f.child_id),
+            ("bounties", 17, None)
+        );
         assert_eq!(f.status.as_deref(), Some("funded"));
         // it carries NO amount: the pallet event does not say how much was
         // funded, which is exactly why the bounty ACCOUNT matters
@@ -536,7 +538,10 @@ mod tests {
         assert_eq!(f.curator.as_deref(), Some(&c[..]));
         assert_eq!(f.status.as_deref(), Some("active"));
         // unassignment goes BACK to funded, never to unfunded
-        let u = one(&ev("bounties.CuratorUnassigned", serde_json::json!({"bounty_id": 9})));
+        let u = one(&ev(
+            "bounties.CuratorUnassigned",
+            serde_json::json!({"bounty_id": 9}),
+        ));
         assert_eq!(u.status.as_deref(), Some("funded"));
     }
 
@@ -646,7 +651,12 @@ mod tests {
         // `core.assets.location_key` holds for USDT — compared against the
         // CONSTRUCTED form, which is what makes this a check and not two
         // copies of one guess (slice 6's twice-repeated mistake)
-        let asset = f.asset_location.as_ref().expect("asset location").get("asset").cloned();
+        let asset = f
+            .asset_location
+            .as_ref()
+            .expect("asset location")
+            .get("asset")
+            .cloned();
         assert_eq!(
             asset.map(|a| a.to_string()),
             crate::assets::canonical_location(&crate::assets::local_asset_location(50, 1984))
@@ -663,7 +673,10 @@ mod tests {
         ));
         assert_eq!(f.amount, Some(250));
         assert_eq!(f.figure_kind.as_deref(), Some("snapshot"));
-        assert!(f.status.is_none(), "a raise does not move the bounty's state");
+        assert!(
+            f.status.is_none(),
+            "a raise does not move the bounty's state"
+        );
     }
 
     #[test]
@@ -673,8 +686,8 @@ mod tests {
             "childbounties.SomeFutureEvent",
             "multiassetbounties.SomeFutureEvent",
         ] {
-            let e = facts_for_event(&ev(name, serde_json::json!({"index": 1})))
-                .expect_err("must halt");
+            let e =
+                facts_for_event(&ev(name, serde_json::json!({"index": 1}))).expect_err("must halt");
             // and halt saying WHAT it did not understand. The child-bounties
             // arm used to extract the child id before matching the variant, so
             // this line read "no child_index" — a true statement about the
@@ -691,9 +704,11 @@ mod tests {
         ))
         .is_err());
         // other pallets are not this mapper's money
-        assert!(facts_for_event(&ev("treasury.Awarded", serde_json::json!({})))
-            .unwrap()
-            .is_empty());
+        assert!(
+            facts_for_event(&ev("treasury.Awarded", serde_json::json!({})))
+                .unwrap()
+                .is_empty()
+        );
     }
 
     /// The account list this slice closes: every bounty's funds live at a
@@ -701,7 +716,10 @@ mod tests {
     /// needs no curation — just the id the event already carried.
     #[test]
     fn every_bounty_id_yields_a_derivable_account() {
-        let f = one(&ev("bounties.BountyBecameActive", serde_json::json!({"index": 17})));
+        let f = one(&ev(
+            "bounties.BountyBecameActive",
+            serde_json::json!({"index": 17}),
+        ));
         let acct = sub_account(
             b"py/trsry",
             &[SubKey::Str("bt"), SubKey::Index(f.bounty_id as u32)],

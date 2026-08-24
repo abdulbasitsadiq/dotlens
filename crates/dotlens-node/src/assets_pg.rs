@@ -210,14 +210,14 @@ pub async fn assets_for_chain(pool: &PgPool, chain_id: &str) -> Result<Vec<Asset
         Option<String>,
         Option<String>,
     )> = sqlx::query_as(
-            "select asset_key, representation_kind, raw_key_bytes, symbol, decimals, \
+        "select asset_key, representation_kind, raw_key_bytes, symbol, decimals, \
                     status, asset_type \
              from core.assets where chain_id = $1 order by asset_key",
-        )
-        .bind(chain_id)
-        .fetch_all(pool)
-        .await
-        .with_context(|| format!("listing assets for {chain_id}"))?;
+    )
+    .bind(chain_id)
+    .fetch_all(pool)
+    .await
+    .with_context(|| format!("listing assets for {chain_id}"))?;
     Ok(rows
         .into_iter()
         .map(
@@ -326,7 +326,10 @@ pub async fn sync_assets(
             .await
             .map_err(|e| anyhow::anyhow!(e))?,
     };
-    let hash = source.block_hash(height).await.map_err(|e| anyhow::anyhow!(e))?;
+    let hash = source
+        .block_hash(height)
+        .await
+        .map_err(|e| anyhow::anyhow!(e))?;
     let spec = source
         .runtime_version_at(hash)
         .await
@@ -828,7 +831,9 @@ async fn sync_orml_registry(
             count += 1;
         }
     }
-    report.per_instance.push((orml::TOKENS_KEY_PREFIX.into(), count));
+    report
+        .per_instance
+        .push((orml::TOKENS_KEY_PREFIX.into(), count));
     Ok(())
 }
 
@@ -920,7 +925,10 @@ pub async fn snapshot_holdings(
             .await
             .map_err(|e| anyhow::anyhow!(e))?,
     };
-    let hash = source.block_hash(height).await.map_err(|e| anyhow::anyhow!(e))?;
+    let hash = source
+        .block_hash(height)
+        .await
+        .map_err(|e| anyhow::anyhow!(e))?;
     let spec = source
         .runtime_version_at(hash)
         .await
@@ -1044,9 +1052,8 @@ pub async fn snapshot_holdings(
                     .asset_key
                     .starts_with(&format!("{}:", adapter_substrate::orml::TOKENS_KEY_PREFIX))
                 {
-                    let key =
-                        orml::accounts_key(prefix, &entry.hashers, &account32, raw_id)
-                            .map_err(|e| anyhow::anyhow!(e))?;
+                    let key = orml::accounts_key(prefix, &entry.hashers, &account32, raw_id)
+                        .map_err(|e| anyhow::anyhow!(e))?;
                     // THE ORDER CHECK, run once per key and free: lift the two
                     // halves back out and require the account half to be the
                     // account we put in. orml keys `(account, currency)` where
@@ -1125,7 +1132,11 @@ pub async fn snapshot_holdings(
                         None,
                     ),
                     None => (
-                        ab::AccountBalances { free: 0, reserved: 0, frozen: None },
+                        ab::AccountBalances {
+                            free: 0,
+                            reserved: 0,
+                            frozen: None,
+                        },
                         Some("absent"),
                     ),
                 };
@@ -1153,7 +1164,10 @@ pub async fn snapshot_holdings(
                         None,
                     ),
                     None => (
-                        aa::AssetHolding { balance: 0, status: None },
+                        aa::AssetHolding {
+                            balance: 0,
+                            status: None,
+                        },
                         Some("absent"),
                     ),
                 };
@@ -1194,12 +1208,15 @@ pub async fn snapshot_holdings(
                 );
                 let (holding, note) = match value {
                     Some(bytes) => (
-                        orml::decode_orml_account(entry, &bytes)
-                            .map_err(|e| anyhow::anyhow!(e))?,
+                        orml::decode_orml_account(entry, &bytes).map_err(|e| anyhow::anyhow!(e))?,
                         None,
                     ),
                     None => (
-                        orml::OrmlHolding { free: 0, reserved: 0, frozen: None },
+                        orml::OrmlHolding {
+                            free: 0,
+                            reserved: 0,
+                            frozen: None,
+                        },
                         Some("absent"),
                     ),
                 };
@@ -1340,7 +1357,11 @@ pub async fn sync_treasury_accounts(
         // ---- seeded: the accounts that cannot be derived ----------------
         for seed in chain.accounts.iter().filter(|a| a.kind == "treasury") {
             let account = acct::parse_account(&seed.address).map_err(|e| {
-                anyhow::anyhow!("seed account '{}' on {} is invalid: {e}", seed.address, chain.id)
+                anyhow::anyhow!(
+                    "seed account '{}' on {} is invalid: {e}",
+                    seed.address,
+                    chain.id
+                )
             })?;
             upsert_treasury_account(
                 &mut tx,

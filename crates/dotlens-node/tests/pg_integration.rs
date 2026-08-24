@@ -79,7 +79,12 @@ impl TestDb {
             .run(&pool)
             .await
             .expect("migrations");
-        Some(TestDb { pool, admin_url, url, name })
+        Some(TestDb {
+            pool,
+            admin_url,
+            url,
+            name,
+        })
     }
 
     async fn drop_db(self) {
@@ -89,9 +94,12 @@ impl TestDb {
             .connect(&self.admin_url)
             .await
         {
-            let _ = sqlx::query(&format!("drop database if exists {} with (force)", self.name))
-                .execute(&admin)
-                .await;
+            let _ = sqlx::query(&format!(
+                "drop database if exists {} with (force)",
+                self.name
+            ))
+            .execute(&admin)
+            .await;
             admin.close().await;
         }
     }
@@ -115,11 +123,15 @@ fn tmp_raw(tag: &str) -> PathBuf {
 
 #[tokio::test]
 async fn registry_sync_is_idempotent_and_creates_partitions() {
-    let Some(db) = TestDb::create().await else { return };
+    let Some(db) = TestDb::create().await else {
+        return;
+    };
     let reg = seeds();
 
     sync_registry(&db.pool, &reg).await.expect("first sync");
-    sync_registry(&db.pool, &reg).await.expect("second sync (idempotent)");
+    sync_registry(&db.pool, &reg)
+        .await
+        .expect("second sync (idempotent)");
 
     let (chains,): (i64,) = sqlx::query_as("select count(*) from core.chains")
         .fetch_one(&db.pool)
@@ -174,7 +186,9 @@ async fn registry_sync_is_idempotent_and_creates_partitions() {
 
 #[tokio::test]
 async fn pg_checkpoints_persist_across_store_instances() {
-    let Some(db) = TestDb::create().await else { return };
+    let Some(db) = TestDb::create().await else {
+        return;
+    };
 
     let store = PgCheckpointStore::new(db.pool.clone());
     store
@@ -191,14 +205,22 @@ async fn pg_checkpoints_persist_across_store_instances() {
 
     // "restart": a brand-new store over the same database resumes correctly
     let store2 = PgCheckpointStore::new(db.pool.clone());
-    let cp = store2.get("polkadot", "blocks").await.unwrap().expect("persisted");
+    let cp = store2
+        .get("polkadot", "blocks")
+        .await
+        .unwrap()
+        .expect("persisted");
     assert_eq!(cp.last_height, 100);
     assert_eq!(
-        should_process(&store2, "polkadot", "blocks", 100).await.unwrap(),
+        should_process(&store2, "polkadot", "blocks", 100)
+            .await
+            .unwrap(),
         IngestOutcome::AlreadyProcessed
     );
     assert_eq!(
-        should_process(&store2, "polkadot", "blocks", 101).await.unwrap(),
+        should_process(&store2, "polkadot", "blocks", 101)
+            .await
+            .unwrap(),
         IngestOutcome::Processed
     );
     // regression refused by the conditional upsert
@@ -218,7 +240,9 @@ async fn pg_checkpoints_persist_across_store_instances() {
 
 #[tokio::test]
 async fn receipts_persist_once_first_fetch_wins() {
-    let Some(db) = TestDb::create().await else { return };
+    let Some(db) = TestDb::create().await else {
+        return;
+    };
 
     let sink = PgReceiptSink::new(db.pool.clone());
     let receipt = raw_store::IngestReceipt {
@@ -235,12 +259,11 @@ async fn receipts_persist_once_first_fetch_wins() {
     later.source = "wss://some-endpoint".into();
     sink.record(&later).await.expect("re-record is a no-op");
 
-    let rows: Vec<(String, i64, String, String)> = sqlx::query_as(
-        "select key, byte_len, source, content_hash from core.ingest_receipts",
-    )
-    .fetch_all(&db.pool)
-    .await
-    .unwrap();
+    let rows: Vec<(String, i64, String, String)> =
+        sqlx::query_as("select key, byte_len, source, content_hash from core.ingest_receipts")
+            .fetch_all(&db.pool)
+            .await
+            .unwrap();
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].2, "fixture"); // first-fetch provenance kept
     assert_eq!(rows[0].3, raw_store::content_hash(b"hello"));
@@ -303,7 +326,9 @@ impl ingest::live::ChainSource for MockSource {
 
 #[tokio::test]
 async fn live_raw_pipeline_persists_lineage_and_resumes() {
-    let Some(db) = TestDb::create().await else { return };
+    let Some(db) = TestDb::create().await else {
+        return;
+    };
     let reg = seeds();
     sync_registry(&db.pool, &reg).await.expect("registry sync");
 
@@ -322,7 +347,13 @@ async fn live_raw_pipeline_persists_lineage_and_resumes() {
 
     // use a registered chain id so the runtime_versions FK to core.chains holds
     let n = ingest::live::ingest_range(
-        "polkadot", &source, &deps, ingest::live::MODULE_BACKFILL, 1, 10, &mut None,
+        "polkadot",
+        &source,
+        &deps,
+        ingest::live::MODULE_BACKFILL,
+        1,
+        10,
+        &mut None,
     )
     .await
     .expect("live range");
@@ -355,7 +386,13 @@ async fn live_raw_pipeline_persists_lineage_and_resumes() {
 
     // re-run: clean no-op (checkpoint resume, no new receipts)
     let n = ingest::live::ingest_range(
-        "polkadot", &source, &deps, ingest::live::MODULE_BACKFILL, 1, 10, &mut None,
+        "polkadot",
+        &source,
+        &deps,
+        ingest::live::MODULE_BACKFILL,
+        1,
+        10,
+        &mut None,
     )
     .await
     .expect("re-run");
@@ -373,7 +410,13 @@ async fn live_raw_pipeline_persists_lineage_and_resumes() {
     };
     let source2 = MockSource { finalized: 15 };
     let n = ingest::live::ingest_range(
-        "polkadot", &source2, &deps2, ingest::live::MODULE_BACKFILL, 1, 15, &mut None,
+        "polkadot",
+        &source2,
+        &deps2,
+        ingest::live::MODULE_BACKFILL,
+        1,
+        15,
+        &mut None,
     )
     .await
     .expect("extended range");
@@ -426,16 +469,19 @@ impl ingest::decode::RawBlockDecoder for MockBlockDecoder {
     }
 
     fn spec_version_of(&self, envelope: &[u8]) -> Result<u32, String> {
-        let v: serde_json::Value =
-            serde_json::from_slice(envelope).map_err(|e| e.to_string())?;
-        v["spec_version"].as_u64().map(|s| s as u32).ok_or("no spec_version".into())
+        let v: serde_json::Value = serde_json::from_slice(envelope).map_err(|e| e.to_string())?;
+        v["spec_version"]
+            .as_u64()
+            .map(|s| s as u32)
+            .ok_or("no spec_version".into())
     }
-
 }
 
 #[tokio::test]
 async fn decode_worker_lands_canonical_rows_in_pg() {
-    let Some(db) = TestDb::create().await else { return };
+    let Some(db) = TestDb::create().await else {
+        return;
+    };
     let reg = seeds();
     sync_registry(&db.pool, &reg).await.expect("registry sync");
 
@@ -453,7 +499,13 @@ async fn decode_worker_lands_canonical_rows_in_pg() {
     };
     let source = MockSource { finalized: 6 };
     ingest::live::ingest_range(
-        "polkadot", &source, &live_deps, ingest::live::MODULE_LIVE, 1, 6, &mut None,
+        "polkadot",
+        &source,
+        &live_deps,
+        ingest::live::MODULE_LIVE,
+        1,
+        6,
+        &mut None,
     )
     .await
     .expect("raw ingest");
@@ -493,7 +545,13 @@ async fn decode_worker_lands_canonical_rows_in_pg() {
     // decode tick chases the raw checkpoint: raw advances to 9 → decode follows
     let source2 = MockSource { finalized: 9 };
     ingest::live::ingest_range(
-        "polkadot", &source2, &live_deps, ingest::live::MODULE_LIVE, 7, 9, &mut None,
+        "polkadot",
+        &source2,
+        &live_deps,
+        ingest::live::MODULE_LIVE,
+        7,
+        9,
+        &mut None,
     )
     .await
     .expect("raw advance");
@@ -525,7 +583,9 @@ async fn decode_worker_lands_canonical_rows_in_pg() {
 
 #[tokio::test]
 async fn end_to_end_pg_pipeline_is_restart_safe() {
-    let Some(db) = TestDb::create().await else { return };
+    let Some(db) = TestDb::create().await else {
+        return;
+    };
     let reg = seeds();
     sync_registry(&db.pool, &reg).await.expect("registry sync");
 
@@ -536,9 +596,16 @@ async fn end_to_end_pg_pipeline_is_restart_safe() {
     let blocks = PgBlockIndex::new(db.pool.clone());
 
     // first run: the fixture is processed and lands durably in postgres
-    let n = ingest_fixtures(&fixtures_dir(), &reg, &raw, &checkpoints, &receipts, &blocks)
-        .await
-        .expect("first ingest");
+    let n = ingest_fixtures(
+        &fixtures_dir(),
+        &reg,
+        &raw,
+        &checkpoints,
+        &receipts,
+        &blocks,
+    )
+    .await
+    .expect("first ingest");
     assert_eq!(n, 1);
 
     let block = blocks
@@ -553,9 +620,16 @@ async fn end_to_end_pg_pipeline_is_restart_safe() {
     assert!(!block.events.is_empty());
 
     // second run, same everything: clean no-op
-    let n = ingest_fixtures(&fixtures_dir(), &reg, &raw, &checkpoints, &receipts, &blocks)
-        .await
-        .expect("re-ingest");
+    let n = ingest_fixtures(
+        &fixtures_dir(),
+        &reg,
+        &raw,
+        &checkpoints,
+        &receipts,
+        &blocks,
+    )
+    .await
+    .expect("re-ingest");
     assert_eq!(n, 0, "re-ingest must be a no-op");
 
     // "restart": brand-new backend instances over the same database — the
@@ -564,11 +638,22 @@ async fn end_to_end_pg_pipeline_is_restart_safe() {
     let checkpoints2 = PgCheckpointStore::new(db.pool.clone());
     let receipts2 = PgReceiptSink::new(db.pool.clone());
     let blocks2 = PgBlockIndex::new(db.pool.clone());
-    let n = ingest_fixtures(&fixtures_dir(), &reg, &raw, &checkpoints2, &receipts2, &blocks2)
-        .await
-        .expect("post-restart ingest");
+    let n = ingest_fixtures(
+        &fixtures_dir(),
+        &reg,
+        &raw,
+        &checkpoints2,
+        &receipts2,
+        &blocks2,
+    )
+    .await
+    .expect("post-restart ingest");
     assert_eq!(n, 0);
-    assert!(blocks2.get("polkadot-asset-hub", 19_000_001).await.unwrap().is_some());
+    assert!(blocks2
+        .get("polkadot-asset-hub", 19_000_001)
+        .await
+        .unwrap()
+        .is_some());
     assert_eq!(blocks2.count().await.unwrap(), 1);
 
     // exactly one receipt, with a real content hash
@@ -589,7 +674,10 @@ async fn end_to_end_pg_pipeline_is_restart_safe() {
         .fetch_one(&db.pool)
         .await
         .unwrap();
-    assert_eq!(in_default, 0, "block should be routed to its chain partition");
+    assert_eq!(
+        in_default, 0,
+        "block should be routed to its chain partition"
+    );
 
     let _ = std::fs::remove_dir_all(&raw_dir);
     db.drop_db().await;
@@ -601,7 +689,9 @@ async fn end_to_end_pg_pipeline_is_restart_safe() {
 async fn account_labels_derive_from_registry_metadata_and_seeds() {
     use api::LabelIndex;
 
-    let Some(db) = TestDb::create().await else { return };
+    let Some(db) = TestDb::create().await else {
+        return;
+    };
     let reg = seeds();
     sync_registry(&db.pool, &reg).await.expect("registry sync");
 
@@ -720,7 +810,9 @@ async fn account_labels_derive_from_registry_metadata_and_seeds() {
 
 #[tokio::test]
 async fn sibling_sovereign_labels_appear_when_a_chain_registers() {
-    let Some(db) = TestDb::create().await else { return };
+    let Some(db) = TestDb::create().await else {
+        return;
+    };
 
     // real seeds + one synthetic parachain — the plug-and-play path: adding a
     // chain is config only, and its sovereigns appear everywhere automatically
@@ -814,7 +906,9 @@ async fn balances_worker_maps_deltas_and_survives_the_boundary_filter() {
     use api::BalanceIndex as _;
     use canonical::{CanonicalBlock, CanonicalEvent, Lineage};
 
-    let Some(db) = TestDb::create().await else { return };
+    let Some(db) = TestDb::create().await else {
+        return;
+    };
     let reg = seeds();
     sync_registry(&db.pool, &reg).await.expect("registry sync");
 
@@ -850,9 +944,13 @@ async fn balances_worker_maps_deltas_and_survives_the_boundary_filter() {
         100,
         "2025-06-01T00:00:00Z",
         vec![
-            ev(0, "balances.Transfer", serde_json::json!({
-                "from": acct_json(&treasury), "to": acct_json(&peer), "amount": big,
-            })),
+            ev(
+                0,
+                "balances.Transfer",
+                serde_json::json!({
+                    "from": acct_json(&treasury), "to": acct_json(&peer), "amount": big,
+                }),
+            ),
             ev(1, "system.ExtrinsicSuccess", serde_json::json!({})),
         ],
     );
@@ -861,9 +959,13 @@ async fn balances_worker_maps_deltas_and_survives_the_boundary_filter() {
         "polkadot-asset-hub",
         200,
         "2026-01-01T00:00:00Z",
-        vec![ev(0, "balances.Withdraw", serde_json::json!({
-            "who": acct_json(&treasury), "amount": 160000000u64,
-        }))],
+        vec![ev(
+            0,
+            "balances.Withdraw",
+            serde_json::json!({
+                "who": acct_json(&treasury), "amount": 160000000u64,
+            }),
+        )],
     );
     let index = PgBlockIndex::new(db.pool.clone());
     index.insert(relay_block).await.expect("insert relay block");
@@ -882,7 +984,11 @@ async fn balances_worker_maps_deltas_and_survives_the_boundary_filter() {
         .await
         .expect("relay range");
     let n2 = ingest::balances::balances_range(
-        "polkadot-asset-hub", &SubstrateDeltaMapper, &deps, 200, 200,
+        "polkadot-asset-hub",
+        &SubstrateDeltaMapper,
+        &deps,
+        200,
+        200,
     )
     .await
     .expect("ah range");
@@ -897,8 +1003,14 @@ async fn balances_worker_maps_deltas_and_survives_the_boundary_filter() {
     .await
     .unwrap();
     assert_eq!(rows.len(), 2);
-    assert_eq!(rows[0], (treasury.to_vec(), format!("-{big}"), "transfer_out".into()));
-    assert_eq!(rows[1], (peer.to_vec(), big.to_string(), "transfer_in".into()));
+    assert_eq!(
+        rows[0],
+        (treasury.to_vec(), format!("-{big}"), "transfer_out".into())
+    );
+    assert_eq!(
+        rows[1],
+        (peer.to_vec(), big.to_string(), "transfer_in".into())
+    );
     let (in_default,): (i64,) =
         sqlx::query_as("select count(*) from balances.balance_changes_default")
             .fetch_one(&db.pool)
@@ -931,7 +1043,13 @@ async fn balances_worker_maps_deltas_and_survives_the_boundary_filter() {
         .unwrap()
         .is_empty());
     let post = idx
-        .changes("polkadot-asset-hub", &treasury, "native", Some(boundary), None)
+        .changes(
+            "polkadot-asset-hub",
+            &treasury,
+            "native",
+            Some(boundary),
+            None,
+        )
         .await
         .unwrap();
     assert_eq!(post.len(), 1);
@@ -952,13 +1070,23 @@ async fn balances_worker_maps_deltas_and_survives_the_boundary_filter() {
     };
     for _ in 0..2 {
         dotlens_node::balances_pg::insert_anchor(
-            &db.pool, "polkadot-asset-hub", &treasury, "native", 150,
-            &ab, Some(2_003_002), "test", None,
+            &db.pool,
+            "polkadot-asset-hub",
+            &treasury,
+            "native",
+            150,
+            &ab,
+            Some(2_003_002),
+            "test",
+            None,
         )
         .await
         .expect("anchor");
     }
-    let anchors = idx.anchors("polkadot-asset-hub", &treasury, "native").await.unwrap();
+    let anchors = idx
+        .anchors("polkadot-asset-hub", &treasury, "native")
+        .await
+        .unwrap();
     assert_eq!(anchors.len(), 1);
     assert_eq!(anchors[0].total, "505000000000");
     assert_eq!(anchors[0].free, "500000000000");
@@ -984,7 +1112,9 @@ async fn gov_worker_builds_timelines_projection_converges_and_tracks_sync() {
     use api::GovIndex as _;
     use canonical::{CanonicalBlock, CanonicalEvent, Lineage};
 
-    let Some(db) = TestDb::create().await else { return };
+    let Some(db) = TestDb::create().await else {
+        return;
+    };
     let reg = seeds();
     sync_registry(&db.pool, &reg).await.expect("registry sync");
 
@@ -1016,36 +1146,67 @@ async fn gov_worker_builds_timelines_projection_converges_and_tracks_sync() {
     // fellowship-instance event to prove class separation.
     let index = PgBlockIndex::new(db.pool.clone());
     index
-        .insert(block("polkadot", 100, "2025-10-20T00:00:00Z", vec![
-            ev(0, "referenda.Submitted", serde_json::json!({
-                "index": 1500, "track": 34,
-                "proposal": {"Lookup": {"hash": h256, "len": 142}},
-            })),
-            ev(1, "system.ExtrinsicSuccess", serde_json::json!({})),
-        ]))
+        .insert(block(
+            "polkadot",
+            100,
+            "2025-10-20T00:00:00Z",
+            vec![
+                ev(
+                    0,
+                    "referenda.Submitted",
+                    serde_json::json!({
+                        "index": 1500, "track": 34,
+                        "proposal": {"Lookup": {"hash": h256, "len": 142}},
+                    }),
+                ),
+                ev(1, "system.ExtrinsicSuccess", serde_json::json!({})),
+            ],
+        ))
         .await
         .expect("relay 100");
     index
-        .insert(block("polkadot", 110, "2025-10-25T00:00:00Z", vec![ev(
-            0,
-            "referenda.DecisionStarted",
-            serde_json::json!({
-                "index": 1500, "track": 34,
-                "proposal": {"Lookup": {"hash": h256, "len": 142}},
-                "tally": {"ayes": 0, "nays": 0, "support": 0},
-            }),
-        )]))
+        .insert(block(
+            "polkadot",
+            110,
+            "2025-10-25T00:00:00Z",
+            vec![ev(
+                0,
+                "referenda.DecisionStarted",
+                serde_json::json!({
+                    "index": 1500, "track": 34,
+                    "proposal": {"Lookup": {"hash": h256, "len": 142}},
+                    "tally": {"ayes": 0, "nays": 0, "support": 0},
+                }),
+            )],
+        ))
         .await
         .expect("relay 110");
     index
-        .insert(block("polkadot-asset-hub", 200, "2025-11-10T00:00:00Z", vec![
-            ev(0, "referenda.ConfirmStarted", serde_json::json!({"index": 1500})),
-            ev(1, "referenda.Confirmed", serde_json::json!({
-                "index": 1500, "tally": {"ayes": 9, "nays": 1, "support": 5},
-            })),
-            ev(2, "referenda.Approved", serde_json::json!({"index": 1500})),
-            ev(3, "fellowshipreferenda.Approved", serde_json::json!({"index": 300})),
-        ]))
+        .insert(block(
+            "polkadot-asset-hub",
+            200,
+            "2025-11-10T00:00:00Z",
+            vec![
+                ev(
+                    0,
+                    "referenda.ConfirmStarted",
+                    serde_json::json!({"index": 1500}),
+                ),
+                ev(
+                    1,
+                    "referenda.Confirmed",
+                    serde_json::json!({
+                        "index": 1500, "tally": {"ayes": 9, "nays": 1, "support": 5},
+                    }),
+                ),
+                ev(2, "referenda.Approved", serde_json::json!({"index": 1500})),
+                ev(
+                    3,
+                    "fellowshipreferenda.Approved",
+                    serde_json::json!({"index": 300}),
+                ),
+            ],
+        ))
         .await
         .expect("ah 200");
     index
@@ -1096,7 +1257,10 @@ async fn gov_worker_builds_timelines_projection_converges_and_tracks_sync() {
     assert_eq!(relay.status, "deciding");
     assert_eq!(relay.status_height, 110);
     assert_eq!(relay.track_id, Some(34));
-    assert_eq!(relay.proposal_hash.as_deref(), Some(&format!("0x{}", "ab".repeat(32))[..]));
+    assert_eq!(
+        relay.proposal_hash.as_deref(),
+        Some(&format!("0x{}", "ab".repeat(32))[..])
+    );
     assert_eq!(relay.proposal_len, Some(142));
     assert_eq!(relay.submitted_at_height, Some(100));
 
@@ -1138,7 +1302,10 @@ async fn gov_worker_builds_timelines_projection_converges_and_tracks_sync() {
             .fetch_one(&db.pool)
             .await
             .unwrap();
-    assert_eq!(in_default, 0, "timeline rows must route to per-chain partitions");
+    assert_eq!(
+        in_default, 0,
+        "timeline rows must route to per-chain partitions"
+    );
 
     // CONVERGENCE: replay everything (behind the frontier, mixed order) —
     // counts stable, statuses unchanged (older status events don't regress)
@@ -1152,8 +1319,15 @@ async fn gov_worker_builds_timelines_projection_converges_and_tracks_sync() {
         .fetch_one(&db.pool)
         .await
         .unwrap();
-    assert_eq!(total_events, 7, "insert-ignore: 2 relay + 4 ah + 1 fellowship");
-    let relay2 = idx.referendum("polkadot", "referenda", 1500).await.unwrap().unwrap();
+    assert_eq!(
+        total_events, 7,
+        "insert-ignore: 2 relay + 4 ah + 1 fellowship"
+    );
+    let relay2 = idx
+        .referendum("polkadot", "referenda", 1500)
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(
         (relay2.status.as_str(), relay2.status_height),
         ("deciding", 110),
@@ -1161,7 +1335,10 @@ async fn gov_worker_builds_timelines_projection_converges_and_tracks_sync() {
     );
 
     // list surface: newest first
-    let listed = idx.list_referenda("polkadot-asset-hub", "referenda", 10).await.unwrap();
+    let listed = idx
+        .list_referenda("polkadot-asset-hub", "referenda", 10)
+        .await
+        .unwrap();
     assert_eq!(listed.len(), 1);
     assert_eq!(listed[0].referendum_id, 1500);
 
@@ -1201,7 +1378,10 @@ async fn gov_worker_builds_timelines_projection_converges_and_tracks_sync() {
             let tracks = idx.tracks("polkadot-asset-hub").await.unwrap();
             assert_eq!(tracks.len(), 16);
             let root = tracks.iter().find(|t| t.track_id == 0).expect("track 0");
-            assert_eq!((root.name.as_str(), root.pallet.as_str()), ("root", "referenda"));
+            assert_eq!(
+                (root.name.as_str(), root.pallet.as_str()),
+                ("root", "referenda")
+            );
             assert_eq!(root.spec_version, 2_003_002);
             assert!(root.params.get("decision_period").is_some());
         }
@@ -1219,7 +1399,9 @@ async fn preimage_rows_upsert_join_and_never_downgrade() {
         fill_inline_proposal_hash, referenda_needing_preimages, upsert_preimage, PreimageRecord,
     };
 
-    let Some(db) = TestDb::create().await else { return };
+    let Some(db) = TestDb::create().await else {
+        return;
+    };
     let reg = seeds();
     sync_registry(&db.pool, &reg).await.expect("registry sync");
 
@@ -1260,15 +1442,22 @@ async fn preimage_rows_upsert_join_and_never_downgrade() {
     };
 
     // missing → decoded upgrades; a later missing must NOT downgrade
-    upsert_preimage(&db.pool, "polkadot-asset-hub", &rec("missing", None)).await.unwrap();
+    upsert_preimage(&db.pool, "polkadot-asset-hub", &rec("missing", None))
+        .await
+        .unwrap();
     upsert_preimage(
         &db.pool,
         "polkadot-asset-hub",
-        &rec("decoded", Some(serde_json::json!({"call": "utility.batch", "args": {}}))),
+        &rec(
+            "decoded",
+            Some(serde_json::json!({"call": "utility.batch", "args": {}})),
+        ),
     )
     .await
     .unwrap();
-    upsert_preimage(&db.pool, "polkadot-asset-hub", &rec("missing", None)).await.unwrap();
+    upsert_preimage(&db.pool, "polkadot-asset-hub", &rec("missing", None))
+        .await
+        .unwrap();
 
     let idx = api::pg::PgGovIndex::new(db.pool.clone());
     let p = idx
@@ -1276,7 +1465,10 @@ async fn preimage_rows_upsert_join_and_never_downgrade() {
         .await
         .unwrap()
         .expect("preimage row");
-    assert_eq!(p.decode_status, "decoded", "decoded rows are never downgraded");
+    assert_eq!(
+        p.decode_status, "decoded",
+        "decoded rows are never downgraded"
+    );
     assert_eq!(p.call_summary.as_deref(), Some("utility.batch"));
     assert_eq!(p.len, 142);
 
@@ -1289,11 +1481,23 @@ async fn preimage_rows_upsert_join_and_never_downgrade() {
 
     // inline fill: hash lands, coalesce-only (a second fill can't overwrite)
     let inline_hash = format!("0x{}", "ee".repeat(32));
-    fill_inline_proposal_hash(&db.pool, "polkadot-asset-hub", "referenda", 2001, &inline_hash, 2)
-        .await
-        .unwrap();
     fill_inline_proposal_hash(
-        &db.pool, "polkadot-asset-hub", "referenda", 2001, "0xdeadbeef", 999,
+        &db.pool,
+        "polkadot-asset-hub",
+        "referenda",
+        2001,
+        &inline_hash,
+        2,
+    )
+    .await
+    .unwrap();
+    fill_inline_proposal_hash(
+        &db.pool,
+        "polkadot-asset-hub",
+        "referenda",
+        2001,
+        "0xdeadbeef",
+        999,
     )
     .await
     .unwrap();
@@ -1304,7 +1508,10 @@ async fn preimage_rows_upsert_join_and_never_downgrade() {
     .fetch_one(&db.pool)
     .await
     .unwrap();
-    assert_eq!((got_hash.as_deref(), got_len), (Some(inline_hash.as_str()), Some(2)));
+    assert_eq!(
+        (got_hash.as_deref(), got_len),
+        (Some(inline_hash.as_str()), Some(2))
+    );
 
     db.drop_db().await;
 }
@@ -1315,7 +1522,9 @@ async fn vote_facts_land_projections_converge_and_voting_anchors_roundtrip() {
     use api::GovIndex as _;
     use canonical::{CanonicalBlock, CanonicalEvent, Lineage};
 
-    let Some(db) = TestDb::create().await else { return };
+    let Some(db) = TestDb::create().await else {
+        return;
+    };
     let reg = seeds();
     sync_registry(&db.pool, &reg).await.expect("registry sync");
 
@@ -1350,53 +1559,89 @@ async fn vote_facts_land_projections_converge_and_voting_anchors_roundtrip() {
     let index = PgBlockIndex::new(db.pool.clone());
     // relay, pre-migration: A votes aye with 1x conviction on ref 1500…
     index
-        .insert(block("polkadot", 100, "2025-10-20T00:00:00Z", vec![
-            ev(0, "convictionvoting.Voted", serde_json::json!({
-                "who": acct(0xa1),
-                // 2^64 plancks: exercises the NUMERIC path end to end
-                "vote": {"Standard": {"vote": [0x81], "balance": "18446744073709551616"}},
-                "poll_index": 1500,
-            })),
-            ev(1, "system.ExtrinsicSuccess", serde_json::json!({})),
-        ]))
+        .insert(block(
+            "polkadot",
+            100,
+            "2025-10-20T00:00:00Z",
+            vec![
+                ev(
+                    0,
+                    "convictionvoting.Voted",
+                    serde_json::json!({
+                        "who": acct(0xa1),
+                        // 2^64 plancks: exercises the NUMERIC path end to end
+                        "vote": {"Standard": {"vote": [0x81], "balance": "18446744073709551616"}},
+                        "poll_index": 1500,
+                    }),
+                ),
+                ev(1, "system.ExtrinsicSuccess", serde_json::json!({})),
+            ],
+        ))
         .await
         .expect("relay 100");
     // …and a legacy-shape vote (no poll_index) that we can NOT attribute
     index
-        .insert(block("polkadot", 105, "2025-10-21T00:00:00Z", vec![ev(
-            0,
-            "convictionvoting.Voted",
-            serde_json::json!({
-                "who": acct(0xb2),
-                "vote": {"Standard": {"vote": [0x00], "balance": 1005}},
-            }),
-        )]))
+        .insert(block(
+            "polkadot",
+            105,
+            "2025-10-21T00:00:00Z",
+            vec![ev(
+                0,
+                "convictionvoting.Voted",
+                serde_json::json!({
+                    "who": acct(0xb2),
+                    "vote": {"Standard": {"vote": [0x00], "balance": 1005}},
+                }),
+            )],
+        ))
         .await
         .expect("relay 105");
     // Asset Hub, post-migration: B votes nay, C delegates to B, a lock expires
     index
-        .insert(block("polkadot-asset-hub", 200, "2025-11-10T00:00:00Z", vec![
-            ev(0, "convictionvoting.Voted", serde_json::json!({
-                "who": acct(0xb2),
-                "vote": {"Standard": {"vote": [0x00], "balance": 1005}},
-                "poll_index": 1500,
-            })),
-            ev(1, "convictionvoting.Delegated", serde_json::json!([acct(0xc3), acct(0xb2), 34])),
-            ev(2, "convictionvoting.VoteUnlocked", serde_json::json!({"who": acct(0xa1), "class": 34})),
-        ]))
+        .insert(block(
+            "polkadot-asset-hub",
+            200,
+            "2025-11-10T00:00:00Z",
+            vec![
+                ev(
+                    0,
+                    "convictionvoting.Voted",
+                    serde_json::json!({
+                        "who": acct(0xb2),
+                        "vote": {"Standard": {"vote": [0x00], "balance": 1005}},
+                        "poll_index": 1500,
+                    }),
+                ),
+                ev(
+                    1,
+                    "convictionvoting.Delegated",
+                    serde_json::json!([acct(0xc3), acct(0xb2), 34]),
+                ),
+                ev(
+                    2,
+                    "convictionvoting.VoteUnlocked",
+                    serde_json::json!({"who": acct(0xa1), "class": 34}),
+                ),
+            ],
+        ))
         .await
         .expect("ah 200");
     // …then B withdraws its vote
     index
-        .insert(block("polkadot-asset-hub", 210, "2025-11-12T00:00:00Z", vec![ev(
-            0,
-            "convictionvoting.VoteRemoved",
-            serde_json::json!({
-                "who": acct(0xb2),
-                "vote": {"Standard": {"vote": [0x00], "balance": 1005}},
-                "poll_index": 1500,
-            }),
-        )]))
+        .insert(block(
+            "polkadot-asset-hub",
+            210,
+            "2025-11-12T00:00:00Z",
+            vec![ev(
+                0,
+                "convictionvoting.VoteRemoved",
+                serde_json::json!({
+                    "who": acct(0xb2),
+                    "vote": {"Standard": {"vote": [0x00], "balance": 1005}},
+                    "poll_index": 1500,
+                }),
+            )],
+        ))
         .await
         .expect("ah 210");
 
@@ -1424,13 +1669,19 @@ async fn vote_facts_land_projections_converge_and_voting_anchors_roundtrip() {
     let idx = api::pg::PgGovIndex::new(db.pool.clone());
 
     // relay: A's aye position, weights exactly as the pallet tallies them
-    let relay_votes = idx.referendum_votes("polkadot", "referenda", 1500, 50).await.unwrap();
+    let relay_votes = idx
+        .referendum_votes("polkadot", "referenda", 1500, 50)
+        .await
+        .unwrap();
     assert_eq!(relay_votes.len(), 1);
     let a = &relay_votes[0];
     assert!(a.active);
     assert_eq!(a.voter, format!("0x{}", "a1".repeat(32)));
     assert_eq!(a.conviction, Some(1));
-    assert_eq!(a.aye_votes, "18446744073709551616", "1x conviction: votes = capital");
+    assert_eq!(
+        a.aye_votes, "18446744073709551616",
+        "1x conviction: votes = capital"
+    );
     assert_eq!(a.support, "18446744073709551616");
     assert_eq!(a.nay_votes, "0");
 
@@ -1440,7 +1691,10 @@ async fn vote_facts_land_projections_converge_and_voting_anchors_roundtrip() {
         .await
         .unwrap();
     assert_eq!(ah_votes.len(), 1);
-    assert!(!ah_votes[0].active, "the later withdrawal wins over the earlier vote");
+    assert!(
+        !ah_votes[0].active,
+        "the later withdrawal wins over the earlier vote"
+    );
     assert_eq!(ah_votes[0].nay_votes, "100", "no conviction → capital/10");
 
     // the legacy unattributed vote: recorded, but never projected
@@ -1456,21 +1710,33 @@ async fn vote_facts_land_projections_converge_and_voting_anchors_roundtrip() {
         .fetch_one(&db.pool)
         .await
         .unwrap();
-    assert_eq!(positions, 2, "A on the relay + B on AH; the legacy vote has no subject");
+    assert_eq!(
+        positions, 2,
+        "A on the relay + B on AH; the legacy vote has no subject"
+    );
 
     // VoteUnlocked is lock bookkeeping: it must produce no fact at all
     let (vote_rows,): (i64,) = sqlx::query_as("select count(*) from gov.votes")
         .fetch_one(&db.pool)
         .await
         .unwrap();
-    assert_eq!(vote_rows, 4, "2 relay + 1 AH vote + 1 AH withdrawal, no unlock row");
+    assert_eq!(
+        vote_rows, 4,
+        "2 relay + 1 AH vote + 1 AH withdrawal, no unlock row"
+    );
 
     // delegation edge + projection
-    let delegations = idx.account_delegations("polkadot-asset-hub", &delegator).await.unwrap();
+    let delegations = idx
+        .account_delegations("polkadot-asset-hub", &delegator)
+        .await
+        .unwrap();
     assert_eq!(delegations.len(), 1);
     assert_eq!(delegations[0].track_id, 34);
     assert!(delegations[0].active);
-    assert_eq!(delegations[0].target, Some(format!("0x{}", "b2".repeat(32))));
+    assert_eq!(
+        delegations[0].target,
+        Some(format!("0x{}", "b2".repeat(32)))
+    );
 
     // partition routing: nothing in the default partitions
     for table in ["gov.votes_default", "gov.delegation_events_default"] {
@@ -1498,13 +1764,20 @@ async fn vote_facts_land_projections_converge_and_voting_anchors_roundtrip() {
         .referendum_votes("polkadot-asset-hub", "referenda", 1500, 50)
         .await
         .unwrap();
-    assert!(!ah_again[0].active, "replaying the older vote must not reactivate it");
+    assert!(
+        !ah_again[0].active,
+        "replaying the older vote must not reactivate it"
+    );
 
     // account surface: A's vote is findable by voter
     let a_votes = idx.account_votes("polkadot", &voter_a, 10).await.unwrap();
     assert_eq!(a_votes.len(), 1);
     assert_eq!(a_votes[0].referendum_id, 1500);
-    assert!(idx.account_votes("polkadot", &voter_b, 10).await.unwrap().is_empty());
+    assert!(idx
+        .account_votes("polkadot", &voter_b, 10)
+        .await
+        .unwrap()
+        .is_empty());
 
     // ---- voting anchors: the numbers no event carries ----------------------
     let position = VotingPosition {
@@ -1550,12 +1823,31 @@ async fn vote_facts_land_projections_converge_and_voting_anchors_roundtrip() {
     .await
     .expect("anchor re-insert");
 
-    let anchors = idx.voting_anchors("polkadot-asset-hub", &delegator).await.unwrap();
-    assert_eq!(anchors.len(), 1, "same (account, class, track, height) → one row");
-    assert_eq!(anchors[0].mode, "delegating", "the first observation is not overwritten");
-    assert_eq!(anchors[0].delegating_balance.as_deref(), Some("5000000000000"));
-    assert_eq!(anchors[0].delegating_conviction_label.as_deref(), Some("locked6x"));
-    assert_eq!(anchors[0].delegating_target, Some(format!("0x{}", "b2".repeat(32))));
+    let anchors = idx
+        .voting_anchors("polkadot-asset-hub", &delegator)
+        .await
+        .unwrap();
+    assert_eq!(
+        anchors.len(),
+        1,
+        "same (account, class, track, height) → one row"
+    );
+    assert_eq!(
+        anchors[0].mode, "delegating",
+        "the first observation is not overwritten"
+    );
+    assert_eq!(
+        anchors[0].delegating_balance.as_deref(),
+        Some("5000000000000")
+    );
+    assert_eq!(
+        anchors[0].delegating_conviction_label.as_deref(),
+        Some("locked6x")
+    );
+    assert_eq!(
+        anchors[0].delegating_target,
+        Some(format!("0x{}", "b2".repeat(32)))
+    );
 
     db.drop_db().await;
 }
@@ -1566,7 +1858,9 @@ async fn treasury_spends_converge_and_pot_flows_stay_unprojected() {
     use api::TreasuryIndex as _;
     use canonical::{CanonicalBlock, CanonicalEvent, Lineage};
 
-    let Some(db) = TestDb::create().await else { return };
+    let Some(db) = TestDb::create().await else {
+        return;
+    };
     let reg = seeds();
     sync_registry(&db.pool, &reg).await.expect("registry sync");
 
@@ -1600,50 +1894,86 @@ async fn treasury_spends_converge_and_pot_flows_stay_unprojected() {
     let index = PgBlockIndex::new(db.pool.clone());
     // approval, then a FAILED payment, then a successful retry, then processed
     index
-        .insert(block("polkadot-asset-hub", 300, "2026-01-01T00:00:00Z", vec![
-            ev(0, "treasury.AssetSpendApproved", serde_json::json!({
-                "index": 313,
-                "asset_kind": {"V4": {"asset_id": {"parents": 0, "interior": {"X2": [
-                    {"PalletInstance": 50}, {"GeneralIndex": 1984}
-                ]}}}},
-                // > u64: exercises the NUMERIC path
-                "amount": "18446744073709551616",
-                "beneficiary": beneficiary,
-                "valid_from": 300,
-                "expire_at": 900,
-            })),
-            ev(1, "treasury.Deposit", serde_json::json!({"value": 1204000000000u64})),
-        ]))
+        .insert(block(
+            "polkadot-asset-hub",
+            300,
+            "2026-01-01T00:00:00Z",
+            vec![
+                ev(
+                    0,
+                    "treasury.AssetSpendApproved",
+                    serde_json::json!({
+                        "index": 313,
+                        "asset_kind": {"V4": {"asset_id": {"parents": 0, "interior": {"X2": [
+                            {"PalletInstance": 50}, {"GeneralIndex": 1984}
+                        ]}}}},
+                        // > u64: exercises the NUMERIC path
+                        "amount": "18446744073709551616",
+                        "beneficiary": beneficiary,
+                        "valid_from": 300,
+                        "expire_at": 900,
+                    }),
+                ),
+                ev(
+                    1,
+                    "treasury.Deposit",
+                    serde_json::json!({"value": 1204000000000u64}),
+                ),
+            ],
+        ))
         .await
         .expect("ah 300");
     index
-        .insert(block("polkadot-asset-hub", 310, "2026-01-02T00:00:00Z", vec![ev(
-            0,
-            "treasury.PaymentFailed",
-            serde_json::json!({"index": 313, "payment_id": 42}),
-        )]))
+        .insert(block(
+            "polkadot-asset-hub",
+            310,
+            "2026-01-02T00:00:00Z",
+            vec![ev(
+                0,
+                "treasury.PaymentFailed",
+                serde_json::json!({"index": 313, "payment_id": 42}),
+            )],
+        ))
         .await
         .expect("ah 310");
     index
-        .insert(block("polkadot-asset-hub", 320, "2026-01-03T00:00:00Z", vec![
-            ev(0, "treasury.Paid", serde_json::json!({"index": 313, "payment_id": 43})),
-            // a legacy-shape proposal in the SAME block: different id space,
-            // same number — must not collide with asset spend 313
-            ev(1, "treasury.Awarded", serde_json::json!({
-                "proposal_index": 313, "award": 500, "account": [payee.clone()]
-            })),
-        ]))
+        .insert(block(
+            "polkadot-asset-hub",
+            320,
+            "2026-01-03T00:00:00Z",
+            vec![
+                ev(
+                    0,
+                    "treasury.Paid",
+                    serde_json::json!({"index": 313, "payment_id": 43}),
+                ),
+                // a legacy-shape proposal in the SAME block: different id space,
+                // same number — must not collide with asset spend 313
+                ev(
+                    1,
+                    "treasury.Awarded",
+                    serde_json::json!({
+                        "proposal_index": 313, "award": 500, "account": [payee.clone()]
+                    }),
+                ),
+            ],
+        ))
         .await
         .expect("ah 320");
     // `check_status` runs in a LATER block than `payout` — keeping them apart
     // is what makes the payment_id ordering testable at all (in one block the
     // sink's own sort hides the bug)
     index
-        .insert(block("polkadot-asset-hub", 325, "2026-01-04T00:00:00Z", vec![ev(
-            0,
-            "treasury.SpendProcessed",
-            serde_json::json!({"index": 313}),
-        )]))
+        .insert(block(
+            "polkadot-asset-hub",
+            325,
+            "2026-01-04T00:00:00Z",
+            vec![ev(
+                0,
+                "treasury.SpendProcessed",
+                serde_json::json!({"index": 313}),
+            )],
+        ))
         .await
         .expect("ah 325");
 
@@ -1662,7 +1992,11 @@ async fn treasury_spends_converge_and_pot_flows_stay_unprojected() {
     // Every column must still converge.
     for (from, to) in [(325, 325), (310, 310), (300, 300), (320, 320)] {
         ingest::treasury::treasury_range(
-            "polkadot-asset-hub", &SubstrateTreasuryMapper, &deps, from, to,
+            "polkadot-asset-hub",
+            &SubstrateTreasuryMapper,
+            &deps,
+            from,
+            to,
         )
         .await
         .expect("out-of-order range");
@@ -1678,13 +2012,26 @@ async fn treasury_spends_converge_and_pot_flows_stay_unprojected() {
     assert_eq!(spend.status, "processed");
     // …while the value columns survived the later, valueless events
     assert_eq!(spend.amount.as_deref(), Some("18446744073709551616"));
-    assert_eq!(spend.beneficiary.as_deref(), Some(&format!("0x{}", "d4".repeat(32))[..]));
-    assert!(spend.asset_kind.is_some(), "asset kind kept from the approval");
+    assert_eq!(
+        spend.beneficiary.as_deref(),
+        Some(&format!("0x{}", "d4".repeat(32))[..])
+    );
+    assert!(
+        spend.asset_kind.is_some(),
+        "asset kind kept from the approval"
+    );
     // THE ordering trap: the failed attempt (310) was applied AFTER the
     // successful retry (320) in this run, and the terminal event (325) owns the
     // status. Only the payment's own coordinate gets this right.
-    assert_eq!(spend.payment_id.as_deref(), Some("43"), "the successful retry's id");
-    assert_eq!(spend.first_seen_height, 300, "least() keeps the earliest sighting");
+    assert_eq!(
+        spend.payment_id.as_deref(),
+        Some("43"),
+        "the successful retry's id"
+    );
+    assert_eq!(
+        spend.first_seen_height, 300,
+        "least() keeps the earliest sighting"
+    );
 
     // the legacy proposal with the SAME number is a different row entirely
     let proposal = idx
@@ -1692,18 +2039,30 @@ async fn treasury_spends_converge_and_pot_flows_stay_unprojected() {
         .await
         .unwrap()
         .expect("proposal 313");
-    assert_eq!((proposal.status.as_str(), proposal.amount.as_deref()), ("awarded", Some("500")));
+    assert_eq!(
+        (proposal.status.as_str(), proposal.amount.as_deref()),
+        ("awarded", Some("500"))
+    );
 
     // pot flows: recorded as facts, never projected
-    let pot = idx.pot_events("polkadot-asset-hub", "treasury", 10).await.unwrap();
+    let pot = idx
+        .pot_events("polkadot-asset-hub", "treasury", 10)
+        .await
+        .unwrap();
     assert_eq!(pot.len(), 1);
-    assert_eq!((pot[0].kind.as_str(), pot[0].amount.as_deref()), ("pot_deposit", Some("1204000000000")));
+    assert_eq!(
+        (pot[0].kind.as_str(), pot[0].amount.as_deref()),
+        ("pot_deposit", Some("1204000000000"))
+    );
     assert!(pot[0].timestamp.is_some(), "joined to the block timestamp");
     let (projected,): (i64,) = sqlx::query_as("select count(*) from treasury.spends")
         .fetch_one(&db.pool)
         .await
         .unwrap();
-    assert_eq!(projected, 2, "one asset spend + one proposal; the deposit is not a spend");
+    assert_eq!(
+        projected, 2,
+        "one asset spend + one proposal; the deposit is not a spend"
+    );
 
     // full timeline for the spend, in order
     let events = idx
@@ -1711,7 +2070,10 @@ async fn treasury_spends_converge_and_pot_flows_stay_unprojected() {
         .await
         .unwrap();
     let kinds: Vec<&str> = events.iter().map(|e| e.kind.as_str()).collect();
-    assert_eq!(kinds, vec!["approved", "payment_failed", "paid", "processed"]);
+    assert_eq!(
+        kinds,
+        vec!["approved", "payment_failed", "paid", "processed"]
+    );
     // pot figures say what they MEAN, so nobody sums a balance as a flow
     let (flows, snapshots): (i64, i64) = sqlx::query_as(
         "select count(*) filter (where figure_kind = 'flow'), \
@@ -1724,14 +2086,21 @@ async fn treasury_spends_converge_and_pot_flows_stay_unprojected() {
     assert_eq!((flows, snapshots), (1, 0), "the Deposit is a flow");
 
     // partition routing + convergence on replay
-    let (in_default,): (i64,) = sqlx::query_as("select count(*) from treasury.spend_events_default")
-        .fetch_one(&db.pool)
-        .await
-        .unwrap();
+    let (in_default,): (i64,) =
+        sqlx::query_as("select count(*) from treasury.spend_events_default")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
     assert_eq!(in_default, 0, "facts must route to per-chain partitions");
-    ingest::treasury::treasury_range("polkadot-asset-hub", &SubstrateTreasuryMapper, &deps, 300, 325)
-        .await
-        .expect("replay");
+    ingest::treasury::treasury_range(
+        "polkadot-asset-hub",
+        &SubstrateTreasuryMapper,
+        &deps,
+        300,
+        325,
+    )
+    .await
+    .expect("replay");
     let (facts,): (i64,) = sqlx::query_as("select count(*) from treasury.spend_events")
         .fetch_one(&db.pool)
         .await
@@ -1742,7 +2111,10 @@ async fn treasury_spends_converge_and_pot_flows_stay_unprojected() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(after.status, "processed", "replaying older events must not regress");
+    assert_eq!(
+        after.status, "processed",
+        "replaying older events must not regress"
+    );
 
     db.drop_db().await;
 }
@@ -1754,7 +2126,9 @@ async fn unfinalized_rows_are_replaceable_finalized_rows_are_immutable() {
     use canonical::{CanonicalBlock, CanonicalEvent, CanonicalTransaction, Lineage};
     use ingest::tip::UnfinalizedStore as _;
 
-    let Some(db) = TestDb::create().await else { return };
+    let Some(db) = TestDb::create().await else {
+        return;
+    };
     let reg = seeds();
     sync_registry(&db.pool, &reg).await.expect("registry sync");
 
@@ -1793,7 +2167,11 @@ async fn unfinalized_rows_are_replaceable_finalized_rows_are_immutable() {
     // 1. unfinalized fork A lands at height 50 (2 events)
     index.insert(block(50, "0xforkA", false, 2)).await.unwrap();
     assert_eq!(
-        store.unfinalized_hash("polkadot", 50).await.unwrap().as_deref(),
+        store
+            .unfinalized_hash("polkadot", 50)
+            .await
+            .unwrap()
+            .as_deref(),
         Some("0xforkA")
     );
 
@@ -1807,7 +2185,10 @@ async fn unfinalized_rows_are_replaceable_finalized_rows_are_immutable() {
     .fetch_one(&db.pool)
     .await
     .unwrap();
-    assert_eq!((hash.as_str(), tx_hash.as_str()), ("0xforkB", "0xforkB-tx0"));
+    assert_eq!(
+        (hash.as_str(), tx_hash.as_str()),
+        ("0xforkB", "0xforkB-tx0")
+    );
     let (ev_count,): (i64,) = sqlx::query_as(
         "select count(*) from core.events where chain_id = 'polkadot' and block_height = 50",
     )
@@ -1818,7 +2199,11 @@ async fn unfinalized_rows_are_replaceable_finalized_rows_are_immutable() {
 
     // 3. finalization arrives with fork B → row becomes finalized
     index.insert(block(50, "0xforkB", true, 3)).await.unwrap();
-    assert!(store.unfinalized_hash("polkadot", 50).await.unwrap().is_none());
+    assert!(store
+        .unfinalized_hash("polkadot", 50)
+        .await
+        .unwrap()
+        .is_none());
     let (finalized,): (bool,) = sqlx::query_as(
         "select finalized from core.blocks where chain_id = 'polkadot' and height = 50",
     )
@@ -1848,7 +2233,10 @@ async fn unfinalized_rows_are_replaceable_finalized_rows_are_immutable() {
 
     // 5. prune: unfinalized 51..53 vanish (children too), finalized 50 survives
     for h in 51..=53 {
-        index.insert(block(h, &format!("0xtip{h}"), false, 1)).await.unwrap();
+        index
+            .insert(block(h, &format!("0xtip{h}"), false, 1))
+            .await
+            .unwrap();
     }
     let pruned = store.prune_unfinalized_above("polkadot", 50).await.unwrap();
     assert_eq!(pruned, 3);
@@ -1891,7 +2279,9 @@ async fn asset_balances_share_the_balances_tables_and_holdings_join_their_assets
     use api::{AssetIndex as _, BalanceIndex as _, TreasuryIndex as _};
     use canonical::{CanonicalBlock, CanonicalEvent, Lineage};
 
-    let Some(db) = TestDb::create().await else { return };
+    let Some(db) = TestDb::create().await else {
+        return;
+    };
     let reg = seeds();
     sync_registry(&db.pool, &reg).await.expect("registry sync");
 
@@ -1921,25 +2311,41 @@ async fn asset_balances_share_the_balances_tables_and_holdings_join_their_assets
         transactions: vec![],
         events: vec![
             // USDT out of the treasury
-            ev(0, "assets.Transferred", serde_json::json!({
-                "asset_id": 1984, "from": acct(&treasury), "to": acct(&peer), "amount": big,
-            })),
+            ev(
+                0,
+                "assets.Transferred",
+                serde_json::json!({
+                    "asset_id": 1984, "from": acct(&treasury), "to": acct(&peer), "amount": big,
+                }),
+            ),
             // a bridged asset minted to the treasury, named by an XCM location
             // in the V4 NESTED-X1 spelling
-            ev(1, "foreignassets.Issued", serde_json::json!({
-                "asset_id": {"parents": 2, "interior": {"X1": [[
-                    {"GlobalConsensus": {"Ethereum": {"chain_id": 1}}}
-                ]]}},
-                "owner": acct(&treasury), "amount": 7u64,
-            })),
+            ev(
+                1,
+                "foreignassets.Issued",
+                serde_json::json!({
+                    "asset_id": {"parents": 2, "interior": {"X1": [[
+                        {"GlobalConsensus": {"Ethereum": {"chain_id": 1}}}
+                    ]]}},
+                    "owner": acct(&treasury), "amount": 7u64,
+                }),
+            ),
             // status, not money
-            ev(2, "assets.Frozen", serde_json::json!({
-                "asset_id": 1984, "who": acct(&treasury),
-            })),
+            ev(
+                2,
+                "assets.Frozen",
+                serde_json::json!({
+                    "asset_id": 1984, "who": acct(&treasury),
+                }),
+            ),
             // and the NATIVE mapper still works in the same pass
-            ev(3, "balances.Withdraw", serde_json::json!({
-                "who": acct(&treasury), "amount": 160000000u64,
-            })),
+            ev(
+                3,
+                "balances.Withdraw",
+                serde_json::json!({
+                    "who": acct(&treasury), "amount": 160000000u64,
+                }),
+            ),
         ],
     };
     let index = PgBlockIndex::new(db.pool.clone());
@@ -1953,15 +2359,9 @@ async fn asset_balances_share_the_balances_tables_and_holdings_join_their_assets
         source: &source,
         sink: &sink,
     };
-    ingest::balances::balances_range(
-        "polkadot-asset-hub",
-        &SubstrateDeltaMapper,
-        &deps,
-        500,
-        500,
-    )
-    .await
-    .expect("balances range");
+    ingest::balances::balances_range("polkadot-asset-hub", &SubstrateDeltaMapper, &deps, 500, 500)
+        .await
+        .expect("balances range");
 
     // ---- 1. asset deltas landed in the balances tables ------------------
     let rows: Vec<(String, String, String, i32)> = sqlx::query_as(
@@ -1985,7 +2385,10 @@ async fn asset_balances_share_the_balances_tables_and_holdings_join_their_assets
         adapter_substrate::balances::MAPPER_VERSION,
         "an asset delta carries the balances mapper's own version as lineage"
     );
-    assert_eq!(by_asset["native"].1, "-160000000", "native mapping untouched");
+    assert_eq!(
+        by_asset["native"].1, "-160000000",
+        "native mapping untouched"
+    );
     let foreign = rows
         .iter()
         .find(|r| r.0.starts_with("foreign:"))
@@ -2060,7 +2463,11 @@ async fn asset_balances_share_the_balances_tables_and_holdings_join_their_assets
         None,
         None,
         None,
-        &aa::AssetMeta { name: None, symbol: Some("STALE".into()), decimals: Some(0) },
+        &aa::AssetMeta {
+            name: None,
+            symbol: Some("STALE".into()),
+            decimals: Some(0),
+        },
         &Default::default(),
         Some(2_000_000),
         Some(100),
@@ -2070,8 +2477,15 @@ async fn asset_balances_share_the_balances_tables_and_holdings_join_their_assets
     .expect("upsert older");
     let assets = api::pg::PgAssetIndex::new(db.pool.clone());
     let listed = assets.assets("polkadot-asset-hub").await.expect("assets");
-    let usdt = listed.iter().find(|a| a.asset_key == "assets:1984").unwrap();
-    assert_eq!(usdt.symbol.as_deref(), Some("USDT"), "older read must not win");
+    let usdt = listed
+        .iter()
+        .find(|a| a.asset_key == "assets:1984")
+        .unwrap();
+    assert_eq!(
+        usdt.symbol.as_deref(),
+        Some("USDT"),
+        "older read must not win"
+    );
     assert_eq!(usdt.decimals, Some(6));
     assert_eq!(usdt.location_key.as_deref(), Some(usdt_key.as_str()));
 
@@ -2207,7 +2621,11 @@ async fn asset_balances_share_the_balances_tables_and_holdings_join_their_assets
         .await
         .expect("spend read")
         .expect("the spend");
-    let round_tripped = spend.asset_ref.as_ref().unwrap().pointer("/location/asset")
+    let round_tripped = spend
+        .asset_ref
+        .as_ref()
+        .unwrap()
+        .pointer("/location/asset")
         .expect("asset half")
         .to_string();
     assert_eq!(
@@ -2242,7 +2660,9 @@ async fn bounty_facts_converge_and_derived_accounts_join_the_treasury_list() {
     use api::BountyIndex as _;
     use canonical::{CanonicalBlock, CanonicalEvent, Lineage};
 
-    let Some(db) = TestDb::create().await else { return };
+    let Some(db) = TestDb::create().await else {
+        return;
+    };
     let reg = seeds();
     sync_registry(&db.pool, &reg).await.expect("registry sync");
 
@@ -2274,55 +2694,79 @@ async fn bounty_facts_converge_and_derived_accounts_join_the_treasury_list() {
     let big = "36893488147419103232";
     let index = PgBlockIndex::new(db.pool.clone());
     index
-        .insert(block(600, "2026-01-01T00:00:00Z", vec![ev(
-            0,
-            "bounties.BountyProposed",
-            serde_json::json!({"index": 22}),
-        )]))
+        .insert(block(
+            600,
+            "2026-01-01T00:00:00Z",
+            vec![ev(
+                0,
+                "bounties.BountyProposed",
+                serde_json::json!({"index": 22}),
+            )],
+        ))
         .await
         .expect("ah 600");
     // an INFO-ONLY event: it names bounty 1 and carries its value, but moves
     // no status. The treasury sink would drop a fact like this; a bounty page
     // that dropped it would never know what any bounty is worth.
     index
-        .insert(block(605, "2026-01-02T00:00:00Z", vec![ev(
-            0,
-            "multiassetbounties.BountyValueIncreased",
-            serde_json::json!({"index": 1, "old_value": 100u64, "new_value": "83760000000"}),
-        )]))
+        .insert(block(
+            605,
+            "2026-01-02T00:00:00Z",
+            vec![ev(
+                0,
+                "multiassetbounties.BountyValueIncreased",
+                serde_json::json!({"index": 1, "old_value": 100u64, "new_value": "83760000000"}),
+            )],
+        ))
         .await
         .expect("ah 605");
     index
-        .insert(block(610, "2026-01-03T00:00:00Z", vec![ev(
-            0,
-            "multiassetbounties.BountyPayoutProcessed",
-            serde_json::json!({
-                "index": 1,
-                "child_index": {"None": []},
-                "asset_kind": {"V4": [{
-                    "location": {"parents": 0, "interior": {"Here": []}},
-                    "asset_id": [{"parents": 0, "interior": {"X2": [[
-                        {"PalletInstance": [50]}, {"GeneralIndex": [1984]}
-                    ]]}}]
-                }]},
-                "value": "83760000000",
-                "beneficiary": acct(&payee),
-            }),
-        )]))
+        .insert(block(
+            610,
+            "2026-01-03T00:00:00Z",
+            vec![ev(
+                0,
+                "multiassetbounties.BountyPayoutProcessed",
+                serde_json::json!({
+                    "index": 1,
+                    "child_index": {"None": []},
+                    "asset_kind": {"V4": [{
+                        "location": {"parents": 0, "interior": {"Here": []}},
+                        "asset_id": [{"parents": 0, "interior": {"X2": [[
+                            {"PalletInstance": [50]}, {"GeneralIndex": [1984]}
+                        ]]}}]
+                    }]},
+                    "value": "83760000000",
+                    "beneficiary": acct(&payee),
+                }),
+            )],
+        ))
         .await
         .expect("ah 610");
     index
-        .insert(block(620, "2026-01-04T00:00:00Z", vec![
-            ev(0, "bounties.BountyClaimed", serde_json::json!({
-                "index": 22, "payout": big, "beneficiary": acct(&payee),
-            })),
-            // the SAME parent id in a different pallet: a child bounty, which
-            // the sentinel is what distinguishes
-            ev(1, "childbounties.Claimed", serde_json::json!({
-                "index": 22, "child_index": 3, "payout": 500u64,
-                "beneficiary": acct(&payee),
-            })),
-        ]))
+        .insert(block(
+            620,
+            "2026-01-04T00:00:00Z",
+            vec![
+                ev(
+                    0,
+                    "bounties.BountyClaimed",
+                    serde_json::json!({
+                        "index": 22, "payout": big, "beneficiary": acct(&payee),
+                    }),
+                ),
+                // the SAME parent id in a different pallet: a child bounty, which
+                // the sentinel is what distinguishes
+                ev(
+                    1,
+                    "childbounties.Claimed",
+                    serde_json::json!({
+                        "index": 22, "child_index": 3, "payout": 500u64,
+                        "beneficiary": acct(&payee),
+                    }),
+                ),
+            ],
+        ))
         .await
         .expect("ah 620");
 
@@ -2341,12 +2785,24 @@ async fn bounty_facts_converge_and_derived_accounts_join_the_treasury_list() {
 
     // OUT OF ORDER, worst first: the claim before the proposal, and the
     // value raise before the payout that gives the bounty a status at all.
-    ingest::bounties::bounties_range("polkadot-asset-hub", &SubstrateBountyMapper, &deps, 620, 620)
-        .await
-        .expect("terminal first");
-    ingest::bounties::bounties_range("polkadot-asset-hub", &SubstrateBountyMapper, &deps, 605, 605)
-        .await
-        .expect("info only");
+    ingest::bounties::bounties_range(
+        "polkadot-asset-hub",
+        &SubstrateBountyMapper,
+        &deps,
+        620,
+        620,
+    )
+    .await
+    .expect("terminal first");
+    ingest::bounties::bounties_range(
+        "polkadot-asset-hub",
+        &SubstrateBountyMapper,
+        &deps,
+        605,
+        605,
+    )
+    .await
+    .expect("info only");
 
     // ---- 1. the placeholder: a bounty known ONLY by an info event ---------
     let placeholder = idx
@@ -2361,12 +2817,24 @@ async fn bounty_facts_converge_and_derived_accounts_join_the_treasury_list() {
     assert_eq!(placeholder.value.as_deref(), Some("83760000000"));
     assert!(placeholder.paid_out.is_none(), "a raise is not a payment");
 
-    ingest::bounties::bounties_range("polkadot-asset-hub", &SubstrateBountyMapper, &deps, 600, 600)
-        .await
-        .expect("proposal, older than the claim");
-    ingest::bounties::bounties_range("polkadot-asset-hub", &SubstrateBountyMapper, &deps, 610, 610)
-        .await
-        .expect("payout, newer than the raise");
+    ingest::bounties::bounties_range(
+        "polkadot-asset-hub",
+        &SubstrateBountyMapper,
+        &deps,
+        600,
+        600,
+    )
+    .await
+    .expect("proposal, older than the claim");
+    ingest::bounties::bounties_range(
+        "polkadot-asset-hub",
+        &SubstrateBountyMapper,
+        &deps,
+        610,
+        610,
+    )
+    .await
+    .expect("payout, newer than the raise");
 
     // ---- 2. three instances, one table; parent and child told apart -------
     let parent = idx
@@ -2374,10 +2842,23 @@ async fn bounty_facts_converge_and_derived_accounts_join_the_treasury_list() {
         .await
         .unwrap()
         .expect("legacy bounty 22");
-    assert!(parent.child_id.is_none(), "the -1 sentinel never reaches a reader");
-    assert_eq!(parent.status, "claimed", "the older proposal must not regress it");
-    assert_eq!(parent.first_seen_height, 600, "least() keeps the earliest sighting");
-    assert_eq!(parent.paid_out.as_deref(), Some(big), "2^65 survived as NUMERIC");
+    assert!(
+        parent.child_id.is_none(),
+        "the -1 sentinel never reaches a reader"
+    );
+    assert_eq!(
+        parent.status, "claimed",
+        "the older proposal must not regress it"
+    );
+    assert_eq!(
+        parent.first_seen_height, 600,
+        "least() keeps the earliest sighting"
+    );
+    assert_eq!(
+        parent.paid_out.as_deref(),
+        Some(big),
+        "2^65 survived as NUMERIC"
+    );
 
     let child = idx
         .bounty("polkadot-asset-hub", "child_bounties", 22, Some(3))
@@ -2398,7 +2879,10 @@ async fn bounty_facts_converge_and_derived_accounts_join_the_treasury_list() {
         .await
         .unwrap()
         .expect("multi-asset bounty 1");
-    assert_eq!(modern.status, "claimed", "the payout moved it off the placeholder");
+    assert_eq!(
+        modern.status, "claimed",
+        "the payout moved it off the placeholder"
+    );
     assert_eq!(modern.value.as_deref(), Some("83760000000"));
     assert_eq!(modern.paid_out.as_deref(), Some("83760000000"));
     // the payout names its asset exactly as a treasury spend does, and
@@ -2437,9 +2921,15 @@ async fn bounty_facts_converge_and_derived_accounts_join_the_treasury_list() {
     // is free. `paid_out` is a running total, and it is safe ONLY because the
     // sink adds a payout when the FACT ROW was really inserted. Replay the
     // whole span and the totals must not move.
-    ingest::bounties::bounties_range("polkadot-asset-hub", &SubstrateBountyMapper, &deps, 600, 620)
-        .await
-        .expect("replay");
+    ingest::bounties::bounties_range(
+        "polkadot-asset-hub",
+        &SubstrateBountyMapper,
+        &deps,
+        600,
+        620,
+    )
+    .await
+    .expect("replay");
     let (facts,): (i64,) = sqlx::query_as("select count(*) from treasury.bounty_events")
         .fetch_one(&db.pool)
         .await
@@ -2461,7 +2951,10 @@ async fn bounty_facts_converge_and_derived_accounts_join_the_treasury_list() {
         .unwrap()
         .unwrap();
     assert_eq!(modern_replayed.paid_out.as_deref(), Some("83760000000"));
-    assert_eq!(modern_replayed.status, "claimed", "replay must not regress it");
+    assert_eq!(
+        modern_replayed.status, "claimed",
+        "replay must not regress it"
+    );
 
     // the timeline reads in order, and the child's events are its own
     let timeline = idx
@@ -2470,7 +2963,10 @@ async fn bounty_facts_converge_and_derived_accounts_join_the_treasury_list() {
         .unwrap();
     let kinds: Vec<&str> = timeline.iter().map(|e| e.kind.as_str()).collect();
     assert_eq!(kinds, vec!["proposed", "claimed"]);
-    assert!(timeline[0].timestamp.is_some(), "joined to the block timestamp");
+    assert!(
+        timeline[0].timestamp.is_some(),
+        "joined to the block timestamp"
+    );
 
     // ---- 5. the accounts, which is what closes the holdings gap ----------
     let raw_dir = tmp_raw("bounties");
@@ -2508,13 +3004,19 @@ async fn bounty_facts_converge_and_derived_accounts_join_the_treasury_list() {
     // …and the legacy CHILD bounty is refused outright: its address depends on
     // whether it predates pallet-child-bounties 38.0.0's renumbering, which
     // this table does not record
-    assert_eq!(report.underivable, 1, "a legacy child bounty is not derivable");
-    assert_eq!(report.linked, 2, "every derivable row's null account_id converged");
+    assert_eq!(
+        report.underivable, 1,
+        "a legacy child bounty is not derivable"
+    );
+    assert_eq!(
+        report.linked, 2,
+        "every derivable row's null account_id converged"
+    );
 
     // the address is DERIVED, not curated: bounty 22's money lives at
     // modl ++ py/trsry ++ SCALE(("bt", 22u32))
-    let expected = sub_account(b"py/trsry", &[SubKey::Str("bt"), SubKey::Index(22)])
-        .expect("derives");
+    let expected =
+        sub_account(b"py/trsry", &[SubKey::Str("bt"), SubKey::Index(22)]).expect("derives");
     let (label, derivation, network, active): (String, Option<String>, String, bool) =
         sqlx::query_as(
             "select label, derivation, network, active from treasury.treasury_accounts \
@@ -2546,12 +3048,11 @@ async fn bounty_facts_converge_and_derived_accounts_join_the_treasury_list() {
         .await
         .expect("second sync");
     assert_eq!(again.linked, 0, "nothing left to converge");
-    let (accounts,): (i64,) = sqlx::query_as(
-        "select count(*) from treasury.treasury_accounts where role = 'bounty'",
-    )
-    .fetch_one(&db.pool)
-    .await
-    .unwrap();
+    let (accounts,): (i64,) =
+        sqlx::query_as("select count(*) from treasury.treasury_accounts where role = 'bounty'")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
     assert_eq!(accounts, 2, "bounty account sync must be idempotent");
 
     db.drop_db().await;
@@ -2566,7 +3067,9 @@ async fn xcm_facts_partition_by_chain_and_the_two_id_shapes_join() {
     use api::XcmIndex as _;
     use canonical::{CanonicalBlock, CanonicalEvent, Lineage};
 
-    let Some(db) = TestDb::create().await else { return };
+    let Some(db) = TestDb::create().await else {
+        return;
+    };
     let reg = seeds();
     sync_registry(&db.pool, &reg).await.expect("registry sync");
 
@@ -2605,16 +3108,24 @@ async fn xcm_facts_partition_by_chain_and_the_two_id_shapes_join() {
             "polkadot-asset-hub",
             900,
             vec![
-                ev(0, "polkadotxcm.Sent", serde_json::json!({
-                    "origin": {"parents": 0, "interior": {"Here": []}},
-                    "destination": {"parents": 1, "interior": {"X1": [{"Parachain": [2034]}]}},
-                    "message": [{"WithdrawAsset": []}],
-                    "message_id": bytes32,
-                })),
+                ev(
+                    0,
+                    "polkadotxcm.Sent",
+                    serde_json::json!({
+                        "origin": {"parents": 0, "interior": {"Here": []}},
+                        "destination": {"parents": 1, "interior": {"X1": [{"Parachain": [2034]}]}},
+                        "message": [{"WithdrawAsset": []}],
+                        "message_id": bytes32,
+                    }),
+                ),
                 // the SAME message's transport-level record, a second id
-                ev(1, "xcmpqueue.XcmpMessageSent", serde_json::json!({
-                    "message_hash": serde_json::json!(vec![0x77u8; 32]),
-                })),
+                ev(
+                    1,
+                    "xcmpqueue.XcmpMessageSent",
+                    serde_json::json!({
+                        "message_hash": serde_json::json!(vec![0x77u8; 32]),
+                    }),
+                ),
                 ev(2, "balances.Transfer", serde_json::json!({})),
             ],
         ),
@@ -2626,12 +3137,16 @@ async fn xcm_facts_partition_by_chain_and_the_two_id_shapes_join() {
         block(
             "hydration",
             100,
-            vec![ev(0, "messagequeue.Processed", serde_json::json!({
-                "id": h256,
-                "origin": {"Sibling": [1000]},
-                "weight_used": {"ref_time": 1_000},
-                "success": true,
-            }))],
+            vec![ev(
+                0,
+                "messagequeue.Processed",
+                serde_json::json!({
+                    "id": h256,
+                    "origin": {"Sibling": [1000]},
+                    "weight_used": {"ref_time": 1_000},
+                    "success": true,
+                }),
+            )],
         ),
     )
     .await
@@ -2640,7 +3155,11 @@ async fn xcm_facts_partition_by_chain_and_the_two_id_shapes_join() {
     let source = dotlens_node::balances_pg::PgEventSource::new(db.pool.clone());
     let sink = dotlens_node::xcm_pg::PgXcmSink::new(db.pool.clone());
     let checkpoints = ingest::pg::PgCheckpointStore::new(db.pool.clone());
-    let deps = ingest::xcm::XcmDeps { checkpoints: &checkpoints, source: &source, sink: &sink };
+    let deps = ingest::xcm::XcmDeps {
+        checkpoints: &checkpoints,
+        source: &source,
+        sink: &sink,
+    };
     ingest::xcm::xcm_range("polkadot-asset-hub", &SubstrateXcmMapper, &deps, 900, 900)
         .await
         .expect("map AH");
@@ -2673,10 +3192,16 @@ async fn xcm_facts_partition_by_chain_and_the_two_id_shapes_join() {
     let both = index.by_message_id(&topic).await.expect("by id");
     assert_eq!(both.len(), 2, "the sending and receiving halves");
     assert_eq!(both[0].chain_id, "hydration");
-    assert_eq!((both[0].side.as_str(), both[0].id_kind.as_str()), ("received", "ambiguous"));
+    assert_eq!(
+        (both[0].side.as_str(), both[0].id_kind.as_str()),
+        ("received", "ambiguous")
+    );
     assert_eq!(both[0].transport, "hrmp");
     assert_eq!(both[0].counterparty.as_deref(), Some("para:1000"));
-    assert_eq!((both[1].side.as_str(), both[1].id_kind.as_str()), ("sent", "topic"));
+    assert_eq!(
+        (both[1].side.as_str(), both[1].id_kind.as_str()),
+        ("sent", "topic")
+    );
     assert_eq!(both[1].counterparty.as_deref(), Some("para:2034"));
     assert!(!both[1].forwarded);
 
@@ -2723,7 +3248,9 @@ async fn xcm_links_pair_the_two_sender_ids_and_a_journey_reads_from_either() {
     use api::XcmIndex as _;
     use canonical::{CanonicalBlock, CanonicalEvent, Lineage};
 
-    let Some(db) = TestDb::create().await else { return };
+    let Some(db) = TestDb::create().await else {
+        return;
+    };
     let reg = seeds();
     sync_registry(&db.pool, &reg).await.expect("registry sync");
 
@@ -2783,13 +3310,17 @@ async fn xcm_links_pair_the_two_sender_ids_and_a_journey_reads_from_either() {
             "hydration",
             100,
             "2026-08-17T09:00:24Z",
-            vec![ev(0, "messagequeue.Processed", serde_json::json!({
-                // H256 — one array layer deeper than the sender's [u8;32]
-                "id": [vec![0xeeu8; 32]],
-                "origin": {"Sibling": [1000]},
-                "weight_used": {"ref_time": 1_000},
-                "success": true,
-            }))],
+            vec![ev(
+                0,
+                "messagequeue.Processed",
+                serde_json::json!({
+                    // H256 — one array layer deeper than the sender's [u8;32]
+                    "id": [vec![0xeeu8; 32]],
+                    "origin": {"Sibling": [1000]},
+                    "weight_used": {"ref_time": 1_000},
+                    "success": true,
+                }),
+            )],
         ),
     )
     .await
@@ -2798,8 +3329,11 @@ async fn xcm_links_pair_the_two_sender_ids_and_a_journey_reads_from_either() {
     let source = dotlens_node::balances_pg::PgEventSource::new(db.pool.clone());
     let checkpoints = ingest::pg::PgCheckpointStore::new(db.pool.clone());
     let facts = dotlens_node::xcm_pg::PgXcmSink::new(db.pool.clone());
-    let fact_deps =
-        ingest::xcm::XcmDeps { checkpoints: &checkpoints, source: &source, sink: &facts };
+    let fact_deps = ingest::xcm::XcmDeps {
+        checkpoints: &checkpoints,
+        source: &source,
+        sink: &facts,
+    };
     let links = dotlens_node::xcm_links_pg::PgXcmLinkSink::new(db.pool.clone());
     let link_deps = ingest::xcm_correlate::XcmCorrelateDeps {
         checkpoints: &checkpoints,
@@ -2832,7 +3366,10 @@ async fn xcm_links_pair_the_two_sender_ids_and_a_journey_reads_from_either() {
             .fetch_one(&db.pool)
             .await
             .unwrap_or_else(|e| panic!("counting {part}: {e}"));
-        assert_eq!(n, want, "{part} — links partition by chain like every fact table");
+        assert_eq!(
+            n, want,
+            "{part} — links partition by chain like every fact table"
+        );
     }
 
     let index = api::pg::PgXcmIndex::new(db.pool.clone());
@@ -2848,9 +3385,15 @@ async fn xcm_links_pair_the_two_sender_ids_and_a_journey_reads_from_either() {
         assert_eq!(found[0].confidence, "high");
         assert_eq!(found[0].evidence["event_gap"], 1);
         assert_eq!(found[0].correlator_version, 2);
-        assert_eq!(found[0].runtime_version, 2_003_002, "lineage: which runtime, which rule");
+        assert_eq!(
+            found[0].runtime_version, 2_003_002,
+            "lineage: which runtime, which rule"
+        );
         assert_eq!(found[0].evidence["block_sends"]["wire"], 1);
-        assert_eq!((found[0].wire_event_index, found[0].topic_event_index), (0, 1));
+        assert_eq!(
+            (found[0].wire_event_index, found[0].topic_event_index),
+            (0, 1)
+        );
     }
 
     // The journey read: three observations across two chains, ordered by the
@@ -2906,7 +3449,10 @@ async fn xcm_links_pair_the_two_sender_ids_and_a_journey_reads_from_either() {
         .fetch_one(&db.pool)
         .await
         .unwrap();
-    assert_eq!(again, 1, "re-correlating a block must replace, never duplicate");
+    assert_eq!(
+        again, 1,
+        "re-correlating a block must replace, never duplicate"
+    );
 
     db.drop_db().await;
 }
@@ -2921,7 +3467,9 @@ async fn simulation_results_are_immutable_per_state_and_read_back_newest_first()
     use dotlens_node::sim_pg::{insert_simulation, simulation_at, PgSimStore};
     use sim::{SimRecord, SimStore as _};
 
-    let Some(db) = TestDb::create().await else { return };
+    let Some(db) = TestDb::create().await else {
+        return;
+    };
     let reg = seeds();
     sync_registry(&db.pool, &reg).await.expect("registry sync");
 
@@ -3067,7 +3615,10 @@ async fn simulation_results_are_immutable_per_state_and_read_back_newest_first()
         .expect("read back");
     assert_eq!(all.len(), 4);
     assert_eq!(all[0].at_height, 19_000_500);
-    assert_eq!(all[0].input_hash, "0x01", "ties break on input_hash, ascending");
+    assert_eq!(
+        all[0].input_hash, "0x01",
+        "ties break on input_hash, ascending"
+    );
     assert_eq!(all[1].input_hash, "0x02");
     assert_eq!(all[2].at_height, 19_000_000);
     assert_eq!(
@@ -3075,7 +3626,10 @@ async fn simulation_results_are_immutable_per_state_and_read_back_newest_first()
         ("dry_run", "fork"),
         "two tiers at one state are ordered, not arbitrary"
     );
-    assert_eq!(all[0].metadata_version, 15, "lineage survives the round trip");
+    assert_eq!(
+        all[0].metadata_version, 15,
+        "lineage survives the round trip"
+    );
     let one = index
         .simulations("polkadot-asset-hub", &call_hash, 1)
         .await
@@ -3132,7 +3686,9 @@ async fn a_fork_row_round_trips_through_both_readers_with_its_null_columns_null(
     use dotlens_node::sim_pg::{insert_simulation, simulation_at};
     use sim::SimRecord;
 
-    let Some(db) = TestDb::create().await else { return };
+    let Some(db) = TestDb::create().await else {
+        return;
+    };
     let reg = seeds();
     sync_registry(&db.pool, &reg).await.expect("registry sync");
 
@@ -3183,7 +3739,9 @@ async fn a_fork_row_round_trips_through_both_readers_with_its_null_columns_null(
             "provider": "relay", "at_parent": 32_519_445u64, "written_at": 32_519_445u64,
         })),
     };
-    insert_simulation(&db.pool, &row).await.expect("insert a fork row");
+    insert_simulation(&db.pool, &row)
+        .await
+        .expect("insert a fork row");
 
     // ---- READER 1: the runner's cache path. A failure here means a second run
     // at one state cannot find its own answer and re-runs a fork.
@@ -3197,12 +3755,18 @@ async fn a_fork_row_round_trips_through_both_readers_with_its_null_columns_null(
     .await
     .expect("the fork row reads back")
     .expect("it is there");
-    assert!(back.forwarded_xcms.is_none(), "NULL stays None, never Some(null)");
+    assert!(
+        back.forwarded_xcms.is_none(),
+        "NULL stays None, never Some(null)"
+    );
     assert!(back.xcm_version.is_none());
     assert!(back.api_version.is_none());
     assert!(back.built_block_hash.is_none());
     assert!(back.baseline_input_hash.is_none());
-    assert_eq!(back.diff_status.as_deref(), Some(sim::DIFF_STATUS_EXTRINSIC_ONLY));
+    assert_eq!(
+        back.diff_status.as_deref(),
+        Some(sim::DIFF_STATUS_EXTRINSIC_ONLY)
+    );
     assert_eq!(back.dispatch_route.as_deref(), Some(sim::ROUTE_SCHEDULED));
     assert_eq!(back.agenda_anchor.as_ref().unwrap()["provider"], "relay");
     assert_eq!(back.sim_version, 2, "lineage survives the round trip");
@@ -3220,7 +3784,10 @@ async fn a_fork_row_round_trips_through_both_readers_with_its_null_columns_null(
     assert!(s.api_version.is_none());
     assert!(s.built_block_hash.is_none());
     assert_eq!(s.storage_diff_count, Some(1));
-    assert_eq!(s.diff_status.as_deref(), Some(sim::DIFF_STATUS_EXTRINSIC_ONLY));
+    assert_eq!(
+        s.diff_status.as_deref(),
+        Some(sim::DIFF_STATUS_EXTRINSIC_ONLY)
+    );
 
     // …and through the single-row lookup, which is a SECOND hand-maintained
     // column list. Two `select`s that name the same columns are a transposition
@@ -3262,11 +3829,10 @@ async fn a_fork_row_round_trips_through_both_readers_with_its_null_columns_null(
     // constraint that permits the opposite. Without this the API had to invent a
     // value for a NULL, and the only available invention — "unavailable" — is a
     // POSITIVE claim about a run nobody made it of.
-    let nulled = sqlx::query(
-        "update sim.simulation_results set diff_status = null where tier = 'fork'",
-    )
-    .execute(&db.pool)
-    .await;
+    let nulled =
+        sqlx::query("update sim.simulation_results set diff_status = null where tier = 'fork'")
+            .execute(&db.pool)
+            .await;
     assert!(
         nulled.is_err(),
         "a fork row must name what its diff covers — see \
@@ -3314,7 +3880,9 @@ async fn a_previewed_arrival_is_its_own_row_and_the_baseline_link_is_a_key() {
     };
     use sim::{SimRecord, XcmSimRecord, XcmSimStore as _};
 
-    let Some(db) = TestDb::create().await else { return };
+    let Some(db) = TestDb::create().await else {
+        return;
+    };
     let reg = seeds();
     sync_registry(&db.pool, &reg).await.expect("registry sync");
 
@@ -3365,7 +3933,12 @@ async fn a_previewed_arrival_is_its_own_row_and_the_baseline_link_is_a_key() {
     // the empty set, which is what a call that queues nothing sent.
     insert_simulation(
         &db.pool,
-        &call("0xba", "system.remark", serde_json::json!([msg(1)]), Some("0xba")),
+        &call(
+            "0xba",
+            "system.remark",
+            serde_json::json!([msg(1)]),
+            Some("0xba"),
+        ),
     )
     .await
     .expect("baseline insert");
@@ -3397,8 +3970,14 @@ async fn a_previewed_arrival_is_its_own_row_and_the_baseline_link_is_a_key() {
         .unwrap()
         .expect("baseline row");
     let attribution = sim::attribute_forwarded(
-        subject.forwarded_xcms.as_ref().expect("a dry_run row has a forwarded list"),
-        baseline.forwarded_xcms.as_ref().expect("a dry_run baseline has one too"),
+        subject
+            .forwarded_xcms
+            .as_ref()
+            .expect("a dry_run row has a forwarded list"),
+        baseline
+            .forwarded_xcms
+            .as_ref()
+            .expect("a dry_run baseline has one too"),
     );
     assert_eq!(attribution.total_messages, 2);
     assert_eq!(attribution.ambient_messages, 1);
@@ -3410,8 +3989,8 @@ async fn a_previewed_arrival_is_its_own_row_and_the_baseline_link_is_a_key() {
     assert_eq!(attribution.destinations[0].messages[0].message_index, 1);
 
     // ---- the receiving side -------------------------------------------------
-    let arrival = |chain: &str, input: &str, status: &str, source: Option<(u32, u32)>| {
-        XcmSimRecord {
+    let arrival =
+        |chain: &str, input: &str, status: &str, source: Option<(u32, u32)>| XcmSimRecord {
             chain_id: chain.into(),
             at_block_hash: "0xdd".into(),
             input_hash: input.into(),
@@ -3445,13 +4024,17 @@ async fn a_previewed_arrival_is_its_own_row_and_the_baseline_link_is_a_key() {
             api_version: 2,
             metadata_version: 15,
             sim_version: 2,
-            raw_location: format!("raw/{chain}/sim/dd/{input}/DryRunApi_dry_run_xcm.response.scale"),
-        }
-    };
+            raw_location: format!(
+                "raw/{chain}/sim/dd/{input}/DryRunApi_dry_run_xcm.response.scale"
+            ),
+        };
 
-    insert_xcm_simulation(&db.pool, &arrival("hydration", "0x04", "not_started", Some((0, 1))))
-        .await
-        .expect("leg insert");
+    insert_xcm_simulation(
+        &db.pool,
+        &arrival("hydration", "0x04", "not_started", Some((0, 1))),
+    )
+    .await
+    .expect("leg insert");
     // Immutable per (state, input), exactly like a call: a second, different
     // answer is refused silently and the first stands.
     let mut contradiction = arrival("hydration", "0x04", "complete", Some((0, 1)));
@@ -3463,7 +4046,10 @@ async fn a_previewed_arrival_is_its_own_row_and_the_baseline_link_is_a_key() {
         .await
         .unwrap()
         .expect("row");
-    assert_eq!(back.status, "not_started", "an observation is never rewritten");
+    assert_eq!(
+        back.status, "not_started",
+        "an observation is never rewritten"
+    );
     assert!(back.note.is_none());
     assert_eq!(back.origin_ref, "para:1000");
     assert_eq!(
@@ -3476,13 +4062,19 @@ async fn a_previewed_arrival_is_its_own_row_and_the_baseline_link_is_a_key() {
     // POSITIONALLY, so two adjacent jsonb columns or two adjacent integers can
     // be transposed by an edit that looks like a formatting change and by
     // nothing else — and only a round trip that names them catches it.
-    assert_eq!(back.program, msg(9), "program is not origin_location or effects");
+    assert_eq!(
+        back.program,
+        msg(9),
+        "program is not origin_location or effects"
+    );
     assert!(
         back.weight_used.is_none(),
         "nothing ran, so no weight — and weight_used is not xcm_error"
     );
-    assert_eq!(back.xcm_error.expect("a rejection names its reason")["error"],
-        serde_json::json!({"Barrier": []}));
+    assert_eq!(
+        back.xcm_error.expect("a rejection names its reason")["error"],
+        serde_json::json!({"Barrier": []})
+    );
     assert_eq!(back.origin_location["V4"][0]["parents"], 1);
     assert_eq!(
         back.baseline_input_hash.as_deref(),
@@ -3501,9 +4093,12 @@ async fn a_previewed_arrival_is_its_own_row_and_the_baseline_link_is_a_key() {
 
     // A second leg, and one preview with NO source at all — a program someone
     // pasted by hand, which must never be mistaken for a leg of a journey.
-    insert_xcm_simulation(&db.pool, &arrival("hydration", "0x06", "complete", Some((0, 0))))
-        .await
-        .expect("second leg");
+    insert_xcm_simulation(
+        &db.pool,
+        &arrival("hydration", "0x06", "complete", Some((0, 0))),
+    )
+    .await
+    .expect("second leg");
     insert_xcm_simulation(&db.pool, &arrival("hydration", "0x07", "complete", None))
         .await
         .expect("hand-supplied preview");
@@ -3513,7 +4108,11 @@ async fn a_previewed_arrival_is_its_own_row_and_the_baseline_link_is_a_key() {
         .legs("polkadot-asset-hub", "0x01", 10)
         .await
         .expect("legs");
-    assert_eq!(legs.len(), 2, "the hand-supplied preview is not a leg of anything");
+    assert_eq!(
+        legs.len(),
+        2,
+        "the hand-supplied preview is not a leg of anything"
+    );
     assert_eq!(
         (legs[0].source_message_index, legs[1].source_message_index),
         (Some(0), Some(1)),
@@ -3523,7 +4122,10 @@ async fn a_previewed_arrival_is_its_own_row_and_the_baseline_link_is_a_key() {
     // The other side of the nullable pair: a program that COMPLETED reports a
     // weight and no error, where the rejected one reported neither.
     assert_eq!(legs[0].status, "complete");
-    assert_eq!(legs[0].weight_used.as_ref().expect("it ran")["ref_time"], 1_000);
+    assert_eq!(
+        legs[0].weight_used.as_ref().expect("it ran")["ref_time"],
+        1_000
+    );
     assert!(legs[0].xcm_error.is_none());
 
     // By program hash, and never borrowed from another chain's runtime.
@@ -3548,11 +4150,12 @@ async fn a_previewed_arrival_is_its_own_row_and_the_baseline_link_is_a_key() {
         .await
         .unwrap()
         .is_some());
-    assert!(store
-        .get("hydration", "0xdd", "0x04", "fork")
-        .await
-        .unwrap()
-        .is_none(),
+    assert!(
+        store
+            .get("hydration", "0xdd", "0x04", "fork")
+            .await
+            .unwrap()
+            .is_none(),
         "the tier is part of the key here too — a Tier 1 answer must not serve a Tier 2 ask"
     );
 
@@ -3596,7 +4199,9 @@ async fn orml_balances_share_the_tables_and_one_asset_resolves_across_two_chains
     // Hydration must be registered by the SEEDS, not by this test — if the seed
     // ever stops loading, this assertion is where we find out rather than in a
     // silently empty result set below.
-    let hydration = reg.chain("hydration").expect("hydration is a registered chain");
+    let hydration = reg
+        .chain("hydration")
+        .expect("hydration is a registered chain");
     assert_eq!(hydration.para_id, Some(2034));
     assert!(
         hydration.has_module("balances"),
@@ -3715,7 +4320,11 @@ async fn orml_balances_share_the_tables_and_one_asset_resolves_across_two_chains
         None,
         Some("Erc20"),
         Some(&1001u32.to_le_bytes()[..]),
-        &aa::AssetMeta { name: Some("aDOT".into()), symbol: Some("aDOT".into()), decimals: Some(10) },
+        &aa::AssetMeta {
+            name: Some("aDOT".into()),
+            symbol: Some("aDOT".into()),
+            decimals: Some(10),
+        },
         &Default::default(),
         Some(435),
         Some(13_653_999),
@@ -3750,7 +4359,11 @@ async fn orml_balances_share_the_tables_and_one_asset_resolves_across_two_chains
         Some(&hdx_absolute.to_string()),
         Some("Token"),
         None,
-        &aa::AssetMeta { name: Some("HDX".into()), symbol: Some("HDX".into()), decimals: Some(12) },
+        &aa::AssetMeta {
+            name: Some("HDX".into()),
+            symbol: Some("HDX".into()),
+            decimals: Some(12),
+        },
         &Default::default(),
         Some(435),
         Some(13_653_999),
@@ -3765,7 +4378,10 @@ async fn orml_balances_share_the_tables_and_one_asset_resolves_across_two_chains
     .fetch_one(&db.pool)
     .await
     .unwrap();
-    assert_eq!(hdx_rows, 1, "HDX is one asset, however many pallets name it");
+    assert_eq!(
+        hdx_rows, 1,
+        "HDX is one asset, however many pallets name it"
+    );
     // AND THE ASSERTION CAN FAIL, which it could not while nothing in this test
     // ever wrote `tokens:0`: the mapper is what forbids that key, so assert the
     // mapper — a `tokens.Deposited` on currency 0 must HALT rather than produce
@@ -3798,7 +4414,11 @@ async fn orml_balances_share_the_tables_and_one_asset_resolves_across_two_chains
             account: account.to_vec(),
             magnitude,
             negative,
-            reason: if negative { "transfer_out".into() } else { "transfer_in".into() },
+            reason: if negative {
+                "transfer_out".into()
+            } else {
+                "transfer_in".into()
+            },
             counterparty: None,
             asset: asset.to_string(),
         }
@@ -3832,8 +4452,15 @@ async fn orml_balances_share_the_tables_and_one_asset_resolves_across_two_chains
     assert_eq!(rows.len(), 4);
     assert_eq!(rows[0].0, "tokens:10");
     assert!(rows[0].2, "the out leg is negative");
-    assert_eq!(rows[2].1, big.to_string(), "an 18-decimal magnitude survives");
-    assert_eq!(rows[3].0, "native", "HDX still goes through pallet_balances");
+    assert_eq!(
+        rows[2].1,
+        big.to_string(),
+        "an 18-decimal magnitude survives"
+    );
+    assert_eq!(
+        rows[3].0, "native",
+        "HDX still goes through pallet_balances"
+    );
 
     // the mapper version on every row is the bumped one, so a future rebuild
     // can tell orml-covered ranges from pre-orml ones
@@ -3848,7 +4475,8 @@ async fn orml_balances_share_the_tables_and_one_asset_resolves_across_two_chains
     .await
     .expect("exactly one mapper_version on these rows");
     assert_eq!(
-        version, adapter_substrate::balances::MAPPER_VERSION as i32,
+        version,
+        adapter_substrate::balances::MAPPER_VERSION as i32,
         "orml rows must carry the bumped version, or a rebuild cannot tell \
          orml-covered ranges from pre-orml ones"
     );
@@ -3878,18 +4506,23 @@ async fn orml_balances_share_the_tables_and_one_asset_resolves_across_two_chains
     )
     .await
     .expect("replay");
-    let (after,): (i64,) =
-        sqlx::query_as("select count(*) from balances.balance_changes where chain_id = 'hydration'")
-            .fetch_one(&db.pool)
-            .await
-            .unwrap();
+    let (after,): (i64,) = sqlx::query_as(
+        "select count(*) from balances.balance_changes where chain_id = 'hydration'",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
     assert_eq!(after, 4, "replay must not duplicate");
 
     // ---- 4. the anchor keeps its reserved half ---------------------------
     // THE ROUTING DECISION 0019 ARGUES FOR, asserted: an orml holding has a
     // free/reserved split, so it takes the NATIVE writer. Through
     // `insert_asset_anchor` the 700 below would be silently zero.
-    let holding = orml::OrmlHolding { free: 5_000, reserved: 700, frozen: Some(100) };
+    let holding = orml::OrmlHolding {
+        free: 5_000,
+        reserved: 700,
+        frozen: Some(100),
+    };
     dotlens_node::balances_pg::insert_anchor(
         &db.pool,
         "hydration",
@@ -3903,15 +4536,14 @@ async fn orml_balances_share_the_tables_and_one_asset_resolves_across_two_chains
     )
     .await
     .expect("orml anchor");
-    let (free, reserved, total, status): (String, String, String, Option<String>) =
-        sqlx::query_as(
-            "select free::text, reserved::text, total::text, status \
+    let (free, reserved, total, status): (String, String, String, Option<String>) = sqlx::query_as(
+        "select free::text, reserved::text, total::text, status \
              from balances.balance_anchors where chain_id = 'hydration' \
              and asset = 'tokens:10'",
-        )
-        .fetch_one(&db.pool)
-        .await
-        .expect("the orml anchor row");
+    )
+    .fetch_one(&db.pool)
+    .await
+    .expect("the orml anchor row");
     assert_eq!(free, "5000");
     assert_eq!(
         reserved, "700",
@@ -3945,7 +4577,9 @@ async fn occupancy_resolves_its_relay_parents_and_serves_two_ratios_that_differ(
     use api::CoretimeIndex as _;
     use canonical::{CanonicalBlock, CanonicalEvent, Lineage};
 
-    let Some(db) = TestDb::create().await else { return };
+    let Some(db) = TestDb::create().await else {
+        return;
+    };
     let reg = seeds();
     sync_registry(&db.pool, &reg).await.expect("registry sync");
 
@@ -4114,10 +4748,11 @@ async fn occupancy_resolves_its_relay_parents_and_serves_two_ratios_that_differ(
     // another module's and two workers corrupt one checkpoint while every other
     // assertion here still passes; `ingest::coretime` ships no worker tests, so
     // this is the only thing that pins it.
-    let cp = ingest::CheckpointStore::get(&checkpoints, "polkadot", ingest::coretime::MODULE_CORETIME)
-        .await
-        .expect("checkpoint read")
-        .expect("the coretime worker advanced its own checkpoint");
+    let cp =
+        ingest::CheckpointStore::get(&checkpoints, "polkadot", ingest::coretime::MODULE_CORETIME)
+            .await
+            .expect("checkpoint read")
+            .expect("the coretime worker advanced its own checkpoint");
     assert_eq!(cp.last_height, 504);
     assert_eq!(cp.module, ingest::coretime::MODULE_CORETIME);
 
@@ -4162,7 +4797,10 @@ async fn occupancy_resolves_its_relay_parents_and_serves_two_ratios_that_differ(
         .fetch_one(&db.pool)
         .await
         .unwrap();
-    assert_eq!(still, 4, "a monotone fill updates in place; it never adds a row");
+    assert_eq!(
+        still, 4,
+        "a monotone fill updates in place; it never adds a row"
+    );
 
     // THE MEASURED INVARIANT, ENFORCED AND NAMED. Zero collisions across 51,998
     // included candidates, so a second inclusion on one core in one block does
@@ -4177,16 +4815,10 @@ async fn occupancy_resolves_its_relay_parents_and_serves_two_ratios_that_differ(
         relay_parent_hash: None,
         pov_hash: None,
     };
-    let err = ingest::coretime::OccupancySink::write(
-        &sink,
-        "polkadot",
-        503,
-        2_003_002,
-        1,
-        &[(9, clash)],
-    )
-    .await
-    .expect_err("a second inclusion on core 0 at #503 must be refused");
+    let err =
+        ingest::coretime::OccupancySink::write(&sink, "polkadot", 503, 2_003_002, 1, &[(9, clash)])
+            .await
+            .expect_err("a second inclusion on core 0 at #503 must be refused");
     assert!(err.contains("TWO INCLUDED CANDIDATES ON CORE 0"), "{err}");
     // ...while a BACKING at the same coordinates is accepted, because the
     // uniqueness is scoped to inclusions and a core legitimately carries both in
@@ -4231,7 +4863,11 @@ async fn occupancy_resolves_its_relay_parents_and_serves_two_ratios_that_differ(
 
     let index = api::pg::PgCoretimeIndex::new(db.pool.clone());
     let cores = index.occupancy_by_core("polkadot", 500, 504).await.unwrap();
-    assert_eq!(cores.len(), 2, "cores 0 and 5 produced; the backing on core 0 is not a core used");
+    assert_eq!(
+        cores.len(),
+        2,
+        "cores 0 and 5 produced; the backing on core 0 is not a core used"
+    );
     assert_eq!((cores[0].core_index, cores[0].included_blocks), (0, 2));
     assert_eq!(cores[0].paras, vec![2004]);
     assert_eq!((cores[1].core_index, cores[1].included_blocks), (5, 1));
@@ -4261,7 +4897,10 @@ async fn occupancy_resolves_its_relay_parents_and_serves_two_ratios_that_differ(
         .expect("a reading at or before the window's end");
     assert_eq!((chosen.block_height, chosen.num_cores), (504, 4));
     assert_eq!(
-        index.num_cores_in_window("polkadot", 500, 504).await.unwrap(),
+        index
+            .num_cores_in_window("polkadot", 500, 504)
+            .await
+            .unwrap(),
         vec![2, 4],
         "two readings that disagree: the denominator MOVED inside the window and a single ratio \
          across it averages two different questions"
@@ -4272,7 +4911,11 @@ async fn occupancy_resolves_its_relay_parents_and_serves_two_ratios_that_differ(
     // entries would mean the window was mapped under two and the ratios are an
     // average of two different definitions of occupancy.
     let lineage = index.occupancy_lineage("polkadot", 500, 504).await.unwrap();
-    assert_eq!(lineage, vec![(2_003_002u64, 1u32, 5u64)], "one runtime, one mapper, five rows");
+    assert_eq!(
+        lineage,
+        vec![(2_003_002u64, 1u32, 5u64)],
+        "one runtime, one mapper, five rows"
+    );
 
     // AND THE STALE DETECTOR SPANS EVERY KIND. `max_core_index` must see core 5
     // whether it arrived as an inclusion or a backing — a detector that read
@@ -4327,7 +4970,9 @@ async fn broker_facts_land_in_two_tables_and_the_governing_assignment_is_one_ann
     use canonical::{CanonicalBlock, CanonicalEvent, Lineage};
     use ingest::broker::{BrokerRow, BrokerSink, CoreAssignmentRow};
 
-    let Some(db) = TestDb::create().await else { return };
+    let Some(db) = TestDb::create().await else {
+        return;
+    };
     let reg = seeds();
     sync_registry(&db.pool, &reg).await.expect("registry sync");
 
@@ -4462,12 +5107,11 @@ async fn broker_facts_land_in_two_tables_and_the_governing_assignment_is_one_ann
 
     // The non-seam variants produced NO assignment rows, and `Renewed` took the
     // NEW core.
-    let (renewed_core,): (Option<i32>,) = sqlx::query_as(
-        "select core_index from coretime.broker_events where variant = 'Renewed'",
-    )
-    .fetch_one(&db.pool)
-    .await
-    .unwrap();
+    let (renewed_core,): (Option<i32>,) =
+        sqlx::query_as("select core_index from coretime.broker_events where variant = 'Renewed'")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
     assert_eq!(renewed_core, Some(9), "the NEW core, never old_core");
 
     // PARTITION ROUTING, exact. A chain must land in its own partition and the
@@ -4538,7 +5182,13 @@ async fn broker_facts_land_in_two_tables_and_the_governing_assignment_is_one_ann
         assignments: vec![],
     };
     let err = sink
-        .write(CHAIN, 300, 2_003_002, 1, &[(0, row("Renewable")), (0, row("Renewed"))])
+        .write(
+            CHAIN,
+            300,
+            2_003_002,
+            1,
+            &[(0, row("Renewable")), (0, row("Renewed"))],
+        )
         .await
         .expect_err("two facts at one event index must be refused");
     assert!(err.contains("keyed by event index"), "{err}");
@@ -4552,7 +5202,11 @@ async fn broker_facts_land_in_two_tables_and_the_governing_assignment_is_one_ann
     // pool row with one credits the wrong chain.
     for (kind, task_id, label) in [
         ("task", None, "a task assignment naming no para"),
-        ("pool", Some(2004u32), "a pool assignment pretending to name one"),
+        (
+            "pool",
+            Some(2004u32),
+            "a pool assignment pretending to name one",
+        ),
     ] {
         let mut r = row("CoreAssigned");
         r.assignments = vec![CoreAssignmentRow {
@@ -4594,8 +5248,15 @@ async fn broker_facts_land_in_two_tables_and_the_governing_assignment_is_one_ann
     // whole delta rests on. At relay 80 core 0 is task 2004; at relay 160 the
     // later sale has taken over and it is task 3388 — while cores 1 and 2 are
     // unchanged, because their announcement is still the newest at or before.
-    let at_80 = broker.entitlement_at(CHAIN, 80).await.expect("entitlement at 80");
-    assert_eq!(at_80.len(), 4, "three cores, one of them interlaced into two");
+    let at_80 = broker
+        .entitlement_at(CHAIN, 80)
+        .await
+        .expect("entitlement at 80");
+    assert_eq!(
+        at_80.len(),
+        4,
+        "three cores, one of them interlaced into two"
+    );
     assert_eq!(at_80[0].core_index, 0);
     assert_eq!(at_80[0].task_id, Some(2004));
     assert_eq!(at_80[1].kind, "pool");
@@ -4607,12 +5268,23 @@ async fn broker_facts_land_in_two_tables_and_the_governing_assignment_is_one_ann
     );
     assert_eq!(at_80[2].parts, 28_800);
 
-    let at_160 = broker.entitlement_at(CHAIN, 160).await.expect("entitlement at 160");
+    let at_160 = broker
+        .entitlement_at(CHAIN, 160)
+        .await
+        .expect("entitlement at 160");
     let core0: Vec<_> = at_160.iter().filter(|r| r.core_index == 0).collect();
     assert_eq!(core0.len(), 1, "one announcement governs, never two");
-    assert_eq!(core0[0].task_id, Some(3388), "the LATER sale governs at 160");
+    assert_eq!(
+        core0[0].task_id,
+        Some(3388),
+        "the LATER sale governs at 160"
+    );
     assert_eq!(core0[0].relay_block, 160);
-    assert_eq!(at_160.len(), 4, "the other cores' older announcements still govern");
+    assert_eq!(
+        at_160.len(),
+        4,
+        "the other cores' older announcements still govern"
+    );
 
     // AND BELOW EVERY ANNOUNCEMENT THERE IS NOTHING, which is what the delta
     // renders as `unknown` and never as idle.
@@ -4641,7 +5313,11 @@ async fn broker_facts_land_in_two_tables_and_the_governing_assignment_is_one_ann
         .expect("a re-announcement at the same relay block is a legal row");
     let after = broker.entitlement_at(CHAIN, 80).await.unwrap();
     let core1: Vec<_> = after.iter().filter(|r| r.core_index == 1).collect();
-    assert_eq!(core1.len(), 1, "one ANNOUNCEMENT per core, not one relay block per core");
+    assert_eq!(
+        core1.len(),
+        1,
+        "one ANNOUNCEMENT per core, not one relay block per core"
+    );
     assert_eq!(
         core1[0].task_id,
         Some(2222),
@@ -4708,17 +5384,20 @@ async fn broker_facts_land_in_two_tables_and_the_governing_assignment_is_one_ann
         .expect("a reading is on record");
     assert_eq!(cfg.block_height, 4_927_655, "the NEWEST reading");
     assert_eq!(cfg.core_count, 100);
-    assert_eq!(cfg.first_core, Some(11), "migration 0026's column round-trips");
+    assert_eq!(
+        cfg.first_core,
+        Some(11),
+        "migration 0026's column round-trips"
+    );
     // `sale_info` is CAPTURED AND READ BY NOTHING, which 0026 states plainly —
     // but a column nobody reads is still a column whose storage must work, or
     // the Dutch price curve it exists to make reconstructible is not there when
     // somebody finally looks.
-    let (si,): (Option<serde_json::Value>,) = sqlx::query_as(
-        "select sale_info from coretime.broker_config where block_height = 4927655",
-    )
-    .fetch_one(&db.pool)
-    .await
-    .unwrap();
+    let (si,): (Option<serde_json::Value>,) =
+        sqlx::query_as("select sale_info from coretime.broker_config where block_height = 4927655")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
     assert_eq!(
         si.expect("the whole record round-trips")["cores_sold"],
         41,
@@ -4762,7 +5441,9 @@ async fn channel_readings_are_immutable_and_a_missing_reading_is_not_an_empty_gr
     use api::ChannelIndex as _;
     use dotlens_node::hrmp_pg::{insert_channel_reading, read_heights, ChannelReading};
 
-    let Some(db) = TestDb::create().await else { return };
+    let Some(db) = TestDb::create().await else {
+        return;
+    };
     let reg = seeds();
     sync_registry(&db.pool, &reg).await.expect("registry sync");
 
@@ -4811,10 +5492,14 @@ async fn channel_readings_are_immutable_and_a_missing_reading_is_not_an_empty_gr
 
     // Three readings, with session 13 SKIPPED so the coverage half has something
     // real to report rather than an empty list nobody checked.
-    assert!(write(2400, 11, vec![open(1000, 2034)]).await.expect("first reading"));
-    assert!(write(4800, 12, vec![open(1000, 2034), requested(2000, 1000)])
+    assert!(write(2400, 11, vec![open(1000, 2034)])
         .await
-        .expect("second reading"));
+        .expect("first reading"));
+    assert!(
+        write(4800, 12, vec![open(1000, 2034), requested(2000, 1000)])
+            .await
+            .expect("second reading")
+    );
     assert!(write(9600, 14, vec![open(1000, 2034), open(2000, 1000)])
         .await
         .expect("third reading"));
@@ -4828,7 +5513,10 @@ async fn channel_readings_are_immutable_and_a_missing_reading_is_not_an_empty_gr
         readings.iter().map(|r| r.block_height).collect::<Vec<_>>(),
         vec![2400, 4800, 9600]
     );
-    assert_eq!((readings[1].channel_count, readings[1].open_request_count), (1, 1));
+    assert_eq!(
+        (readings[1].channel_count, readings[1].open_request_count),
+        (1, 1)
+    );
 
     // Detail cannot exist without its header — the structural half of "we did
     // not look" never being confusable with "there was nothing there".
@@ -4841,7 +5529,10 @@ async fn channel_readings_are_immutable_and_a_missing_reading_is_not_an_empty_gr
     .bind(CHAIN)
     .execute(&db.pool)
     .await;
-    assert!(orphan.is_err(), "a snapshot with no reading must be refused by the FK");
+    assert!(
+        orphan.is_err(),
+        "a snapshot with no reading must be refused by the FK"
+    );
 
     // --- the two CHECKs, in BOTH directions ----------------------------------
     // An 'open' row with no recipient deposit, and a 'requested' row carrying
@@ -4863,14 +5554,24 @@ async fn channel_readings_are_immutable_and_a_missing_reading_is_not_an_empty_gr
         .bind(confirmed)
         .execute(&db.pool)
         .await;
-        assert!(bad.is_err(), "state={state} rdep={rdep:?} confirmed={confirmed:?} must be refused");
+        assert!(
+            bad.is_err(),
+            "state={state} rdep={rdep:?} confirmed={confirmed:?} must be refused"
+        );
     }
 
     // --- u128 round-trips, and direction survives ----------------------------
     let edges = channels.edges_at(CHAIN, 4800).await.expect("edges");
     assert_eq!(edges.len(), 2);
-    assert_eq!((edges[0].sender, edges[0].recipient), (1000, 2034), "sorted by (sender, recipient)");
-    assert_eq!(edges[0].sender_deposit, (u128::from(u64::MAX) + 1).to_string());
+    assert_eq!(
+        (edges[0].sender, edges[0].recipient),
+        (1000, 2034),
+        "sorted by (sender, recipient)"
+    );
+    assert_eq!(
+        edges[0].sender_deposit,
+        (u128::from(u64::MAX) + 1).to_string()
+    );
     assert_eq!(
         edges[0].recipient_deposit.as_deref(),
         Some((u128::from(u64::MAX) + 2).to_string().as_str()),
@@ -4888,21 +5589,34 @@ async fn channel_readings_are_immutable_and_a_missing_reading_is_not_an_empty_gr
         .edge_observations(CHAIN, 2000, 1000)
         .await
         .expect("observations");
-    assert_eq!(obs.len(), 3, "one row per READING, including the one with no edge");
+    assert_eq!(
+        obs.len(),
+        3,
+        "one row per READING, including the one with no edge"
+    );
     assert_eq!(obs[0].state, None);
     assert_eq!(obs[1].state.as_deref(), Some("requested"));
     assert_eq!(obs[2].state.as_deref(), Some("open"));
 
     let history = api::channels::derive_history(&obs);
     assert_eq!(history.transitions.len(), 2);
-    assert!(history.transitions[0].exact, "sessions 11 -> 12 are adjacent");
-    assert!(!history.transitions[1].exact, "sessions 12 -> 14 skip one boundary");
+    assert!(
+        history.transitions[0].exact,
+        "sessions 11 -> 12 are adjacent"
+    );
+    assert!(
+        !history.transitions[1].exact,
+        "sessions 12 -> 14 skip one boundary"
+    );
     assert_eq!(history.unread.len(), 1);
     assert_eq!(history.unread[0].sessions, 1, "session 13 was never read");
 
     // The reverse edge never existed, and that reads as a fact about the chain
     // rather than as a gap, because the readings are there.
-    let reverse = channels.edge_observations(CHAIN, 1, 2).await.expect("observations");
+    let reverse = channels
+        .edge_observations(CHAIN, 1, 2)
+        .await
+        .expect("observations");
     assert_eq!(reverse.len(), 3);
     assert!(reverse.iter().all(|o| o.state.is_none()));
 
@@ -4938,29 +5652,58 @@ async fn channel_readings_are_immutable_and_a_missing_reading_is_not_an_empty_gr
     let msg = format!("{err:#}");
     assert!(msg.contains("DISAGREES"), "{msg}");
     assert!(msg.contains("defect to find"), "{msg}");
-    assert!(msg.contains("HRMP_READER_VERSION"), "the halt says what would explain it: {msg}");
+    assert!(
+        msg.contains("HRMP_READER_VERSION"),
+        "the halt says what would explain it: {msg}"
+    );
     let still = channels.edges_at(CHAIN, 4800).await.expect("edges");
     assert_eq!(still.len(), 2, "and the recorded reading was not touched");
 
     // --- what `channels-range` uses to skip work -----------------------------
-    let heights = read_heights(&db.pool, CHAIN, 0, 10_000).await.expect("heights");
+    let heights = read_heights(&db.pool, CHAIN, 0, 10_000)
+        .await
+        .expect("heights");
     assert_eq!(heights, vec![2400, 4800, 9600]);
-    assert!(read_heights(&db.pool, CHAIN, 5000, 9000).await.unwrap().is_empty());
+    assert!(read_heights(&db.pool, CHAIN, 5000, 9000)
+        .await
+        .unwrap()
+        .is_empty());
 
     // --- reading_at never extrapolates backwards -----------------------------
     assert_eq!(
-        channels.reading_at(CHAIN, Some(9599)).await.unwrap().unwrap().block_height,
+        channels
+            .reading_at(CHAIN, Some(9599))
+            .await
+            .unwrap()
+            .unwrap()
+            .block_height,
         4800
     );
-    assert_eq!(channels.reading_at(CHAIN, None).await.unwrap().unwrap().block_height, 9600);
+    assert_eq!(
+        channels
+            .reading_at(CHAIN, None)
+            .await
+            .unwrap()
+            .unwrap()
+            .block_height,
+        9600
+    );
     assert!(
-        channels.reading_at(CHAIN, Some(100)).await.unwrap().is_none(),
+        channels
+            .reading_at(CHAIN, Some(100))
+            .await
+            .unwrap()
+            .is_none(),
         "before the first reading there is nothing to report, and nothing is invented"
     );
 
     // A chain with no readings at all is EMPTY here, and the endpoint's
     // `reads_as` is what tells the two apart — not this method.
-    assert!(channels.readings("polkadot-asset-hub").await.unwrap().is_empty());
+    assert!(channels
+        .readings("polkadot-asset-hub")
+        .await
+        .unwrap()
+        .is_empty());
 
     db.drop_db().await;
 }
@@ -4987,7 +5730,9 @@ async fn channel_readings_are_immutable_and_a_missing_reading_is_not_an_empty_gr
 ///     one rule.
 #[tokio::test]
 async fn a_halt_upserts_on_its_coordinates_and_stops_blocking_without_being_deleted() {
-    let Some(db) = TestDb::create().await else { return };
+    let Some(db) = TestDb::create().await else {
+        return;
+    };
     const CHAIN: &str = "polkadot";
 
     let store = PgCheckpointStore::new(db.pool.clone());
@@ -5000,14 +5745,32 @@ async fn a_halt_upserts_on_its_coordinates_and_stops_blocking_without_being_dele
     };
     // The stack, in the one table that already holds it: raw ahead of decode,
     // decode ahead of both modules.
-    store.advance(cp(CHAIN, freshness::MODULE_RAW, 400)).await.expect("raw frontier");
-    store.advance(cp(CHAIN, freshness::MODULE_DECODE, 300)).await.expect("decode frontier");
-    store.advance(cp(CHAIN, "balances", 100)).await.expect("balances checkpoint");
-    store.advance(cp(CHAIN, "gov", 100)).await.expect("gov checkpoint");
+    store
+        .advance(cp(CHAIN, freshness::MODULE_RAW, 400))
+        .await
+        .expect("raw frontier");
+    store
+        .advance(cp(CHAIN, freshness::MODULE_DECODE, 300))
+        .await
+        .expect("decode frontier");
+    store
+        .advance(cp(CHAIN, "balances", 100))
+        .await
+        .expect("balances checkpoint");
+    store
+        .advance(cp(CHAIN, "gov", 100))
+        .await
+        .expect("gov checkpoint");
     // A bounded backfill chunk is not a follower and must not appear as one.
-    store.advance(cp(CHAIN, "raw_backfill:0-100", 100)).await.expect("backfill chunk");
+    store
+        .advance(cp(CHAIN, "raw_backfill:0-100", 100))
+        .await
+        .expect("backfill chunk");
     // A second chain, to prove both readers filter rather than returning the lot.
-    store.advance(cp("kusama", "balances", 7)).await.expect("kusama checkpoint");
+    store
+        .advance(cp("kusama", "balances", 7))
+        .await
+        .expect("kusama checkpoint");
 
     let halt = |chain: &'static str, module: &'static str, height: u64, event_index: u32| Halt {
         chain_id: chain,
@@ -5021,7 +5784,10 @@ async fn a_halt_upserts_on_its_coordinates_and_stops_blocking_without_being_dele
     };
 
     // --- the follower meets one refusal, over and over ------------------------
-    store.record_halt(&halt(CHAIN, "balances", 150, 2)).await.expect("first observation");
+    store
+        .record_halt(&halt(CHAIN, "balances", 150, 2))
+        .await
+        .expect("first observation");
     let (first_seen, last_seen, seen): (
         chrono::DateTime<chrono::Utc>,
         chrono::DateTime<chrono::Utc>,
@@ -5036,16 +5802,22 @@ async fn a_halt_upserts_on_its_coordinates_and_stops_blocking_without_being_dele
     .expect("one row after the first observation");
     assert_eq!(seen, 1);
 
-    store.record_halt(&halt(CHAIN, "balances", 150, 2)).await.expect("second observation");
-    let rows: Vec<(chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>, i64)> =
-        sqlx::query_as(
-            "select first_seen_at, last_seen_at, seen_count from core.module_halts \
-             where chain_id = $1 and module = 'balances'",
-        )
-        .bind(CHAIN)
-        .fetch_all(&db.pool)
+    store
+        .record_halt(&halt(CHAIN, "balances", 150, 2))
         .await
-        .unwrap();
+        .expect("second observation");
+    let rows: Vec<(
+        chrono::DateTime<chrono::Utc>,
+        chrono::DateTime<chrono::Utc>,
+        i64,
+    )> = sqlx::query_as(
+        "select first_seen_at, last_seen_at, seen_count from core.module_halts \
+             where chain_id = $1 and module = 'balances'",
+    )
+    .bind(CHAIN)
+    .fetch_all(&db.pool)
+    .await
+    .unwrap();
     assert_eq!(rows.len(), 1, "a repeat is an update, never a second row");
     assert_eq!(rows[0].2, 2, "seen_count counts observations");
     assert_eq!(rows[0].0, first_seen, "first_seen_at never moves");
@@ -5057,11 +5829,20 @@ async fn a_halt_upserts_on_its_coordinates_and_stops_blocking_without_being_dele
     // because the runtime processes in order and can never reach 320. A reader
     // taking `max(last_seen_at)` would send whoever reads this at 3am to a block
     // the module cannot have got to.
-    store.record_halt(&halt(CHAIN, "gov", 150, 0)).await.expect("gov halt at 150");
-    store.record_halt(&halt(CHAIN, "gov", 320, 1)).await.expect("gov halt at 320, seen later");
+    store
+        .record_halt(&halt(CHAIN, "gov", 150, 0))
+        .await
+        .expect("gov halt at 150");
+    store
+        .record_halt(&halt(CHAIN, "gov", 320, 1))
+        .await
+        .expect("gov halt at 320, seen later");
 
     // A halt on the other chain, for the same module name.
-    store.record_halt(&halt("kusama", "balances", 9, 0)).await.expect("kusama halt");
+    store
+        .record_halt(&halt("kusama", "balances", 9, 0))
+        .await
+        .expect("kusama halt");
 
     // --- the readers, and what they must not return -------------------------
     let idx = api::pg::PgFreshnessIndex::new(db.pool.clone());
@@ -5080,7 +5861,10 @@ async fn a_halt_upserts_on_its_coordinates_and_stops_blocking_without_being_dele
     assert_eq!(report.frontiers.raw, Some(400));
     assert_eq!(report.frontiers.decode, Some(300));
     assert_eq!(report.frontiers.decode_behind_raw, Some(100));
-    assert_eq!(report.frontiers.raw_behind_chain, None, "the chain's own head is not read");
+    assert_eq!(
+        report.frontiers.raw_behind_chain, None,
+        "the chain's own head is not read"
+    );
     let names: Vec<&str> = report.modules.iter().map(|m| m.module.as_str()).collect();
     assert_eq!(
         names,
@@ -5091,10 +5875,19 @@ async fn a_halt_upserts_on_its_coordinates_and_stops_blocking_without_being_dele
 
     let balances = &report.modules[0];
     assert_eq!(balances.state, ModuleState::Halted);
-    let blocking = balances.blocking_halt.as_ref().expect("the refusal that stops it");
+    let blocking = balances
+        .blocking_halt
+        .as_ref()
+        .expect("the refusal that stops it");
     assert_eq!(blocking.height, 150);
-    assert_eq!(blocking.seen_count, 2, "the observation window survives the round trip");
-    assert_eq!(blocking.runtime_version, 1_002_006, "lineage: which runtime refused");
+    assert_eq!(
+        blocking.seen_count, 2,
+        "the observation window survives the round trip"
+    );
+    assert_eq!(
+        blocking.runtime_version, 1_002_006,
+        "lineage: which runtime refused"
+    );
     assert_eq!(
         balances.blocks_behind_decode,
         Some(200),
@@ -5110,13 +5903,18 @@ async fn a_halt_upserts_on_its_coordinates_and_stops_blocking_without_being_dele
     );
     assert!(report.reads_as.contains("HALTED"), "{}", report.reads_as);
     assert!(
-        report.reads_as.contains("DECODE IS 100 BLOCKS BEHIND RAW INGESTION"),
+        report
+            .reads_as
+            .contains("DECODE IS 100 BLOCKS BEHIND RAW INGESTION"),
         "the two lags are stated separately and never summed: {}",
         report.reads_as
     );
 
     // --- the mapper is fixed, the module runs past it, NOTHING IS DELETED ----
-    store.advance(cp(CHAIN, "balances", 200)).await.expect("past the halt");
+    store
+        .advance(cp(CHAIN, "balances", 200))
+        .await
+        .expect("past the halt");
     let after = freshness::derive(
         CHAIN,
         &idx.checkpoints(CHAIN).await.unwrap(),
@@ -5124,7 +5922,11 @@ async fn a_halt_upserts_on_its_coordinates_and_stops_blocking_without_being_dele
         observed,
     );
     let balances = &after.modules[0];
-    assert_eq!(balances.state, ModuleState::Behind, "resolved by the checkpoint alone");
+    assert_eq!(
+        balances.state,
+        ModuleState::Behind,
+        "resolved by the checkpoint alone"
+    );
     assert!(balances.blocking_halt.is_none());
     assert_eq!(balances.blocks_behind_decode, Some(100));
     let (still,): (i64,) = sqlx::query_as(
@@ -5134,15 +5936,32 @@ async fn a_halt_upserts_on_its_coordinates_and_stops_blocking_without_being_dele
     .fetch_one(&db.pool)
     .await
     .unwrap();
-    assert_eq!(still, 1, "no row was deleted and no flag was written — that is the design");
+    assert_eq!(
+        still, 1,
+        "no row was deleted and no flag was written — that is the design"
+    );
 
     // What an alert acts on, which is what `status` exits 2 and 1 on.
-    assert_eq!(after.halted().iter().map(|m| m.module.as_str()).collect::<Vec<_>>(), vec!["gov"]);
     assert_eq!(
-        after.behind_by_more_than(50).iter().map(|m| m.module.as_str()).collect::<Vec<_>>(),
+        after
+            .halted()
+            .iter()
+            .map(|m| m.module.as_str())
+            .collect::<Vec<_>>(),
+        vec!["gov"]
+    );
+    assert_eq!(
+        after
+            .behind_by_more_than(50)
+            .iter()
+            .map(|m| m.module.as_str())
+            .collect::<Vec<_>>(),
         vec!["balances"]
     );
-    assert!(after.behind_by_more_than(100).is_empty(), "the bound is exclusive");
+    assert!(
+        after.behind_by_more_than(100).is_empty(),
+        "the bound is exclusive"
+    );
 
     // --- the two backends must not be two implementations of one rule -------
     let mem = MemoryFreshnessIndex::new();

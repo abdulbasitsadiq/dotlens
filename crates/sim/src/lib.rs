@@ -143,7 +143,8 @@ impl OriginSpec {
         let trimmed = spec.trim();
         if trimmed.is_empty() {
             return Err(SimError::Encode(
-                "empty origin — expected root | none | signed:<account> | <pallet>:<Variant>".into(),
+                "empty origin — expected root | none | signed:<account> | <pallet>:<Variant>"
+                    .into(),
             ));
         }
         match trimmed.to_ascii_lowercase().as_str() {
@@ -243,9 +244,10 @@ impl LocationSpec {
                  sibling:<para> | child:<para>"
             )));
         };
-        let para: u32 = rest.trim().parse().map_err(|_| {
-            SimError::Encode(format!("'{}' is not a parachain id", rest.trim()))
-        })?;
+        let para: u32 = rest
+            .trim()
+            .parse()
+            .map_err(|_| SimError::Encode(format!("'{}' is not a parachain id", rest.trim())))?;
         match head.trim().to_ascii_lowercase().as_str() {
             "sibling" => Ok(Self::Sibling(para)),
             "child" => Ok(Self::Child(para)),
@@ -721,15 +723,8 @@ pub async fn run_simulation(
                 .await?
                 .is_none()
             {
-                execute_and_record(
-                    runner,
-                    store,
-                    raw,
-                    receipts,
-                    &baseline,
-                    Some(own.clone()),
-                )
-                .await?;
+                execute_and_record(runner, store, raw, receipts, &baseline, Some(own.clone()))
+                    .await?;
             }
             baseline_input_hash = Some(own);
         }
@@ -966,7 +961,10 @@ pub trait XcmDryRunner: Send + Sync {
     /// executes nothing, so whatever it reports as forwarded was already in
     /// flight. Same role as the call side's `system.remark`, and the same
     /// honest `None` when a runtime cannot express one.
-    fn baseline_request(&self, prepared: &PreparedXcmRun) -> Result<Option<XcmSimRequest>, SimError>;
+    fn baseline_request(
+        &self,
+        prepared: &PreparedXcmRun,
+    ) -> Result<Option<XcmSimRequest>, SimError>;
 }
 
 #[async_trait]
@@ -1045,15 +1043,8 @@ pub async fn run_xcm_simulation(
                 .await?
                 .is_none()
             {
-                execute_and_record_xcm(
-                    runner,
-                    store,
-                    raw,
-                    receipts,
-                    &baseline,
-                    Some(own.clone()),
-                )
-                .await?;
+                execute_and_record_xcm(runner, store, raw, receipts, &baseline, Some(own.clone()))
+                    .await?;
             }
             baseline_input_hash = Some(own);
         }
@@ -1471,9 +1462,10 @@ impl SimRecord {
         let overrides = if prepared.overrides.is_empty() {
             None
         } else {
-            Some(serde_json::to_value(&prepared.overrides).map_err(|e| {
-                SimError::Encode(format!("serializing storage overrides: {e}"))
-            })?)
+            Some(
+                serde_json::to_value(&prepared.overrides)
+                    .map_err(|e| SimError::Encode(format!("serializing storage overrides: {e}")))?,
+            )
         };
         Ok(Self {
             chain_id: prepared.chain_id.clone(),
@@ -1738,12 +1730,8 @@ pub async fn run_job(
     };
     match run_fork_simulation(runner, store, raw, receipts, &req).await {
         Ok(run) => {
-            jobs.complete(
-                job.id,
-                &run.record.at_block_hash,
-                &run.record.input_hash,
-            )
-            .await?;
+            jobs.complete(job.id, &run.record.at_block_hash, &run.record.input_hash)
+                .await?;
             Ok(run)
         }
         Err(e) => {
@@ -1810,7 +1798,9 @@ mod tests {
             OriginSpec::Signed([1u8; 32])
         );
         assert_eq!(
-            OriginSpec::parse("signed:alice", account).unwrap().normalized(),
+            OriginSpec::parse("signed:alice", account)
+                .unwrap()
+                .normalized(),
             format!("signed:0x{}", hex::encode([1u8; 32]))
         );
         // an unparseable account is the ACCOUNT's error, surfaced verbatim
@@ -1855,7 +1845,10 @@ mod tests {
         // …so the ambiguous spelling is REFUSED rather than defaulted, and the
         // refusal names both ways to say what was meant.
         let err = LocationSpec::parse("para:2034").unwrap_err().to_string();
-        assert!(err.contains("sibling:2034") && err.contains("child:2034"), "{err}");
+        assert!(
+            err.contains("sibling:2034") && err.contains("child:2034"),
+            "{err}"
+        );
         for bad in ["", "  ", "sibling", "sibling:abc", "cousin:2034", "2034"] {
             assert!(
                 LocationSpec::parse(bad).is_err(),
@@ -1999,10 +1992,8 @@ mod tests {
     fn tmp_raw(tag: &str) -> (raw_store::FsRawStore, std::path::PathBuf) {
         static SEQ: AtomicUsize = AtomicUsize::new(0);
         let n = SEQ.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!(
-            "dotlens-sim-{}-{tag}-{n}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("dotlens-sim-{}-{tag}-{n}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         (raw_store::FsRawStore::new(&dir), dir)
     }
@@ -2063,7 +2054,10 @@ mod tests {
         let second = run_simulation(&runner, &store, &raw, &receipts, &req)
             .await
             .expect("second run");
-        assert!(second.cached, "same state + same input = the recorded answer");
+        assert!(
+            second.cached,
+            "same state + same input = the recorded answer"
+        );
         assert_eq!(
             runner.dispatches.load(Ordering::SeqCst),
             1,
@@ -2251,11 +2245,7 @@ mod tests {
             self.dispatches.fetch_add(1, Ordering::SeqCst);
             Ok(vec![0x33, 0x44])
         }
-        fn interpret_xcm(
-            &self,
-            _p: &PreparedXcmRun,
-            _r: &[u8],
-        ) -> Result<XcmSimOutcome, SimError> {
+        fn interpret_xcm(&self, _p: &PreparedXcmRun, _r: &[u8]) -> Result<XcmSimOutcome, SimError> {
             if self.interpret_fails {
                 return Err(SimError::Decode("outcome shape not recognised".into()));
             }
@@ -2368,7 +2358,10 @@ mod tests {
         // PROVENANCE: the five source columns are the stitch, and this is the
         // only place `XcmSimRecord::new` fans a ProgramSource out into them —
         // exactly the transposition the migration's own comment warns about.
-        assert_eq!(first.record.source_chain_id.as_deref(), Some("polkadot-asset-hub"));
+        assert_eq!(
+            first.record.source_chain_id.as_deref(),
+            Some("polkadot-asset-hub")
+        );
         assert_eq!(first.record.source_at_block_hash.as_deref(), Some("0xcd"));
         assert_eq!(first.record.source_input_hash.as_deref(), Some("0x01"));
         assert_eq!(first.record.source_forwarded_index, Some(0));
@@ -2453,7 +2446,10 @@ mod tests {
         let a = attribute_forwarded(&subject, &baseline);
         assert_eq!(a.total_messages, 4);
         assert_eq!(a.ambient_messages, 2);
-        assert_eq!(a.attributed_messages, 2, "only the two the call really added");
+        assert_eq!(
+            a.attributed_messages, 2,
+            "only the two the call really added"
+        );
         assert_eq!(
             a.destinations.len(),
             2,
@@ -2514,7 +2510,10 @@ mod tests {
             // `into_iter()` rather than `iter()`: the array yields `&'static str`
             // in one step, where `iter()` would hand the closure a `&&&str` and
             // lean on transitive deref coercion at the call site.
-            DIFF_STATUSES.into_iter().filter(|s| diff_is_present(s)).count(),
+            DIFF_STATUSES
+                .into_iter()
+                .filter(|s| diff_is_present(s))
+                .count(),
             2,
             "exactly two of the five statuses carry bytes; update this test AND the gate together"
         );
@@ -2532,11 +2531,17 @@ mod tests {
         // On the extrinsic route the subject IS the extrinsic, so the same bytes
         // are complete — and this is not a lucky exception, it is why the status
         // is about SCOPE and the coverage sentence is chosen by ROUTE.
-        assert!(diff_covers_subject(DIFF_STATUS_EXTRINSIC_ONLY, ROUTE_DRY_RUN_EXTRINSIC));
+        assert!(diff_covers_subject(
+            DIFF_STATUS_EXTRINSIC_ONLY,
+            ROUTE_DRY_RUN_EXTRINSIC
+        ));
 
         // A whole-block diff covers the call on either route.
         assert!(diff_covers_subject(DIFF_STATUS_DECODED, ROUTE_SCHEDULED));
-        assert!(diff_covers_subject(DIFF_STATUS_DECODED, ROUTE_DRY_RUN_EXTRINSIC));
+        assert!(diff_covers_subject(
+            DIFF_STATUS_DECODED,
+            ROUTE_DRY_RUN_EXTRINSIC
+        ));
 
         // No bytes, no coverage — on either route, and never confused with
         // "nothing changed".

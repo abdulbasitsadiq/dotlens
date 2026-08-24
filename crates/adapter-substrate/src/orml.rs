@@ -483,8 +483,7 @@ pub fn absolutize(
     {
         return None;
     }
-    let mut out: Vec<serde_json::Value> =
-        observer_path[..observer_path.len() - parents].to_vec();
+    let mut out: Vec<serde_json::Value> = observer_path[..observer_path.len() - parents].to_vec();
     out.extend(interior.iter().cloned());
     Some(serde_json::Value::Array(out))
 }
@@ -563,8 +562,16 @@ pub fn orml_pallets_from_metadata(metadata_blob: &[u8]) -> Result<OrmlPallets, S
                 // a SECOND match halts; see the type's doc for why keeping the
                 // first would hide an entire money pallet
                 for (matches, slot, what) in [
-                    (has("Assets") && has("AssetLocations"), &mut registry, "AssetRegistry"),
-                    (has("Accounts") && has("TotalIssuance"), &mut tokens, "orml-tokens"),
+                    (
+                        has("Assets") && has("AssetLocations"),
+                        &mut registry,
+                        "AssetRegistry",
+                    ),
+                    (
+                        has("Accounts") && has("TotalIssuance"),
+                        &mut tokens,
+                        "orml-tokens",
+                    ),
                 ] {
                     if !matches {
                         continue;
@@ -1185,9 +1192,7 @@ mod tests {
     #[test]
     fn nul_padded_names_are_trimmed_and_never_reach_the_database() {
         fn named(fields: Vec<(&str, Value<()>)>) -> Value<()> {
-            Value::named_composite(
-                fields.into_iter().map(|(k, v)| (k.to_string(), v)),
-            )
+            Value::named_composite(fields.into_iter().map(|(k, v)| (k.to_string(), v)))
         }
         fn bytes_of(s: &[u8]) -> Value<()> {
             Value::unnamed_composite(s.iter().map(|b| Value::u128(*b as u128)))
@@ -1213,7 +1218,10 @@ mod tests {
         // database actually enforces
         for probe in [&b"USDT\0"[..], &b"  vDOT \0\0"[..], &b"aDOT"[..]] {
             if let Some(got) = named_string(&named(vec![("name", bytes_of(probe))]), "name") {
-                assert!(!got.contains('\0'), "a stored name may never carry a NUL: {got:?}");
+                assert!(
+                    !got.contains('\0'),
+                    "a stored name may never carry a NUL: {got:?}"
+                );
             }
         }
     }
@@ -1418,7 +1426,10 @@ mod tests {
         ];
         let key = accounts_key("Tokens", &hashers, &account, &currency).unwrap();
         assert_eq!(key.len(), 32 + 16 + 32 + 8 + 4);
-        assert_eq!(&key[..32], &crate::assets::map_prefix("Tokens", "Accounts")[..]);
+        assert_eq!(
+            &key[..32],
+            &crate::assets::map_prefix("Tokens", "Accounts")[..]
+        );
         // the ACCOUNT sits in the first segment — which is the whole claim
         assert_eq!(&key[48..80], &account[..]);
         assert_eq!(&key[key.len() - 4..], &currency[..]);
@@ -1471,8 +1482,10 @@ mod tests {
     #[test]
     fn network_variants_capitalise_and_the_path_shape_is_relay_then_para() {
         assert_eq!(chain_path("polkadot", None).len(), 1);
-        assert_eq!(chain_path("kusama", Some(2000))[0]["GlobalConsensus"]["Kusama"],
-                   serde_json::json!([]));
+        assert_eq!(
+            chain_path("kusama", Some(2000))[0]["GlobalConsensus"]["Kusama"],
+            serde_json::json!([])
+        );
         assert_eq!(chain_path("polkadot", Some(2034))[1]["Parachain"], 2034);
     }
 }

@@ -234,7 +234,16 @@ pub async fn tick(
         Some(cp) => cp.last_height + 1,
         None => target, // first run: start at the tip
     };
-    ingest_range(chain_id, source, deps, MODULE_LIVE, from, target, last_runtime_version).await
+    ingest_range(
+        chain_id,
+        source,
+        deps,
+        MODULE_LIVE,
+        from,
+        target,
+        last_runtime_version,
+    )
+    .await
 }
 
 /// Follow finalized heads forever, polling every `poll`. Errors are logged
@@ -284,10 +293,17 @@ mod tests {
 
     impl MockSource {
         fn new(finalized: u64) -> Self {
-            Self { finalized: Mutex::new(finalized), fail_next: Mutex::new(0) }
+            Self {
+                finalized: Mutex::new(finalized),
+                fail_next: Mutex::new(0),
+            }
         }
         fn version_for(height: u64) -> u32 {
-            if height <= 5 { 100 } else { 101 }
+            if height <= 5 {
+                100
+            } else {
+                101
+            }
         }
     }
 
@@ -314,8 +330,14 @@ mod tests {
                 runtime_version: Self::version_for(height),
                 transaction_version: Some(1),
                 artifacts: vec![
-                    RawArtifact { item: "block.json".into(), bytes: format!("{{\"h\":{height}}}").into_bytes() },
-                    RawArtifact { item: "events.scale".into(), bytes: vec![height as u8] },
+                    RawArtifact {
+                        item: "block.json".into(),
+                        bytes: format!("{{\"h\":{height}}}").into_bytes(),
+                    },
+                    RawArtifact {
+                        item: "events.scale".into(),
+                        bytes: vec![height as u8],
+                    },
                 ],
             })
         }
@@ -354,7 +376,8 @@ mod tests {
     fn tmp_raw(tag: &str) -> (raw_store::FsRawStore, std::path::PathBuf) {
         static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!("dotlens-live-{}-{tag}-{n}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("dotlens-live-{}-{tag}-{n}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         (raw_store::FsRawStore::new(&dir), dir)
     }
@@ -374,7 +397,9 @@ mod tests {
         };
 
         let mut rv = None;
-        let n = ingest_range("mockchain", &source, &deps, MODULE_BACKFILL, 1, 10, &mut rv).await.unwrap();
+        let n = ingest_range("mockchain", &source, &deps, MODULE_BACKFILL, 1, 10, &mut rv)
+            .await
+            .unwrap();
         assert_eq!(n, 10);
 
         // metadata archived exactly once per era, with correct boundaries
@@ -392,7 +417,17 @@ mod tests {
         assert_eq!(receipts.0.lock().unwrap().len(), 22);
 
         // re-run: clean no-op
-        let n = ingest_range("mockchain", &source, &deps, MODULE_BACKFILL, 1, 10, &mut None).await.unwrap();
+        let n = ingest_range(
+            "mockchain",
+            &source,
+            &deps,
+            MODULE_BACKFILL,
+            1,
+            10,
+            &mut None,
+        )
+        .await
+        .unwrap();
         assert_eq!(n, 0);
 
         let _ = std::fs::remove_dir_all(dir);
@@ -420,7 +455,11 @@ mod tests {
         // finality advances → exactly the delta is ingested
         *source.finalized.lock().unwrap() = 12;
         assert_eq!(tick("mockchain", &source, &deps, &mut rv).await.unwrap(), 5);
-        let cp = checkpoints.get("mockchain", MODULE_LIVE).await.unwrap().unwrap();
+        let cp = checkpoints
+            .get("mockchain", MODULE_LIVE)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(cp.last_height, 12);
 
         let _ = std::fs::remove_dir_all(dir);
@@ -448,7 +487,11 @@ mod tests {
         assert!(tick("mockchain", &source, &deps, &mut rv).await.is_err());
         // third tick succeeds and picks up exactly where it left off
         assert_eq!(tick("mockchain", &source, &deps, &mut rv).await.unwrap(), 4);
-        let cp = checkpoints.get("mockchain", MODULE_LIVE).await.unwrap().unwrap();
+        let cp = checkpoints
+            .get("mockchain", MODULE_LIVE)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(cp.last_height, 9);
 
         let _ = std::fs::remove_dir_all(dir);

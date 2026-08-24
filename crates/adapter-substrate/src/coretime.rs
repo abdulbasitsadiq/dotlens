@@ -341,8 +341,9 @@ pub fn decode_active_config(
              not to produce"
                 .to_string()
         })?;
-    let num_cores = u32::try_from(num_cores)
-        .map_err(|_| format!("num_cores {num_cores} does not fit a u32 — that is not a core count"))?;
+    let num_cores = u32::try_from(num_cores).map_err(|_| {
+        format!("num_cores {num_cores} does not fit a u32 — that is not a core count")
+    })?;
     Ok(SchedulerParamsView {
         num_cores,
         scheduler_params: crate::frame_decoder::value_to_json(params),
@@ -586,7 +587,10 @@ mod tests {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../fixtures/real/polkadot-32566550/metadata.scale");
         let Ok(blob) = std::fs::read(&path) else {
-            eprintln!("SKIP: real relay fixture metadata not present at {}", path.display());
+            eprintln!(
+                "SKIP: real relay fixture metadata not present at {}",
+                path.display()
+            );
             return;
         };
         let info = crate::assets::storage_entry_info(&blob, CONFIG_PALLET, ACTIVE_CONFIG_ENTRY)
@@ -605,7 +609,10 @@ mod tests {
             crate::votes::twox_128(CONFIG_PALLET.as_bytes())[..],
             "the first half is twox128 of the PALLET's storage prefix"
         );
-        assert_eq!(key[16..], crate::votes::twox_128(ACTIVE_CONFIG_ENTRY.as_bytes())[..]);
+        assert_eq!(
+            key[16..],
+            crate::votes::twox_128(ACTIVE_CONFIG_ENTRY.as_bytes())[..]
+        );
 
         // …and a value this runtime cannot decode is refused rather than
         // yielding a plausible number from the wrong offset.
@@ -620,9 +627,7 @@ mod tests {
     fn the_relay_parent_and_pov_hash_survive_their_double_nesting() {
         // `relay_parent` is a [[32 bytes]] double-nested H256 — the same layer
         // slice 2 met on `Processed.id`, which is why this reuses that reader.
-        let fact = occupancy_for_event(&included(1, 1, 1000))
-            .unwrap()
-            .unwrap();
+        let fact = occupancy_for_event(&included(1, 1, 1000)).unwrap().unwrap();
         assert_eq!(
             fact.relay_parent_hash.as_deref(),
             Some(format!("0x{}", "01".repeat(32)).as_str())
@@ -640,6 +645,9 @@ mod tests {
         let fact = occupancy_for_event(&thin).unwrap().unwrap();
         assert_eq!(fact.relay_parent_hash, None);
         assert_eq!(fact.pov_hash, None);
-        assert_eq!(fact.core_index, 1, "the occupancy fact itself is unaffected");
+        assert_eq!(
+            fact.core_index, 1,
+            "the occupancy fact itself is unaffected"
+        );
     }
 }

@@ -124,7 +124,10 @@ fn call_node(v: &Value<u32>, call_ty: u32) -> Result<serde_json::Value, String> 
     }
     .ok_or_else(|| format!("pallet variant {} has no call", pallet_var.name))?;
     let ValueDef::Variant(call_var) = &inner.value else {
-        return Err(format!("{}: inner value is not a call variant", pallet_var.name));
+        return Err(format!(
+            "{}: inner value is not a call variant",
+            pallet_var.name
+        ));
     };
     Ok(serde_json::json!({
         // matches canonical transaction call naming ("balances.transfer_keep_alive")
@@ -224,7 +227,11 @@ mod tests {
             let scale_info::TypeDef::Variant(var) = &ty.type_def else {
                 panic!("call type is a variant");
             };
-            let v = var.variants.iter().find(|v| v.name == call).expect("call variant");
+            let v = var
+                .variants
+                .iter()
+                .find(|v| v.name == call)
+                .expect("call variant");
             (p.index, v.index)
         }
     }
@@ -275,7 +282,9 @@ mod tests {
 
         let d = decode_call(&ix.blob(), &bytes).expect("decodes");
         assert_eq!(d.summary, "utility.batch");
-        let calls = d.tree["args"]["calls"].as_array().expect("nested calls array");
+        let calls = d.tree["args"]["calls"]
+            .as_array()
+            .expect("nested calls array");
         assert_eq!(calls.len(), 2, "both nested calls unwrap");
         assert_eq!(calls[0]["call"], "system.remark");
         assert_eq!(calls[0]["args"]["remark"], serde_json::json!([104, 105]));
@@ -292,7 +301,9 @@ mod tests {
         let mut bytes = vec![sys, remark];
         bytes.extend(compact(0));
         bytes.push(0xFF); // trailing garbage
-        assert!(decode_call(&ix.blob(), &bytes).unwrap_err().contains("trailing"));
+        assert!(decode_call(&ix.blob(), &bytes)
+            .unwrap_err()
+            .contains("trailing"));
         assert!(decode_call(&ix.blob(), &[0xFF, 0xFF, 0xFF]).is_err());
     }
 
@@ -307,7 +318,10 @@ mod tests {
 
     #[test]
     fn json_bytes_collects_nested_and_rejects_non_bytes() {
-        assert_eq!(json_bytes(&serde_json::json!([[1, 2], 3])), Some(vec![1, 2, 3]));
+        assert_eq!(
+            json_bytes(&serde_json::json!([[1, 2], 3])),
+            Some(vec![1, 2, 3])
+        );
         assert_eq!(json_bytes(&serde_json::json!([256])), None);
         assert_eq!(json_bytes(&serde_json::json!("nope")), None);
         assert_eq!(json_bytes(&serde_json::json!([])), Some(vec![]));

@@ -20,9 +20,8 @@ use tokio::sync::Mutex;
 /// twox128("System") ++ twox128("Events") — the storage key of System.Events.
 /// Substrate-protocol knowledge; allowed here (adapters only — Invariant 4).
 const SYSTEM_EVENTS_KEY: [u8; 32] = [
-    0x26, 0xaa, 0x39, 0x4e, 0xea, 0x56, 0x30, 0xe0, 0x7c, 0x48, 0xae, 0x0c, 0x95, 0x58, 0xce,
-    0xf7, 0x80, 0xd4, 0x1e, 0x5e, 0x16, 0x05, 0x67, 0x65, 0xbc, 0x84, 0x61, 0x85, 0x10, 0x72,
-    0xc9, 0xd7,
+    0x26, 0xaa, 0x39, 0x4e, 0xea, 0x56, 0x30, 0xe0, 0x7c, 0x48, 0xae, 0x0c, 0x95, 0x58, 0xce, 0xf7,
+    0x80, 0xd4, 0x1e, 0x5e, 0x16, 0x05, 0x67, 0x65, 0xbc, 0x84, 0x61, 0x85, 0x10, 0x72, 0xc9, 0xd7,
 ];
 
 type Methods = LegacyRpcMethods<RpcConfigFor<PolkadotConfig>>;
@@ -76,9 +75,7 @@ impl SubstrateSource {
             let methods = {
                 let mut guard = self.conn.lock().await;
                 if guard.is_none() {
-                    let idx = self
-                        .next_index
-                        .load(std::sync::atomic::Ordering::Relaxed)
+                    let idx = self.next_index.load(std::sync::atomic::Ordering::Relaxed)
                         % self.endpoints.len();
                     let url = &self.endpoints[idx];
                     match RpcClient::from_url(url).await {
@@ -109,8 +106,10 @@ impl SubstrateSource {
                         let url = &self.endpoints[conn.endpoint_index];
                         last_err = format!("{url}: {what}: {e}");
                         tracing::warn!(chain = %self.chain_id, %url, error = %e, "rpc call failed — rotating endpoint");
-                        self.next_index
-                            .store(conn.endpoint_index + 1, std::sync::atomic::Ordering::Relaxed);
+                        self.next_index.store(
+                            conn.endpoint_index + 1,
+                            std::sync::atomic::Ordering::Relaxed,
+                        );
                     } else {
                         last_err = format!("{what}: {e}");
                     }
@@ -238,10 +237,7 @@ impl SubstrateSource {
 
     /// spec_version at block `hash` — anchors record the runtime they were
     /// decoded against (lineage).
-    pub async fn runtime_version_at(
-        &self,
-        hash: subxt::utils::H256,
-    ) -> Result<u32, SourceError> {
+    pub async fn runtime_version_at(&self, hash: subxt::utils::H256) -> Result<u32, SourceError> {
         Ok(self.runtime_version_info(hash).await?.spec_version)
     }
 
@@ -266,7 +262,11 @@ impl SubstrateSource {
             .await?;
         Ok(RuntimeVersionInfo {
             spec_version: rv.spec_version,
-            apis: rv.other.get("apis").cloned().unwrap_or(serde_json::Value::Null),
+            apis: rv
+                .other
+                .get("apis")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null),
         })
     }
 
@@ -405,7 +405,12 @@ impl SubstrateSource {
             extrinsics_root: hex32(&header.extrinsics_root),
             spec_version: runtime.spec_version,
             finalized,
-            extrinsics: block.block.extrinsics.iter().map(|xt| xt.0.clone()).collect(),
+            extrinsics: block
+                .block
+                .extrinsics
+                .iter()
+                .map(|xt| xt.0.clone())
+                .collect(),
         };
         let mut artifacts = vec![RawArtifact {
             item: crate::envelope::ITEM_V2.into(),

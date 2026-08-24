@@ -37,11 +37,7 @@ impl UnfinalizedStore for PgUnfinalizedStore {
         Ok(row.map(|(h,)| h))
     }
 
-    async fn prune_unfinalized_above(
-        &self,
-        chain_id: &str,
-        height: u64,
-    ) -> Result<u64, SinkError> {
+    async fn prune_unfinalized_above(&self, chain_id: &str, height: u64) -> Result<u64, SinkError> {
         let err = |e: sqlx::Error| SinkError(e.to_string());
         let mut tx = self.pool.begin().await.map_err(err)?;
         // children first (no FK, but never leave orphans even mid-crash)

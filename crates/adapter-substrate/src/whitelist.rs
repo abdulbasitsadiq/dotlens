@@ -102,9 +102,10 @@ pub fn facts_for_event(event: &CanonicalEvent) -> Result<Vec<WhitelistFact>, Str
     // Defaulting here would report a reverted runtime upgrade as enacted.
     let (dispatch_ok, dispatch_error) = if variant == "WhitelistedCallDispatched" {
         let result = field(data, "result", 1).ok_or_else(|| ctx("no result"))?;
-        let (ok, err) = dispatch_result(result)
-            .ok_or_else(|| ctx("result is neither Ok nor Err — cannot tell whether the \
-                                whitelisted call succeeded, and guessing is not an option"))?;
+        let (ok, err) = dispatch_result(result).ok_or_else(|| {
+            ctx("result is neither Ok nor Err — cannot tell whether the \
+                                whitelisted call succeeded, and guessing is not an option")
+        })?;
         (Some(ok), err)
     } else {
         (None, None)
@@ -180,7 +181,11 @@ mod tests {
 
     #[test]
     fn non_whitelist_events_map_to_nothing() {
-        for name in ["balances.Transfer", "referenda.Submitted", "system.ExtrinsicSuccess"] {
+        for name in [
+            "balances.Transfer",
+            "referenda.Submitted",
+            "system.ExtrinsicSuccess",
+        ] {
             assert!(facts_for_event(&ev(name, json!({}))).unwrap().is_empty());
         }
     }
@@ -228,7 +233,8 @@ mod tests {
     /// adjacent fields and post_info comes FIRST.
     #[test]
     fn a_failed_dispatch_is_not_success_and_reads_error_not_post_info() {
-        let post_info = json!({"actual_weight": {"Some": {"ref_time": 1, "proof_size": 2}}, "pays_fee": "Yes"});
+        let post_info =
+            json!({"actual_weight": {"Some": {"ref_time": 1, "proof_size": 2}}, "pays_fee": "Yes"});
         let error = json!({"Module": {"index": 31, "error": "0x02000000"}});
 
         // named form, and the array form where post_info sits at index 0
@@ -242,8 +248,15 @@ mod tests {
                 json!({"call_hash": hash_json(2), "result": result}),
             ))
             .unwrap();
-            assert_eq!(f[0].dispatch_ok, Some(false), "a dispatched call that reverted is NOT ok");
-            assert_eq!(f[0].kind, "dispatched", "it was still dispatched, and storage was still cleaned");
+            assert_eq!(
+                f[0].dispatch_ok,
+                Some(false),
+                "a dispatched call that reverted is NOT ok"
+            );
+            assert_eq!(
+                f[0].kind, "dispatched",
+                "it was still dispatched, and storage was still cleaned"
+            );
             assert_eq!(
                 f[0].dispatch_error.as_ref().unwrap(),
                 &error,
@@ -280,7 +293,10 @@ mod tests {
         ))
         .unwrap_err();
         assert!(err.contains("unknown whitelist event"), "got: {err}");
-        assert!(err.contains("deferred-dispatch"), "the halt must point at the likely cause");
+        assert!(
+            err.contains("deferred-dispatch"),
+            "the halt must point at the likely cause"
+        );
     }
 
     #[test]

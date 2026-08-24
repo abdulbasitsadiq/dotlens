@@ -108,7 +108,10 @@ pub async fn write_facts(
         .execute(&mut *tx)
         .await
         .with_context(|| {
-            format!("inserting broker event {chain_id}/{height}/{event_index} ({})", r.variant)
+            format!(
+                "inserting broker event {chain_id}/{height}/{event_index} ({})",
+                r.variant
+            )
         })?;
 
         for a in &r.assignments {

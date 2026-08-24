@@ -104,7 +104,11 @@ fn bounty_account_parts(
         // the modern pallet has only ever had per-parent child ids, so it has
         // no renumbering behind it and its children ARE derivable
         ("multi_asset_bounties", Some(c)) => Some((
-            vec![SubKey::Bytes(b"mcb"), SubKey::Index(parent), SubKey::Index(c)],
+            vec![
+                SubKey::Bytes(b"mcb"),
+                SubKey::Index(parent),
+                SubKey::Index(c),
+            ],
             format!("mcb/{parent}/{c}"),
         )),
         _ => None,
@@ -635,8 +639,7 @@ mod tests {
         let (m, d) = bounty_account(t, "multi_asset_bounties", 17, None).expect("modern parent");
         assert_ne!(a, m, "the two generations must not collide at one index");
         assert_eq!(d, "modl:py/trsry/mbt/17");
-        let (mc, _) =
-            bounty_account(t, "multi_asset_bounties", 17, Some(0)).expect("modern child");
+        let (mc, _) = bounty_account(t, "multi_asset_bounties", 17, Some(0)).expect("modern child");
         assert_ne!(m, mc, "child 0 is not the parent");
 
         // shapes that cannot name an account are REFUSED, never guessed
@@ -656,7 +659,10 @@ mod tests {
     #[test]
     fn labels_disambiguate_the_two_id_spaces() {
         assert_eq!(bounty_label("bounties", 17, None), "Bounty 17");
-        assert_eq!(bounty_label("child_bounties", 17, Some(3)), "Child bounty 17-3");
+        assert_eq!(
+            bounty_label("child_bounties", 17, Some(3)),
+            "Child bounty 17-3"
+        );
         // the modern id space starts at 0 too, so its labels say so
         assert_eq!(
             bounty_label("multi_asset_bounties", 17, None),

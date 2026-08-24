@@ -226,7 +226,16 @@ pub async fn upsert_preimage(pool: &PgPool, chain_id: &str, r: &PreimageRecord) 
 pub async fn referenda_needing_preimages(
     pool: &PgPool,
     chain_id: &str,
-) -> Result<Vec<(String, i64, serde_json::Value, Option<String>, Option<i64>, Option<i64>)>> {
+) -> Result<
+    Vec<(
+        String,
+        i64,
+        serde_json::Value,
+        Option<String>,
+        Option<i64>,
+        Option<i64>,
+    )>,
+> {
     sqlx::query_as(
         "select r.class, r.referendum_id, r.proposal, r.proposal_hash, r.proposal_len, \
                 r.submitted_at_height \

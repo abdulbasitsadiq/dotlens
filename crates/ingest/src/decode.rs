@@ -178,7 +178,10 @@ pub async fn decode_range(
             continue;
         }
         let (envelope_key, envelope) = read_block_envelope(deps.raw, chain_id, height)?;
-        let events = match deps.raw.get(&keys::block(chain_id, height, keys::EVENTS_ITEM)) {
+        let events = match deps
+            .raw
+            .get(&keys::block(chain_id, height, keys::EVENTS_ITEM))
+        {
             Ok(bytes) => Some(bytes),
             Err(RawStoreError::NotFound(_)) => {
                 // legitimately absent — but success flags then default true
@@ -239,7 +242,11 @@ pub async fn decode_tick(
     decoder: &dyn RawBlockDecoder,
     deps: &DecodeDeps<'_>,
 ) -> Result<u64, DecodeWorkerError> {
-    let Some(raw_cp) = deps.checkpoints.get(chain_id, crate::live::MODULE_LIVE).await? else {
+    let Some(raw_cp) = deps
+        .checkpoints
+        .get(chain_id, crate::live::MODULE_LIVE)
+        .await?
+    else {
         return Ok(0); // raw follower hasn't started yet
     };
     let target = raw_cp.last_height;
@@ -312,9 +319,13 @@ mod tests {
             spec_version: u32,
             raw_location: &str,
         ) -> Result<CanonicalBlock, String> {
-            let v: serde_json::Value = serde_json::from_slice(envelope).map_err(|e| e.to_string())?;
+            let v: serde_json::Value =
+                serde_json::from_slice(envelope).map_err(|e| e.to_string())?;
             let height = v["height"].as_u64().ok_or("no height")?;
-            self.seen_metadata.lock().unwrap().push((height, metadata.to_vec()));
+            self.seen_metadata
+                .lock()
+                .unwrap()
+                .push((height, metadata.to_vec()));
             if events.is_none() {
                 return Err(format!("mock requires events for {height}"));
             }
@@ -338,9 +349,11 @@ mod tests {
         fn spec_version_of(&self, envelope: &[u8]) -> Result<u32, String> {
             let v: serde_json::Value =
                 serde_json::from_slice(envelope).map_err(|e| e.to_string())?;
-            v["spec_version"].as_u64().map(|s| s as u32).ok_or("no spec_version".into())
+            v["spec_version"]
+                .as_u64()
+                .map(|s| s as u32)
+                .ok_or("no spec_version".into())
         }
-
     }
 
     #[derive(Default)]
@@ -364,18 +377,28 @@ mod tests {
     fn tmp_raw(tag: &str) -> (raw_store::FsRawStore, std::path::PathBuf) {
         static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!("dotlens-dec-{}-{tag}-{n}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("dotlens-dec-{}-{tag}-{n}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         (raw_store::FsRawStore::new(&dir), dir)
     }
 
     fn seed_raw(raw: &raw_store::FsRawStore, chain: &str, h: u64, spec: u32) {
         let env = serde_json::json!({"chain_id": chain, "height": h, "spec_version": spec});
-        raw.put(&keys::block(chain, h, "block.json"), &serde_json::to_vec(&env).unwrap(), "t")
+        raw.put(
+            &keys::block(chain, h, "block.json"),
+            &serde_json::to_vec(&env).unwrap(),
+            "t",
+        )
+        .unwrap();
+        raw.put(&keys::block(chain, h, "events.scale"), &[h as u8], "t")
             .unwrap();
-        raw.put(&keys::block(chain, h, "events.scale"), &[h as u8], "t").unwrap();
         // metadata blob per spec (idempotent re-put for same spec)
-        let _ = raw.put(&keys::metadata(chain, spec), format!("meta-{spec}").as_bytes(), "t");
+        let _ = raw.put(
+            &keys::metadata(chain, spec),
+            format!("meta-{spec}").as_bytes(),
+            "t",
+        );
     }
 
     #[tokio::test]
@@ -386,8 +409,14 @@ mod tests {
         }
         let checkpoints = MemoryCheckpointStore::new();
         let sink = MemSink::default();
-        let decoder = MockDecoder { seen_metadata: Mutex::new(vec![]) };
-        let deps = DecodeDeps { raw: &raw, checkpoints: &checkpoints, sink: &sink };
+        let decoder = MockDecoder {
+            seen_metadata: Mutex::new(vec![]),
+        };
+        let deps = DecodeDeps {
+            raw: &raw,
+            checkpoints: &checkpoints,
+            sink: &sink,
+        };
 
         let n = decode_range("mock", &decoder, &deps, 1, 8).await.unwrap();
         assert_eq!(n, 8);
@@ -399,7 +428,10 @@ mod tests {
         drop(seen);
 
         // re-run: no-op
-        assert_eq!(decode_range("mock", &decoder, &deps, 1, 8).await.unwrap(), 0);
+        assert_eq!(
+            decode_range("mock", &decoder, &deps, 1, 8).await.unwrap(),
+            0
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -415,18 +447,39 @@ mod tests {
         seed_raw(&raw, "mock", 10, 100);
         let checkpoints = MemoryCheckpointStore::new();
         let sink = MemSink::default();
-        let decoder = MockDecoder { seen_metadata: Mutex::new(vec![]) };
-        let deps = DecodeDeps { raw: &raw, checkpoints: &checkpoints, sink: &sink };
+        let decoder = MockDecoder {
+            seen_metadata: Mutex::new(vec![]),
+        };
+        let deps = DecodeDeps {
+            raw: &raw,
+            checkpoints: &checkpoints,
+            sink: &sink,
+        };
         decode_range("mock", &decoder, &deps, 10, 10).await.unwrap();
-        assert_eq!(checkpoints.get("mock", MODULE_DECODE).await.unwrap().unwrap().last_height, 10);
+        assert_eq!(
+            checkpoints
+                .get("mock", MODULE_DECODE)
+                .await
+                .unwrap()
+                .unwrap()
+                .last_height,
+            10
+        );
 
         let n = decode_range("mock", &decoder, &deps, 1, 5).await.unwrap();
         assert_eq!(n, 5);
         assert_eq!(sink.0.lock().unwrap().len(), 6);
-        let cp = checkpoints.get("mock", MODULE_DECODE).await.unwrap().unwrap();
+        let cp = checkpoints
+            .get("mock", MODULE_DECODE)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(cp.last_height, 10, "gap-fill must not move the frontier");
 
-        assert_eq!(decode_range("mock", &decoder, &deps, 1, 5).await.unwrap(), 0);
+        assert_eq!(
+            decode_range("mock", &decoder, &deps, 1, 5).await.unwrap(),
+            0
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -434,19 +487,42 @@ mod tests {
     async fn missing_metadata_is_a_loud_error_not_a_guess() {
         let (raw, dir) = tmp_raw("nometa");
         let env = serde_json::json!({"chain_id": "mock", "height": 1, "spec_version": 999});
-        raw.put(&keys::block("mock", 1, "block.json"), &serde_json::to_vec(&env).unwrap(), "t")
+        raw.put(
+            &keys::block("mock", 1, "block.json"),
+            &serde_json::to_vec(&env).unwrap(),
+            "t",
+        )
+        .unwrap();
+        raw.put(&keys::block("mock", 1, "events.scale"), &[1], "t")
             .unwrap();
-        raw.put(&keys::block("mock", 1, "events.scale"), &[1], "t").unwrap();
 
         let checkpoints = MemoryCheckpointStore::new();
         let sink = MemSink::default();
-        let decoder = MockDecoder { seen_metadata: Mutex::new(vec![]) };
-        let deps = DecodeDeps { raw: &raw, checkpoints: &checkpoints, sink: &sink };
+        let decoder = MockDecoder {
+            seen_metadata: Mutex::new(vec![]),
+        };
+        let deps = DecodeDeps {
+            raw: &raw,
+            checkpoints: &checkpoints,
+            sink: &sink,
+        };
 
-        let err = decode_range("mock", &decoder, &deps, 1, 1).await.unwrap_err();
-        assert!(matches!(err, DecodeWorkerError::MetadataMissing { spec_version: 999, .. }));
+        let err = decode_range("mock", &decoder, &deps, 1, 1)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            DecodeWorkerError::MetadataMissing {
+                spec_version: 999,
+                ..
+            }
+        ));
         // nothing advanced, nothing inserted
-        assert!(checkpoints.get("mock", MODULE_DECODE).await.unwrap().is_none());
+        assert!(checkpoints
+            .get("mock", MODULE_DECODE)
+            .await
+            .unwrap()
+            .is_none());
         assert!(sink.0.lock().unwrap().is_empty());
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -456,8 +532,14 @@ mod tests {
         let (raw, dir) = tmp_raw("tick");
         let checkpoints = MemoryCheckpointStore::new();
         let sink = MemSink::default();
-        let decoder = MockDecoder { seen_metadata: Mutex::new(vec![]) };
-        let deps = DecodeDeps { raw: &raw, checkpoints: &checkpoints, sink: &sink };
+        let decoder = MockDecoder {
+            seen_metadata: Mutex::new(vec![]),
+        };
+        let deps = DecodeDeps {
+            raw: &raw,
+            checkpoints: &checkpoints,
+            sink: &sink,
+        };
 
         // raw follower hasn't started → decode does nothing
         assert_eq!(decode_tick("mock", &decoder, &deps).await.unwrap(), 0);
@@ -493,7 +575,11 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(decode_tick("mock", &decoder, &deps).await.unwrap(), 2);
-        let cp = checkpoints.get("mock", MODULE_DECODE).await.unwrap().unwrap();
+        let cp = checkpoints
+            .get("mock", MODULE_DECODE)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(cp.last_height, 9);
         let _ = std::fs::remove_dir_all(dir);
     }

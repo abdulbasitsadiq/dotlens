@@ -97,8 +97,7 @@ use async_trait::async_trait;
 use ingest::live::ChainSource;
 use raw_store::RawStore;
 use sim::{
-    ForkOutcome, ForkOverride, ForkRequest, ForkRunner, PreparedFork, SimError, SimEvent,
-    TIER_FORK,
+    ForkOutcome, ForkOverride, ForkRequest, ForkRunner, PreparedFork, SimError, SimEvent, TIER_FORK,
 };
 
 /// How many changed keys get their BEFORE value read back.
@@ -145,9 +144,7 @@ impl ForkConfig {
                 .map(|s| s.to_string())
                 .collect(),
             db_dir: std::path::PathBuf::from(get("SIM_FORK_DB_DIR", "data/chopsticks")),
-            startup_timeout_secs: get("SIM_FORK_STARTUP_SECS", "180")
-                .parse()
-                .unwrap_or(180),
+            startup_timeout_secs: get("SIM_FORK_STARTUP_SECS", "180").parse().unwrap_or(180),
             max_before_reads: get("SIM_FORK_MAX_BEFORE_READS", "")
                 .parse()
                 .unwrap_or(DEFAULT_MAX_BEFORE_READS),
@@ -436,11 +433,12 @@ impl ForkRunner for SubstrateForkRunner<'_> {
         // check that these bytes are a RuntimeCall for THIS runtime at all —
         // scheduling bytes that are not a call produces a `CallUnavailable` two
         // steps later, which reads like a harness fault.
-        let decoded = adapter_substrate::calls::decode_call(&metadata, &req.call)
-            .map_err(|e| SimError::Encode(format!(
+        let decoded = adapter_substrate::calls::decode_call(&metadata, &req.call).map_err(|e| {
+            SimError::Encode(format!(
                 "these bytes are not a RuntimeCall for {} at spec {}: {e}",
                 self.chain_id, rv.spec_version
-            )))?;
+            ))
+        })?;
 
         // ---- 2. resolve the overrides, and read what the REAL chain holds
         let mut resolved = Vec::new();
@@ -491,24 +489,23 @@ impl ForkRunner for SubstrateForkRunner<'_> {
                 .await
                 .map_err(|e| SimError::Source(e.to_string()))?;
             let heights = fork::agenda_key_heights(&index, &keys);
-            let relay = match index
-                .entry(fork::PARACHAIN_SYSTEM_PALLET, fork::LAST_RELAY_NUMBER_ENTRY)
-            {
-                None => None,
-                Some(entry) => {
-                    let raw = self
-                        .source
-                        .storage_at(&entry.prefix, block_hash)
-                        .await
-                        .map_err(|e| SimError::Source(e.to_string()))?;
-                    raw.and_then(|b| {
-                        index
-                            .decode_value(entry.value_type, &b)
-                            .ok()
-                            .and_then(|v| v.as_u64())
-                    })
-                }
-            };
+            let relay =
+                match index.entry(fork::PARACHAIN_SYSTEM_PALLET, fork::LAST_RELAY_NUMBER_ENTRY) {
+                    None => None,
+                    Some(entry) => {
+                        let raw = self
+                            .source
+                            .storage_at(&entry.prefix, block_hash)
+                            .await
+                            .map_err(|e| SimError::Source(e.to_string()))?;
+                        raw.and_then(|b| {
+                            index
+                                .decode_value(entry.value_type, &b)
+                                .ok()
+                                .and_then(|v| v.as_u64())
+                        })
+                    }
+                };
             let anchor = fork::decide_agenda_anchor(height, relay, &heights)
                 .map_err(|e| SimError::Encode(e.to_string()))?;
             tracing::info!(
@@ -611,7 +608,9 @@ impl ForkRunner for SubstrateForkRunner<'_> {
         // On the scheduled route the extrinsic is a NO-OP whose only job is to
         // make the block execute; on the extrinsic route it IS the call.
         let vehicle = match &dispatch {
-            Some(_) => fork::noop_call_bytes(&metadata).map_err(|e| SimError::Encode(e.to_string()))?,
+            Some(_) => {
+                fork::noop_call_bytes(&metadata).map_err(|e| SimError::Encode(e.to_string()))?
+            }
             None => call.clone(),
         };
 
@@ -752,8 +751,9 @@ impl ForkRunner for SubstrateForkRunner<'_> {
         prepared: &PreparedFork,
         response: &[u8],
     ) -> Result<ForkOutcome, SimError> {
-        let answer: serde_json::Value = serde_json::from_slice(response)
-            .map_err(|e| SimError::Decode(format!("the archived harness answer is not JSON: {e}")))?;
+        let answer: serde_json::Value = serde_json::from_slice(response).map_err(|e| {
+            SimError::Decode(format!("the archived harness answer is not JSON: {e}"))
+        })?;
         let (metadata, _) = self.archived_metadata(prepared.spec_version)?;
         let index = StorageKeyIndex::from_metadata(&metadata)
             .map_err(|e| SimError::Decode(e.to_string()))?;
@@ -860,9 +860,10 @@ impl ForkRunner for SubstrateForkRunner<'_> {
             Some(entries) => {
                 let mut pairs = Vec::with_capacity(entries.len());
                 for e in entries {
-                    let key = hex_bytes(e.get("key").and_then(|k| k.as_str()).ok_or_else(|| {
-                        SimError::Decode("a recorded diff entry has no key".into())
-                    })?)?;
+                    let key =
+                        hex_bytes(e.get("key").and_then(|k| k.as_str()).ok_or_else(|| {
+                            SimError::Decode("a recorded diff entry has no key".into())
+                        })?)?;
                     let before = match e.get("before").and_then(|v| v.as_str()) {
                         Some(s) => Some(hex_bytes(s)?),
                         None => None,
@@ -917,7 +918,10 @@ impl ForkRunner for SubstrateForkRunner<'_> {
                 .get("built_block_hash")
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string()),
-            harness: answer.get("harness").cloned().unwrap_or(serde_json::json!({})),
+            harness: answer
+                .get("harness")
+                .cloned()
+                .unwrap_or(serde_json::json!({})),
             // The diff's own caveat travels with the row. Built in `drive` and
             // dropped on the floor before this fix, so the "only the first N
             // keys had their before value read" sentence never reached anybody.
@@ -1028,7 +1032,11 @@ impl SubstrateForkRunner<'_> {
             let read_it = reads < self.config.max_before_reads;
             let before = if read_it {
                 reads += 1;
-                harness.client.storage_at(key, &parent).await.map_err(chops)?
+                harness
+                    .client
+                    .storage_at(key, &parent)
+                    .await
+                    .map_err(chops)?
             } else {
                 capped = true;
                 None

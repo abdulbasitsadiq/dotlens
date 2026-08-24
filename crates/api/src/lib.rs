@@ -105,10 +105,7 @@ pub trait BlockIndex: Send + Sync {
     /// found and let the caller see the ambiguity.
     async fn blocks_by_hash(&self, hash: &str) -> Result<Vec<(String, u64)>, IndexError>;
     /// Which (chain, height, index) carries this extrinsic hash? Same reasoning.
-    async fn extrinsics_by_hash(
-        &self,
-        hash: &str,
-    ) -> Result<Vec<(String, u64, u32)>, IndexError>;
+    async fn extrinsics_by_hash(&self, hash: &str) -> Result<Vec<(String, u64, u32)>, IndexError>;
 }
 
 #[derive(Default)]
@@ -124,11 +121,7 @@ impl MemoryBlockIndex {
 
 #[async_trait]
 impl BlockIndex for MemoryBlockIndex {
-    async fn get(
-        &self,
-        chain_id: &str,
-        height: u64,
-    ) -> Result<Option<CanonicalBlock>, IndexError> {
+    async fn get(&self, chain_id: &str, height: u64) -> Result<Option<CanonicalBlock>, IndexError> {
         let map = self.inner.read().map_err(|e| IndexError(e.to_string()))?;
         Ok(map.get(&(chain_id.to_string(), height)).cloned())
     }
@@ -159,10 +152,7 @@ impl BlockIndex for MemoryBlockIndex {
         out.sort();
         Ok(out)
     }
-    async fn extrinsics_by_hash(
-        &self,
-        hash: &str,
-    ) -> Result<Vec<(String, u64, u32)>, IndexError> {
+    async fn extrinsics_by_hash(&self, hash: &str) -> Result<Vec<(String, u64, u32)>, IndexError> {
         let map = self.inner.read().map_err(|e| IndexError(e.to_string()))?;
         let mut out: Vec<(String, u64, u32)> = map
             .values()
@@ -578,8 +568,7 @@ pub struct XcmLinkRow {
 #[async_trait]
 pub trait XcmIndex: Send + Sync {
     /// Recent observations on one chain, newest first.
-    async fn messages(&self, chain_id: &str, limit: u32)
-        -> Result<Vec<XcmMessageRow>, IndexError>;
+    async fn messages(&self, chain_id: &str, limit: u32) -> Result<Vec<XcmMessageRow>, IndexError>;
     /// Every observation carrying this id, on ANY chain.
     async fn by_message_id(&self, message_id: &str) -> Result<Vec<XcmMessageRow>, IndexError>;
     /// Every observation carrying ANY of these ids — the journey read, once the
@@ -612,14 +601,13 @@ impl MemoryXcmIndex {
 
 #[async_trait]
 impl XcmIndex for MemoryXcmIndex {
-    async fn messages(
-        &self,
-        chain_id: &str,
-        limit: u32,
-    ) -> Result<Vec<XcmMessageRow>, IndexError> {
+    async fn messages(&self, chain_id: &str, limit: u32) -> Result<Vec<XcmMessageRow>, IndexError> {
         let rows = self.rows.read().map_err(|e| IndexError(e.to_string()))?;
-        let mut out: Vec<XcmMessageRow> =
-            rows.iter().filter(|r| r.chain_id == chain_id).cloned().collect();
+        let mut out: Vec<XcmMessageRow> = rows
+            .iter()
+            .filter(|r| r.chain_id == chain_id)
+            .cloned()
+            .collect();
         // identical to the Pg ordering, tie-break included
         out.sort_by(|a, b| {
             b.block_height
@@ -1015,8 +1003,10 @@ fn is_foreign_consensus(observed: &str, network: &str) -> bool {
 /// chain says where it addressed one, and the two must be mirror images of each
 /// other. `None` means the registry cannot say, which is reported as `unknown`
 /// and never as a contradiction.
-fn xcm_counterparty_name(from: &registry::ChainConfig, to: &registry::ChainConfig)
-    -> Option<String> {
+fn xcm_counterparty_name(
+    from: &registry::ChainConfig,
+    to: &registry::ChainConfig,
+) -> Option<String> {
     if from.id == to.id {
         return Some("here".into());
     }
@@ -1689,10 +1679,7 @@ pub trait AssetIndex: Send + Sync {
     /// Not chain-scoped, on purpose: "one logical asset, every representation,
     /// every chain" is the question no chain-shaped explorer can ask
     /// (PRODUCT.md gap 6), and scoping it by chain would throw that away.
-    async fn assets_by_symbol(
-        &self,
-        symbol: &str,
-    ) -> Result<Vec<(String, AssetRow)>, IndexError>;
+    async fn assets_by_symbol(&self, symbol: &str) -> Result<Vec<(String, AssetRow)>, IndexError>;
 
     /// Every representation of ONE logical asset, across every chain, found by
     /// its observer-free name.
@@ -1739,10 +1726,7 @@ impl AssetIndex for MemoryAssetIndex {
         rows.sort_by(|a, b| a.asset_key.cmp(&b.asset_key));
         Ok(rows)
     }
-    async fn assets_by_symbol(
-        &self,
-        symbol: &str,
-    ) -> Result<Vec<(String, AssetRow)>, IndexError> {
+    async fn assets_by_symbol(&self, symbol: &str) -> Result<Vec<(String, AssetRow)>, IndexError> {
         let want = symbol.to_lowercase();
         let map = self.assets.read().map_err(|e| IndexError(e.to_string()))?;
         let mut out: Vec<(String, AssetRow)> = map
@@ -2186,7 +2170,12 @@ impl TreasuryIndex for MemoryTreasuryIndex {
     ) -> Result<Option<SpendRow>, IndexError> {
         let map = self.spends.read().map_err(|e| IndexError(e.to_string()))?;
         Ok(map
-            .get(&(chain_id.into(), instance.into(), spend_kind.into(), spend_id))
+            .get(&(
+                chain_id.into(),
+                instance.into(),
+                spend_kind.into(),
+                spend_id,
+            ))
             .cloned())
     }
     async fn spend_events(
@@ -2202,7 +2191,9 @@ impl TreasuryIndex for MemoryTreasuryIndex {
             .map(|rows| {
                 rows.iter()
                     .filter(|(subject, _)| {
-                        subject.as_ref().is_some_and(|(k, i)| k == spend_kind && *i == spend_id)
+                        subject
+                            .as_ref()
+                            .is_some_and(|(k, i)| k == spend_kind && *i == spend_id)
                     })
                     .map(|(_, r)| r.clone())
                     .collect()
@@ -2232,9 +2223,14 @@ impl TreasuryIndex for MemoryTreasuryIndex {
         Ok(rows)
     }
     async fn accounts(&self, network: &str) -> Result<Vec<TreasuryAccountRow>, IndexError> {
-        let map = self.accounts.read().map_err(|e| IndexError(e.to_string()))?;
+        let map = self
+            .accounts
+            .read()
+            .map_err(|e| IndexError(e.to_string()))?;
         let mut rows = map.get(network).cloned().unwrap_or_default();
-        rows.sort_by(|a, b| (&a.chain_id, &a.role, &a.label).cmp(&(&b.chain_id, &b.role, &b.label)));
+        rows.sort_by(|a, b| {
+            (&a.chain_id, &a.role, &a.label).cmp(&(&b.chain_id, &b.role, &b.label))
+        });
         Ok(rows)
     }
 }
@@ -2389,7 +2385,10 @@ impl BountyIndex for MemoryBountyIndex {
         status: Option<&str>,
         limit: u64,
     ) -> Result<Vec<BountyRow>, IndexError> {
-        let map = self.bounties.read().map_err(|e| IndexError(e.to_string()))?;
+        let map = self
+            .bounties
+            .read()
+            .map_err(|e| IndexError(e.to_string()))?;
         let mut rows: Vec<BountyRow> = map
             .iter()
             .filter(|((c, i, _, _), r)| {
@@ -2415,7 +2414,10 @@ impl BountyIndex for MemoryBountyIndex {
         bounty_id: u64,
         child_id: Option<u64>,
     ) -> Result<Option<BountyRow>, IndexError> {
-        let map = self.bounties.read().map_err(|e| IndexError(e.to_string()))?;
+        let map = self
+            .bounties
+            .read()
+            .map_err(|e| IndexError(e.to_string()))?;
         Ok(map
             .get(&(chain_id.into(), instance.into(), bounty_id, child_id))
             .cloned())
@@ -2567,7 +2569,12 @@ impl MemoryGovIndex {
             .push(row);
     }
     pub fn insert_track(&self, chain: &str, row: GovTrackRow) {
-        self.tracks.write().expect("lock").entry(chain.into()).or_default().push(row);
+        self.tracks
+            .write()
+            .expect("lock")
+            .entry(chain.into())
+            .or_default()
+            .push(row);
     }
     pub fn insert_preimage(&self, chain: &str, row: PreimageRow) {
         self.preimages
@@ -2578,7 +2585,12 @@ impl MemoryGovIndex {
             .push(row);
     }
     pub fn insert_vote(&self, chain: &str, row: VoteRow) {
-        self.votes.write().expect("lock").entry(chain.into()).or_default().push(row);
+        self.votes
+            .write()
+            .expect("lock")
+            .entry(chain.into())
+            .or_default()
+            .push(row);
     }
     pub fn insert_delegation(&self, chain: &str, row: DelegationRow) {
         self.delegations
@@ -2606,7 +2618,10 @@ impl GovIndex for MemoryGovIndex {
         class: &str,
         id: u64,
     ) -> Result<Option<ReferendumRow>, IndexError> {
-        let map = self.referenda.read().map_err(|e| IndexError(e.to_string()))?;
+        let map = self
+            .referenda
+            .read()
+            .map_err(|e| IndexError(e.to_string()))?;
         Ok(map.get(&(chain_id.into(), class.into(), id)).cloned())
     }
     async fn referendum_events(
@@ -2629,7 +2644,10 @@ impl GovIndex for MemoryGovIndex {
         class: &str,
         limit: u64,
     ) -> Result<Vec<ReferendumRow>, IndexError> {
-        let map = self.referenda.read().map_err(|e| IndexError(e.to_string()))?;
+        let map = self
+            .referenda
+            .read()
+            .map_err(|e| IndexError(e.to_string()))?;
         let mut rows: Vec<ReferendumRow> = map
             .iter()
             .filter(|((c, cl, _), _)| c == chain_id && cl == class)
@@ -2650,7 +2668,10 @@ impl GovIndex for MemoryGovIndex {
         chain_id: &str,
         proposal_hash: &str,
     ) -> Result<Option<PreimageRow>, IndexError> {
-        let map = self.preimages.read().map_err(|e| IndexError(e.to_string()))?;
+        let map = self
+            .preimages
+            .read()
+            .map_err(|e| IndexError(e.to_string()))?;
         let rows = map.get(&(chain_id.into(), proposal_hash.into()));
         Ok(rows.and_then(|rows| {
             rows.iter()
@@ -2664,7 +2685,10 @@ impl GovIndex for MemoryGovIndex {
         chain_id: &str,
         call_hash: &str,
     ) -> Result<Option<WhitelistedCallRow>, IndexError> {
-        let map = self.whitelisted.read().map_err(|e| IndexError(e.to_string()))?;
+        let map = self
+            .whitelisted
+            .read()
+            .map_err(|e| IndexError(e.to_string()))?;
         Ok(map.get(&(chain_id.into(), call_hash.into())).cloned())
     }
     async fn whitelist_events(
@@ -2688,7 +2712,10 @@ impl GovIndex for MemoryGovIndex {
         chain_id: &str,
         limit: u64,
     ) -> Result<Vec<WhitelistedCallRow>, IndexError> {
-        let map = self.whitelisted.read().map_err(|e| IndexError(e.to_string()))?;
+        let map = self
+            .whitelisted
+            .read()
+            .map_err(|e| IndexError(e.to_string()))?;
         let mut rows: Vec<WhitelistedCallRow> = map
             .iter()
             .filter(|((c, _), _)| c == chain_id)
@@ -2698,9 +2725,7 @@ impl GovIndex for MemoryGovIndex {
         // subset from either — the rule slice 3 set for paired backends. The
         // hash is the tiebreak because two rows can share a status coordinate
         // only across different hashes.
-        rows.sort_by(|a, b| {
-            (b.status_height, &b.call_hash).cmp(&(a.status_height, &a.call_hash))
-        });
+        rows.sort_by(|a, b| (b.status_height, &b.call_hash).cmp(&(a.status_height, &a.call_hash)));
         rows.truncate(limit as usize);
         Ok(rows)
     }
@@ -2724,7 +2749,9 @@ impl GovIndex for MemoryGovIndex {
         // same order as the Pg backend: heaviest first, then voter — otherwise
         // a `limit` returns different subsets from the two backends
         rows.sort_by(|a, b| {
-            weight(b).cmp(&weight(a)).then_with(|| a.voter.cmp(&b.voter))
+            weight(b)
+                .cmp(&weight(a))
+                .then_with(|| a.voter.cmp(&b.voter))
         });
         rows.truncate(limit as usize);
         Ok(rows)
@@ -2755,10 +2782,18 @@ impl GovIndex for MemoryGovIndex {
         delegator: &[u8],
     ) -> Result<Vec<DelegationRow>, IndexError> {
         let hex = format!("0x{}", hex_lower(delegator));
-        let map = self.delegations.read().map_err(|e| IndexError(e.to_string()))?;
+        let map = self
+            .delegations
+            .read()
+            .map_err(|e| IndexError(e.to_string()))?;
         let mut rows: Vec<DelegationRow> = map
             .get(chain_id)
-            .map(|rows| rows.iter().filter(|r| r.delegator == hex).cloned().collect())
+            .map(|rows| {
+                rows.iter()
+                    .filter(|r| r.delegator == hex)
+                    .cloned()
+                    .collect()
+            })
             .unwrap_or_default();
         rows.sort_by_key(|r| (r.class.clone(), r.track_id));
         Ok(rows)
@@ -2770,7 +2805,10 @@ impl GovIndex for MemoryGovIndex {
     ) -> Result<Vec<VotingAnchorRow>, IndexError> {
         let hex = format!("0x{}", hex_lower(account));
         let map = self.anchors.read().map_err(|e| IndexError(e.to_string()))?;
-        let mut rows = map.get(&(chain_id.into(), hex)).cloned().unwrap_or_default();
+        let mut rows = map
+            .get(&(chain_id.into(), hex))
+            .cloned()
+            .unwrap_or_default();
         rows.sort_by_key(|r| (r.track_id, r.height));
         Ok(rows)
     }
@@ -2968,10 +3006,16 @@ impl MemoryCoretimeIndex {
         ));
     }
     pub fn insert_config(&self, chain_id: &str, row: CoreConfigRow) {
-        self.configs.write().expect("lock").push((chain_id.into(), row));
+        self.configs
+            .write()
+            .expect("lock")
+            .push((chain_id.into(), row));
     }
     pub fn insert_indexed_height(&self, chain_id: &str, height: u64) {
-        self.indexed.write().expect("lock").push((chain_id.into(), height));
+        self.indexed
+            .write()
+            .expect("lock")
+            .push((chain_id.into(), height));
     }
 }
 
@@ -2984,12 +3028,15 @@ impl CoretimeIndex for MemoryCoretimeIndex {
         to: u64,
     ) -> Result<Vec<CoreOccupancyRow>, IndexError> {
         let rows = self.rows.read().map_err(|e| IndexError(e.to_string()))?;
-        let mut by_core: std::collections::BTreeMap<u32, (u64, std::collections::BTreeSet<u32>)> = std::collections::BTreeMap::new();
+        let mut by_core: std::collections::BTreeMap<u32, (u64, std::collections::BTreeSet<u32>)> =
+            std::collections::BTreeMap::new();
         for (c, h, _, kind, core, para) in rows.iter() {
             if c != chain_id || *h < from || *h > to || kind != "included" {
                 continue;
             }
-            let e = by_core.entry(*core).or_insert_with(|| (0, std::collections::BTreeSet::new()));
+            let e = by_core
+                .entry(*core)
+                .or_insert_with(|| (0, std::collections::BTreeSet::new()));
             e.0 += 1;
             e.1.insert(*para);
         }
@@ -3019,11 +3066,13 @@ impl CoretimeIndex for MemoryCoretimeIndex {
         }
         Ok(by
             .into_iter()
-            .map(|((core_index, para_id), included_blocks)| coretime_delta::OccupancyCell {
-                core_index,
-                para_id,
-                included_blocks,
-            })
+            .map(
+                |((core_index, para_id), included_blocks)| coretime_delta::OccupancyCell {
+                    core_index,
+                    para_id,
+                    included_blocks,
+                },
+            )
             .collect())
     }
 
@@ -3251,7 +3300,10 @@ impl MemoryBrokerIndex {
         Self::default()
     }
     pub fn insert_event(&self, chain_id: &str, row: BrokerEventRow) {
-        self.events.write().expect("lock").push((chain_id.into(), row));
+        self.events
+            .write()
+            .expect("lock")
+            .push((chain_id.into(), row));
     }
     /// `block_height` and `event_index` are the ANNOUNCING coordinate — the
     /// tie-break that keeps a re-announcement from looking like interlacing.
@@ -3262,13 +3314,18 @@ impl MemoryBrokerIndex {
         event_index: u32,
         row: coretime_delta::EntitlementRow,
     ) {
-        self.assignments
-            .write()
-            .expect("lock")
-            .push((chain_id.into(), block_height, event_index, row));
+        self.assignments.write().expect("lock").push((
+            chain_id.into(),
+            block_height,
+            event_index,
+            row,
+        ));
     }
     pub fn insert_config(&self, chain_id: &str, row: BrokerConfigRow) {
-        self.configs.write().expect("lock").push((chain_id.into(), row));
+        self.configs
+            .write()
+            .expect("lock")
+            .push((chain_id.into(), row));
     }
 }
 
@@ -3279,7 +3336,10 @@ impl BrokerIndex for MemoryBrokerIndex {
         chain_id: &str,
         relay_height: u64,
     ) -> Result<Vec<coretime_delta::EntitlementRow>, IndexError> {
-        let rows = self.assignments.read().map_err(|e| IndexError(e.to_string()))?;
+        let rows = self
+            .assignments
+            .read()
+            .map_err(|e| IndexError(e.to_string()))?;
         // The winning ANNOUNCEMENT per core: newest relay_block, then newest
         // announcing coordinate. Mirrors the pg `distinct on` exactly, or the
         // two backends disagree about which entitlement governs.
@@ -3371,9 +3431,7 @@ impl MemoryBrokerIndex {
             .filter(|(c, r)| c == chain_id && pred(r))
             .map(|(_, r)| r.clone())
             .collect();
-        out.sort_by(|a, b| {
-            (b.block_height, b.event_index).cmp(&(a.block_height, a.event_index))
-        });
+        out.sort_by(|a, b| (b.block_height, b.event_index).cmp(&(a.block_height, a.event_index)));
         out.truncate(limit as usize);
         Ok(out)
     }
@@ -3384,7 +3442,10 @@ impl MemoryBrokerIndex {
         limit: u32,
         pred: impl Fn(&coretime_delta::EntitlementRow) -> bool,
     ) -> Result<Vec<coretime_delta::EntitlementRow>, IndexError> {
-        let rows = self.assignments.read().map_err(|e| IndexError(e.to_string()))?;
+        let rows = self
+            .assignments
+            .read()
+            .map_err(|e| IndexError(e.to_string()))?;
         let mut out: Vec<(u64, u32, coretime_delta::EntitlementRow)> = rows
             .iter()
             .filter(|(c, _, _, r)| c == chain_id && pred(r))
@@ -3486,7 +3547,10 @@ impl MemoryChannelIndex {
         Self::default()
     }
     pub fn insert_reading(&self, chain_id: &str, row: ChannelReadingRow) {
-        self.readings.write().expect("lock").push((chain_id.into(), row));
+        self.readings
+            .write()
+            .expect("lock")
+            .push((chain_id.into(), row));
     }
     pub fn insert_edge(&self, chain_id: &str, block_height: u64, row: ChannelEdgeRow) {
         self.edges
@@ -3499,7 +3563,10 @@ impl MemoryChannelIndex {
 #[async_trait]
 impl ChannelIndex for MemoryChannelIndex {
     async fn readings(&self, chain_id: &str) -> Result<Vec<ChannelReadingRow>, IndexError> {
-        let rows = self.readings.read().map_err(|e| IndexError(e.to_string()))?;
+        let rows = self
+            .readings
+            .read()
+            .map_err(|e| IndexError(e.to_string()))?;
         let mut out: Vec<ChannelReadingRow> = rows
             .iter()
             .filter(|(c, _)| c == chain_id)
@@ -3517,8 +3584,7 @@ impl ChannelIndex for MemoryChannelIndex {
         let rows = self.readings(chain_id).await?;
         Ok(rows
             .into_iter()
-            .filter(|r| at.is_none_or(|h| r.block_height <= h))
-            .next_back())
+            .rfind(|r| at.is_none_or(|h| r.block_height <= h)))
     }
 
     async fn edges_at(
@@ -3625,7 +3691,10 @@ impl FreshnessIndex for MemoryFreshnessIndex {
         &self,
         chain_id: &str,
     ) -> Result<Vec<freshness::CheckpointRow>, IndexError> {
-        let rows = self.checkpoints.read().map_err(|e| IndexError(e.to_string()))?;
+        let rows = self
+            .checkpoints
+            .read()
+            .map_err(|e| IndexError(e.to_string()))?;
         Ok(rows
             .iter()
             .filter(|(c, _)| c == chain_id)
@@ -3691,11 +3760,13 @@ pub mod pg {
             .map_err(IndexError::from)?;
             Ok(rows
                 .into_iter()
-                .map(|(module, height, updated_at)| super::freshness::CheckpointRow {
-                    module,
-                    height: height as u64,
-                    updated_at,
-                })
+                .map(
+                    |(module, height, updated_at)| super::freshness::CheckpointRow {
+                        module,
+                        height: height as u64,
+                        updated_at,
+                    },
+                )
                 .collect())
         }
 
@@ -3808,37 +3879,44 @@ pub mod pg {
             chain_id: &str,
             block_height: u64,
         ) -> Result<Vec<super::ChannelEdgeRow>, IndexError> {
-            let rows: Vec<(i64, i64, String, i64, i64, i64, String, Option<String>, Option<bool>)> =
-                sqlx::query_as(
-                    "select sender, recipient, state, max_capacity, max_total_size, \
+            let rows: Vec<(
+                i64,
+                i64,
+                String,
+                i64,
+                i64,
+                i64,
+                String,
+                Option<String>,
+                Option<bool>,
+            )> = sqlx::query_as(
+                "select sender, recipient, state, max_capacity, max_total_size, \
                             max_message_size, sender_deposit::text, recipient_deposit::text, \
                             confirmed \
                      from xcm.channel_snapshots \
                      where chain_id = $1 and block_height = $2 \
                      order by sender, recipient",
-                )
-                .bind(chain_id)
-                .bind(block_height as i64)
-                .fetch_all(&self.pool)
-                .await
-                .map_err(IndexError::from)?;
+            )
+            .bind(chain_id)
+            .bind(block_height as i64)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(IndexError::from)?;
             Ok(rows
                 .into_iter()
-                .map(
-                    |(s, r, state, cap, total, msg, sdep, rdep, confirmed)| {
-                        super::ChannelEdgeRow {
-                            sender: s as u32,
-                            recipient: r as u32,
-                            state,
-                            max_capacity: cap as u32,
-                            max_total_size: total as u32,
-                            max_message_size: msg as u32,
-                            sender_deposit: sdep,
-                            recipient_deposit: rdep,
-                            confirmed,
-                        }
-                    },
-                )
+                .map(|(s, r, state, cap, total, msg, sdep, rdep, confirmed)| {
+                    super::ChannelEdgeRow {
+                        sender: s as u32,
+                        recipient: r as u32,
+                        state,
+                        max_capacity: cap as u32,
+                        max_total_size: total as u32,
+                        max_message_size: msg as u32,
+                        sender_deposit: sdep,
+                        recipient_deposit: rdep,
+                        confirmed,
+                    }
+                })
                 .collect())
         }
 
@@ -3956,34 +4034,54 @@ pub mod pg {
             height: u64,
         ) -> Result<Option<CanonicalBlock>, IndexError> {
             let err = |e: sqlx::Error| IndexError::from(e);
-            let head: Option<(String, String, Option<DateTime<Utc>>, bool, i64, i32, String)> =
-                sqlx::query_as(
-                    "select hash, parent_hash, timestamp, finalized, \
+            let head: Option<(
+                String,
+                String,
+                Option<DateTime<Utc>>,
+                bool,
+                i64,
+                i32,
+                String,
+            )> = sqlx::query_as(
+                "select hash, parent_hash, timestamp, finalized, \
                             runtime_version, decoder_version, raw_location \
                      from core.blocks where chain_id = $1 and height = $2",
-                )
-                .bind(chain_id)
-                .bind(height as i64)
-                .fetch_optional(&self.pool)
-                .await
-                .map_err(err)?;
-            let Some((hash, parent_hash, timestamp, finalized, runtime_version, decoder_version, raw_location)) =
-                head
+            )
+            .bind(chain_id)
+            .bind(height as i64)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(err)?;
+            let Some((
+                hash,
+                parent_hash,
+                timestamp,
+                finalized,
+                runtime_version,
+                decoder_version,
+                raw_location,
+            )) = head
             else {
                 return Ok(None);
             };
 
-            let txs: Vec<(i32, Option<String>, Option<String>, String, serde_json::Value, bool)> =
-                sqlx::query_as(
-                    "select tx_index, hash, signer, call_name, args, success \
+            let txs: Vec<(
+                i32,
+                Option<String>,
+                Option<String>,
+                String,
+                serde_json::Value,
+                bool,
+            )> = sqlx::query_as(
+                "select tx_index, hash, signer, call_name, args, success \
                      from core.transactions where chain_id = $1 and block_height = $2 \
                      order by tx_index",
-                )
-                .bind(chain_id)
-                .bind(height as i64)
-                .fetch_all(&self.pool)
-                .await
-                .map_err(err)?;
+            )
+            .bind(chain_id)
+            .bind(height as i64)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(err)?;
 
             let events: Vec<(i32, Option<i32>, String, serde_json::Value)> = sqlx::query_as(
                 "select event_index, tx_index, name, data \
@@ -4010,14 +4108,16 @@ pub mod pg {
                 },
                 transactions: txs
                     .into_iter()
-                    .map(|(index, hash, signer, call, args, success)| CanonicalTransaction {
-                        index: index as u32,
-                        hash,
-                        signer,
-                        call,
-                        args,
-                        success,
-                    })
+                    .map(
+                        |(index, hash, signer, call, args, success)| CanonicalTransaction {
+                            index: index as u32,
+                            hash,
+                            signer,
+                            call,
+                            args,
+                            success,
+                        },
+                    )
                     .collect(),
                 events: events
                     .into_iter()
@@ -4187,9 +4287,15 @@ pub mod pg {
             from: Option<DateTime<Utc>>,
             to: Option<DateTime<Utc>>,
         ) -> Result<Vec<super::BalanceChangeRow>, IndexError> {
-            let rows: Vec<(i64, Option<DateTime<Utc>>, i32, String, String, Option<Vec<u8>>)> =
-                sqlx::query_as(
-                    "select c.block_height, b.timestamp, c.event_index, c.delta::text, \
+            let rows: Vec<(
+                i64,
+                Option<DateTime<Utc>>,
+                i32,
+                String,
+                String,
+                Option<Vec<u8>>,
+            )> = sqlx::query_as(
+                "select c.block_height, b.timestamp, c.event_index, c.delta::text, \
                             c.reason, c.counterparty \
                      from balances.balance_changes c \
                      left join core.blocks b \
@@ -4198,15 +4304,15 @@ pub mod pg {
                        and ($4::timestamptz is null or b.timestamp >= $4) \
                        and ($5::timestamptz is null or b.timestamp < $5) \
                      order by c.block_height, c.event_index",
-                )
-                .bind(chain_id)
-                .bind(account_id)
-                .bind(asset)
-                .bind(from)
-                .bind(to)
-                .fetch_all(&self.pool)
-                .await
-                .map_err(IndexError::from)?;
+            )
+            .bind(chain_id)
+            .bind(account_id)
+            .bind(asset)
+            .bind(from)
+            .bind(to)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(IndexError::from)?;
             Ok(rows
                 .into_iter()
                 .map(|(height, timestamp, event_index, delta, reason, cp)| {
@@ -4254,19 +4360,21 @@ pub mod pg {
             .map_err(IndexError::from)?;
             Ok(rows
                 .into_iter()
-                .map(|(height, free, reserved, total, frozen, spec, source, note, status)| {
-                    super::BalanceAnchorRow {
-                        height: height as u64,
-                        free,
-                        reserved,
-                        total,
-                        frozen,
-                        spec_version: spec.map(|s| s as u64),
-                        source,
-                        note,
-                        status,
-                    }
-                })
+                .map(
+                    |(height, free, reserved, total, frozen, spec, source, note, status)| {
+                        super::BalanceAnchorRow {
+                            height: height as u64,
+                            free,
+                            reserved,
+                            total,
+                            frozen,
+                            spec_version: spec.map(|s| s as u64),
+                            source,
+                            note,
+                            status,
+                        }
+                    },
+                )
                 .collect())
         }
 
@@ -5570,7 +5678,16 @@ pub mod pg {
             Ok(rows
                 .into_iter()
                 .map(
-                    |(kind, label, derivation, source, ss58, verified_at, verified_block, verified_note)| {
+                    |(
+                        kind,
+                        label,
+                        derivation,
+                        source,
+                        ss58,
+                        verified_at,
+                        verified_block,
+                        verified_note,
+                    )| {
                         canonical::AccountLabel {
                             kind,
                             label,
@@ -5643,7 +5760,17 @@ pub mod pg {
 
     #[allow(clippy::type_complexity)]
     fn referendum_from_row(
-        (class, referendum_id, track_id, status, status_height, proposal, proposal_hash, proposal_len, submitted_at): (
+        (
+            class,
+            referendum_id,
+            track_id,
+            status,
+            status_height,
+            proposal,
+            proposal_hash,
+            proposal_len,
+            submitted_at,
+        ): (
             String,
             i64,
             Option<i32>,
@@ -5715,13 +5842,15 @@ pub mod pg {
                 .map_err(IndexError::from)?;
             Ok(rows
                 .into_iter()
-                .map(|(height, timestamp, event_index, kind, data)| super::ReferendumEventRow {
-                    height: height as u64,
-                    timestamp,
-                    event_index: event_index as u32,
-                    kind,
-                    data,
-                })
+                .map(
+                    |(height, timestamp, event_index, kind, data)| super::ReferendumEventRow {
+                        height: height as u64,
+                        timestamp,
+                        event_index: event_index as u32,
+                        kind,
+                        data,
+                    },
+                )
                 .collect())
         }
 
@@ -5756,13 +5885,15 @@ pub mod pg {
             .map_err(IndexError::from)?;
             Ok(rows
                 .into_iter()
-                .map(|(pallet, track_id, name, params, spec_version)| super::GovTrackRow {
-                    pallet,
-                    track_id: track_id as u32,
-                    name,
-                    params,
-                    spec_version: spec_version as u64,
-                })
+                .map(
+                    |(pallet, track_id, name, params, spec_version)| super::GovTrackRow {
+                        pallet,
+                        track_id: track_id as u32,
+                        name,
+                        params,
+                        spec_version: spec_version as u64,
+                    },
+                )
                 .collect())
         }
 
@@ -5802,19 +5933,26 @@ pub mod pg {
             chain_id: &str,
             call_hash: &str,
         ) -> Result<Vec<super::WhitelistEventRow>, IndexError> {
-            let rows: Vec<(i64, i32, String, Option<bool>, Option<serde_json::Value>, serde_json::Value, i64)> =
-                sqlx::query_as(
-                    "select block_height, event_index, kind, dispatch_ok, dispatch_error, \
+            let rows: Vec<(
+                i64,
+                i32,
+                String,
+                Option<bool>,
+                Option<serde_json::Value>,
+                serde_json::Value,
+                i64,
+            )> = sqlx::query_as(
+                "select block_height, event_index, kind, dispatch_ok, dispatch_error, \
                             data, runtime_version \
                      from gov.whitelist_events \
                      where chain_id = $1 and call_hash = $2 \
                      order by block_height, event_index",
-                )
-                .bind(chain_id)
-                .bind(call_hash)
-                .fetch_all(&self.pool)
-                .await
-                .map_err(IndexError::from)?;
+            )
+            .bind(chain_id)
+            .bind(call_hash)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(IndexError::from)?;
             Ok(rows
                 .into_iter()
                 .map(|(h, i, kind, ok, err, data, rv)| super::WhitelistEventRow {
@@ -5894,7 +6032,17 @@ pub mod pg {
             .await
             .map_err(IndexError::from)?;
             Ok(row.map(
-                |(proposal_hash, len, decode_status, source, call_summary, decoded_call, note, spec, height)| {
+                |(
+                    proposal_hash,
+                    len,
+                    decode_status,
+                    source,
+                    call_summary,
+                    decoded_call,
+                    note,
+                    spec,
+                    height,
+                )| {
                     super::PreimageRow {
                         proposal_hash,
                         len: len as u64,
@@ -5970,16 +6118,16 @@ pub mod pg {
             .map_err(IndexError::from)?;
             Ok(rows
                 .into_iter()
-                .map(|(class, track_id, delegator, target, active, height)| {
-                    super::DelegationRow {
+                .map(
+                    |(class, track_id, delegator, target, active, height)| super::DelegationRow {
                         class,
                         track_id: track_id as u32,
                         delegator: format!("0x{}", super::hex_lower(&delegator)),
                         target: target.map(|t| format!("0x{}", super::hex_lower(&t))),
                         active,
                         height: height as u64,
-                    }
-                })
+                    },
+                )
                 .collect())
         }
 
@@ -6034,8 +6182,7 @@ pub mod pg {
                         track_id: track_id as u32,
                         height: height as u64,
                         mode,
-                        delegating_target: target
-                            .map(|t| format!("0x{}", super::hex_lower(&t))),
+                        delegating_target: target.map(|t| format!("0x{}", super::hex_lower(&t))),
                         delegating_balance: balance,
                         delegating_conviction_label: conviction_label,
                         delegations_votes: votes,
@@ -6472,15 +6619,13 @@ pub mod pg {
             Ok(rows
                 .into_iter()
                 .map(
-                    |(height, timestamp, event_index, kind, amount, data)| {
-                        super::BountyEventRow {
-                            height: height as u64,
-                            timestamp,
-                            event_index: event_index as u32,
-                            kind,
-                            amount,
-                            data,
-                        }
+                    |(height, timestamp, event_index, kind, amount, data)| super::BountyEventRow {
+                        height: height as u64,
+                        timestamp,
+                        event_index: event_index as u32,
+                        kind,
+                        amount,
+                        data,
                     },
                 )
                 .collect())
@@ -6573,18 +6718,36 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/chains", get(list_chains))
         .route("/v1/blocks/{chain}/{height}", get(get_block))
         .route("/v1/accounts/{chain}/{account}/labels", get(get_labels))
-        .route("/v1/balances/{network}/{account}/history", get(get_balance_history))
+        .route(
+            "/v1/balances/{network}/{account}/history",
+            get(get_balance_history),
+        )
         .route("/v1/gov/{network}/referenda", get(list_gov_referenda))
         .route("/v1/gov/{network}/referenda/{id}", get(get_gov_referendum))
-        .route("/v1/gov/{network}/referenda/{id}/votes", get(get_gov_referendum_votes))
-        .route("/v1/gov/{network}/accounts/{account}/votes", get(get_gov_account_votes))
+        .route(
+            "/v1/gov/{network}/referenda/{id}/votes",
+            get(get_gov_referendum_votes),
+        )
+        .route(
+            "/v1/gov/{network}/accounts/{account}/votes",
+            get(get_gov_account_votes),
+        )
         .route("/v1/gov/{network}/tracks", get(get_gov_tracks))
         .route("/v1/gov/{network}/whitelist", get(list_gov_whitelist))
-        .route("/v1/gov/{network}/whitelist/{hash}", get(get_gov_whitelisted_call))
+        .route(
+            "/v1/gov/{network}/whitelist/{hash}",
+            get(get_gov_whitelisted_call),
+        )
         .route("/v1/treasury/{network}/spends", get(list_treasury_spends))
-        .route("/v1/treasury/{network}/spends/{id}", get(get_treasury_spend))
+        .route(
+            "/v1/treasury/{network}/spends/{id}",
+            get(get_treasury_spend),
+        )
         .route("/v1/treasury/{network}/pot", get(get_treasury_pot))
-        .route("/v1/treasury/{network}/holdings", get(get_treasury_holdings))
+        .route(
+            "/v1/treasury/{network}/holdings",
+            get(get_treasury_holdings),
+        )
         .route(
             "/v1/treasury/{network}/consolidated",
             get(get_treasury_consolidated),
@@ -6594,7 +6757,10 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/bounties/{network}/{id}", get(get_bounty))
         .route("/v1/assets/{chain}", get(list_assets))
         .route("/v1/sim/{chain}/calls/{call_hash}", get(get_simulations))
-        .route("/v1/sim/{chain}/xcm/{program_hash}", get(get_xcm_simulations))
+        .route(
+            "/v1/sim/{chain}/xcm/{program_hash}",
+            get(get_xcm_simulations),
+        )
         .route("/v1/xcm/{chain}/messages", get(list_xcm_messages))
         .route("/v1/xcm/messages/{message_id}", get(get_xcm_message))
         .route("/v1/xcm/journeys/{message_id}", get(get_xcm_journey))
@@ -6673,7 +6839,12 @@ async fn get_labels(
     }
     let account_id = match (state.parse_account)(&account) {
         Ok(bytes) => bytes,
-        Err(e) => return error(StatusCode::BAD_REQUEST, format!("bad account '{account}': {e}")),
+        Err(e) => {
+            return error(
+                StatusCode::BAD_REQUEST,
+                format!("bad account '{account}': {e}"),
+            )
+        }
     };
     match state.labels.labels_for(&chain, &account_id).await {
         Ok(labels) => Json(serde_json::json!({
@@ -6713,7 +6884,12 @@ async fn get_balance_history(
     let asset = q.asset.unwrap_or_else(|| "native".to_string());
     let account_id = match (state.parse_account)(&account) {
         Ok(bytes) => bytes,
-        Err(e) => return error(StatusCode::BAD_REQUEST, format!("bad account '{account}': {e}")),
+        Err(e) => {
+            return error(
+                StatusCode::BAD_REQUEST,
+                format!("bad account '{account}': {e}"),
+            )
+        }
     };
     let mut windows: Vec<&registry::ResidencyEntry> = state
         .registry
@@ -7255,9 +7431,7 @@ async fn get_gov_referendum(
     // second line ("the call is dispatched directly") is false of this tier on
     // either route. Each row already carries its own in `tier_coverage`; this
     // says so rather than letting the response-level list read as complete.
-    let has_fork = simulations
-        .iter()
-        .any(|s| s["tier"] == sim::TIER_FORK);
+    let has_fork = simulations.iter().any(|s| s["tier"] == sim::TIER_FORK);
     let tiers_carry_their_own = has_fork.then_some(
         "at least one row below is a `fork` row, whose limits are different IN KIND from the \
          dry-run tier's — not a subset. `not_covered` here describes the dry-run tier only; \
@@ -7404,7 +7578,10 @@ async fn get_coretime_occupancy(
         );
     };
     if from > to {
-        return error(StatusCode::BAD_REQUEST, "`from` must not exceed `to`".to_string());
+        return error(
+            StatusCode::BAD_REQUEST,
+            "`from` must not exceed `to`".to_string(),
+        );
     }
     // `to - from` is already non-negative, but `?to=18446744073709551615` makes
     // `+ 1` overflow: a debug build panics inside a public GET and a release
@@ -7698,7 +7875,11 @@ fn hrmp_chain<'a>(
         n => Err(format!(
             "{n} chains on network '{network}' declare the `hrmp` module ({}), so the channel \
              graph is ambiguous. This reader refuses to pick one. Fix the registry seeds",
-            found.iter().map(|c| c.id.as_str()).collect::<Vec<_>>().join(", ")
+            found
+                .iter()
+                .map(|c| c.id.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
         )),
     }
 }
@@ -7812,7 +7993,10 @@ async fn get_xcm_channels(
     // readings. Sessions after the last reading are not in it and never can be,
     // and a sentence pointing at it for them would point at an empty list.
     if let Some(last) = all.last() {
-        if reading.as_ref().is_some_and(|r| r.block_height == last.block_height) {
+        if reading
+            .as_ref()
+            .is_some_and(|r| r.block_height == last.block_height)
+        {
             reads_as.push_str(&format!(
                 " This is the NEWEST reading on record (session {}); every session after it is \
                  unread, and `coverage.unread` does not list those — it covers only the gaps \
@@ -7957,7 +8141,10 @@ async fn get_coretime_delta(
         );
     };
     if from > to {
-        return error(StatusCode::BAD_REQUEST, "`from` must not exceed `to`".to_string());
+        return error(
+            StatusCode::BAD_REQUEST,
+            "`from` must not exceed `to`".to_string(),
+        );
     }
     let span = (to - from).saturating_add(1);
     if span > CORETIME_MAX_SPAN {
@@ -7976,7 +8163,11 @@ async fn get_coretime_delta(
         Ok(o) => o,
         Err(e) => return ise(e),
     };
-    let coverage = match state.coretime.window_coverage(&occ_chain.id, from, to).await {
+    let coverage = match state
+        .coretime
+        .window_coverage(&occ_chain.id, from, to)
+        .await
+    {
         Ok(c) => c,
         Err(e) => return ise(e),
     };
@@ -7990,7 +8181,11 @@ async fn get_coretime_delta(
     // window this slice's own drill uses, an at-or-before-only probe returns
     // NOTHING: `/occupancy` would report 100 declared cores and `/delta` would
     // report null, over the same blocks, in the same minute.
-    let at_or_before = match state.coretime.core_config_at_or_before(&occ_chain.id, to).await {
+    let at_or_before = match state
+        .coretime
+        .core_config_at_or_before(&occ_chain.id, to)
+        .await
+    {
         Ok(c) => c,
         Err(e) => return ise(e),
     };
@@ -8020,7 +8215,11 @@ async fn get_coretime_delta(
         Err(e) => return ise(e),
     };
 
-    let occupancy_lineage = match state.coretime.occupancy_lineage(&occ_chain.id, from, to).await {
+    let occupancy_lineage = match state
+        .coretime
+        .occupancy_lineage(&occ_chain.id, from, to)
+        .await
+    {
         Ok(l) => l,
         Err(e) => return ise(e),
     };
@@ -8042,7 +8241,9 @@ async fn get_coretime_delta(
     let mut ent_lineage: std::collections::BTreeMap<(u64, u32), u64> =
         std::collections::BTreeMap::new();
     for r in &entitlement {
-        *ent_lineage.entry((r.runtime_version, r.mapper_version)).or_default() += 1;
+        *ent_lineage
+            .entry((r.runtime_version, r.mapper_version))
+            .or_default() += 1;
     }
 
     Json(serde_json::json!({
@@ -8315,26 +8516,34 @@ async fn get_xcm_message(
         sides.contains(&"received"),
         rows.is_empty(),
     ) {
-        (_, _, true) => "no chain we index has seen this id — which is not the same as the \
+        (_, _, true) => {
+            "no chain we index has seen this id — which is not the same as the \
                          message not existing, since a journey through an unindexed chain \
-                         leaves no row here",
+                         leaves no row here"
+        }
         (true, true, _) if one_chain => {
             "both halves are on record ON ONE CHAIN, which is what a HOP looks like: this \
              chain processed the id and then sent it on under the same id, because the topic \
              propagates across a hop. One message passing through, not a round trip — see \
              coverage.not_covered"
         }
-        (true, true, _) => "both halves are on record: one chain reported sending this id and \
+        (true, true, _) => {
+            "both halves are on record: one chain reported sending this id and \
                             another reported processing it. That is strong evidence of one \
-                            message and is still not an assertion — see coverage.not_covered",
-        (true, false, _) => "only the SENDING half is on record. That can mean the message is \
+                            message and is still not an assertion — see coverage.not_covered"
+        }
+        (true, false, _) => {
+            "only the SENDING half is on record. That can mean the message is \
                              still in flight, that the receiving chain is not indexed here, or \
                              that it was dropped in transit — indistinguishable from this side \
                              UNLESS the row's counterparty names another consensus system, in \
-                             which case the journey endpoint says so outright",
-        (false, true, _) => "only the RECEIVING half is on record. The sending chain is either \
+                             which case the journey endpoint says so outright"
+        }
+        (false, true, _) => {
+            "only the RECEIVING half is on record. The sending chain is either \
                              not indexed here or does not emit a sender event for forwarded \
-                             messages",
+                             messages"
+        }
         _ => "observations recorded, but neither a send nor a receive among them",
     };
     Json(serde_json::json!({
@@ -8425,9 +8634,20 @@ async fn get_xcm_journey(
     // first), where they read as "we could not place this" rather than as the
     // start of the journey.
     rows.sort_by(|a, b| {
-        (a.timestamp.is_none(), a.timestamp, &a.chain_id, a.block_height, a.event_index).cmp(
-            &(b.timestamp.is_none(), b.timestamp, &b.chain_id, b.block_height, b.event_index),
+        (
+            a.timestamp.is_none(),
+            a.timestamp,
+            &a.chain_id,
+            a.block_height,
+            a.event_index,
         )
+            .cmp(&(
+                b.timestamp.is_none(),
+                b.timestamp,
+                &b.chain_id,
+                b.block_height,
+                b.event_index,
+            ))
     });
 
     let sends: Vec<&XcmMessageRow> = rows.iter().filter(|r| r.side == "sent").collect();
@@ -8450,10 +8670,9 @@ async fn get_xcm_journey(
     let remote_destinations: Vec<String> = {
         let mut seen: Vec<String> = Vec::new();
         for r in &rows {
-            let (Some(cp), Some(chain)) = (
-                r.counterparty.as_deref(),
-                state.registry.chain(&r.chain_id),
-            ) else {
+            let (Some(cp), Some(chain)) =
+                (r.counterparty.as_deref(), state.registry.chain(&r.chain_id))
+            else {
                 continue;
             };
             if is_foreign_consensus(cp, &chain.network) && !seen.contains(&cp.to_string()) {
@@ -8616,7 +8835,8 @@ async fn get_xcm_journey(
                 (_, _, Some(er), Some(gr)) if er != gr => "contradicted",
                 _ => "unknown",
             };
-            if verdict == "contradicted" || (verdict == "corroborated" && mirror_status != "contradicted")
+            if verdict == "contradicted"
+                || (verdict == "corroborated" && mirror_status != "contradicted")
             {
                 mirror_status = verdict;
             }
@@ -8686,20 +8906,22 @@ async fn get_xcm_journey(
             _ => None,
         })
         .flatten()
-        .map(|ok| if ok {
-            serde_json::json!({
-                "delivered": true, "receiver_success": true,
-                "note": "the receiving chain's message queue treated this as handled and \
-                         discarded it. pallet-message-queue's own doc says that is ALL it \
-                         means — it is not a claim that the XCM achieved its intent",
-            })
-        } else {
-            serde_json::json!({
-                "delivered": true, "receiver_success": false,
-                "note": "the message ARRIVED and its execution did not complete \
-                         (Outcome::Incomplete). Delivery and intent are different facts and \
-                         this journey separates them",
-            })
+        .map(|ok| {
+            if ok {
+                serde_json::json!({
+                    "delivered": true, "receiver_success": true,
+                    "note": "the receiving chain's message queue treated this as handled and \
+                             discarded it. pallet-message-queue's own doc says that is ALL it \
+                             means — it is not a claim that the XCM achieved its intent",
+                })
+            } else {
+                serde_json::json!({
+                    "delivered": true, "receiver_success": false,
+                    "note": "the message ARRIVED and its execution did not complete \
+                             (Outcome::Incomplete). Delivery and intent are different facts and \
+                             this journey separates them",
+                })
+            }
         });
 
     Json(serde_json::json!({
@@ -8952,10 +9174,7 @@ async fn get_simulations(
     Query(q): Query<SimQuery>,
 ) -> Response {
     if state.registry.chain(&chain).is_none() {
-        return error(
-            StatusCode::NOT_FOUND,
-            format!("unknown chain '{chain}'"),
-        );
+        return error(StatusCode::NOT_FOUND, format!("unknown chain '{chain}'"));
     }
     let hash = normalize_call_hash(&call_hash);
     // Clamped at 1, not 0: `?limit=0` would return an empty list under a
@@ -9013,9 +9232,7 @@ async fn get_simulations(
                             .await
                         {
                             Ok(b) => b,
-                            Err(e) => {
-                                return read_failure(e)
-                            }
+                            Err(e) => return read_failure(e),
                         }
                     }
                 };
@@ -9198,7 +9415,8 @@ async fn list_gov_referenda(
             ),
         );
     }
-    let mut by_id: std::collections::BTreeMap<u64, ReferendumRow> = std::collections::BTreeMap::new();
+    let mut by_id: std::collections::BTreeMap<u64, ReferendumRow> =
+        std::collections::BTreeMap::new();
     for w in &windows {
         let rows = match state.gov.list_referenda(&w.chain, &class, limit).await {
             Ok(r) => r,
@@ -9271,12 +9489,15 @@ async fn get_gov_referendum_votes(
     }
 
     // windows are time-ordered, so a later insert overwrites an earlier one
-    let mut merged: std::collections::BTreeMap<String, VoteRow> =
-        std::collections::BTreeMap::new();
+    let mut merged: std::collections::BTreeMap<String, VoteRow> = std::collections::BTreeMap::new();
     let mut segments = Vec::with_capacity(windows.len());
     let mut truncated = false;
     for w in &windows {
-        let votes = match state.gov.referendum_votes(&w.chain, &class, id, limit).await {
+        let votes = match state
+            .gov
+            .referendum_votes(&w.chain, &class, id, limit)
+            .await
+        {
             Ok(v) => v,
             Err(e) => return read_failure(e),
         };
@@ -9327,7 +9548,12 @@ async fn get_gov_account_votes(
     let class = q.class;
     let account_id = match (state.parse_account)(&account) {
         Ok(bytes) => bytes,
-        Err(e) => return error(StatusCode::BAD_REQUEST, format!("bad account '{account}': {e}")),
+        Err(e) => {
+            return error(
+                StatusCode::BAD_REQUEST,
+                format!("bad account '{account}': {e}"),
+            )
+        }
     };
     // no class given → walk every registered instance's chains, because an
     // account's Fellowship votes live on a different chain from its token
@@ -9540,7 +9766,13 @@ async fn list_treasury_spends(
     for w in &windows {
         let rows = match state
             .treasury
-            .spends(&w.chain, &instance, q.status.as_deref(), q.kind.as_deref(), limit)
+            .spends(
+                &w.chain,
+                &instance,
+                q.status.as_deref(),
+                q.kind.as_deref(),
+                limit,
+            )
             .await
         {
             Ok(r) => r,
@@ -9617,7 +9849,11 @@ async fn get_treasury_spend(
             Ok(None) => {}
             Err(e) => return read_failure(e),
         }
-        let events = match state.treasury.spend_events(&w.chain, &instance, &kind, id).await {
+        let events = match state
+            .treasury
+            .spend_events(&w.chain, &instance, &kind, id)
+            .await
+        {
             Ok(e) => e,
             Err(e) => return read_failure(e),
         };
@@ -9712,7 +9948,10 @@ async fn resolve_asset_ref(
     // the value is null — a normalization that half-failed must read as "names
     // no asset", not as a search for the literal string "null" (slice 6's
     // twice-repeated defect, said out loud here).
-    let Some(asset_loc) = asset_ref.pointer("/location/asset").filter(|v| !v.is_null()) else {
+    let Some(asset_loc) = asset_ref
+        .pointer("/location/asset")
+        .filter(|v| !v.is_null())
+    else {
         return unresolved("asset_location names no asset");
     };
     // An EMPTY interior names the holding chain's own currency. The mapper
@@ -9978,7 +10217,10 @@ async fn list_bounties(
             // the sentinel is fine as a MAP KEY (it sorts parents before their
             // children, which is the order a page wants); it just never
             // reaches the response
-            let key = (r.bounty_id, r.child_id.map_or(PARENT_SENTINEL, |c| c as i64));
+            let key = (
+                r.bounty_id,
+                r.child_id.map_or(PARENT_SENTINEL, |c| c as i64),
+            );
             let merged_row = match merged.remove(&key) {
                 None => r,
                 Some(prev) => merge_bounty(prev, r),
@@ -10035,7 +10277,11 @@ async fn get_bounty(
     let mut bounty: Option<BountyRow> = None;
     let mut segments = Vec::with_capacity(windows.len());
     for w in &windows {
-        match state.bounties.bounty(&w.chain, &instance, id, q.child).await {
+        match state
+            .bounties
+            .bounty(&w.chain, &instance, id, q.child)
+            .await
+        {
             // merge, never replace: only some events carry a curator, a value
             // or a beneficiary, and they may sit in the earlier window
             Ok(Some(b)) => {
@@ -10222,7 +10468,10 @@ async fn get_treasury_holdings(
         for (account, roles) in &on_chain {
             let mut positions = Vec::new();
             let mut zero_assets = 0usize;
-            for h in holdings.iter().filter(|h| h.account_id == account.account_id) {
+            for h in holdings
+                .iter()
+                .filter(|h| h.account_id == account.account_id)
+            {
                 let amount = h.amount();
                 // a zero position is not news; an UNKNOWN one is
                 if amount.as_deref() == Some("0") {
@@ -11014,7 +11263,9 @@ pub(crate) mod tests {
     /// producer writes, using the shared constant on both sides rather than two
     /// hand-written strings that could drift apart.
     fn timeout_error() -> IndexError {
-        IndexError(format!("{TIMEOUT_REFUSAL}: the window asked for is too expensive"))
+        IndexError(format!(
+            "{TIMEOUT_REFUSAL}: the window asked for is too expensive"
+        ))
     }
 
     #[test]
@@ -11074,9 +11325,11 @@ pub(crate) mod tests {
         let fixture = FsPath::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../fixtures/synthetic/polkadot-asset-hub-19000001.json");
         let bytes = std::fs::read(&fixture).expect("fixture");
-        let block =
-            adapter_substrate::decode_block(&bytes, "raw/polkadot-asset-hub/0001900/19000001/block.json")
-                .expect("decode");
+        let block = adapter_substrate::decode_block(
+            &bytes,
+            "raw/polkadot-asset-hub/0001900/19000001/block.json",
+        )
+        .expect("decode");
         blocks.insert(block).await.expect("insert");
 
         // one derived label so the labels surface is testable end to end
@@ -11521,7 +11774,11 @@ pub(crate) mod tests {
         }
         coretime.insert_config(
             "polkadot",
-            CoreConfigRow { block_height: 109, num_cores: 10, runtime_version: 2_003_002 },
+            CoreConfigRow {
+                block_height: 109,
+                num_cores: 10,
+                runtime_version: 2_003_002,
+            },
         );
         let coretime: Arc<dyn CoretimeIndex> = coretime;
 
@@ -11672,7 +11929,14 @@ pub(crate) mod tests {
             transport: "hrmp".into(),
             message_id: Some(format!("0x{}", "ee".repeat(32))),
             id_kind: id_kind.into(),
-            counterparty: Some(if side == "sent" { "para:2034" } else { "para:1000" }.into()),
+            counterparty: Some(
+                if side == "sent" {
+                    "para:2034"
+                } else {
+                    "para:1000"
+                }
+                .into(),
+            ),
             origin_location: None,
             destination: None,
             message: None,
@@ -11687,9 +11951,13 @@ pub(crate) mod tests {
             // are not comparable, so this is the only thing that orders a
             // journey — and the only thing that can CONTRADICT one.
             timestamp: Some(
-                if side == "sent" { "2026-08-17T09:00:00Z" } else { "2026-08-17T09:00:24Z" }
-                    .parse()
-                    .unwrap(),
+                if side == "sent" {
+                    "2026-08-17T09:00:00Z"
+                } else {
+                    "2026-08-17T09:00:24Z"
+                }
+                .parse()
+                .unwrap(),
             ),
         };
         xcm.insert(xcm_row("polkadot-asset-hub", 19_000_900, "sent", "topic"));
@@ -11829,7 +12097,9 @@ pub(crate) mod tests {
                 track_id: Some(34),
                 status: "deciding".into(),
                 status_height: 28_400_000,
-                proposal: Some(serde_json::json!({"Lookup": {"hash": [vec![171u8; 32]], "len": 142}})),
+                proposal: Some(
+                    serde_json::json!({"Lookup": {"hash": [vec![171u8; 32]], "len": 142}}),
+                ),
                 proposal_hash: Some(format!("0x{}", "ab".repeat(32))),
                 proposal_len: Some(142),
                 submitted_at_height: Some(28_399_000),
@@ -11958,7 +12228,9 @@ pub(crate) mod tests {
                 call_hash: wl_hash.clone(),
                 status: "dispatched".into(),
                 dispatch_ok: Some(false),
-                dispatch_error: Some(serde_json::json!({"Module": {"index": 31, "error": "0x02000000"}})),
+                dispatch_error: Some(
+                    serde_json::json!({"Module": {"index": 31, "error": "0x02000000"}}),
+                ),
                 dispatch_height: Some(19_000_200),
                 first_seen_height: 19_000_100,
                 whitelisted_height: Some(19_000_100),
@@ -11988,7 +12260,9 @@ pub(crate) mod tests {
                 event_index: 7,
                 kind: "dispatched".into(),
                 dispatch_ok: Some(false),
-                dispatch_error: Some(serde_json::json!({"Module": {"index": 31, "error": "0x02000000"}})),
+                dispatch_error: Some(
+                    serde_json::json!({"Module": {"index": 31, "error": "0x02000000"}}),
+                ),
                 data: serde_json::json!({}),
                 runtime_version: 2_003_002,
             },
@@ -12050,25 +12324,39 @@ pub(crate) mod tests {
         let voter_a = adapter_substrate::accounts::para_sovereign(1000);
         let voter_b = adapter_substrate::accounts::para_sovereign(2034);
         let delegator = adapter_substrate::accounts::para_sovereign(2004);
-        let vote_row = |voter: &[u8; 32], active: bool, aye: &str, nay: &str, height: u64| VoteRow {
-            class: "referenda".into(),
-            referendum_id: 1500,
-            voter: format!("0x{}", hex_lower(voter)),
-            active,
-            vote_type: "standard".into(),
-            aye_balance: (aye != "0").then(|| "1000".to_string()),
-            nay_balance: (nay != "0").then(|| "1000".to_string()),
-            abstain_balance: None,
-            conviction: Some(if aye != "0" { 3 } else { 0 }),
-            conviction_label: Some(if aye != "0" { "locked3x" } else { "none" }.into()),
-            aye_votes: aye.into(),
-            nay_votes: nay.into(),
-            support: if aye != "0" { "1000".into() } else { "0".into() },
-            height,
-        };
-        gov.insert_vote("polkadot", vote_row(&voter_a, true, "3000", "0", 28_400_100));
-        gov.insert_vote("polkadot-asset-hub", vote_row(&voter_b, true, "0", "100", 10_290_000));
-        gov.insert_vote("polkadot-asset-hub", vote_row(&voter_a, false, "3000", "0", 10_295_000));
+        let vote_row =
+            |voter: &[u8; 32], active: bool, aye: &str, nay: &str, height: u64| VoteRow {
+                class: "referenda".into(),
+                referendum_id: 1500,
+                voter: format!("0x{}", hex_lower(voter)),
+                active,
+                vote_type: "standard".into(),
+                aye_balance: (aye != "0").then(|| "1000".to_string()),
+                nay_balance: (nay != "0").then(|| "1000".to_string()),
+                abstain_balance: None,
+                conviction: Some(if aye != "0" { 3 } else { 0 }),
+                conviction_label: Some(if aye != "0" { "locked3x" } else { "none" }.into()),
+                aye_votes: aye.into(),
+                nay_votes: nay.into(),
+                support: if aye != "0" {
+                    "1000".into()
+                } else {
+                    "0".into()
+                },
+                height,
+            };
+        gov.insert_vote(
+            "polkadot",
+            vote_row(&voter_a, true, "3000", "0", 28_400_100),
+        );
+        gov.insert_vote(
+            "polkadot-asset-hub",
+            vote_row(&voter_b, true, "0", "100", 10_290_000),
+        );
+        gov.insert_vote(
+            "polkadot-asset-hub",
+            vote_row(&voter_a, false, "3000", "0", 10_295_000),
+        );
         gov.insert_delegation(
             "polkadot-asset-hub",
             DelegationRow {
@@ -12284,11 +12572,9 @@ pub(crate) mod tests {
             &adapter_substrate::assets::local_asset_location(50, 1984),
         )
         .expect("usdt absolutizes");
-        let relay_dot_absolute = adapter_substrate::orml::absolutize(
-            &ah_path,
-            &registry::NativeToken::Relay.location(),
-        )
-        .expect("AH's native token is the relay's DOT");
+        let relay_dot_absolute =
+            adapter_substrate::orml::absolutize(&ah_path, &registry::NativeToken::Relay.location())
+                .expect("AH's native token is the relay's DOT");
         assets.insert(
             "polkadot-asset-hub",
             AssetRow {
@@ -12374,9 +12660,11 @@ pub(crate) mod tests {
         );
         // HDX — Hydration's OWN token, so it absolutizes to Hydration itself and
         // must NOT land in the same group as anybody's DOT
-        let hdx_absolute =
-            adapter_substrate::orml::absolutize(&hydra_path, &registry::NativeToken::Own.location())
-                .expect("hdx absolutizes");
+        let hdx_absolute = adapter_substrate::orml::absolutize(
+            &hydra_path,
+            &registry::NativeToken::Own.location(),
+        )
+        .expect("hdx absolutizes");
         assets.insert(
             "hydration",
             AssetRow {
@@ -12772,7 +13060,9 @@ pub(crate) mod tests {
             .await
             .unwrap();
         let status = res.status();
-        let body = axum::body::to_bytes(res.into_body(), 1_000_000).await.unwrap();
+        let body = axum::body::to_bytes(res.into_body(), 1_000_000)
+            .await
+            .unwrap();
         let json = if body.is_empty() {
             serde_json::Value::Null
         } else {
@@ -12808,11 +13098,17 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn domain_resolution_is_migration_aware_over_http() {
         let app = router(test_state().await);
-        let (_, before) =
-            get_json(&app, "/v1/domains/polkadot/governance?at=2025-06-01T00:00:00Z").await;
+        let (_, before) = get_json(
+            &app,
+            "/v1/domains/polkadot/governance?at=2025-06-01T00:00:00Z",
+        )
+        .await;
         assert_eq!(before["chain"], "polkadot");
-        let (_, after) =
-            get_json(&app, "/v1/domains/polkadot/governance?at=2026-01-27T12:00:00Z").await;
+        let (_, after) = get_json(
+            &app,
+            "/v1/domains/polkadot/governance?at=2026-01-27T12:00:00Z",
+        )
+        .await;
         assert_eq!(after["chain"], "polkadot-asset-hub");
     }
 
@@ -12831,19 +13127,22 @@ pub(crate) mod tests {
 
         // same account by 0x-hex resolves identically
         let hex_addr = json["account_id"].as_str().unwrap().to_string();
-        let (s2, j2) =
-            get_json(&app, &format!("/v1/accounts/polkadot-asset-hub/{hex_addr}/labels")).await;
+        let (s2, j2) = get_json(
+            &app,
+            &format!("/v1/accounts/polkadot-asset-hub/{hex_addr}/labels"),
+        )
+        .await;
         assert_eq!(s2, StatusCode::OK);
         assert_eq!(j2["labels"], json["labels"]);
 
         // corrupted address → 400, unknown-but-valid account → empty labels
-        let (s3, _) = get_json(&app, "/v1/accounts/polkadot-asset-hub/13UVJyLnbVpXXX/labels").await;
-        assert_eq!(s3, StatusCode::BAD_REQUEST);
-        let (s4, j4) = get_json(
+        let (s3, _) = get_json(
             &app,
-            &format!("/v1/accounts/polkadot/{hex_addr}/labels"),
+            "/v1/accounts/polkadot-asset-hub/13UVJyLnbVpXXX/labels",
         )
         .await;
+        assert_eq!(s3, StatusCode::BAD_REQUEST);
+        let (s4, j4) = get_json(&app, &format!("/v1/accounts/polkadot/{hex_addr}/labels")).await;
         assert_eq!(s4, StatusCode::OK);
         assert_eq!(j4["labels"].as_array().unwrap().len(), 0);
     }
@@ -12964,8 +13263,12 @@ pub(crate) mod tests {
         let gaps = json["simulation_coverage"]["not_covered"]
             .as_array()
             .expect("not_covered list");
-        assert!(gaps.iter().any(|g| g.as_str().unwrap().contains("NOT the state at enactment")));
-        assert!(gaps.iter().any(|g| g.as_str().unwrap().contains("proposal_origin")));
+        assert!(gaps
+            .iter()
+            .any(|g| g.as_str().unwrap().contains("NOT the state at enactment")));
+        assert!(gaps
+            .iter()
+            .any(|g| g.as_str().unwrap().contains("proposal_origin")));
 
         // EVERY ROW ON THIS PAGE IS ENRICHED THE SAME WAY IT IS ON /v1/sim/…,
         // through the same function. Until slice 10 this page serialized rows
@@ -12992,7 +13295,9 @@ pub(crate) mod tests {
         // something unchecked. Ref 1400 has no hash on either chain.
         let (_, j1400) = get_json(&app, "/v1/gov/polkadot/referenda/1400").await;
         assert!(j1400["simulations"].as_array().unwrap().is_empty());
-        let why = j1400["simulation_coverage"]["recorded_only"].as_str().unwrap();
+        let why = j1400["simulation_coverage"]["recorded_only"]
+            .as_str()
+            .unwrap();
         assert!(why.contains("no proposal hash indexed yet"), "{why}");
         assert!(
             !why.contains("no preview of any tier has been run"),
@@ -13014,12 +13319,19 @@ pub(crate) mod tests {
         let id = format!("0x{}", "ee".repeat(32));
 
         // Both halves, on two chains, found by id alone — no chain named.
-        let (status, json) = get_json(&app, &format!("/v1/xcm/messages/{}", id.to_uppercase())).await;
+        let (status, json) =
+            get_json(&app, &format!("/v1/xcm/messages/{}", id.to_uppercase())).await;
         assert_eq!(status, StatusCode::OK);
-        assert_eq!(json["message_id"], id, "0X… normalises like every other hash");
+        assert_eq!(
+            json["message_id"], id,
+            "0X… normalises like every other hash"
+        );
         let obs = json["observations"].as_array().unwrap();
         assert_eq!(obs.len(), 2);
-        assert_eq!(obs[0]["chain_id"], "hydration", "chain-ordered, C collation");
+        assert_eq!(
+            obs[0]["chain_id"], "hydration",
+            "chain-ordered, C collation"
+        );
         assert_eq!(obs[0]["side"], "received");
         assert_eq!(obs[1]["chain_id"], "polkadot-asset-hub");
         assert_eq!(obs[1]["side"], "sent");
@@ -13035,14 +13347,20 @@ pub(crate) mod tests {
         // An id nobody saw is not "the message does not exist".
         let (_, none) = get_json(&app, &format!("/v1/xcm/messages/0x{}", "99".repeat(32))).await;
         assert!(none["observations"].as_array().unwrap().is_empty());
-        assert!(none["reads_as"].as_str().unwrap().contains("unindexed chain"));
+        assert!(none["reads_as"]
+            .as_str()
+            .unwrap()
+            .contains("unindexed chain"));
 
         // Per-chain listing: newest first, and an unknown chain 404s.
         let (_, ah) = get_json(&app, "/v1/xcm/polkadot-asset-hub/messages").await;
         let rows = ah["messages"].as_array().unwrap();
         assert_eq!(rows.len(), 8);
         assert_eq!(rows[0]["block_height"], 19_000_900);
-        assert_eq!(rows[0]["event_index"], 3, "newest block first, then event order");
+        assert_eq!(
+            rows[0]["event_index"], 3,
+            "newest block first, then event order"
+        );
         assert_eq!(rows[2]["block_height"], 19_000_100);
         assert!(ah["coverage"]["not_covered"]
             .as_array()
@@ -13062,24 +13380,31 @@ pub(crate) mod tests {
         let topic = format!("0x{}", "ee".repeat(32));
         let wire = format!("0x{}", "77".repeat(32));
 
-        let (status, j) = get_json(&app, &format!("/v1/xcm/journeys/{}", topic.to_uppercase()))
-            .await;
+        let (status, j) =
+            get_json(&app, &format!("/v1/xcm/journeys/{}", topic.to_uppercase())).await;
         assert_eq!(status, StatusCode::OK);
-        assert_eq!(j["message_id"], topic, "0X… normalises like every other hash");
+        assert_eq!(
+            j["message_id"], topic,
+            "0X… normalises like every other hash"
+        );
         assert_eq!(j["shape"], "send_and_receive");
         assert_eq!(j["chains"], 2, "no request named a chain");
 
         // Ordered by BLOCK TIMESTAMP, which is the only clock two chains share.
         let steps = j["steps"].as_array().unwrap();
         assert_eq!(steps.len(), 3, "both sending ids plus the receiving half");
-        assert_eq!((steps[0]["chain"].as_str(), steps[0]["event_index"].as_u64()),
-                   (Some("polkadot-asset-hub"), Some(3)));
+        assert_eq!(
+            (steps[0]["chain"].as_str(), steps[0]["event_index"].as_u64()),
+            (Some("polkadot-asset-hub"), Some(3))
+        );
         assert_eq!(steps[0]["id_kind"], "wire_hash");
         assert_eq!(steps[1]["id_kind"], "topic");
         assert_eq!(steps[2]["chain"], "hydration");
         assert_eq!(steps[2]["id_kind"], "ambiguous");
         // Invariant 3: every step carries the lineage of the row it came from.
-        assert!(steps.iter().all(|s| s["lineage"]["runtime_version"] == 2_003_002));
+        assert!(steps
+            .iter()
+            .all(|s| s["lineage"]["runtime_version"] == 2_003_002));
 
         // THE STITCH IS AUDITABLE. The wire row reached this journey through a
         // recorded link, and the link's rule, confidence and evidence ship with
@@ -13105,7 +13430,10 @@ pub(crate) mod tests {
         // Delivery and intent are different facts, and the payload keeps them so.
         assert_eq!(j["outcome"]["delivered"], true);
         assert_eq!(j["outcome"]["receiver_success"], true);
-        assert!(j["outcome"]["note"].as_str().unwrap().contains("not a claim"));
+        assert!(j["outcome"]["note"]
+            .as_str()
+            .unwrap()
+            .contains("not a claim"));
 
         // THE DEAD END SLICE 2 MEASURED, now closed: asking by the WIRE hash
         // returns the same journey, because the alias expansion runs first.
@@ -13132,13 +13460,20 @@ pub(crate) mod tests {
         let (_, unseen) = get_json(&app, &format!("/v1/xcm/journeys/0x{}", "99".repeat(32))).await;
         assert_eq!(unseen["shape"], "unseen");
         assert!(unseen["steps"].as_array().unwrap().is_empty());
-        assert!(unseen["reads_as"].as_str().unwrap().contains("chain we do not map"));
+        assert!(unseen["reads_as"]
+            .as_str()
+            .unwrap()
+            .contains("chain we do not map"));
 
         // The honest limits ship in the payload, including the rule we did NOT
         // write and why its window may be empty.
         let gaps = j["coverage"]["not_covered"].as_array().unwrap();
-        assert!(gaps.iter().any(|g| g.as_str().unwrap().contains("NO hop rule")));
-        assert!(gaps.iter().any(|g| g.as_str().unwrap().contains("hash of CONTENT")));
+        assert!(gaps
+            .iter()
+            .any(|g| g.as_str().unwrap().contains("NO hop rule")));
+        assert!(gaps
+            .iter()
+            .any(|g| g.as_str().unwrap().contains("hash of CONTENT")));
         // AND IT NEVER SENDS THE READER TO THE ENDPOINT THEY ARE ALREADY ON. The
         // observations endpoint's own first line says "nothing on THIS endpoint
         // asserts it — /v1/xcm/journeys/{id} is the endpoint that does", which is
@@ -13147,9 +13482,10 @@ pub(crate) mod tests {
         // stale line reached the review one endpoint over. Assert the property, not
         // the wording, so a future edit to either list cannot reintroduce it.
         assert!(
-            !gaps
-                .iter()
-                .any(|g| g.as_str().unwrap().contains("/v1/xcm/journeys/{id} is the endpoint")),
+            !gaps.iter().any(|g| g
+                .as_str()
+                .unwrap()
+                .contains("/v1/xcm/journeys/{id} is the endpoint")),
             "the journey endpoint's not_covered must not defer to the journey endpoint"
         );
         // A purely local journey must NOT claim it left the ecosystem.
@@ -13176,7 +13512,11 @@ pub(crate) mod tests {
         assert_eq!(aliases[0]["confidence"], "medium");
         assert_eq!(aliases[0]["transport"], "hrmp");
         assert_eq!(aliases[0]["correlator_version"], 2);
-        assert_eq!(j["steps"].as_array().unwrap().len(), 2, "two ids, one message");
+        assert_eq!(
+            j["steps"].as_array().unwrap().len(),
+            2,
+            "two ids, one message"
+        );
 
         // THE POINT: `send_only` here is a BOUNDARY, and the payload separates
         // it from the three-way "in flight / unindexed / dropped" it would
@@ -13194,7 +13534,10 @@ pub(crate) mod tests {
         // No receiving half, so nothing to mirror — and crucially a foreign
         // counterparty produces no CONTRADICTION anywhere.
         assert_eq!(j["checks"]["counterparty_mirror"]["status"], "unknown");
-        assert!(j["checks"]["counterparty_mirror"]["pairs"].as_array().unwrap().is_empty());
+        assert!(j["checks"]["counterparty_mirror"]["pairs"]
+            .as_array()
+            .unwrap()
+            .is_empty());
         assert!(j["coverage"]["not_covered"]
             .as_array()
             .unwrap()
@@ -13217,7 +13560,10 @@ pub(crate) mod tests {
 
         let (status, j) = get_json(&app, &format!("/v1/xcm/journeys/{wire}")).await;
         assert_eq!(status, StatusCode::OK);
-        assert_eq!(j["shape"], "send_and_receive", "the topic crossed the hop, so this stitches");
+        assert_eq!(
+            j["shape"], "send_and_receive",
+            "the topic crossed the hop, so this stitches"
+        );
         assert_eq!(j["steps"].as_array().unwrap().len(), 3);
         assert_eq!(j["leaves_consensus"], true);
         assert_eq!(j["remote_destinations"][0], "remote:ethereum:1");
@@ -13249,7 +13595,10 @@ pub(crate) mod tests {
         let two = format!("0x{}", "ee".repeat(32));
         let (_, m2) = get_json(&app, &format!("/v1/xcm/messages/{two}")).await;
         let across = m2["reads_as"].as_str().unwrap();
-        assert!(across.contains("one chain reported sending this id and another"), "{across}");
+        assert!(
+            across.contains("one chain reported sending this id and another"),
+            "{across}"
+        );
     }
 
     #[tokio::test]
@@ -13264,7 +13613,10 @@ pub(crate) mod tests {
         assert_eq!(status, StatusCode::OK);
         assert_eq!(json["call_hash"], format!("0x{}", "ab".repeat(32)));
         assert_eq!(json["simulations"].as_array().unwrap().len(), 1);
-        assert_eq!(json["simulations"][0]["origin_spec"], "Origins:MediumSpender");
+        assert_eq!(
+            json["simulations"][0]["origin_spec"],
+            "Origins:MediumSpender"
+        );
         assert_eq!(json["simulations"][0]["event_count"], 1);
 
         // The same call on the chain it was NOT simulated on is empty — a
@@ -13286,7 +13638,11 @@ pub(crate) mod tests {
             &format!("/v1/sim/nowhere/calls/0x{}", "ab".repeat(32)),
         )
         .await;
-        assert_eq!(s, StatusCode::NOT_FOUND, "an unknown chain is refused, not empty");
+        assert_eq!(
+            s,
+            StatusCode::NOT_FOUND,
+            "an unknown chain is refused, not empty"
+        );
     }
 
     /// Pull the two fork rows out of the response by their ROUTE rather than by
@@ -13498,7 +13854,13 @@ pub(crate) mod tests {
 
         // THE RAW LIST IS UNCHANGED and still says two messages — nothing is
         // hidden, the difference is reported BESIDE it.
-        assert_eq!(sim["forwarded_xcms"][0]["messages"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            sim["forwarded_xcms"][0]["messages"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
 
         let a = &sim["forwarded_attribution"];
         assert_eq!(a["total_messages"], 2);
@@ -13528,8 +13890,14 @@ pub(crate) mod tests {
             "Hydration is told the sender is para 1000 — the MIRROR of the destination \
              Asset Hub addressed, not the destination itself"
         );
-        assert_eq!(legs[0]["source_message_index"], 1, "it is the ATTRIBUTED message");
-        assert_eq!(legs[0]["xcm_error"]["error"], serde_json::json!({"Barrier": []}));
+        assert_eq!(
+            legs[0]["source_message_index"], 1,
+            "it is the ATTRIBUTED message"
+        );
+        assert_eq!(
+            legs[0]["xcm_error"]["error"],
+            serde_json::json!({"Barrier": []})
+        );
 
         // THE COVERAGE LISTS ARE PINNED BY PROPERTY, not by wording, because
         // this project has twice shipped a shared not_covered helper whose first
@@ -13576,10 +13944,16 @@ pub(crate) mod tests {
         .await;
         let a = &older["simulations"][0]["forwarded_attribution"];
         assert_eq!(a["baseline"], serde_json::Value::Null);
-        assert!(a["attributed_messages"].is_null(), "nothing is counted without a baseline");
+        assert!(
+            a["attributed_messages"].is_null(),
+            "nothing is counted without a baseline"
+        );
         assert!(a["reads_as"].as_str().unwrap().contains("messages present"));
         assert!(
-            older["simulations"][0]["legs"].as_array().unwrap().is_empty(),
+            older["simulations"][0]["legs"]
+                .as_array()
+                .unwrap()
+                .is_empty(),
             "nobody followed it"
         );
     }
@@ -13614,7 +13988,10 @@ pub(crate) mod tests {
         assert_eq!(a["ambient_messages"], 1);
         assert_eq!(a["total_messages"], 0);
         assert_eq!(a["attributed_messages"], 0);
-        assert!(a["reads_as"].as_str().unwrap().contains("nothing of its own"));
+        assert!(a["reads_as"]
+            .as_str()
+            .unwrap()
+            .contains("nothing of its own"));
 
         // The same program on a chain nobody previewed it on is empty, not
         // borrowed from another runtime's answer.
@@ -13665,7 +14042,10 @@ pub(crate) mod tests {
         // exact, because whitelist_call requests the preimage of what it
         // whitelists, so a whitelisted hash IS a preimage hash
         assert_eq!(json["authorized_call"]["call_summary"], "system.set_code");
-        assert_eq!(json["authorized_call"]["decoded_call"]["call"], "system.set_code");
+        assert_eq!(
+            json["authorized_call"]["decoded_call"]["call"],
+            "system.set_code"
+        );
 
         // full history, oldest first, on the chain governance currently lives on
         let seg = json["segments"]
@@ -13683,7 +14063,9 @@ pub(crate) mod tests {
         // and the gaps are stated in the payload, not in a doc
         let nc = json["coverage"]["not_covered"].as_array().unwrap();
         assert_eq!(nc.len(), 4);
-        assert!(nc.iter().any(|s| s.as_str().unwrap().contains("XCM Transact")));
+        assert!(nc
+            .iter()
+            .any(|s| s.as_str().unwrap().contains("XCM Transact")));
     }
 
     /// A hash that was whitelisted and never dispatched is TERMINAL, not
@@ -13695,7 +14077,11 @@ pub(crate) mod tests {
         let app = router(test_state().await);
         let hash = format!("0x{}", "5d".repeat(32));
         // upper-case and bare forms must resolve identically to the stored form
-        for form in [hash.clone(), hash.to_uppercase(), hash.trim_start_matches("0x").to_string()] {
+        for form in [
+            hash.clone(),
+            hash.to_uppercase(),
+            hash.trim_start_matches("0x").to_string(),
+        ] {
             let (status, json) =
                 get_json(&app, &format!("/v1/gov/polkadot/whitelist/{form}")).await;
             assert_eq!(status, StatusCode::OK, "form {form} should resolve");
@@ -13779,7 +14165,10 @@ pub(crate) mod tests {
         // relay row must NOT survive as an active aye.
         let votes = json["votes"].as_array().unwrap();
         assert_eq!(votes.len(), 2, "two voters, not three rows");
-        let a_addr = format!("0x{}", hex_lower(&adapter_substrate::accounts::para_sovereign(1000)));
+        let a_addr = format!(
+            "0x{}",
+            hex_lower(&adapter_substrate::accounts::para_sovereign(1000))
+        );
         let a = votes
             .iter()
             .find(|v| v["voter"] == a_addr)
@@ -13793,7 +14182,10 @@ pub(crate) mod tests {
         assert_eq!(json["direct_tally"]["support"], "0");
         assert_eq!(json["direct_tally"]["truncated"], false);
         // coverage is stated, never implied
-        assert!(json["direct_tally"]["note"].as_str().unwrap().contains("delegated"));
+        assert!(json["direct_tally"]["note"]
+            .as_str()
+            .unwrap()
+            .contains("delegated"));
     }
 
     #[tokio::test]
@@ -13817,7 +14209,10 @@ pub(crate) mod tests {
         assert_eq!(ah["delegations"][0]["active"], true);
         // the ONLY place the delegated amount exists
         assert_eq!(ah["voting_anchors"][0]["delegating_balance"], "5000");
-        assert_eq!(ah["voting_anchors"][0]["delegating_conviction_label"], "locked6x");
+        assert_eq!(
+            ah["voting_anchors"][0]["delegating_conviction_label"],
+            "locked6x"
+        );
 
         let (bad, _) = get_json(&app, "/v1/gov/polkadot/accounts/13UVJyLnbVpXXX/votes").await;
         assert_eq!(bad, StatusCode::BAD_REQUEST);
@@ -13829,8 +14224,11 @@ pub(crate) mod tests {
         // lives on a chain that never moved to Asset Hub, and the only thing
         // that knows it is registry data (referenda_classes → domain → chain).
         let app = router(test_state().await);
-        let (status, json) =
-            get_json(&app, "/v1/gov/polkadot/referenda/300?class=fellowship_referenda").await;
+        let (status, json) = get_json(
+            &app,
+            "/v1/gov/polkadot/referenda/300?class=fellowship_referenda",
+        )
+        .await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(json["referendum"]["status"], "approved");
         assert_eq!(json["referendum"]["class"], "fellowship_referenda");
@@ -13840,8 +14238,11 @@ pub(crate) mod tests {
         assert_eq!(segments[0]["events"][0]["kind"], "approved");
 
         // ranked votes come back through the same class-scoped residency
-        let (vs, votes) =
-            get_json(&app, "/v1/gov/polkadot/referenda/300/votes?class=fellowship_referenda").await;
+        let (vs, votes) = get_json(
+            &app,
+            "/v1/gov/polkadot/referenda/300/votes?class=fellowship_referenda",
+        )
+        .await;
         assert_eq!(vs, StatusCode::OK);
         assert_eq!(votes["votes"][0]["vote_type"], "ranked");
         assert_eq!(votes["direct_tally"]["ayes"], "9");
@@ -13853,7 +14254,10 @@ pub(crate) mod tests {
     }
 
     fn payee_hex_expected() -> String {
-        format!("0x{}", hex_lower(&adapter_substrate::accounts::para_sovereign(2034)))
+        format!(
+            "0x{}",
+            hex_lower(&adapter_substrate::accounts::para_sovereign(2034))
+        )
     }
 
     #[tokio::test]
@@ -13916,11 +14320,18 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn sub_treasuries_resolve_to_their_own_chain() {
         let app = router(test_state().await);
-        let (status, json) =
-            get_json(&app, "/v1/treasury/polkadot/spends?instance=fellowship_treasury").await;
+        let (status, json) = get_json(
+            &app,
+            "/v1/treasury/polkadot/spends?instance=fellowship_treasury",
+        )
+        .await;
         assert_eq!(status, StatusCode::OK);
         let segments = json["segments"].as_array().unwrap();
-        assert_eq!(segments.len(), 1, "the sub-treasury has one residency window");
+        assert_eq!(
+            segments.len(),
+            1,
+            "the sub-treasury has one residency window"
+        );
         assert_eq!(segments[0]["chain"], "polkadot-collectives");
         assert_eq!(json["spends"][0]["spend_id"], 7);
         assert_eq!(json["spends"][0]["status"], "processed");
@@ -13936,8 +14347,7 @@ pub(crate) mod tests {
         assert!(!ids.contains(&7));
 
         // status filter reaches the index, not just the response
-        let (_, filtered) =
-            get_json(&app, "/v1/treasury/polkadot/spends?status=rejected").await;
+        let (_, filtered) = get_json(&app, "/v1/treasury/polkadot/spends?status=rejected").await;
         assert_eq!(filtered["spends"].as_array().unwrap().len(), 0);
     }
 
@@ -14013,7 +14423,10 @@ pub(crate) mod tests {
             .find(|p| p["asset"] == "native")
             .expect("the native position");
         assert_eq!(native["amount"], "700");
-        assert_eq!((native["symbol"].as_str(), native["decimals"].as_u64()), (Some("DOT"), Some(10)));
+        assert_eq!(
+            (native["symbol"].as_str(), native["decimals"].as_u64()),
+            (Some("DOT"), Some(10))
+        );
         assert_eq!(native["display"], "0.0000000700");
 
         // 3 anchored: AH's USDT and native, plus Hydration's USDT (slice 7's
@@ -14053,7 +14466,10 @@ pub(crate) mod tests {
         // working — "never swept" and "unanchorable in principle" are different
         // failures with different remedies, and only one of them has a remedy.
         assert_eq!(coverage["positions_without_an_anchor"], 3);
-        assert!(coverage["valuation"].as_str().unwrap().contains("quantities only"));
+        assert!(coverage["valuation"]
+            .as_str()
+            .unwrap()
+            .contains("quantities only"));
         let gaps = coverage["not_covered"].as_array().unwrap();
         assert!(gaps.iter().any(|g| g.as_str().unwrap().contains("bounty")));
 
@@ -14091,7 +14507,10 @@ pub(crate) mod tests {
             .filter(|s| !s["accounts"].as_array().unwrap().is_empty())
             .map(|s| s["chain"].as_str().unwrap())
             .collect();
-        assert!(listed.contains(&"hydration"), "the fixture must list Hydration accounts");
+        assert!(
+            listed.contains(&"hydration"),
+            "the fixture must list Hydration accounts"
+        );
         for gap in gaps.iter().map(|g| g.as_str().unwrap().to_lowercase()) {
             if !gap.contains("not registered") {
                 continue;
@@ -14130,7 +14549,10 @@ pub(crate) mod tests {
         let state = test_state().await;
         let ah_rows = state.assets.assets("polkadot-asset-hub").await.unwrap();
         let hy_rows = state.assets.assets("hydration").await.unwrap();
-        let ah_usdt = ah_rows.iter().find(|a| a.asset_key == "assets:1984").unwrap();
+        let ah_usdt = ah_rows
+            .iter()
+            .find(|a| a.asset_key == "assets:1984")
+            .unwrap();
         let hy_usdt = hy_rows.iter().find(|a| a.asset_key == "tokens:10").unwrap();
         assert_ne!(
             ah_usdt.location_key, hy_usdt.location_key,
@@ -14145,10 +14567,17 @@ pub(crate) mod tests {
         // the sum, and the units it is summed in
         assert_eq!(usdt["addable"], true);
         assert_eq!(usdt["decimals"], 6);
-        assert_eq!(usdt["total"], "25000000000", "20,000 on AH + 5,000 on Hydration");
+        assert_eq!(
+            usdt["total"], "25000000000",
+            "20,000 on AH + 5,000 on Hydration"
+        );
         assert_eq!(usdt["display"], "25000.000000");
-        let chains: Vec<&str> = usdt["chains"].as_array().unwrap()
-            .iter().map(|c| c.as_str().unwrap()).collect();
+        let chains: Vec<&str> = usdt["chains"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c.as_str().unwrap())
+            .collect();
         assert_eq!(chains, vec!["hydration", "polkadot-asset-hub"]);
         // cross-chain positions sort first — the ones this endpoint exists for
         assert_eq!(positions[0]["symbol"], "USDT");
@@ -14194,7 +14623,8 @@ pub(crate) mod tests {
         );
         assert!(
             dot["absolute_key"].as_str().unwrap().contains("Parachain") == false,
-            "the relay's DOT names no parachain: {}", dot["absolute_key"]
+            "the relay's DOT names no parachain: {}",
+            dot["absolute_key"]
         );
 
         // NOTHING IS SUMMED ACROSS ASSETS and the response says why. Assert the
@@ -14233,7 +14663,10 @@ pub(crate) mod tests {
             .find(|u| u["asset_key"] == "assets:1337")
             .expect("the unanchored position is listed, not dropped");
         assert!(unanchored["amount"].is_null());
-        assert!(unanchored["reason"].as_str().unwrap().contains("not in core.assets"));
+        assert!(unanchored["reason"]
+            .as_str()
+            .unwrap()
+            .contains("not in core.assets"));
         // BOTH unanchored positions are counted, but only ONE of them lands
         // here: the other has an absolute name, so it joins its group and
         // suppresses that group's total instead (see the test above). The two
@@ -14260,7 +14693,10 @@ pub(crate) mod tests {
             .iter()
             .find(|u| u["asset_key"] == "tokens:1001")
             .expect("the Erc20 position is LISTED, not dropped");
-        assert!(erc20["amount"].is_null(), "an Erc20 has no readable position");
+        assert!(
+            erc20["amount"].is_null(),
+            "an Erc20 has no readable position"
+        );
         assert_eq!(
             erc20["movement_only"], "123000000000",
             "the event-stream total is shown as movement, never as a position"
@@ -14268,16 +14704,20 @@ pub(crate) mod tests {
         assert!(erc20["reason"].as_str().unwrap().contains("pallet_evm"));
         // and the remedy that cannot work is not offered
         assert!(
-            !erc20["reason"].as_str().unwrap().contains("run treasury-holdings"),
+            !erc20["reason"]
+                .as_str()
+                .unwrap()
+                .contains("run treasury-holdings"),
             "advising a sweep that skips Erc20 by design is worse than no advice"
         );
         assert!(gaps
             .iter()
             .any(|g| g.as_str().unwrap().contains("HashedDescription")));
-        assert!(gaps
-            .iter()
-            .any(|g| g.as_str().unwrap().contains("DIFFERENT blocks")),
-            "a consolidated total is as-of its anchors, not as of one instant");
+        assert!(
+            gaps.iter()
+                .any(|g| g.as_str().unwrap().contains("DIFFERENT blocks")),
+            "a consolidated total is as-of its anchors, not as of one instant"
+        );
 
         // every registered chain declares `native_token`, so nothing is silently
         // under-reported for that reason — and the endpoint says so rather than
@@ -14311,8 +14751,10 @@ pub(crate) mod tests {
             .unwrap()
             .iter()
             .find(|p| p["symbol"] == "USDC")
-            .expect("USDC is a REGISTERED asset with an absolute name, so it \
-                     belongs in `positions` even though its balance is unknown");
+            .expect(
+                "USDC is a REGISTERED asset with an absolute name, so it \
+                     belongs in `positions` even though its balance is unknown",
+            );
 
         // the leg JOINED its group rather than being filed away elsewhere…
         assert_eq!(usdc["legs"].as_array().unwrap().len(), 1);
@@ -14385,7 +14827,10 @@ pub(crate) mod tests {
         // their DIFFERING is the finding and a reader should not have to take
         // the normalizer on trust
         assert_ne!(reps[0]["location_key"], reps[1]["location_key"]);
-        assert!(json["reads_as"].as_str().unwrap().contains("directly addable"));
+        assert!(json["reads_as"]
+            .as_str()
+            .unwrap()
+            .contains("directly addable"));
 
         // an unknown key is an honest empty answer, not a 404 — "we have not
         // indexed this" and "this does not exist" are different claims
@@ -14441,11 +14886,17 @@ pub(crate) mod tests {
 
         // the fellowship spend carries no asset_location (a v1-mapper row), and
         // the response says exactly that instead of quietly showing nothing
-        let (status, json) =
-            get_json(&app, "/v1/treasury/polkadot/spends/7?instance=fellowship_treasury").await;
+        let (status, json) = get_json(
+            &app,
+            "/v1/treasury/polkadot/spends/7?instance=fellowship_treasury",
+        )
+        .await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(json["asset"]["resolved"], false);
-        assert!(json["asset"]["reason"].as_str().unwrap().contains("treasury-range"));
+        assert!(json["asset"]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("treasury-range"));
     }
 
     /// The list surface for the outflow no treasury table can see — and the
@@ -14463,9 +14914,13 @@ pub(crate) mod tests {
         assert_eq!(list[0]["bounty_id"], 22);
         // status from the LATER window…
         assert_eq!(list[0]["status"], "active");
-        assert_eq!(list[0]["curator"], format!("0x{}", hex_lower(
-            &adapter_substrate::accounts::para_sovereign(1000)
-        )));
+        assert_eq!(
+            list[0]["curator"],
+            format!(
+                "0x{}",
+                hex_lower(&adapter_substrate::accounts::para_sovereign(1000))
+            )
+        );
         // …value from the EARLIER one, where the proposal was
         assert_eq!(list[0]["value"], "100000000000");
         // paid_out is a per-chain RUNNING TOTAL, so the windows ADD: choosing
@@ -14480,7 +14935,9 @@ pub(crate) mod tests {
         // serialized body at all
         assert!(list[0]["child_id"].is_null());
         assert!(
-            !serde_json::to_string(&json).unwrap().contains("\"child_id\":-1"),
+            !serde_json::to_string(&json)
+                .unwrap()
+                .contains("\"child_id\":-1"),
             "the -1 sentinel must not survive serialization"
         );
         assert_eq!(json["segments"].as_array().unwrap().len(), 2);
@@ -14514,7 +14971,10 @@ pub(crate) mod tests {
             row("unknown", 10_500_000, Some("100000000000")),
         );
         assert_eq!(merged.status, "active", "a placeholder is not a verdict");
-        assert_eq!(merged.status_height, 27_000_000, "the status keeps ITS height");
+        assert_eq!(
+            merged.status_height, 27_000_000,
+            "the status keeps ITS height"
+        );
         // …and the placeholder row's information still arrives
         assert_eq!(merged.value.as_deref(), Some("100000000000"));
     }
@@ -14522,8 +14982,11 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn a_child_bounty_is_addressed_by_child_and_is_not_its_parent() {
         let app = router(test_state().await);
-        let (status, json) =
-            get_json(&app, "/v1/bounties/polkadot/22?instance=child_bounties&child=3").await;
+        let (status, json) = get_json(
+            &app,
+            "/v1/bounties/polkadot/22?instance=child_bounties&child=3",
+        )
+        .await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(json["bounty"]["child_id"], 3);
         assert_eq!(json["child_id"], 3);
@@ -14533,7 +14996,10 @@ pub(crate) mod tests {
         // a native-token pallet says so as an ANSWER, not as a gap
         assert_eq!(json["asset"]["resolved"], true);
         assert_eq!(json["asset"]["asset"], "native");
-        assert!(json["asset"]["note"].as_str().unwrap().contains("native-token-only"));
+        assert!(json["asset"]["note"]
+            .as_str()
+            .unwrap()
+            .contains("native-token-only"));
 
         // the same id WITHOUT ?child= is the parent bounty, which this pallet
         // does not have — a child is not addressable as its parent
@@ -14563,8 +15029,11 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn a_multi_asset_bounty_payout_resolves_to_the_asset_it_was_paid_in() {
         let app = router(test_state().await);
-        let (status, json) =
-            get_json(&app, "/v1/bounties/polkadot/1?instance=multi_asset_bounties").await;
+        let (status, json) = get_json(
+            &app,
+            "/v1/bounties/polkadot/1?instance=multi_asset_bounties",
+        )
+        .await;
         assert_eq!(status, StatusCode::OK);
         assert!(json["bounty"]["child_id"].is_null(), "None IS the parent");
         let asset = &json["asset"];
@@ -14586,7 +15055,10 @@ pub(crate) mod tests {
     /// spelled twice. This is the only thing stopping the two copies drifting.
     #[test]
     fn the_parent_sentinel_agrees_with_the_adapter() {
-        assert_eq!(PARENT_SENTINEL, adapter_substrate::bounties::PARENT_SENTINEL);
+        assert_eq!(
+            PARENT_SENTINEL,
+            adapter_substrate::bounties::PARENT_SENTINEL
+        );
     }
 
     #[test]
@@ -14697,7 +15169,10 @@ pub(crate) mod tests {
         assert_eq!(d["denominators"]["relay_reading_position"], "inside_window");
         assert_eq!(d["denominators"]["broker_read_at_height"], 4_927_655);
         assert!(
-            d["denominators"]["reads_as"].as_str().unwrap().contains("ONE NUMBER"),
+            d["denominators"]["reads_as"]
+                .as_str()
+                .unwrap()
+                .contains("ONE NUMBER"),
             "both readings are present, so the cross-check DID happen"
         );
         assert_eq!(d["checks"]["denominators_agree"], "ok");
@@ -14774,11 +15249,16 @@ pub(crate) mod tests {
         assert!(d["waste"].is_null());
         let why = d["waste_withheld_because"].as_array().unwrap();
         assert!(
-            why.iter()
-                .any(|s| s.as_str().unwrap().contains("NO assignment at or before the anchor")),
+            why.iter().any(|s| s
+                .as_str()
+                .unwrap()
+                .contains("NO assignment at or before the anchor")),
             "{why:?}"
         );
-        assert!(d["reads_as"].as_str().unwrap().contains("NO WASTE FIGURE IS SERVED"));
+        assert!(d["reads_as"]
+            .as_str()
+            .unwrap()
+            .contains("NO WASTE FIGURE IS SERVED"));
 
         // The ATTRIBUTION is still served — it is a count over rows we hold, and
         // "0 of 17 attributed" is itself the coverage statement.
@@ -14807,14 +15287,16 @@ pub(crate) mod tests {
         let events = t["events"].as_array().unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0]["variant"], "AutoRenewalEnabled");
-        assert_eq!(events[0]["core_index"], 9, "the tenant is on a DIFFERENT core now");
+        assert_eq!(
+            events[0]["core_index"], 9,
+            "the tenant is on a DIFFERENT core now"
+        );
         // Its assignment is still keyed on the core it held.
         assert_eq!(t["assignments"].as_array().unwrap().len(), 1);
         assert_eq!(t["assignments"][0]["core_index"], 0);
         assert_eq!(t["assignments"][0]["parts"], 57_600);
 
-        let (status, c) =
-            get_json(&app, "/v1/coretime/polkadot-coretime/entitlement?core=0").await;
+        let (status, c) = get_json(&app, "/v1/coretime/polkadot-coretime/entitlement?core=0").await;
         assert_eq!(status, StatusCode::OK);
         let events = c["events"].as_array().unwrap();
         assert_eq!(events.len(), 1);
@@ -14856,14 +15338,25 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn core_occupancy_serves_two_ratios_and_never_collapses_them_into_one() {
         let app = router(test_state().await);
-        let (status, json) = get_json(&app, "/v1/coretime/polkadot/occupancy?from=100&to=109").await;
+        let (status, json) =
+            get_json(&app, "/v1/coretime/polkadot/occupancy?from=100&to=109").await;
         assert_eq!(status, StatusCode::OK);
 
         let occ = &json["occupancy"];
-        let touched = occ["cores_touched_ratio"].as_f64().expect("cores touched ratio");
-        let filled = occ["slots_filled_ratio"].as_f64().expect("slots filled ratio");
-        assert!((touched - 0.30).abs() < 1e-9, "3 of 10 declared cores produced: {touched}");
-        assert!((filled - 0.17).abs() < 1e-9, "17 of 100 core-block slots: {filled}");
+        let touched = occ["cores_touched_ratio"]
+            .as_f64()
+            .expect("cores touched ratio");
+        let filled = occ["slots_filled_ratio"]
+            .as_f64()
+            .expect("slots filled ratio");
+        assert!(
+            (touched - 0.30).abs() < 1e-9,
+            "3 of 10 declared cores produced: {touched}"
+        );
+        assert!(
+            (filled - 0.17).abs() < 1e-9,
+            "17 of 100 core-block slots: {filled}"
+        );
         assert!(
             touched > filled,
             "the gap between them IS the finding — even the cores that are used sit idle"
@@ -14915,7 +15408,10 @@ pub(crate) mod tests {
         // The memory index carries no per-row lineage, so the list is EMPTY —
         // an honest absence rather than a fabricated runtime version. The pg
         // round-trip is what proves a real one comes through.
-        assert_eq!(occ["lineage"].as_array().expect("a list, never null").len(), 0);
+        assert_eq!(
+            occ["lineage"].as_array().expect("a list, never null").len(),
+            0
+        );
 
         // The distribution, which is the shape no marketplace view shows: one
         // saturated core (10/10), one at 60%, one at 10%, seven producing
@@ -14933,8 +15429,11 @@ pub(crate) mod tests {
 
         // A registered PARACHAIN is a 404 with a reason rather than an empty
         // window that would read as "this chain's cores did nothing".
-        let (status, json) =
-            get_json(&app, "/v1/coretime/polkadot-asset-hub/occupancy?from=100&to=109").await;
+        let (status, json) = get_json(
+            &app,
+            "/v1/coretime/polkadot-asset-hub/occupancy?from=100&to=109",
+        )
+        .await;
         assert_eq!(status, StatusCode::NOT_FOUND);
         assert!(
             json["error"].as_str().unwrap().contains("RELAY pallet"),
@@ -14950,7 +15449,8 @@ pub(crate) mod tests {
         // A WINDOW WE HOLD NO BLOCKS FOR IS UNDEFINED, NOT ZERO — the arm a
         // two-way match would have sent to "no `num_cores` reading is on
         // record" while naming the reading three lines below it.
-        let (status, json) = get_json(&app, "/v1/coretime/polkadot/occupancy?from=900&to=910").await;
+        let (status, json) =
+            get_json(&app, "/v1/coretime/polkadot/occupancy?from=900&to=910").await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(json["window"]["blocks_indexed"], 0);
         assert!(
@@ -15017,7 +15517,10 @@ pub(crate) mod tests {
         let (status, body) = get_json(&app, "/v1/xcm/polkadot/channels").await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["chain"], "polkadot");
-        assert_eq!(body["reading"]["block_height"], 30000, "the NEWEST reading by default");
+        assert_eq!(
+            body["reading"]["block_height"], 30000,
+            "the NEWEST reading by default"
+        );
         assert_eq!(body["reading"]["session_index"], 20);
         assert_eq!(body["coverage"]["readings_on_record"], 4);
         assert_eq!(body["coverage"]["header_matches_detail"], true);
@@ -15039,7 +15542,10 @@ pub(crate) mod tests {
         let (_, early) = get_json(&app, "/v1/xcm/polkadot/channels?at=50").await;
         assert!(early["reading"].is_null());
         let reads_as = early["reads_as"].as_str().unwrap();
-        assert!(reads_as.contains("none of them is at or before"), "{reads_as}");
+        assert!(
+            reads_as.contains("none of them is at or before"),
+            "{reads_as}"
+        );
         assert!(
             !reads_as.contains("NO READING"),
             "a covered chain with an early `at` must not claim the index is empty: {reads_as}"
@@ -15055,8 +15561,11 @@ pub(crate) mod tests {
     async fn an_edge_history_is_directional_and_dates_only_what_the_readings_pin() {
         let app = router(test_state().await);
 
-        let (status, body) =
-            get_json(&app, "/v1/xcm/polkadot/channels/history?sender=1000&recipient=2034").await;
+        let (status, body) = get_json(
+            &app,
+            "/v1/xcm/polkadot/channels/history?sender=1000&recipient=2034",
+        )
+        .await;
         assert_eq!(status, StatusCode::OK);
         let h = &body["history"];
         // absent -> requested -> open -> absent
@@ -15070,20 +15579,32 @@ pub(crate) mod tests {
         // close spans eight sessions and is not.
         assert_eq!(h["transitions"][0]["exact"], true);
         assert_eq!(h["transitions"][1]["exact"], true);
-        assert_eq!(h["transitions"][2]["exact"], false, "sessions 12 -> 20 pins nothing");
+        assert_eq!(
+            h["transitions"][2]["exact"], false,
+            "sessions 12 -> 20 pins nothing"
+        );
         assert_eq!(h["transitions"][2]["candidate_boundaries"], 8);
         assert!(
-            h["reads_as"].as_str().unwrap().contains("opened AND CLOSED"),
+            h["reads_as"]
+                .as_str()
+                .unwrap()
+                .contains("opened AND CLOSED"),
             "a gap must warn that a whole channel lifetime can hide in it: {}",
             h["reads_as"]
         );
-        assert!(h["state_at_last_reading"].is_null(), "closed by the newest reading");
+        assert!(
+            h["state_at_last_reading"].is_null(),
+            "closed by the newest reading"
+        );
 
         // DIRECTIONALITY, and it is asserted as a PROPERTY rather than as
         // wording: the reverse edge is open throughout and has NO transitions, so
         // a reader that folded the pair would return this instead.
-        let (_, rev) =
-            get_json(&app, "/v1/xcm/polkadot/channels/history?sender=2034&recipient=1000").await;
+        let (_, rev) = get_json(
+            &app,
+            "/v1/xcm/polkadot/channels/history?sender=2034&recipient=1000",
+        )
+        .await;
         assert!(
             rev["history"]["transitions"].as_array().unwrap().is_empty(),
             "2034 -> 1000 never changed state; folding the pair would have shown 3 changes"
@@ -15092,8 +15613,11 @@ pub(crate) mod tests {
 
         // An edge nobody ever saw says so ABOUT THE CHAIN, because the readings
         // exist — this is the arm that must not read like an unindexed chain.
-        let (_, never) =
-            get_json(&app, "/v1/xcm/polkadot/channels/history?sender=1000&recipient=9999").await;
+        let (_, never) = get_json(
+            &app,
+            "/v1/xcm/polkadot/channels/history?sender=1000&recipient=9999",
+        )
+        .await;
         assert_eq!(never["history"]["readings"], 4);
         assert_eq!(never["history"]["readings_present"], 0);
         let reads_as = never["history"]["reads_as"].as_str().unwrap();
@@ -15123,7 +15647,10 @@ pub(crate) mod tests {
         let reads_as = body["reads_as"].as_str().unwrap();
         assert!(reads_as.contains("NO READING"), "{reads_as}");
         assert!(reads_as.contains("OUR INDEX"), "{reads_as}");
-        assert!(reads_as.contains("channels-range"), "and it says what to run: {reads_as}");
+        assert!(
+            reads_as.contains("channels-range"),
+            "and it says what to run: {reads_as}"
+        );
 
         // ARM 3: a reading exists and the graph was empty. A statement about the
         // CHAIN, and it must not borrow arm 1's wording.
@@ -15148,7 +15675,10 @@ pub(crate) mod tests {
         let reads_as = body["reads_as"].as_str().unwrap();
         assert!(reads_as.contains("graph was EMPTY"), "{reads_as}");
         assert!(reads_as.contains("not a gap"), "{reads_as}");
-        assert!(!reads_as.contains("NO READING"), "the two arms must not share wording");
+        assert!(
+            !reads_as.contains("NO READING"),
+            "the two arms must not share wording"
+        );
         assert_eq!(
             body["coverage"]["header_matches_detail"], true,
             "zero and zero agree"
@@ -15240,7 +15770,13 @@ pub(crate) mod tests {
             }
         }
         let app = router(test_state().await);
-        let banned = ["msg_count", "total_size", "mqc_head", "backlog", "queue_depth"];
+        let banned = [
+            "msg_count",
+            "total_size",
+            "mqc_head",
+            "backlog",
+            "queue_depth",
+        ];
         for uri in [
             "/v1/xcm/polkadot/channels",
             "/v1/xcm/polkadot/channels/history?sender=1000&recipient=2034",

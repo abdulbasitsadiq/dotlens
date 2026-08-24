@@ -53,8 +53,12 @@ impl TreasurySink for PgSpendSink {
         // follower cannot deadlock on DO UPDATE row locks
         let mut ordered: Vec<&(u32, SpendFact)> = rows.iter().collect();
         ordered.sort_by(|(ai, a), (bi, b)| {
-            (&a.instance, &a.spend_kind, a.spend_id, ai)
-                .cmp(&(&b.instance, &b.spend_kind, b.spend_id, bi))
+            (&a.instance, &a.spend_kind, a.spend_id, ai).cmp(&(
+                &b.instance,
+                &b.spend_kind,
+                b.spend_id,
+                bi,
+            ))
         });
 
         let mut tx = self.pool.begin().await.map_err(|e| e.to_string())?;

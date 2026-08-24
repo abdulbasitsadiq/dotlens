@@ -273,7 +273,11 @@ pub fn parse(raw: &str, registry: &Registry) -> Result<Query, ParseError> {
                 // eating the first word there turns a name search into a search
                 // for "Treasury", silently. So the remainder must either start
                 // with a codeword or be a single self-identifying token.
-                let first = tail.split_whitespace().next().unwrap_or("").to_ascii_lowercase();
+                let first = tail
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or("")
+                    .to_ascii_lowercase();
                 let looks_like_a_query = Codeword::parse(&first).is_some()
                     || Codeword::refused(&first).is_some()
                     || (tail.split_whitespace().count() == 1
@@ -434,7 +438,9 @@ pub fn infer_shape(s: &str) -> Shape {
     // NOT exclusive: the resolver probes symbols AND reports the name-index gap,
     // because `DOT` is a symbol and `Polkadot Treasury` is a name, and a
     // two-character difference should not decide which question we answer.
-    if t.len() <= 12 && !t.contains(char::is_whitespace) && t.chars().all(|c| c.is_ascii_alphanumeric())
+    if t.len() <= 12
+        && !t.contains(char::is_whitespace)
+        && t.chars().all(|c| c.is_ascii_alphanumeric())
     {
         return Shape::Symbol(t.to_string());
     }
@@ -600,8 +606,14 @@ async fn resolve_shape(
         Shape::Hash32(h) => {
             if let Ok(hits) = state.blocks.blocks_by_hash(h).await {
                 for (chain, height) in hits {
-                    push_block(state, &chain, height, "a block with this hash is indexed", out)
-                        .await;
+                    push_block(
+                        state,
+                        &chain,
+                        height,
+                        "a block with this hash is indexed",
+                        out,
+                    )
+                    .await;
                 }
             }
             if let Ok(hits) = state.blocks.extrinsics_by_hash(h).await {
@@ -684,7 +696,7 @@ async fn resolve_shape(
                     kind: "para",
                     chain: Some(c.id.clone()),
                     title: format!("{} (para {n})", c.name),
-                    href: format!("/v1/chains"),
+                    href: "/v1/chains".to_string(),
                     why: "a registered parachain has this para id",
                     id: serde_json::json!({ "para_id": n, "chain": c.id }),
                     lineage: None,
@@ -794,13 +806,18 @@ async fn resolve_codeword(
                         }
                     }
                 }
-                _ => gaps.push(format!("'block {arg}' — expected a height or a 0x block hash")),
+                _ => gaps.push(format!(
+                    "'block {arg}' — expected a height or a 0x block hash"
+                )),
             },
         },
         Codeword::Acc => push_account(state, q, arg, out, gaps).await,
         Codeword::Preimage | Codeword::Whitelist => match infer_shape(arg) {
             Shape::Hash32(h) => resolve_shape(&Shape::Hash32(h), q, state, out, gaps).await,
-            _ => gaps.push(format!("'{} {arg}' — expected a 32-byte 0x hash", word.as_str())),
+            _ => gaps.push(format!(
+                "'{} {arg}' — expected a 32-byte 0x hash",
+                word.as_str()
+            )),
         },
         Codeword::Asset => {
             push_symbol(state, arg, out).await;
@@ -820,11 +837,12 @@ async fn resolve_codeword(
             )),
         },
         Codeword::Para => {
-            if let Some(c) = state
-                .registry
-                .chain_by_alias(arg)
-                .or_else(|| state.registry.chains().find(|c| Some(arg) == c.para_id.map(|p| p.to_string()).as_deref()))
-            {
+            if let Some(c) = state.registry.chain_by_alias(arg).or_else(|| {
+                state
+                    .registry
+                    .chains()
+                    .find(|c| Some(arg) == c.para_id.map(|p| p.to_string()).as_deref())
+            }) {
                 out.push(Candidate {
                     kind: "para",
                     chain: Some(c.id.clone()),
@@ -1044,9 +1062,11 @@ async fn push_core(
     // `coretime_delta` withholds its entire waste figure for, and rendering it
     // as a confident single tenant would answer where the endpoint this
     // candidate points at refuses.
-    let assignments = state.broker.assignments_for_core(&ent_chain.id, core, 2).await;
-    let rows: &[crate::EntitlementRow] =
-        assignments.as_ref().map(|v| v.as_slice()).unwrap_or(&[]);
+    let assignments = state
+        .broker
+        .assignments_for_core(&ent_chain.id, core, 2)
+        .await;
+    let rows: &[crate::EntitlementRow] = assignments.as_ref().map(|v| v.as_slice()).unwrap_or(&[]);
     let events = if rows.is_empty() {
         state.broker.events_for_core(&ent_chain.id, core, 1).await
     } else {
@@ -1136,7 +1156,7 @@ async fn push_core(
     // AND would say "this candidate identifies an entitlement" beside a `why`
     // saying our index holds no assignment for it. Two sentences in one response
     // asserting opposite things about one row: slice 14's fixed defect, verbatim.
-    if rows.first().is_some() {
+    if !rows.is_empty() {
         gaps.push(format!(
             "A CORE INDEX IS A SLOT, NOT A TENANT. Measured at coretime block 4919882: para 3428 \
              renewed five cores and every index moved (35->43, 36->44, 37->45, 40->46, 41->47). \
@@ -1184,7 +1204,7 @@ async fn push_core(
         // neither `assigned to` nor `sold to`. A coverage line describing a
         // property the row beside it does not have, again — so the gate is the
         // same expression, not a similar one.
-        if rows.first().is_some() {
+        if !rows.is_empty() {
             gaps.push(format!(
                 "WHETHER THIS CORE IS RESERVED OR MARKET-SIDE IS NOT READ HERE. Cores below \
                  `SaleInfo.first_core` are reserved system cores set by governance and never \
@@ -1316,13 +1336,19 @@ async fn push_extrinsic(
     index: u32,
     out: &mut Vec<Candidate>,
 ) {
-    let lineage = state.blocks.get(chain, height).await.ok().flatten().map(|b| {
-        serde_json::json!({
-            "runtime_version": b.lineage.runtime_version,
-            "decoder_version": b.lineage.decoder_version,
-            "raw_location": b.lineage.raw_location,
-        })
-    });
+    let lineage = state
+        .blocks
+        .get(chain, height)
+        .await
+        .ok()
+        .flatten()
+        .map(|b| {
+            serde_json::json!({
+                "runtime_version": b.lineage.runtime_version,
+                "decoder_version": b.lineage.decoder_version,
+                "raw_location": b.lineage.raw_location,
+            })
+        });
     out.push(Candidate {
         kind: "extrinsic",
         chain: Some(chain.to_string()),
@@ -1396,7 +1422,11 @@ async fn push_referendum(
                  simply be incomplete. What did NOT happen is this quietly answering with the \
                  network's own referendum {id} instead",
                 network = q.network,
-                module = if declares { "declares" } else { "does not declare" },
+                module = if declares {
+                    "declares"
+                } else {
+                    "does not declare"
+                },
             ));
         }
     }
@@ -1433,7 +1463,9 @@ async fn push_account(
     // The adapter owns address parsing (Invariant 4) and is the only thing that
     // can verify a checksum — a shape test cannot.
     let Ok(bytes) = (state.parse_account)(addr) else {
-        gaps.push(format!("'{addr}' looks like an address but its checksum does not verify"));
+        gaps.push(format!(
+            "'{addr}' looks like an address but its checksum does not verify"
+        ));
         return;
     };
     let mut labels = Vec::new();
@@ -1506,7 +1538,10 @@ mod tests {
         assert_eq!(infer_shape("19,532,910"), Shape::Number(19_532_910));
         assert_eq!(
             infer_shape("19532910-4"),
-            Shape::ExtrinsicId { height: 19_532_910, index: 4 }
+            Shape::ExtrinsicId {
+                height: 19_532_910,
+                index: 4
+            }
         );
         let h = format!("0x{}", "ab".repeat(32));
         assert_eq!(infer_shape(&h.to_uppercase()), Shape::Hash32(h.clone()));
@@ -1530,7 +1565,10 @@ mod tests {
         // the roadmap's hardest cost rule: partial hashes are a range scan and
         // must not be a shape at all
         let short = format!("0x{}", "ab".repeat(8));
-        assert!(matches!(infer_shape(&short), Shape::Text(_) | Shape::Symbol(_)));
+        assert!(matches!(
+            infer_shape(&short),
+            Shape::Text(_) | Shape::Symbol(_)
+        ));
     }
 
     #[test]
@@ -1541,19 +1579,29 @@ mod tests {
         assert_eq!(q.chain, None);
         assert_eq!(
             q.term,
-            Term::Codeword { word: Codeword::Ref, arg: "1930".into() }
+            Term::Codeword {
+                word: Codeword::Ref,
+                arg: "1930".into()
+            }
         );
         assert_eq!(q.reads_as, "ref 1930 on polkadot");
 
         // `on <alias>` resolves through the REGISTRY, not a code list
-        for form in ["block 19532910 on ah", "block 19532910 @ah", "block 19532910 on assethub"] {
+        for form in [
+            "block 19532910 on ah",
+            "block 19532910 @ah",
+            "block 19532910 on assethub",
+        ] {
             let q = parse(form, &r).unwrap();
             assert_eq!(q.chain.as_deref(), Some("polkadot-asset-hub"), "{form}");
         }
         // synonyms
         assert!(matches!(
             parse("tx 19532910-4", &r).unwrap().term,
-            Term::Codeword { word: Codeword::Extrinsic, .. }
+            Term::Codeword {
+                word: Codeword::Extrinsic,
+                ..
+            }
         ));
     }
 
@@ -1591,10 +1639,16 @@ mod tests {
         // `core` is IN the grammar now — the debt this slice pays.
         assert_eq!(
             parse("core 47", &r).unwrap().term,
-            Term::Codeword { word: Codeword::Core, arg: "47".into() }
+            Term::Codeword {
+                word: Codeword::Core,
+                arg: "47".into()
+            }
         );
         assert!(Codeword::ALL.contains(&Codeword::Core));
-        assert!(Codeword::refused("core").is_none(), "core is answerable now");
+        assert!(
+            Codeword::refused("core").is_none(),
+            "core is answerable now"
+        );
 
         // `sale` is still refused, and NOT because a phase is pending. Asserted
         // as a property — no phase claim of any kind — so that a later slice
@@ -1642,8 +1696,15 @@ mod tests {
         // 1. `ref 1930` — and NO chain is named anywhere in the query
         let q = parse("ref 1500", &state.registry).unwrap();
         let r = resolve(&q, &state, "ref 1500").await;
-        let refs: Vec<&Candidate> = r.candidates.iter().filter(|c| c.kind == "referendum").collect();
-        assert!(!refs.is_empty(), "a referendum must resolve without a chain");
+        let refs: Vec<&Candidate> = r
+            .candidates
+            .iter()
+            .filter(|c| c.kind == "referendum")
+            .collect();
+        assert!(
+            !refs.is_empty(),
+            "a referendum must resolve without a chain"
+        );
         assert!(
             refs.iter().all(|c| c.chain.is_some()),
             "…and every candidate must say which chain it was FOUND on"
@@ -1662,7 +1723,11 @@ mod tests {
         let treasury = "13UVJyLnbVp9RBZYFwFGyDvVd1y27Tt8tkntv6Q7JVPhFsTB";
         let q = parse(treasury, &state.registry).unwrap();
         let r = resolve(&q, &state, treasury).await;
-        let acc = r.candidates.iter().find(|c| c.kind == "account").expect("account");
+        let acc = r
+            .candidates
+            .iter()
+            .find(|c| c.kind == "account")
+            .expect("account");
         assert!(
             acc.title.contains("Treasury"),
             "a labelled account must resolve labelled, not bare: {}",
@@ -1686,7 +1751,12 @@ mod tests {
 
         // …and the block-hash probe works on a hash that IS a block's, proving
         // the fourth arm rather than assuming it
-        let block = state.blocks.get("polkadot-asset-hub", 19_000_001).await.unwrap().unwrap();
+        let block = state
+            .blocks
+            .get("polkadot-asset-hub", 19_000_001)
+            .await
+            .unwrap()
+            .unwrap();
         let q = parse(&block.hash, &state.registry).unwrap();
         let r = resolve(&q, &state, &block.hash).await;
         let by_hash = r
@@ -1719,7 +1789,11 @@ mod tests {
         // forms reach one indexed row and must describe it identically.
         let q_h = parse("19000001", &state.registry).unwrap();
         let r_h = resolve(&q_h, &state, "19000001").await;
-        let by_height = r_h.candidates.iter().find(|c| c.kind == "block").expect("block by height");
+        let by_height = r_h
+            .candidates
+            .iter()
+            .find(|c| c.kind == "block")
+            .expect("block by height");
         assert_eq!(
             by_hash.lineage, by_height.lineage,
             "the same block reached by hash and by height must report one lineage"
@@ -1782,10 +1856,25 @@ mod tests {
         let wire = format!("0x{}", "77".repeat(32));
 
         let q = parse(&format!("xcm {wire}"), &state.registry).expect("no longer refused");
-        assert_eq!(q.term, Term::Codeword { word: Codeword::Xcm, arg: wire.clone() });
+        assert_eq!(
+            q.term,
+            Term::Codeword {
+                word: Codeword::Xcm,
+                arg: wire.clone()
+            }
+        );
         let r = resolve(&q, &state, &wire).await;
-        let xcm: Vec<&Candidate> = r.candidates.iter().filter(|c| c.kind == "xcm_message").collect();
-        assert_eq!(xcm.len(), 3, "both sending ids and the receiving half: {:?}", r.candidates);
+        let xcm: Vec<&Candidate> = r
+            .candidates
+            .iter()
+            .filter(|c| c.kind == "xcm_message")
+            .collect();
+        assert_eq!(
+            xcm.len(),
+            3,
+            "both sending ids and the receiving half: {:?}",
+            r.candidates
+        );
         let other_chain = xcm
             .iter()
             .find(|c| c.chain.as_deref() == Some("hydration"))
@@ -1795,7 +1884,9 @@ mod tests {
         // journey has no single lineage, which is why this is one candidate per
         // OBSERVATION rather than one per journey.
         assert!(xcm.iter().all(|c| c.lineage.is_some() && c.chain.is_some()));
-        assert!(xcm.iter().all(|c| c.href == format!("/v1/xcm/journeys/{wire}")));
+        assert!(xcm
+            .iter()
+            .all(|c| c.href == format!("/v1/xcm/journeys/{wire}")));
 
         // A bare paste is ONE probe and no expansion: it asks "what is this",
         // and the journey endpoint it points at does the expanding.
@@ -1829,7 +1920,13 @@ mod tests {
         let state = crate::tests::test_state().await;
 
         let q = parse("core 0", &state.registry).expect("no longer refused");
-        assert_eq!(q.term, Term::Codeword { word: Codeword::Core, arg: "0".into() });
+        assert_eq!(
+            q.term,
+            Term::Codeword {
+                word: Codeword::Core,
+                arg: "0".into()
+            }
+        );
         assert_eq!(q.reads_as, "core 0 on polkadot");
         let r = resolve(&q, &state, "core 0").await;
 
@@ -1847,10 +1944,17 @@ mod tests {
         // live Polkadot `first_core = 11`, so cores 0-10 are all of that kind and
         // "sold" would be wrong on every one of them.
         assert!(c.title.contains("assigned to task 2004"), "{}", c.title);
-        assert!(!c.title.contains("sold"), "a reserved core was not sold: {}", c.title);
+        assert!(
+            !c.title.contains("sold"),
+            "a reserved core was not sold: {}",
+            c.title
+        );
         // Lineage, on every candidate — slice 10 shipped two arms without it and
         // slice 14 shipped two coverage lines naming fields that did not exist.
-        let lineage = c.lineage.as_ref().expect("an entitlement row carries lineage");
+        let lineage = c
+            .lineage
+            .as_ref()
+            .expect("an entitlement row carries lineage");
         for field in ["runtime_version", "mapper_version"] {
             assert!(
                 lineage.get(field).is_some_and(|v| !v.is_null()),
@@ -1859,13 +1963,19 @@ mod tests {
         }
         // The coordinate the `sale` refusal points at, present on the candidate
         // it points at — so the refusal is navigable rather than merely correct.
-        assert_eq!(c.id.get("governing_relay_block").and_then(|v| v.as_u64()), Some(80));
+        assert_eq!(
+            c.id.get("governing_relay_block").and_then(|v| v.as_u64()),
+            Some(80)
+        );
         // The caveat rides on the CANDIDATE, not only in coverage, because a
         // dropdown renders candidates and throws coverage away.
         assert!(c.why.contains("SLOT"), "{}", c.why);
 
         let gaps = r.not_covered.join(" | ");
-        assert!(gaps.contains("35->43"), "the measured renewal evidence: {gaps}");
+        assert!(
+            gaps.contains("35->43"),
+            "the measured renewal evidence: {gaps}"
+        );
         assert!(gaps.contains("occupancy?from=&to="), "{gaps}");
         assert!(gaps.contains("delta?from=&to="), "{gaps}");
         // The reserved-vs-market split is NOT read here, and the omission is
@@ -1904,7 +2014,10 @@ mod tests {
             r.candidates
         );
         let gaps = r.not_covered.join(" | ");
-        assert!(gaps.contains("at or above the declared core count of 10"), "{gaps}");
+        assert!(
+            gaps.contains("at or above the declared core count of 10"),
+            "{gaps}"
+        );
         assert!(
             !gaps.contains("SALE BOUNDARIES") && !gaps.contains("WITHHOLDS"),
             "a core that was never declared is not a core whose sale we missed: {gaps}"
@@ -1914,7 +2027,10 @@ mod tests {
         let q = parse("core notanumber", &state.registry).unwrap();
         let r = resolve(&q, &state, "core notanumber").await;
         assert!(r.candidates.iter().all(|c| c.kind != "coretime_core"));
-        assert!(r.not_covered.iter().any(|g| g.contains("core index is a small")));
+        assert!(r
+            .not_covered
+            .iter()
+            .any(|g| g.contains("core index is a small")));
     }
 
     /// Each module makes a bare number MORE ambiguous, and the probe is what
@@ -1930,11 +2046,16 @@ mod tests {
         let kinds: Vec<&str> = r.candidates.iter().map(|c| c.kind).collect();
         assert!(kinds.contains(&"coretime_core"), "{kinds:?}");
         // The candidate's caveat travels with it even unasked-for…
-        assert!(r.not_covered.iter().any(|g| g.contains("SLOT, NOT A TENANT")));
+        assert!(r
+            .not_covered
+            .iter()
+            .any(|g| g.contains("SLOT, NOT A TENANT")));
         // …but the endpoint tour does NOT, because the caller asked "what is 0",
         // not "tell me about core 0".
         assert!(
-            !r.not_covered.iter().any(|g| g.contains("occupancy?from=&to=")),
+            !r.not_covered
+                .iter()
+                .any(|g| g.contains("occupancy?from=&to=")),
             "an unasked-for probe must not lecture: {:?}",
             r.not_covered
         );
@@ -1975,15 +2096,27 @@ mod tests {
         let state = state_with_broker(broker).await;
         let q = parse("core 63", &state.registry).unwrap();
         let gaps = resolve(&q, &state, "core 63").await.not_covered.join(" | ");
-        assert!(gaps.contains("within the declared core count of 100"), "{gaps}");
+        assert!(
+            gaps.contains("within the declared core count of 100"),
+            "{gaps}"
+        );
         assert!(gaps.contains("SALE BOUNDARIES"), "{gaps}");
         assert!(gaps.contains("WITHHOLDS its waste figure"), "{gaps}");
 
         // (b) above the declared count: no such core, and the reading is dated.
         let q = parse("core 4242", &state.registry).unwrap();
-        let gaps = resolve(&q, &state, "core 4242").await.not_covered.join(" | ");
-        assert!(gaps.contains("at or above the declared core count of 100"), "{gaps}");
-        assert!(gaps.contains("DATED"), "the count is configuration, not a constant: {gaps}");
+        let gaps = resolve(&q, &state, "core 4242")
+            .await
+            .not_covered
+            .join(" | ");
+        assert!(
+            gaps.contains("at or above the declared core count of 100"),
+            "{gaps}"
+        );
+        assert!(
+            gaps.contains("DATED"),
+            "the count is configuration, not a constant: {gaps}"
+        );
         assert!(!gaps.contains("SALE BOUNDARIES"), "{gaps}");
 
         // (c) no configuration reading at all: we cannot say whether the core
@@ -2009,7 +2142,10 @@ mod tests {
         let q = parse("core 63", &state.registry).unwrap();
         let gaps = resolve(&q, &state, "core 63").await.not_covered.join(" | ");
         assert!(gaps.contains("entitlement index on"), "{gaps}");
-        assert!(gaps.contains("our failure and not an absence on chain"), "{gaps}");
+        assert!(
+            gaps.contains("our failure and not an absence on chain"),
+            "{gaps}"
+        );
         assert!(
             !gaps.contains("sync-broker-config")
                 && !gaps.contains("declared core count")
@@ -2134,7 +2270,11 @@ mod tests {
 
         let q = parse("core 47", &state.registry).unwrap();
         let r = resolve(&q, &state, "core 47").await;
-        let c = r.candidates.iter().find(|c| c.kind == "coretime_core").expect("candidate");
+        let c = r
+            .candidates
+            .iter()
+            .find(|c| c.kind == "coretime_core")
+            .expect("candidate");
         assert!(
             c.title.contains("shared or interlaced"),
             "one of two entitlements must not read as the whole core: {}",
@@ -2142,7 +2282,10 @@ mod tests {
         );
         let gaps = r.not_covered.join(" | ");
         assert!(gaps.contains("MORE THAN ONE ENTITLEMENT"), "{gaps}");
-        assert!(gaps.contains("count_ones"), "the mask's pattern does not cross: {gaps}");
+        assert!(
+            gaps.contains("count_ones"),
+            "the mask's pattern does not cross: {gaps}"
+        );
 
         // CONTROL: two assignments at DIFFERENT relay blocks are successive
         // sales, not a split core, and must render as an ordinary single tenant.
@@ -2156,14 +2299,20 @@ mod tests {
         let state = state_with_broker(broker).await;
         let q = parse("core 47", &state.registry).unwrap();
         let r = resolve(&q, &state, "core 47").await;
-        let c = r.candidates.iter().find(|c| c.kind == "coretime_core").expect("candidate");
+        let c = r
+            .candidates
+            .iter()
+            .find(|c| c.kind == "coretime_core")
+            .expect("candidate");
         assert!(
             c.title.contains("assigned to task 2034"),
             "the NEWEST sale wins and nothing is shared: {}",
             c.title
         );
         assert!(
-            !r.not_covered.iter().any(|g| g.contains("MORE THAN ONE ENTITLEMENT")),
+            !r.not_covered
+                .iter()
+                .any(|g| g.contains("MORE THAN ONE ENTITLEMENT")),
             "history is not interlacing: {:?}",
             r.not_covered
         );
@@ -2208,8 +2357,14 @@ mod tests {
         // Lineage from the EVENT row, not a hardcoded literal: assert the values
         // rather than the presence, or this passes by construction.
         let lineage = c.lineage.as_ref().expect("the event row carries lineage");
-        assert_eq!(lineage.get("runtime_version").and_then(|v| v.as_u64()), Some(2_003_002));
-        assert_eq!(lineage.get("mapper_version").and_then(|v| v.as_u64()), Some(1));
+        assert_eq!(
+            lineage.get("runtime_version").and_then(|v| v.as_u64()),
+            Some(2_003_002)
+        );
+        assert_eq!(
+            lineage.get("mapper_version").and_then(|v| v.as_u64()),
+            Some(1)
+        );
         assert_eq!(c.chain.as_deref(), Some("polkadot-coretime"));
         // No assignment, so no sale coordinate to offer — absent rather than a
         // zero pretending to be one.
@@ -2220,12 +2375,16 @@ mod tests {
         // beside it does not have — while that row's own `why` said we hold no
         // assignment at all. Two sentences, one response, opposite claims.
         assert!(
-            !r.not_covered.iter().any(|g| g.contains("governing_relay_block")),
+            !r.not_covered
+                .iter()
+                .any(|g| g.contains("governing_relay_block")),
             "coverage must not cite a field this arm's candidate has no way to carry: {:?}",
             r.not_covered
         );
         assert!(
-            !r.not_covered.iter().any(|g| g.contains("this candidate identifies an entitlement")),
+            !r.not_covered
+                .iter()
+                .any(|g| g.contains("this candidate identifies an entitlement")),
             "we hold no assignment for this core: {:?}",
             r.not_covered
         );
@@ -2301,7 +2460,10 @@ mod tests {
         // as a conclusion.
         assert!(gaps.contains("hydration"), "{gaps}");
         assert!(gaps.contains("governance residency windows"), "{gaps}");
-        assert!(gaps.contains("does not declare"), "the module bit is reported: {gaps}");
+        assert!(
+            gaps.contains("does not declare"),
+            "the module bit is reported: {gaps}"
+        );
         // AND IT MUST NOT PICK A CAUSE. A first draft branched and told one arm
         // the chain "runs its OWN referendum id space" — a conclusion the
         // registry cannot support, since a missing residency window is equally
@@ -2337,6 +2499,12 @@ mod tests {
         // `dot` is the ticker people type for the polkadot network
         let q = parse("dot ref 1930", &r).unwrap();
         assert_eq!(q.network, "polkadot");
-        assert_eq!(q.term, Term::Codeword { word: Codeword::Ref, arg: "1930".into() });
+        assert_eq!(
+            q.term,
+            Term::Codeword {
+                word: Codeword::Ref,
+                arg: "1930".into()
+            }
+        );
     }
 }

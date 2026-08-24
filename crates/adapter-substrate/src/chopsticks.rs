@@ -417,9 +417,7 @@ pub fn parse_dry_run_raw_pairs(out: &Value) -> Result<crate::RawStorageDiff, Str
                 hex::decode(s.trim_start_matches("0x"))
                     .map_err(|e| format!("diff value '{s}' is not hex: {e}"))?,
             ),
-            Some(other) => {
-                return Err(format!("a diff value is neither hex nor null: {other}"))
-            }
+            Some(other) => return Err(format!("a diff value is neither hex nor null: {other}")),
         };
         pairs.push((key, value));
     }
@@ -473,7 +471,9 @@ pub fn parse_run_block_diff(out: &Value) -> Result<crate::RawStorageDiff, String
                         .map_err(|e| format!("storageDiff value '{s}' is not hex: {e}"))?,
                 ),
                 Some(other) => {
-                    return Err(format!("a storageDiff value is neither hex nor null: {other}"))
+                    return Err(format!(
+                        "a storageDiff value is neither hex nor null: {other}"
+                    ))
                 }
             };
             // LAST WRITE WINS, and it must: a key touched in more than one phase
@@ -537,8 +537,8 @@ mod tests {
         assert!(err.contains("phases"), "{err}");
 
         // phases present, none of them carrying a diff field
-        let err = parse_run_block_diff(&json!({ "phases": [ { "runtimeLogs": [] } ] }))
-            .unwrap_err();
+        let err =
+            parse_run_block_diff(&json!({ "phases": [ { "runtimeLogs": [] } ] })).unwrap_err();
         assert!(err.contains("shape change"), "{err}");
 
         // ...but a phase whose diff is genuinely EMPTY is a real empty diff
@@ -561,7 +561,10 @@ mod tests {
         ]);
         let pairs = parse_dry_run_raw_pairs(&out).expect("reads");
         assert_eq!(pairs.len(), 3);
-        assert_eq!(pairs[0], (vec![0x26, 0xaa, 0x39, 0x4e], Some(vec![0x01, 0x02])));
+        assert_eq!(
+            pairs[0],
+            (vec![0x26, 0xaa, 0x39, 0x4e], Some(vec![0x01, 0x02]))
+        );
         assert_eq!(
             pairs[1].1, None,
             "a null value is a DELETION, never an empty value"
@@ -573,15 +576,17 @@ mod tests {
 
         // An empty diff is DATA — a run that changed nothing — and must not be
         // an error.
-        assert!(parse_dry_run_raw_pairs(&json!([])).expect("empty is data").is_empty());
+        assert!(parse_dry_run_raw_pairs(&json!([]))
+            .expect("empty is data")
+            .is_empty());
     }
 
     #[test]
     fn a_dry_run_answer_in_the_wrong_shape_is_refused_and_says_which_part() {
         // The wrapped form `dev_dryRun` returns WITHOUT `raw: true`. Accepting it
         // by walking into it would mean reading a decoded rendering as raw bytes.
-        let err = parse_dry_run_raw_pairs(&json!({ "old": {}, "new": {}, "delta": {} }))
-            .unwrap_err();
+        let err =
+            parse_dry_run_raw_pairs(&json!({ "old": {}, "new": {}, "delta": {} })).unwrap_err();
         assert!(err.contains("array of [key, value] pairs"), "{err}");
 
         let err = parse_dry_run_raw_pairs(&json!([["0xaa", { "decoded": 1 }]])).unwrap_err();

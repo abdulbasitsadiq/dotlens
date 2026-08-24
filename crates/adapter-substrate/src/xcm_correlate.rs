@@ -82,9 +82,7 @@ struct Candidate {
 const PAIRABLE: [&str; 2] = ["hrmp", "ump"];
 
 /// One block's XCM events → its id aliases.
-pub fn links_for_block(
-    events: &[CanonicalEvent],
-) -> Result<Vec<(u32, XcmLink)>, BlockMapError> {
+pub fn links_for_block(events: &[CanonicalEvent]) -> Result<Vec<(u32, XcmLink)>, BlockMapError> {
     let mut wires: Vec<Candidate> = Vec::new();
     let mut topics: Vec<Candidate> = Vec::new();
 
@@ -403,7 +401,10 @@ mod tests {
         assert_eq!(link.rule, "unique_in_block");
         assert_eq!(link.confidence, "high");
         assert_eq!(link.evidence["event_gap"], 1);
-        assert_eq!(link.evidence["block_sends"], serde_json::json!({"wire": 1, "topic": 1}));
+        assert_eq!(
+            link.evidence["block_sends"],
+            serde_json::json!({"wire": 1, "topic": 1})
+        );
     }
 
     /// The ordering constraint is the mechanism: `send_xcm` delivers before its
@@ -425,10 +426,19 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(links.len(), 2);
-        assert_eq!((links[0].1.wire_hash.clone(), links[0].1.topic.clone()), (id(0x11), id(0xaa)));
-        assert_eq!((links[1].1.wire_hash.clone(), links[1].1.topic.clone()), (id(0x22), id(0xbb)));
+        assert_eq!(
+            (links[0].1.wire_hash.clone(), links[0].1.topic.clone()),
+            (id(0x11), id(0xaa))
+        );
+        assert_eq!(
+            (links[1].1.wire_hash.clone(), links[1].1.topic.clone()),
+            (id(0x22), id(0xbb))
+        );
         assert_eq!(links[0].1.rule, "interleaved");
-        assert_eq!(links[0].1.confidence, "medium", "n>1 is weaker evidence and says so");
+        assert_eq!(
+            links[0].1.confidence, "medium",
+            "n>1 is weaker evidence and says so"
+        );
         assert_eq!(links[0].1.evidence["ordinal"], 0);
         assert_eq!(links[1].1.evidence["ordinal"], 1);
         // The block-wide counts are what an auditor cannot re-derive from the
@@ -500,8 +510,8 @@ mod tests {
                 "message_id": vec![0xccu8; 32],
             }),
         );
-        let links = links_for_block(&[wire_hrmp(0, 0x77), sent_hrmp(1, 0x16, 2034), failed])
-            .unwrap();
+        let links =
+            links_for_block(&[wire_hrmp(0, 0x77), sent_hrmp(1, 0x16, 2034), failed]).unwrap();
         assert_eq!(links.len(), 1, "the delivered message still pairs");
         assert_eq!(links[0].1.topic, id(0x16));
     }
@@ -563,10 +573,17 @@ mod tests {
     #[test]
     fn a_bridged_send_pairs_across_the_transport_disagreement() {
         let links = links_for_block(&[wire_hrmp(6, 0x73), sent_remote(7, 0x16)]).unwrap();
-        assert_eq!(links.len(), 1, "before slice 4 this refused and the wire hash dead-ended");
+        assert_eq!(
+            links.len(),
+            1,
+            "before slice 4 this refused and the wire hash dead-ended"
+        );
         let (wire_index, link) = &links[0];
         assert_eq!(*wire_index, 6);
-        assert_eq!(link.transport, "hrmp", "from the wire event, never the destination");
+        assert_eq!(
+            link.transport, "hrmp",
+            "from the wire event, never the destination"
+        );
         assert_eq!(link.rule, "remote_destination");
         assert_eq!(link.confidence, "medium");
         assert_eq!(link.evidence["topic_transport"], "remote");
@@ -590,7 +607,10 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(links.len(), 2, "both sends pair: {links:?}");
-        assert_eq!(links[0].1.rule, "unique_in_block", "the ordinary send is untouched");
+        assert_eq!(
+            links[0].1.rule, "unique_in_block",
+            "the ordinary send is untouched"
+        );
         assert_eq!(links[0].1.topic, id(0xaa));
         assert_eq!(links[1].1.rule, "remote_destination");
         assert_eq!(links[1].1.topic, id(0x16));
@@ -626,7 +646,9 @@ mod tests {
             }),
         );
         // alone: nothing to pair with, and no pairing invented
-        assert!(links_for_block(&[wire_hrmp(6, 0x73), unreadable.clone()]).unwrap().is_empty());
+        assert!(links_for_block(&[wire_hrmp(6, 0x73), unreadable.clone()])
+            .unwrap()
+            .is_empty());
         // after a bridged send: the wire belongs to the candidate immediately
         // after it, and the unreadable one is simply a `Sent` with no wire event
         let links =
@@ -638,9 +660,11 @@ mod tests {
         // so the bridged topic has no adjacent wire and nothing is recorded.
         let mut earlier = unreadable;
         earlier.index = 7;
-        assert!(links_for_block(&[wire_hrmp(6, 0x73), earlier, sent_remote(8, 0x16)])
-            .unwrap()
-            .is_empty());
+        assert!(
+            links_for_block(&[wire_hrmp(6, 0x73), earlier, sent_remote(8, 0x16)])
+                .unwrap()
+                .is_empty()
+        );
     }
 
     /// A bridged topic does not reach past an intervening send to claim a wire.
@@ -652,7 +676,11 @@ mod tests {
             sent_remote(2, 0x16),
         ])
         .unwrap();
-        assert_eq!(links.len(), 1, "the local pair holds; the bridged one has no wire left");
+        assert_eq!(
+            links.len(),
+            1,
+            "the local pair holds; the bridged one has no wire left"
+        );
         assert_eq!(links[0].1.rule, "unique_in_block");
         assert_eq!(links[0].1.topic, id(0xaa));
     }

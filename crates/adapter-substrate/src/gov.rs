@@ -174,7 +174,11 @@ fn bounded_call_hash_len(proposal: &serde_json::Value) -> (Option<String>, Optio
 // as objects, positional as arrays; H256 as (nested) byte arrays; small
 // numbers as JSON numbers, >u64 as decimal strings.
 
-pub(crate) fn field<'a>(data: &'a serde_json::Value, name: &str, index: usize) -> Option<&'a serde_json::Value> {
+pub(crate) fn field<'a>(
+    data: &'a serde_json::Value,
+    name: &str,
+    index: usize,
+) -> Option<&'a serde_json::Value> {
     match data {
         serde_json::Value::Object(map) => map.get(name),
         serde_json::Value::Array(items) => items.get(index),
@@ -221,9 +225,8 @@ pub(crate) fn json_h256_hex(v: &serde_json::Value) -> Option<String> {
 /// reference xxhash with the same derivation that reproduces
 /// accounts::SYSTEM_ACCOUNT_PREFIX byte-for-byte.
 pub const PREIMAGE_FOR_PREFIX: [u8; 32] = [
-    0xd8, 0xf3, 0x14, 0xb7, 0xf4, 0xe6, 0xb0, 0x95, 0xf0, 0xf8, 0xee, 0x46, 0x56, 0xa4, 0x48,
-    0x25, 0x7c, 0x7d, 0xda, 0x85, 0xc9, 0xc2, 0x97, 0x99, 0x9f, 0xd0, 0x22, 0x15, 0xe8, 0xc8,
-    0xf9, 0xde,
+    0xd8, 0xf3, 0x14, 0xb7, 0xf4, 0xe6, 0xb0, 0x95, 0xf0, 0xf8, 0xee, 0x46, 0x56, 0xa4, 0x48, 0x25,
+    0x7c, 0x7d, 0xda, 0x85, 0xc9, 0xc2, 0x97, 0x99, 0x9f, 0xd0, 0x22, 0x15, 0xe8, 0xc8, 0xf9, 0xde,
 ];
 
 /// Full preimage.preimageFor storage key for one (hash, len). The map's
@@ -273,9 +276,7 @@ pub fn tracks_from_metadata(metadata_blob: &[u8]) -> Result<Vec<TrackDef>, Strin
                     let mut cursor = &constant.value[..];
                     let value =
                         scale_value::scale::decode_as_type(&mut cursor, constant.ty.id, &$m.types)
-                            .map_err(|e| {
-                                format!("{}.Tracks constant decode: {e}", pallet.name)
-                            })?;
+                            .map_err(|e| format!("{}.Tracks constant decode: {e}", pallet.name))?;
                     let defs = tracks_from_value(&value.remove_context())
                         .map_err(|e| format!("{}.Tracks walk: {e}", pallet.name))?;
                     for (track_id, name, params) in defs {
@@ -429,7 +430,10 @@ mod tests {
         assert_eq!(t.kind, "submitted");
         assert_eq!(t.status.as_deref(), Some("submitted"));
         assert_eq!(t.track_id, Some(34));
-        assert_eq!(t.proposal_hash.as_deref(), Some(&format!("0x{}", "ab".repeat(32))[..]));
+        assert_eq!(
+            t.proposal_hash.as_deref(),
+            Some(&format!("0x{}", "ab".repeat(32))[..])
+        );
         assert_eq!(t.proposal_len, Some(142));
         assert!(t.proposal.is_some());
     }
@@ -467,7 +471,11 @@ mod tests {
             ("Cancelled", "cancelled", Some("cancelled")),
             ("Killed", "killed", Some("killed")),
             ("DecisionDepositPlaced", "decision_deposit_placed", None),
-            ("SubmissionDepositRefunded", "submission_deposit_refunded", None),
+            (
+                "SubmissionDepositRefunded",
+                "submission_deposit_refunded",
+                None,
+            ),
             ("MetadataSet", "metadata_set", None),
         ];
         for (variant, kind, status) in cases {
@@ -504,9 +512,16 @@ mod tests {
 
     #[test]
     fn other_pallets_are_not_governance() {
-        for name in ["balances.Transfer", "system.ExtrinsicSuccess", "whitelist.CallWhitelisted"] {
+        for name in [
+            "balances.Transfer",
+            "system.ExtrinsicSuccess",
+            "whitelist.CallWhitelisted",
+        ] {
             let e = ev(name, serde_json::json!({"index": 1}));
-            assert!(timeline_for_event(&e).unwrap().is_empty(), "{name} must map to ∅");
+            assert!(
+                timeline_for_event(&e).unwrap().is_empty(),
+                "{name} must map to ∅"
+            );
         }
     }
 
@@ -533,7 +548,10 @@ mod tests {
             }),
         );
         let t = &timeline_for_event(&e).unwrap()[0];
-        assert_eq!(t.proposal_hash.as_deref(), Some(&format!("0x{}", "0d".repeat(32))[..]));
+        assert_eq!(
+            t.proposal_hash.as_deref(),
+            Some(&format!("0x{}", "0d".repeat(32))[..])
+        );
         assert_eq!(t.proposal_len, None);
     }
 
@@ -543,7 +561,10 @@ mod tests {
         // the name AND the copy inside params must come out clean — Postgres
         // rejects NUL in TEXT/JSONB
         let info = Value::named_composite([
-            ("name", Value::string("big_spender\0\0\0\0\0\0\0\0\0\0\0\0\0\0")),
+            (
+                "name",
+                Value::string("big_spender\0\0\0\0\0\0\0\0\0\0\0\0\0\0"),
+            ),
             ("max_deciding", Value::u128(50)),
         ]);
         let entry = Value::unnamed_composite([Value::u128(34), info]);
@@ -562,17 +583,26 @@ mod tests {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../fixtures/real/polkadot-asset-hub-19498783/metadata.scale");
         let Ok(blob) = std::fs::read(&path) else {
-            eprintln!("SKIP: real fixture metadata not present at {}", path.display());
+            eprintln!(
+                "SKIP: real fixture metadata not present at {}",
+                path.display()
+            );
             return;
         };
         let tracks = tracks_from_metadata(&blob).expect("tracks decode");
-        let referenda: Vec<&TrackDef> =
-            tracks.iter().filter(|t| t.pallet == "referenda").collect();
+        let referenda: Vec<&TrackDef> = tracks.iter().filter(|t| t.pallet == "referenda").collect();
         assert_eq!(referenda.len(), 16, "OpenGov has 16 tracks (ECOSYSTEM §7)");
         let root = referenda.iter().find(|t| t.track_id == 0).expect("track 0");
         assert_eq!(root.name, "root");
-        let big_spender = referenda.iter().find(|t| t.track_id == 34).expect("track 34");
-        assert!(big_spender.name.contains("big_spender"), "got {}", big_spender.name);
+        let big_spender = referenda
+            .iter()
+            .find(|t| t.track_id == 34)
+            .expect("track 34");
+        assert!(
+            big_spender.name.contains("big_spender"),
+            "got {}",
+            big_spender.name
+        );
         // params carry the decision-period machinery, schema-on-read
         assert!(root.params.get("max_deciding").is_some());
         assert!(root.params.get("decision_period").is_some());

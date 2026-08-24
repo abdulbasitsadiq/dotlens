@@ -310,7 +310,10 @@ mod tests {
     #[tokio::test]
     async fn range_maps_bounties_and_info_events_skips_gaps_and_advances() {
         let mut src = HashMap::new();
-        src.insert(1, vec![ev(0, "mock.Bounty", serde_json::json!({"index": 42}))]);
+        src.insert(
+            1,
+            vec![ev(0, "mock.Bounty", serde_json::json!({"index": 42}))],
+        );
         // height 2 is a decode gap
         src.insert(
             3,
@@ -326,7 +329,9 @@ mod tests {
             source: &MemSource(src),
             sink: &sink,
         };
-        let n = bounties_range("mock", &MockMapper, &deps, 1, 3).await.unwrap();
+        let n = bounties_range("mock", &MockMapper, &deps, 1, 3)
+            .await
+            .unwrap();
         assert_eq!(n, 2, "two decoded heights, one gap skipped");
         let rows = sink.0.lock().unwrap();
         assert_eq!(rows.len(), 2);
@@ -335,14 +340,21 @@ mod tests {
         assert_eq!((rows[1].2.bounty_id, rows[1].2.child_id), (7, Some(3)));
         assert!(rows[1].2.status.is_none());
         drop(rows);
-        let cp = checkpoints.get("mock", MODULE_BOUNTIES).await.unwrap().unwrap();
+        let cp = checkpoints
+            .get("mock", MODULE_BOUNTIES)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(cp.last_height, 3, "checkpoint advanced through the gap");
     }
 
     #[tokio::test]
     async fn rerun_behind_frontier_rewrites_without_moving_checkpoint() {
         let mut src = HashMap::new();
-        src.insert(1, vec![ev(0, "mock.Bounty", serde_json::json!({"index": 1}))]);
+        src.insert(
+            1,
+            vec![ev(0, "mock.Bounty", serde_json::json!({"index": 1}))],
+        );
         src.insert(2, vec![]);
         let checkpoints = MemoryCheckpointStore::new();
         let sink = MemSink::default();
@@ -351,10 +363,21 @@ mod tests {
             source: &MemSource(src),
             sink: &sink,
         };
-        bounties_range("mock", &MockMapper, &deps, 1, 2).await.unwrap();
-        let n = bounties_range("mock", &MockMapper, &deps, 1, 1).await.unwrap();
-        assert_eq!(n, 1, "behind-frontier reprocess is allowed (sink converges)");
-        let cp = checkpoints.get("mock", MODULE_BOUNTIES).await.unwrap().unwrap();
+        bounties_range("mock", &MockMapper, &deps, 1, 2)
+            .await
+            .unwrap();
+        let n = bounties_range("mock", &MockMapper, &deps, 1, 1)
+            .await
+            .unwrap();
+        assert_eq!(
+            n, 1,
+            "behind-frontier reprocess is allowed (sink converges)"
+        );
+        let cp = checkpoints
+            .get("mock", MODULE_BOUNTIES)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(cp.last_height, 2, "frontier untouched by reprocess");
     }
 
@@ -369,17 +392,26 @@ mod tests {
             source: &MemSource(src),
             sink: &sink,
         };
-        let err = bounties_range("mock", &MockMapper, &deps, 1, 1).await.unwrap_err();
+        let err = bounties_range("mock", &MockMapper, &deps, 1, 1)
+            .await
+            .unwrap_err();
         assert!(matches!(err, BountyWorkerError::Mapper { height: 1, .. }));
         assert!(sink.0.lock().unwrap().is_empty());
-        assert!(checkpoints.get("mock", MODULE_BOUNTIES).await.unwrap().is_none());
+        assert!(checkpoints
+            .get("mock", MODULE_BOUNTIES)
+            .await
+            .unwrap()
+            .is_none());
     }
 
     #[tokio::test]
     async fn tick_chases_the_decode_checkpoint() {
         let mut src = HashMap::new();
         for h in 5..=9 {
-            src.insert(h, vec![ev(0, "mock.Bounty", serde_json::json!({"index": h}))]);
+            src.insert(
+                h,
+                vec![ev(0, "mock.Bounty", serde_json::json!({"index": h}))],
+            );
         }
         let checkpoints = MemoryCheckpointStore::new();
         let sink = MemSink::default();
@@ -401,7 +433,11 @@ mod tests {
         assert_eq!(bounties_tick("mock", &MockMapper, &deps).await.unwrap(), 1);
         checkpoints.advance(decode_cp(9)).await.unwrap();
         assert_eq!(bounties_tick("mock", &MockMapper, &deps).await.unwrap(), 2);
-        let cp = checkpoints.get("mock", MODULE_BOUNTIES).await.unwrap().unwrap();
+        let cp = checkpoints
+            .get("mock", MODULE_BOUNTIES)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(cp.last_height, 9);
         assert_eq!(bounties_tick("mock", &MockMapper, &deps).await.unwrap(), 0);
     }

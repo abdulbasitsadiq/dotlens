@@ -248,12 +248,22 @@ mod tests {
     #[tokio::test]
     async fn range_maps_events_skips_gaps_and_advances() {
         let mut src = HashMap::new();
-        src.insert(1, vec![ev(0, "mock.Move", serde_json::json!({"amount": 5}))]);
+        src.insert(
+            1,
+            vec![ev(0, "mock.Move", serde_json::json!({"amount": 5}))],
+        );
         // height 2 is a decode gap
-        src.insert(3, vec![
-            ev(0, "mock.Other", serde_json::json!({})),
-            ev(1, "mock.Move", serde_json::json!({"amount": 9, "neg": true})),
-        ]);
+        src.insert(
+            3,
+            vec![
+                ev(0, "mock.Other", serde_json::json!({})),
+                ev(
+                    1,
+                    "mock.Move",
+                    serde_json::json!({"amount": 9, "neg": true}),
+                ),
+            ],
+        );
         let checkpoints = MemoryCheckpointStore::new();
         let sink = MemSink::default();
         let deps = BalancesDeps {
@@ -261,30 +271,46 @@ mod tests {
             source: &MemSource(src),
             sink: &sink,
         };
-        let n = balances_range("mock", &MockMapper, &deps, 1, 3).await.unwrap();
+        let n = balances_range("mock", &MockMapper, &deps, 1, 3)
+            .await
+            .unwrap();
         assert_eq!(n, 2, "two decoded heights, one gap skipped");
         let rows = sink.0.lock().unwrap();
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].0, 1);
         assert!(!rows[0].2.negative);
-        assert_eq!(rows[1], (3, 1, BalanceDelta {
-            account: vec![7u8; 32],
-            magnitude: 9,
-            negative: true,
-            reason: "mock".into(),
-            counterparty: None,
-            asset: "native".into(),
-        }));
+        assert_eq!(
+            rows[1],
+            (
+                3,
+                1,
+                BalanceDelta {
+                    account: vec![7u8; 32],
+                    magnitude: 9,
+                    negative: true,
+                    reason: "mock".into(),
+                    counterparty: None,
+                    asset: "native".into(),
+                }
+            )
+        );
         drop(rows);
         // checkpoint advanced through the gap
-        let cp = checkpoints.get("mock", MODULE_BALANCES).await.unwrap().unwrap();
+        let cp = checkpoints
+            .get("mock", MODULE_BALANCES)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(cp.last_height, 3);
     }
 
     #[tokio::test]
     async fn rerun_behind_frontier_rewrites_without_moving_checkpoint() {
         let mut src = HashMap::new();
-        src.insert(1, vec![ev(0, "mock.Move", serde_json::json!({"amount": 5}))]);
+        src.insert(
+            1,
+            vec![ev(0, "mock.Move", serde_json::json!({"amount": 5}))],
+        );
         src.insert(2, vec![]);
         let checkpoints = MemoryCheckpointStore::new();
         let sink = MemSink::default();
@@ -293,10 +319,18 @@ mod tests {
             source: &MemSource(src),
             sink: &sink,
         };
-        balances_range("mock", &MockMapper, &deps, 1, 2).await.unwrap();
-        let n = balances_range("mock", &MockMapper, &deps, 1, 1).await.unwrap();
+        balances_range("mock", &MockMapper, &deps, 1, 2)
+            .await
+            .unwrap();
+        let n = balances_range("mock", &MockMapper, &deps, 1, 1)
+            .await
+            .unwrap();
         assert_eq!(n, 1, "behind-frontier reprocess is allowed (sink dedupes)");
-        let cp = checkpoints.get("mock", MODULE_BALANCES).await.unwrap().unwrap();
+        let cp = checkpoints
+            .get("mock", MODULE_BALANCES)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(cp.last_height, 2, "frontier untouched by reprocess");
     }
 
@@ -311,10 +345,16 @@ mod tests {
             source: &MemSource(src),
             sink: &sink,
         };
-        let err = balances_range("mock", &MockMapper, &deps, 1, 1).await.unwrap_err();
+        let err = balances_range("mock", &MockMapper, &deps, 1, 1)
+            .await
+            .unwrap_err();
         assert!(matches!(err, BalancesWorkerError::Mapper { height: 1, .. }));
         assert!(sink.0.lock().unwrap().is_empty());
-        assert!(checkpoints.get("mock", MODULE_BALANCES).await.unwrap().is_none());
+        assert!(checkpoints
+            .get("mock", MODULE_BALANCES)
+            .await
+            .unwrap()
+            .is_none());
     }
 
     #[tokio::test]
@@ -332,7 +372,9 @@ mod tests {
             sink: &sink,
         };
 
-        let err = balances_range("mock", &MockMapper, &deps, 1, 1).await.unwrap_err();
+        let err = balances_range("mock", &MockMapper, &deps, 1, 1)
+            .await
+            .unwrap_err();
         assert!(matches!(err, BalancesWorkerError::Mapper { height: 1, .. }));
 
         let halts = checkpoints.recorded_halts();
@@ -347,12 +389,19 @@ mod tests {
         assert_eq!(h.height, 1);
         assert_eq!(h.event, "mock.Bad", "the variant, not a normalised code");
         assert_eq!(h.seen_count, 1);
-        assert!(!h.reason.is_empty(), "the mapper's own sentence, per-module voice");
+        assert!(
+            !h.reason.is_empty(),
+            "the mapper's own sentence, per-module voice"
+        );
 
         // Recording must not have changed the halt itself.
         assert!(sink.0.lock().unwrap().is_empty(), "still writes nothing");
         assert!(
-            checkpoints.get("mock", MODULE_BALANCES).await.unwrap().is_none(),
+            checkpoints
+                .get("mock", MODULE_BALANCES)
+                .await
+                .unwrap()
+                .is_none(),
             "still advances nothing"
         );
     }
@@ -374,7 +423,9 @@ mod tests {
         };
 
         for _ in 0..3 {
-            assert!(balances_range("mock", &MockMapper, &deps, 1, 1).await.is_err());
+            assert!(balances_range("mock", &MockMapper, &deps, 1, 1)
+                .await
+                .is_err());
         }
 
         let halts = checkpoints.recorded_halts();
@@ -390,7 +441,10 @@ mod tests {
     async fn tick_chases_the_decode_checkpoint() {
         let mut src = HashMap::new();
         for h in 5..=9 {
-            src.insert(h, vec![ev(0, "mock.Move", serde_json::json!({"amount": h}))]);
+            src.insert(
+                h,
+                vec![ev(0, "mock.Move", serde_json::json!({"amount": h}))],
+            );
         }
         let checkpoints = MemoryCheckpointStore::new();
         let sink = MemSink::default();
@@ -414,7 +468,11 @@ mod tests {
         assert_eq!(balances_tick("mock", &MockMapper, &deps).await.unwrap(), 1);
         checkpoints.advance(decode_cp(9)).await.unwrap();
         assert_eq!(balances_tick("mock", &MockMapper, &deps).await.unwrap(), 2);
-        let cp = checkpoints.get("mock", MODULE_BALANCES).await.unwrap().unwrap();
+        let cp = checkpoints
+            .get("mock", MODULE_BALANCES)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(cp.last_height, 9);
         // caught up → no-op
         assert_eq!(balances_tick("mock", &MockMapper, &deps).await.unwrap(), 0);

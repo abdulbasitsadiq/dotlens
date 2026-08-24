@@ -12,9 +12,7 @@
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
-use sim::{
-    JobStore, NewSimJob, SimError, SimJob, SimRecord, SimStore, XcmSimRecord, XcmSimStore,
-};
+use sim::{JobStore, NewSimJob, SimError, SimJob, SimRecord, SimStore, XcmSimRecord, XcmSimStore};
 use sqlx::{PgPool, Row};
 
 pub struct PgSimStore {
@@ -81,7 +79,9 @@ pub async fn simulation_at(
         // row has no `result_xcms_version` and no DryRunApi version, and reading
         // a NULL as 0 would put "XCM v0" and "DryRunApi v0" on a row that called
         // neither.
-        xcm_version: r.try_get::<Option<i32>, _>("xcm_version")?.map(|n| n as u32),
+        xcm_version: r
+            .try_get::<Option<i32>, _>("xcm_version")?
+            .map(|n| n as u32),
         status: r.try_get("status")?,
         dispatch_ok: r.try_get("dispatch_ok")?,
         dispatch_error: r.try_get("dispatch_error")?,
@@ -92,7 +92,9 @@ pub async fn simulation_at(
         effects: r.try_get("effects")?,
         note: r.try_get("note")?,
         spec_version: r.try_get::<i64, _>("spec_version")? as u32,
-        api_version: r.try_get::<Option<i32>, _>("api_version")?.map(|n| n as u32),
+        api_version: r
+            .try_get::<Option<i32>, _>("api_version")?
+            .map(|n| n as u32),
         metadata_version: r.try_get::<i32, _>("metadata_version")? as u32,
         sim_version: r.try_get::<i32, _>("sim_version")? as u32,
         raw_location: r.try_get("raw_location")?,

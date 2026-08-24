@@ -330,15 +330,15 @@ mod tests {
 /// runtime's own metadata.
 pub mod fork;
 
-/// The `dev_*` JSON-RPC vocabulary of a running chopsticks fork (Phase 3,
-/// slice 8). Live-gated: it is a client, and a client needs a transport.
-#[cfg(feature = "live")]
-pub mod chopsticks;
 /// Coretime ENTITLEMENT, read from `pallet-broker` on the Coretime chain (Phase
 /// 3, slice 13) — who bought, renewed, split or pooled what, and the
 /// `CoreAssigned` seam that joins it to occupancy on a relay-block number line
 /// the chain states itself.
 pub mod broker;
+/// The `dev_*` JSON-RPC vocabulary of a running chopsticks fork (Phase 3,
+/// slice 8). Live-gated: it is a client, and a client needs a transport.
+#[cfg(feature = "live")]
+pub mod chopsticks;
 
 /// Core OCCUPANCY, read from the relay's own candidate-inclusion events (Phase
 /// 3, slice 11) — the usage half of coretime, and the half no marketplace can

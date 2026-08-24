@@ -123,7 +123,12 @@ pub fn facts_for_event(event: &CanonicalEvent) -> Result<Vec<XcmFact>, String> {
                     .map(transport_for_destination)
                     .unwrap_or("unknown")
                     .into(),
-                id_kind: if message_id.is_some() { "topic" } else { "none" }.into(),
+                id_kind: if message_id.is_some() {
+                    "topic"
+                } else {
+                    "none"
+                }
+                .into(),
                 message_id,
                 counterparty: destination.as_ref().and_then(location_counterparty),
                 origin_location: field(data, "origin", 0).cloned(),
@@ -313,7 +318,10 @@ pub fn facts_for_event(event: &CanonicalEvent) -> Result<Vec<XcmFact>, String> {
             message_id: field(data, "message_id", 1)
                 .and_then(json_h256_hex)
                 .or_else(|| field(data, "message_hash", 0).and_then(json_h256_hex)),
-            id_kind: if field(data, "message_id", 1).and_then(json_h256_hex).is_some() {
+            id_kind: if field(data, "message_id", 1)
+                .and_then(json_h256_hex)
+                .is_some()
+            {
                 "topic".into()
             } else {
                 "wire_hash".into()
@@ -436,8 +444,10 @@ pub fn facts_for_event(event: &CanonicalEvent) -> Result<Vec<XcmFact>, String> {
         ) => return Ok(vec![]),
 
         // Anything else in a pallet we claim to map is a HALT.
-        ("polkadotxcm" | "xcmpallet" | "xcmpqueue" | "messagequeue" | "cumulusxcm"
-        | "dmpqueue", _) => {
+        (
+            "polkadotxcm" | "xcmpallet" | "xcmpqueue" | "messagequeue" | "cumulusxcm" | "dmpqueue",
+            _,
+        ) => {
             return Err(format!(
                 "unknown XCM event {} — the xcm mapper must be extended and the range re-run \
                  rather than silently miss cross-chain traffic",
@@ -739,7 +749,10 @@ mod tests {
         assert_eq!(pallet_originated.side, "sent");
         assert_eq!(pallet_originated.transport, "hrmp");
         assert_eq!(pallet_originated.counterparty, Some("para:2034".into()));
-        assert!(!pallet_originated.forwarded, "a non-empty message is pallet-originated");
+        assert!(
+            !pallet_originated.forwarded,
+            "a non-empty message is pallet-originated"
+        );
 
         // An EMPTY program is the executor's deliberate `None`, not corruption —
         // and through the newtype it is `[[]]`, whose OUTER length is 1. Reading
@@ -751,16 +764,21 @@ mod tests {
                 "message": [[]], "message_id": bytes32(0x02),
             }),
         );
-        assert!(forwarded.forwarded, "[[]] is an empty program, not a one-item one");
+        assert!(
+            forwarded.forwarded,
+            "[[]] is an empty program, not a one-item one"
+        );
         assert_eq!(forwarded.transport, "ump");
         assert_eq!(forwarded.counterparty, Some("parent".into()));
         // …and the un-newtyped spelling must give the same answer, because the
         // decoder's layering is a property of the pipeline, not of XCM.
-        assert!(one(
-            "polkadotxcm.Sent",
-            json!({"origin": {}, "destination": {}, "message": [], "message_id": bytes32(3)}),
-        )
-        .forwarded);
+        assert!(
+            one(
+                "polkadotxcm.Sent",
+                json!({"origin": {}, "destination": {}, "message": [], "message_id": bytes32(3)}),
+            )
+            .forwarded
+        );
 
         // THE RELAY'S OWN SEND: parents 0 + a Parachain junction is a CHILD,
         // i.e. downward. Calling it hrmp would mislabel every DMP the relay
@@ -782,8 +800,14 @@ mod tests {
     fn the_transport_events_are_the_only_record_a_silent_chain_leaves() {
         // Hydration sets `XcmEventEmitter = ()` and emits no Sent for forwarded
         // messages — these two events are all it produces outbound.
-        let hrmp = one("xcmpqueue.XcmpMessageSent", json!({"message_hash": bytes32(0x03)}));
-        assert_eq!((hrmp.side.as_str(), hrmp.transport.as_str()), ("sent", "hrmp"));
+        let hrmp = one(
+            "xcmpqueue.XcmpMessageSent",
+            json!({"message_hash": bytes32(0x03)}),
+        );
+        assert_eq!(
+            (hrmp.side.as_str(), hrmp.transport.as_str()),
+            ("sent", "hrmp")
+        );
         assert_eq!(hrmp.id_kind, "wire_hash");
         assert_eq!(hrmp.message_id, Some(hex32(0x03)));
 
@@ -801,8 +825,16 @@ mod tests {
     fn the_receiving_side_reads_its_transport_from_the_queue_origin() {
         let cases = [
             (json!({"Parent": []}), "dmp", Some("parent".to_string())),
-            (json!({"Sibling": [2034]}), "hrmp", Some("para:2034".to_string())),
-            (json!({"Ump": [{"Para": [2034]}]}), "ump", Some("para:2034".to_string())),
+            (
+                json!({"Sibling": [2034]}),
+                "hrmp",
+                Some("para:2034".to_string()),
+            ),
+            (
+                json!({"Ump": [{"Para": [2034]}]}),
+                "ump",
+                Some("para:2034".to_string()),
+            ),
         ];
         for (origin, transport, counterparty) in cases {
             let f = one(
@@ -852,13 +884,22 @@ mod tests {
         // v4-shaped (named fields) and v5-shaped (Error is a newtype again).
         for (outcome, ok) in [
             (json!({"Complete": {"used": {"ref_time": 1}}}), true),
-            (json!({"Incomplete": {"used": {}, "error": {"Overflow": []}}}), false),
-            (json!({"Error": [{"index": 0, "error": {"Barrier": []}}]}), false),
+            (
+                json!({"Incomplete": {"used": {}, "error": {"Overflow": []}}}),
+                false,
+            ),
+            (
+                json!({"Error": [{"index": 0, "error": {"Barrier": []}}]}),
+                false,
+            ),
             // v3-shaped tuple variant — same names, different bodies.
             (json!({"Complete": [{"ref_time": 1}]}), true),
         ] {
             let f = one("polkadotxcm.Attempted", json!({"outcome": outcome}));
-            assert_eq!(f.side, "local", "a local execute is neither half of a journey");
+            assert_eq!(
+                f.side, "local",
+                "a local execute is neither half of a journey"
+            );
             assert_eq!(f.id_kind, "none");
             assert_eq!(f.message_id, None);
             assert_eq!(f.success, Some(ok));
@@ -874,25 +915,47 @@ mod tests {
             json!({"message_hash": bytes32(0x08), "message_id": bytes32(0x09),
                    "weight": {"ref_time": 5}}),
         );
-        assert_eq!(f.message_id, Some(hex32(0x09)), "the topic is the journey key");
+        assert_eq!(
+            f.message_id,
+            Some(hex32(0x09)),
+            "the topic is the journey key"
+        );
         assert_eq!(f.id_kind, "topic");
         assert_eq!(f.success, Some(true));
         // and the hash is not lost — schema-on-read keeps the whole event
         assert_eq!(f.data["message_hash"], bytes32(0x08));
 
-        let f = one("xcmpqueue.Fail", json!({"message_hash": bytes32(0x0a), "error": {"Barrier": []}}));
-        assert_eq!(f.id_kind, "wire_hash", "no topic in this one, and it says so");
+        let f = one(
+            "xcmpqueue.Fail",
+            json!({"message_hash": bytes32(0x0a), "error": {"Barrier": []}}),
+        );
+        assert_eq!(
+            f.id_kind, "wire_hash",
+            "no topic in this one, and it says so"
+        );
         assert_eq!(f.success, Some(false));
     }
 
     #[test]
     fn bookkeeping_is_nothing_and_an_unknown_xcm_event_is_loud() {
         for (name, data) in [
-            ("messagequeue.PageReaped", json!({"origin": {"Parent": []}, "index": 1})),
-            ("parachainsystem.DownwardMessagesReceived", json!({"count": 3})),
-            ("parainclusion.UpwardMessagesReceived", json!({"from": 2034, "count": 2})),
+            (
+                "messagequeue.PageReaped",
+                json!({"origin": {"Parent": []}, "index": 1}),
+            ),
+            (
+                "parachainsystem.DownwardMessagesReceived",
+                json!({"count": 3}),
+            ),
+            (
+                "parainclusion.UpwardMessagesReceived",
+                json!({"from": 2034, "count": 2}),
+            ),
             ("polkadotxcm.FeesPaid", json!({"paying": {}, "fees": []})),
-            ("polkadotxcm.AssetsTrapped", json!({"hash": bytes32(1), "origin": {}, "assets": []})),
+            (
+                "polkadotxcm.AssetsTrapped",
+                json!({"hash": bytes32(1), "origin": {}, "assets": []}),
+            ),
             ("balances.Transfer", json!({})),
         ] {
             assert!(
@@ -980,7 +1043,10 @@ mod tests {
                 }},
             ]]},
         }));
-        assert_eq!(f.transport, "hrmp", "a sibling that mentions Ethereum is still a sibling");
+        assert_eq!(
+            f.transport, "hrmp",
+            "a sibling that mentions Ethereum is still a sibling"
+        );
         assert_eq!(f.counterparty.as_deref(), Some("para:2034"));
     }
 
@@ -989,7 +1055,11 @@ mod tests {
     #[test]
     fn local_destinations_are_classified_exactly_as_before() {
         for (dest, transport, counterparty) in [
-            (json!({"parents": 1, "interior": {"Here": []}}), "ump", Some("parent")),
+            (
+                json!({"parents": 1, "interior": {"Here": []}}),
+                "ump",
+                Some("parent"),
+            ),
             (
                 json!({"parents": 1, "interior": {"X1": [[{"Parachain": [2034]}]]}}),
                 "hrmp",
@@ -1002,7 +1072,11 @@ mod tests {
             ),
             // parents >= 2 with no GlobalConsensus names nothing we can read:
             // ignorance stays `unknown`, which is a different claim from `remote`
-            (json!({"parents": 2, "interior": {"Here": []}}), "unknown", None),
+            (
+                json!({"parents": 2, "interior": {"Here": []}}),
+                "unknown",
+                None,
+            ),
         ] {
             let f = sent_to(dest);
             assert_eq!(f.transport, transport);

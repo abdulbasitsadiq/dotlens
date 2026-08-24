@@ -541,7 +541,8 @@ pub fn compute(input: DeltaInput<'_>) -> DeltaReport {
     let mut changed_in_window: Vec<CoreChange> = Vec::new();
     let mut governing: BTreeSet<u64> = BTreeSet::new();
 
-    let (mut task_cores, mut pool_cores, mut idle_cores, mut unattributable_cores) = (0u64, 0, 0, 0);
+    let (mut task_cores, mut pool_cores, mut idle_cores, mut unattributable_cores) =
+        (0u64, 0, 0, 0);
     let (mut agree_cores, mut disagree_cores) = (0u64, 0u64);
     let (mut pool_used, mut idle_used, mut unknown_used) = (0u64, 0u64, 0u64);
     let mut candidates_total = 0u64;
@@ -558,22 +559,29 @@ pub fn compute(input: DeltaInput<'_>) -> DeltaReport {
     for core in universe {
         let paras_map = occ.get(&core);
         let included: u64 = paras_map.map(|m| m.values().sum()).unwrap_or(0);
-        let paras: Vec<u32> = paras_map.map(|m| m.keys().copied().collect()).unwrap_or_default();
+        let paras: Vec<u32> = paras_map
+            .map(|m| m.keys().copied().collect())
+            .unwrap_or_default();
         candidates_total += included;
         if have_blocks && included > input.blocks_indexed {
             occupancy_exceeds_slots = true;
         }
 
         let ent = ents.get(&core);
-        let kind = ent.map(|e| kind_of(e)).unwrap_or(EntitlementKind::Unknown);
-        let tasks: Vec<u32> = ent.map(|e| e.tasks.iter().copied().collect()).unwrap_or_default();
+        let kind = ent.map(&kind_of).unwrap_or(EntitlementKind::Unknown);
+        let tasks: Vec<u32> = ent
+            .map(|e| e.tasks.iter().copied().collect())
+            .unwrap_or_default();
         let governing_relay_block = ent.map(|e| e.relay_block);
         if let Some(b) = governing_relay_block {
             governing.insert(b);
             // An assignment taking effect AT `window_from` governs the whole
             // window; one taking effect above it does not. Strictly greater.
             if b > input.window_from {
-                changed_in_window.push(CoreChange { core_index: core, relay_block: b });
+                changed_in_window.push(CoreChange {
+                    core_index: core,
+                    relay_block: b,
+                });
             }
         }
 
@@ -720,7 +728,11 @@ pub fn compute(input: DeltaInput<'_>) -> DeltaReport {
         } else {
             Check::Ok
         },
-        entitlement_stable: if entitlement_stable { Check::Ok } else { Check::Contradicted },
+        entitlement_stable: if entitlement_stable {
+            Check::Ok
+        } else {
+            Check::Contradicted
+        },
     };
 
     // ---- the gates ----
@@ -957,7 +969,11 @@ mod tests {
     }
 
     fn cell(core: u32, para: u32, n: u64) -> OccupancyCell {
-        OccupancyCell { core_index: core, para_id: para, included_blocks: n }
+        OccupancyCell {
+            core_index: core,
+            para_id: para,
+            included_blocks: n,
+        }
     }
 
     /// THE GOVERNING SALE, at relay 32278800 — the one slice 13's verification
@@ -1007,7 +1023,11 @@ mod tests {
                     others += 1;
                     // 44 cores at 770 plus one at 771 = 34,651, which with the
                     // two outliers below makes exactly 34,690.
-                    if others == 45 { 771 } else { 770 }
+                    if others == 45 {
+                        771
+                    } else {
+                        770
+                    }
                 }
             };
             occ.push(cell(core, task, n));
@@ -1031,10 +1051,7 @@ mod tests {
         (ents, occ)
     }
 
-    fn input<'a>(
-        ents: &'a [EntitlementRow],
-        occ: &'a [OccupancyCell],
-    ) -> DeltaInput<'a> {
+    fn input<'a>(ents: &'a [EntitlementRow], occ: &'a [OccupancyCell]) -> DeltaInput<'a> {
         DeltaInput {
             occupancy: occ,
             entitlement: ents,
@@ -1128,13 +1145,22 @@ mod tests {
     fn the_two_barely_used_cores_are_bulk_purchases_and_not_on_demand() {
         let (ents, occ) = measured_window();
         let r = compute(input(&ents, &occ));
-        let find = |c: u32| r.cores.iter().find(|x| x.core_index == c).expect("core present");
+        let find = |c: u32| {
+            r.cores
+                .iter()
+                .find(|x| x.core_index == c)
+                .expect("core present")
+        };
 
         for (core, blocks, pct) in [(53u32, 10u64, 1.0f64), (13, 29, 2.9)] {
             let row = find(core);
             assert_eq!(row.entitlement_kind, "task");
             assert_eq!(row.verdict, "agree");
-            assert_eq!(row.parts, Some(PARTS_WHOLE_CORE), "a WHOLE core, not a slice of one");
+            assert_eq!(
+                row.parts,
+                Some(PARTS_WHOLE_CORE),
+                "a WHOLE core, not a slice of one"
+            );
             assert_eq!(row.included_blocks, blocks);
             let got = row.used_ratio.expect("blocks are indexed") * 100.0;
             assert!((got - pct).abs() < 0.05, "core {core}: {got}% vs {pct}%");
@@ -1258,7 +1284,10 @@ mod tests {
         assert!(!r.entitlement_stable_across_window);
         assert_eq!(
             r.changed_in_window,
-            vec![CoreChange { core_index: 1, relay_block: WINDOW_FROM + 500 }]
+            vec![CoreChange {
+                core_index: 1,
+                relay_block: WINDOW_FROM + 500
+            }]
         );
         assert_eq!(r.checks.entitlement_stable, Check::Contradicted);
         assert!(r.waste.is_none());
@@ -1272,7 +1301,10 @@ mod tests {
             broker_core_count: Some(1),
             ..input(&ents, &occ)
         });
-        assert!(r.entitlement_stable_across_window, "at `from` governs [from, to]");
+        assert!(
+            r.entitlement_stable_across_window,
+            "at `from` governs [from, to]"
+        );
         assert!(r.waste.is_some());
     }
 
@@ -1324,7 +1356,10 @@ mod tests {
         });
         assert_eq!(r.cores[0].entitlement_kind, "task");
         assert_eq!(r.cores[0].entitled_tasks, vec![2000, 2004]);
-        assert_eq!(r.cores[0].verdict, "agree", "either entitled task attributes");
+        assert_eq!(
+            r.cores[0].verdict, "agree",
+            "either entitled task attributes"
+        );
         assert!(r.waste.is_some());
 
         // A core split between a task and the pool is MIXED: entitled to half of
@@ -1382,7 +1417,9 @@ mod tests {
         assert!(r.waste.is_none());
         assert!(r.cores.iter().all(|c| c.used_ratio.is_none()));
         assert_eq!(r.checks.occupancy_within_slots, Check::Unknown);
-        assert!(r.reads_as.contains("NEITHER A WASTE FIGURE NOR AN ATTRIBUTION"));
+        assert!(r
+            .reads_as
+            .contains("NEITHER A WASTE FIGURE NOR AN ATTRIBUTION"));
         // The entitlement census survives — we DID look at that.
         assert_eq!(r.task_entitled_cores, 1);
     }
@@ -1416,7 +1453,11 @@ mod tests {
             "{}",
             r.reads_as
         );
-        assert!(!r.reads_as.contains("NOT about the network"), "{}", r.reads_as);
+        assert!(
+            !r.reads_as.contains("NOT about the network"),
+            "{}",
+            r.reads_as
+        );
     }
 
     /// GATE 6: a core cannot be included more times than the window holds
@@ -1484,7 +1525,10 @@ mod tests {
             ..input(&ents, &occ)
         });
         assert_eq!(r.checks.cores_within_denominator, Check::Contradicted);
-        assert_eq!(r.cores_seen, 5, "0..4 declared, plus the core that exists anyway");
+        assert_eq!(
+            r.cores_seen, 5,
+            "0..4 declared, plus the core that exists anyway"
+        );
     }
 
     /// Without a `first_core` reading the reserved/market split is NOT assumed.
@@ -1492,7 +1536,10 @@ mod tests {
     /// the waste on the wrong side of the boundary — see 0026.
     #[test]
     fn without_first_core_the_market_split_is_absent_rather_than_guessed() {
-        let ents = vec![ent(0, KIND_TASK, Some(2004), SALE), ent(1, KIND_TASK, Some(2034), SALE)];
+        let ents = vec![
+            ent(0, KIND_TASK, Some(2004), SALE),
+            ent(1, KIND_TASK, Some(2034), SALE),
+        ];
         let occ = vec![cell(0, 2004, 900)];
         let r = compute(DeltaInput {
             relay_num_cores: Some(2),
@@ -1500,7 +1547,9 @@ mod tests {
             first_core: None,
             ..input(&ents, &occ)
         });
-        let w = r.waste.expect("first_core is not a gate — the split is, not the ratio");
+        let w = r
+            .waste
+            .expect("first_core is not a gate — the split is, not the ratio");
         assert_eq!(w.idle_task_cores, 1);
         assert_eq!(w.idle_task_cores_market, None);
         assert_eq!(w.idle_task_cores_reserved, None);

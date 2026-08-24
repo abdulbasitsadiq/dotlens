@@ -149,10 +149,7 @@ impl<'a> FactWriter<SpendFact> for SinkBridge<'a> {
     }
 }
 
-fn run<'a>(
-    mapper: &'a dyn TreasuryMapper,
-    deps: &'a TreasuryDeps<'a>,
-) -> ModuleRun<'a, SpendFact> {
+fn run<'a>(mapper: &'a dyn TreasuryMapper, deps: &'a TreasuryDeps<'a>) -> ModuleRun<'a, SpendFact> {
     ModuleRun {
         module: MODULE_TREASURY,
         checkpoints: deps.checkpoints,
@@ -242,7 +239,11 @@ mod tests {
             payment_id: None,
             valid_from: None,
             expire_at: None,
-            attribution: if id.is_some() { "event".into() } else { "pot".into() },
+            attribution: if id.is_some() {
+                "event".into()
+            } else {
+                "pot".into()
+            },
             data: serde_json::json!({}),
         }
     }
@@ -297,7 +298,10 @@ mod tests {
     #[tokio::test]
     async fn range_maps_spends_and_pot_flows_skips_gaps_and_advances() {
         let mut src = HashMap::new();
-        src.insert(1, vec![ev(0, "mock.Spend", serde_json::json!({"index": 42}))]);
+        src.insert(
+            1,
+            vec![ev(0, "mock.Spend", serde_json::json!({"index": 42}))],
+        );
         // height 2 is a decode gap
         src.insert(
             3,
@@ -313,7 +317,9 @@ mod tests {
             source: &MemSource(src),
             sink: &sink,
         };
-        let n = treasury_range("mock", &MockMapper, &deps, 1, 3).await.unwrap();
+        let n = treasury_range("mock", &MockMapper, &deps, 1, 3)
+            .await
+            .unwrap();
         assert_eq!(n, 2, "two decoded heights, one gap skipped");
         let rows = sink.0.lock().unwrap();
         assert_eq!(rows.len(), 2);
@@ -321,14 +327,21 @@ mod tests {
         assert_eq!(rows[1].2.attribution, "pot");
         assert_eq!(rows[1].2.spend_id, None);
         drop(rows);
-        let cp = checkpoints.get("mock", MODULE_TREASURY).await.unwrap().unwrap();
+        let cp = checkpoints
+            .get("mock", MODULE_TREASURY)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(cp.last_height, 3, "checkpoint advanced through the gap");
     }
 
     #[tokio::test]
     async fn rerun_behind_frontier_rewrites_without_moving_checkpoint() {
         let mut src = HashMap::new();
-        src.insert(1, vec![ev(0, "mock.Spend", serde_json::json!({"index": 1}))]);
+        src.insert(
+            1,
+            vec![ev(0, "mock.Spend", serde_json::json!({"index": 1}))],
+        );
         src.insert(2, vec![]);
         let checkpoints = MemoryCheckpointStore::new();
         let sink = MemSink::default();
@@ -337,10 +350,21 @@ mod tests {
             source: &MemSource(src),
             sink: &sink,
         };
-        treasury_range("mock", &MockMapper, &deps, 1, 2).await.unwrap();
-        let n = treasury_range("mock", &MockMapper, &deps, 1, 1).await.unwrap();
-        assert_eq!(n, 1, "behind-frontier reprocess is allowed (sink converges)");
-        let cp = checkpoints.get("mock", MODULE_TREASURY).await.unwrap().unwrap();
+        treasury_range("mock", &MockMapper, &deps, 1, 2)
+            .await
+            .unwrap();
+        let n = treasury_range("mock", &MockMapper, &deps, 1, 1)
+            .await
+            .unwrap();
+        assert_eq!(
+            n, 1,
+            "behind-frontier reprocess is allowed (sink converges)"
+        );
+        let cp = checkpoints
+            .get("mock", MODULE_TREASURY)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(cp.last_height, 2, "frontier untouched by reprocess");
     }
 
@@ -355,17 +379,26 @@ mod tests {
             source: &MemSource(src),
             sink: &sink,
         };
-        let err = treasury_range("mock", &MockMapper, &deps, 1, 1).await.unwrap_err();
+        let err = treasury_range("mock", &MockMapper, &deps, 1, 1)
+            .await
+            .unwrap_err();
         assert!(matches!(err, TreasuryWorkerError::Mapper { height: 1, .. }));
         assert!(sink.0.lock().unwrap().is_empty());
-        assert!(checkpoints.get("mock", MODULE_TREASURY).await.unwrap().is_none());
+        assert!(checkpoints
+            .get("mock", MODULE_TREASURY)
+            .await
+            .unwrap()
+            .is_none());
     }
 
     #[tokio::test]
     async fn tick_chases_the_decode_checkpoint() {
         let mut src = HashMap::new();
         for h in 5..=9 {
-            src.insert(h, vec![ev(0, "mock.Spend", serde_json::json!({"index": h}))]);
+            src.insert(
+                h,
+                vec![ev(0, "mock.Spend", serde_json::json!({"index": h}))],
+            );
         }
         let checkpoints = MemoryCheckpointStore::new();
         let sink = MemSink::default();
@@ -387,7 +420,11 @@ mod tests {
         assert_eq!(treasury_tick("mock", &MockMapper, &deps).await.unwrap(), 1);
         checkpoints.advance(decode_cp(9)).await.unwrap();
         assert_eq!(treasury_tick("mock", &MockMapper, &deps).await.unwrap(), 2);
-        let cp = checkpoints.get("mock", MODULE_TREASURY).await.unwrap().unwrap();
+        let cp = checkpoints
+            .get("mock", MODULE_TREASURY)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(cp.last_height, 9);
         assert_eq!(treasury_tick("mock", &MockMapper, &deps).await.unwrap(), 0);
     }

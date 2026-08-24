@@ -290,7 +290,11 @@ impl Registry {
             })?
             .filter_map(|e| e.ok())
             .map(|e| e.path())
-            .filter(|p| p.extension().map(|e| e == "yaml" || e == "yml").unwrap_or(false))
+            .filter(|p| {
+                p.extension()
+                    .map(|e| e == "yaml" || e == "yml")
+                    .unwrap_or(false)
+            })
             .collect();
         entries.sort();
 
@@ -583,13 +587,25 @@ mod tests {
         let reg = Registry::load_from_dir(&seeds_dir()).unwrap();
         let before = Utc.with_ymd_and_hms(2025, 6, 1, 0, 0, 0).unwrap();
         let after = Utc.with_ymd_and_hms(2026, 1, 27, 12, 0, 0).unwrap();
-        assert_eq!(reg.resolve_domain("governance", "polkadot", before).unwrap().id, "polkadot");
         assert_eq!(
-            reg.resolve_domain("governance", "polkadot", after).unwrap().id,
+            reg.resolve_domain("governance", "polkadot", before)
+                .unwrap()
+                .id,
+            "polkadot"
+        );
+        assert_eq!(
+            reg.resolve_domain("governance", "polkadot", after)
+                .unwrap()
+                .id,
             "polkadot-asset-hub"
         );
         // consensus never moved
-        assert_eq!(reg.resolve_domain("consensus", "polkadot", after).unwrap().id, "polkadot");
+        assert_eq!(
+            reg.resolve_domain("consensus", "polkadot", after)
+                .unwrap()
+                .id,
+            "polkadot"
+        );
     }
 
     #[test]
@@ -607,7 +623,10 @@ mod tests {
         let collectives = reg.chain("polkadot-collectives").expect("collectives");
         assert_eq!(collectives.para_id, Some(1001));
         assert_eq!(collectives.relay.as_deref(), Some("polkadot"));
-        assert!(collectives.has_module("governance"), "fellowship referenda + votes");
+        assert!(
+            collectives.has_module("governance"),
+            "fellowship referenda + votes"
+        );
         assert!(collectives.has_capability("fellowship"));
         let people = reg.chain("polkadot-people").expect("people");
         assert_eq!(people.para_id, Some(1004));
@@ -683,7 +702,9 @@ mod tests {
         // so if this assertion fails the whole module is dark and nothing else
         // says so.
         assert!(
-            reg.chain("polkadot").expect("polkadot").has_module("coretime"),
+            reg.chain("polkadot")
+                .expect("polkadot")
+                .has_module("coretime"),
             "the relay must declare `coretime`: `paraInclusion` is a relay pallet and it is the \
              only place core occupancy is reported"
         );
@@ -726,7 +747,10 @@ mod tests {
         );
         let entitlement = reg.chains_with_module("polkadot", "broker");
         assert_eq!(
-            entitlement.iter().map(|c| c.id.as_str()).collect::<Vec<_>>(),
+            entitlement
+                .iter()
+                .map(|c| c.id.as_str())
+                .collect::<Vec<_>>(),
             vec!["polkadot-coretime"],
             "entitlement is `pallet-broker`, which lives on the coretime chain"
         );
@@ -750,16 +774,25 @@ mod tests {
         let now = Utc.with_ymd_and_hms(2026, 8, 15, 0, 0, 0).unwrap();
         // the Fellowship did not follow governance to Asset Hub
         assert_eq!(
-            reg.resolve_domain("fellowship", "polkadot", now).unwrap().id,
+            reg.resolve_domain("fellowship", "polkadot", now)
+                .unwrap()
+                .id,
             "polkadot-collectives"
         );
         assert_eq!(
-            reg.resolve_domain("governance", "polkadot", now).unwrap().id,
+            reg.resolve_domain("governance", "polkadot", now)
+                .unwrap()
+                .id,
             "polkadot-asset-hub"
         );
         // identity: the OTHER migration, relay → People on 2024-07-25
         let before = Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap();
-        assert_eq!(reg.resolve_domain("identity", "polkadot", before).unwrap().id, "polkadot");
+        assert_eq!(
+            reg.resolve_domain("identity", "polkadot", before)
+                .unwrap()
+                .id,
+            "polkadot"
+        );
         assert_eq!(
             reg.resolve_domain("identity", "polkadot", now).unwrap().id,
             "polkadot-people"
@@ -772,7 +805,10 @@ mod tests {
         assert_eq!(reg.domain_for_class("referenda"), "governance");
         assert_eq!(reg.domain_for_class("fellowship_referenda"), "fellowship");
         // an instance nobody registered still resolves to public OpenGov
-        assert_eq!(reg.domain_for_class("ambassador_referenda"), DEFAULT_GOV_DOMAIN);
+        assert_eq!(
+            reg.domain_for_class("ambassador_referenda"),
+            DEFAULT_GOV_DOMAIN
+        );
 
         // the pallet each class's tracks live under — the disambiguator for a
         // chain running several instances with colliding track ids
@@ -804,8 +840,14 @@ mod tests {
         // assets. Absolutizing `{parents:0, Here}` from Asset Hub would name the
         // PARACHAIN, so AH's DOT would join nothing and the treasury's largest
         // position would split off on its own.
-        assert_eq!(reg.chain("polkadot").unwrap().native_token, Some(NativeToken::Own));
-        assert_eq!(reg.chain("hydration").unwrap().native_token, Some(NativeToken::Own));
+        assert_eq!(
+            reg.chain("polkadot").unwrap().native_token,
+            Some(NativeToken::Own)
+        );
+        assert_eq!(
+            reg.chain("hydration").unwrap().native_token,
+            Some(NativeToken::Own)
+        );
         for parachain in [
             "polkadot-asset-hub",
             "polkadot-collectives",

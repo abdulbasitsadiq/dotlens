@@ -325,7 +325,11 @@ mod tests {
         assert!(matches!(rows[1].2, VoteFact::Delegation(_)));
         assert_eq!((rows[1].0, rows[1].1), (3, 1));
         drop(rows);
-        let cp = checkpoints.get("mock", MODULE_VOTES).await.unwrap().unwrap();
+        let cp = checkpoints
+            .get("mock", MODULE_VOTES)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(cp.last_height, 3, "checkpoint advanced through the gap");
     }
 
@@ -343,8 +347,15 @@ mod tests {
         };
         votes_range("mock", &MockMapper, &deps, 1, 2).await.unwrap();
         let n = votes_range("mock", &MockMapper, &deps, 1, 1).await.unwrap();
-        assert_eq!(n, 1, "behind-frontier reprocess is allowed (sink converges)");
-        let cp = checkpoints.get("mock", MODULE_VOTES).await.unwrap().unwrap();
+        assert_eq!(
+            n, 1,
+            "behind-frontier reprocess is allowed (sink converges)"
+        );
+        let cp = checkpoints
+            .get("mock", MODULE_VOTES)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(cp.last_height, 2, "frontier untouched by reprocess");
     }
 
@@ -359,10 +370,16 @@ mod tests {
             source: &MemSource(src),
             sink: &sink,
         };
-        let err = votes_range("mock", &MockMapper, &deps, 1, 1).await.unwrap_err();
+        let err = votes_range("mock", &MockMapper, &deps, 1, 1)
+            .await
+            .unwrap_err();
         assert!(matches!(err, VotesWorkerError::Mapper { height: 1, .. }));
         assert!(sink.0.lock().unwrap().is_empty());
-        assert!(checkpoints.get("mock", MODULE_VOTES).await.unwrap().is_none());
+        assert!(checkpoints
+            .get("mock", MODULE_VOTES)
+            .await
+            .unwrap()
+            .is_none());
     }
 
     #[tokio::test]
@@ -392,7 +409,11 @@ mod tests {
         assert_eq!(votes_tick("mock", &MockMapper, &deps).await.unwrap(), 1);
         checkpoints.advance(decode_cp(9)).await.unwrap();
         assert_eq!(votes_tick("mock", &MockMapper, &deps).await.unwrap(), 2);
-        let cp = checkpoints.get("mock", MODULE_VOTES).await.unwrap().unwrap();
+        let cp = checkpoints
+            .get("mock", MODULE_VOTES)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(cp.last_height, 9);
         assert_eq!(votes_tick("mock", &MockMapper, &deps).await.unwrap(), 0);
     }

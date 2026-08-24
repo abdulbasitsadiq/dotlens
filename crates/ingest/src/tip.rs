@@ -73,11 +73,7 @@ pub trait UnfinalizedStore: Send + Sync {
     ) -> Result<Option<String>, SinkError>;
     /// Delete unfinalized rows ABOVE `height` (shortening reorg leftovers).
     /// Returns how many block rows were pruned.
-    async fn prune_unfinalized_above(
-        &self,
-        chain_id: &str,
-        height: u64,
-    ) -> Result<u64, SinkError>;
+    async fn prune_unfinalized_above(&self, chain_id: &str, height: u64) -> Result<u64, SinkError>;
 }
 
 pub struct TipDeps<'a> {
@@ -166,8 +162,11 @@ pub async fn tip_tick(
             return Err(TipError::Decode {
                 chain: chain_id.to_string(),
                 height,
-                reason: format!("source returned no {} or {} artifact",
-                    keys::BLOCK_ITEM_V2, keys::BLOCK_ITEM_V1),
+                reason: format!(
+                    "source returned no {} or {} artifact",
+                    keys::BLOCK_ITEM_V2,
+                    keys::BLOCK_ITEM_V1
+                ),
             });
         };
 
@@ -249,9 +248,7 @@ mod tests {
 
     impl MockTip {
         fn new(finalized: u64, best: u64) -> Self {
-            let hashes = (1..=best)
-                .map(|h| (h, format!("0xaa{h:02x}")))
-                .collect();
+            let hashes = (1..=best).map(|h| (h, format!("0xaa{h:02x}"))).collect();
             Self {
                 finalized: Mutex::new(finalized),
                 best: Mutex::new(best),
@@ -317,7 +314,10 @@ mod tests {
                         item: "block.json".into(),
                         bytes: serde_json::to_vec(&env).unwrap(),
                     },
-                    RawArtifact { item: "events.scale".into(), bytes: vec![0] },
+                    RawArtifact {
+                        item: "events.scale".into(),
+                        bytes: vec![0],
+                    },
                 ],
             })
         }
@@ -357,9 +357,11 @@ mod tests {
         fn spec_version_of(&self, envelope: &[u8]) -> Result<u32, String> {
             let v: serde_json::Value =
                 serde_json::from_slice(envelope).map_err(|e| e.to_string())?;
-            v["spec_version"].as_u64().map(|s| s as u32).ok_or("no spec_version".into())
+            v["spec_version"]
+                .as_u64()
+                .map(|s| s as u32)
+                .ok_or("no spec_version".into())
         }
-
     }
 
     /// Mock canonical store with the REPLACEMENT RULE (finalized immutable,
@@ -426,7 +428,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         let raw = raw_store::FsRawStore::new(&dir);
         // tip decode needs archived metadata for the current spec
-        raw.put(&keys::metadata("mock", 100), b"meta-100", "t").unwrap();
+        raw.put(&keys::metadata("mock", 100), b"meta-100", "t")
+            .unwrap();
         (raw, dir)
     }
 
@@ -435,9 +438,16 @@ mod tests {
         let source = MockTip::new(5, 8);
         let (raw, dir) = tmp_raw("window");
         let store = MemStore::default();
-        let deps = TipDeps { raw: &raw, receipts: &crate::NoopReceiptSink, store: &store, sink: &store };
+        let deps = TipDeps {
+            raw: &raw,
+            receipts: &crate::NoopReceiptSink,
+            store: &store,
+            sink: &store,
+        };
 
-        let n = tip_tick("mock", &source, &EnvelopeDecoder, &deps).await.unwrap();
+        let n = tip_tick("mock", &source, &EnvelopeDecoder, &deps)
+            .await
+            .unwrap();
         assert_eq!(n, 3, "heights 6..=8");
         {
             let map = store.0.lock().unwrap();
@@ -445,7 +455,9 @@ mod tests {
             assert_eq!(map.get(&7).unwrap().hash, "0xaa07");
         }
         // second tick: nothing changed on-chain → no-op
-        let n = tip_tick("mock", &source, &EnvelopeDecoder, &deps).await.unwrap();
+        let n = tip_tick("mock", &source, &EnvelopeDecoder, &deps)
+            .await
+            .unwrap();
         assert_eq!(n, 0);
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -455,12 +467,21 @@ mod tests {
         let source = MockTip::new(5, 8);
         let (raw, dir) = tmp_raw("reorg");
         let store = MemStore::default();
-        let deps = TipDeps { raw: &raw, receipts: &crate::NoopReceiptSink, store: &store, sink: &store };
-        tip_tick("mock", &source, &EnvelopeDecoder, &deps).await.unwrap();
+        let deps = TipDeps {
+            raw: &raw,
+            receipts: &crate::NoopReceiptSink,
+            store: &store,
+            sink: &store,
+        };
+        tip_tick("mock", &source, &EnvelopeDecoder, &deps)
+            .await
+            .unwrap();
 
         // reorg at height 7: new fork 7..=9
         source.reorg(7, 9);
-        let n = tip_tick("mock", &source, &EnvelopeDecoder, &deps).await.unwrap();
+        let n = tip_tick("mock", &source, &EnvelopeDecoder, &deps)
+            .await
+            .unwrap();
         assert_eq!(n, 3, "7 and 8 replaced, 9 new");
         {
             let map = store.0.lock().unwrap();
@@ -469,8 +490,12 @@ mod tests {
             assert_eq!(map.get(&9).unwrap().hash, "0xbb09");
         }
         // BOTH forks' raw artifacts exist (immutability across reorgs)
-        assert!(raw.exists(&keys::unfinalized_block("mock", 7, "aa07", "block.json")).unwrap());
-        assert!(raw.exists(&keys::unfinalized_block("mock", 7, "bb07", "block.json")).unwrap());
+        assert!(raw
+            .exists(&keys::unfinalized_block("mock", 7, "aa07", "block.json"))
+            .unwrap());
+        assert!(raw
+            .exists(&keys::unfinalized_block("mock", 7, "bb07", "block.json"))
+            .unwrap());
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -498,8 +523,15 @@ mod tests {
             })
             .await
             .unwrap();
-        let deps = TipDeps { raw: &raw, receipts: &crate::NoopReceiptSink, store: &store, sink: &store };
-        tip_tick("mock", &source, &EnvelopeDecoder, &deps).await.unwrap();
+        let deps = TipDeps {
+            raw: &raw,
+            receipts: &crate::NoopReceiptSink,
+            store: &store,
+            sink: &store,
+        };
+        tip_tick("mock", &source, &EnvelopeDecoder, &deps)
+            .await
+            .unwrap();
         assert!(store.0.lock().unwrap().contains_key(&9));
         // finalized row was NOT overwritten by the tip fetch at height 6
         assert_eq!(store.0.lock().unwrap().get(&6).unwrap().hash, "0xfinal6");
@@ -508,10 +540,18 @@ mod tests {
         *source.best.lock().unwrap() = 7;
         source.hashes.lock().unwrap().remove(&8);
         source.hashes.lock().unwrap().remove(&9);
-        tip_tick("mock", &source, &EnvelopeDecoder, &deps).await.unwrap();
+        tip_tick("mock", &source, &EnvelopeDecoder, &deps)
+            .await
+            .unwrap();
         let map = store.0.lock().unwrap();
-        assert!(!map.contains_key(&8) && !map.contains_key(&9), "stale rows pruned");
-        assert!(map.get(&6).unwrap().finalized, "finalized rows never pruned");
+        assert!(
+            !map.contains_key(&8) && !map.contains_key(&9),
+            "stale rows pruned"
+        );
+        assert!(
+            map.get(&6).unwrap().finalized,
+            "finalized rows never pruned"
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 }

@@ -98,7 +98,9 @@ pub fn pack(
     level: i32,
 ) -> Result<Vec<u8>, RawStoreError> {
     if members.is_empty() {
-        return Err(RawStoreError::Bucket("refusing to pack an empty bucket".into()));
+        return Err(RawStoreError::Bucket(
+            "refusing to pack an empty bucket".into(),
+        ));
     }
     let mut payload = Vec::new();
     let mut entries = Vec::with_capacity(members.len());
@@ -141,7 +143,9 @@ pub fn read_manifest(bytes: &[u8]) -> Result<Option<BucketManifest>, RawStoreErr
         return Ok(None);
     }
     if &bytes[..7] != BUCKET_MAGIC {
-        return Err(RawStoreError::Bucket("not a bucket object (bad magic)".into()));
+        return Err(RawStoreError::Bucket(
+            "not a bucket object (bad magic)".into(),
+        ));
     }
     let ver = bytes[7];
     if ver != BUCKET_VERSION {
@@ -203,7 +207,11 @@ impl OpenBucket {
                 payload.len()
             )));
         }
-        Ok(Self { manifest, payload, offsets })
+        Ok(Self {
+            manifest,
+            payload,
+            offsets,
+        })
     }
 
     pub fn get(&self, height: u64, item: &str) -> Option<&[u8]> {
@@ -212,7 +220,9 @@ impl OpenBucket {
             .members
             .iter()
             .position(|m| m.height == height && m.item == item)?;
-        Some(&self.payload[self.offsets[i]..self.offsets[i] + self.manifest.members[i].len as usize])
+        Some(
+            &self.payload[self.offsets[i]..self.offsets[i] + self.manifest.members[i].len as usize],
+        )
     }
 
     pub fn contains(&self, height: u64, item: &str) -> bool {

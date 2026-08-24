@@ -173,12 +173,16 @@ pub fn facts_for_event(event: &CanonicalEvent) -> Result<Vec<SpendFact>, String>
         // ---------------------------------------------- legacy proposal flow
         "Proposed" => SpendFact {
             spend_kind: Some(KIND_PROPOSAL.into()),
-            spend_id: Some(field_u64(data, "proposal_index", 0).ok_or_else(|| ctx("no proposal_index"))?),
+            spend_id: Some(
+                field_u64(data, "proposal_index", 0).ok_or_else(|| ctx("no proposal_index"))?,
+            ),
             ..base("proposed", Some("proposed"))
         },
         "SpendApproved" => SpendFact {
             spend_kind: Some(KIND_PROPOSAL.into()),
-            spend_id: Some(field_u64(data, "proposal_index", 0).ok_or_else(|| ctx("no proposal_index"))?),
+            spend_id: Some(
+                field_u64(data, "proposal_index", 0).ok_or_else(|| ctx("no proposal_index"))?,
+            ),
             amount: Some(field_u128(data, "amount", 1).ok_or_else(|| ctx("no amount"))?),
             figure_kind: Some("flow".into()),
             beneficiary: field_account(data, "beneficiary", 2).map(|a| a.to_vec()),
@@ -186,7 +190,9 @@ pub fn facts_for_event(event: &CanonicalEvent) -> Result<Vec<SpendFact>, String>
         },
         "Awarded" => SpendFact {
             spend_kind: Some(KIND_PROPOSAL.into()),
-            spend_id: Some(field_u64(data, "proposal_index", 0).ok_or_else(|| ctx("no proposal_index"))?),
+            spend_id: Some(
+                field_u64(data, "proposal_index", 0).ok_or_else(|| ctx("no proposal_index"))?,
+            ),
             amount: Some(field_u128(data, "award", 1).ok_or_else(|| ctx("no award"))?),
             figure_kind: Some("flow".into()),
             // the field is `account` here, not `beneficiary` (pallet naming)
@@ -195,7 +201,9 @@ pub fn facts_for_event(event: &CanonicalEvent) -> Result<Vec<SpendFact>, String>
         },
         "Rejected" => SpendFact {
             spend_kind: Some(KIND_PROPOSAL.into()),
-            spend_id: Some(field_u64(data, "proposal_index", 0).ok_or_else(|| ctx("no proposal_index"))?),
+            spend_id: Some(
+                field_u64(data, "proposal_index", 0).ok_or_else(|| ctx("no proposal_index"))?,
+            ),
             // NOT a spend: this is the proposer's bond being slashed
             slashed: field_u128(data, "slashed", 1),
             ..base("rejected", Some("rejected"))
@@ -312,7 +320,11 @@ pub fn facts_for_event(event: &CanonicalEvent) -> Result<Vec<SpendFact>, String>
 // as objects, positional as arrays; AccountId32 as (nested) byte arrays or
 // SS58 strings (decoder v1); u128 as numbers when small, decimal strings when big.
 
-fn field<'a>(data: &'a serde_json::Value, name: &str, index: usize) -> Option<&'a serde_json::Value> {
+fn field<'a>(
+    data: &'a serde_json::Value,
+    name: &str,
+    index: usize,
+) -> Option<&'a serde_json::Value> {
     match data {
         serde_json::Value::Object(map) => map.get(name),
         serde_json::Value::Array(items) => items.get(index),
@@ -333,7 +345,9 @@ fn field_u128(data: &serde_json::Value, name: &str, index: usize) -> Option<u128
 }
 
 fn field_u64(data: &serde_json::Value, name: &str, index: usize) -> Option<u64> {
-    field(data, name, index).and_then(json_u128).and_then(|n| u64::try_from(n).ok())
+    field(data, name, index)
+        .and_then(json_u128)
+        .and_then(|n| u64::try_from(n).ok())
 }
 
 fn json_account_bytes(v: &serde_json::Value) -> Option<[u8; 32]> {
@@ -441,7 +455,10 @@ mod tests {
         ))
         .unwrap());
         assert_eq!(proposed.spend_kind.as_deref(), Some("proposal"));
-        assert_eq!((proposed.spend_id, proposed.status.as_deref()), (Some(42), Some("proposed")));
+        assert_eq!(
+            (proposed.spend_id, proposed.status.as_deref()),
+            (Some(42), Some("proposed"))
+        );
 
         let approved = one(facts_for_event(&ev(
             "treasury.SpendApproved",
@@ -452,14 +469,20 @@ mod tests {
         .unwrap());
         assert_eq!(approved.amount, Some(12_000_000_000_000));
         assert_eq!(approved.beneficiary.as_deref(), Some(&who[..]));
-        assert_eq!(approved.asset_kind, None, "the legacy flow is always native");
+        assert_eq!(
+            approved.asset_kind, None,
+            "the legacy flow is always native"
+        );
 
         let awarded = one(facts_for_event(&ev(
             "treasury.Awarded",
             serde_json::json!({"proposal_index": 42, "award": 500, "account": acct_json(&who)}),
         ))
         .unwrap());
-        assert_eq!((awarded.kind.as_str(), awarded.amount), ("awarded", Some(500)));
+        assert_eq!(
+            (awarded.kind.as_str(), awarded.amount),
+            ("awarded", Some(500))
+        );
         assert_eq!(awarded.beneficiary.as_deref(), Some(&who[..]));
     }
 
@@ -502,10 +525,23 @@ mod tests {
         assert_eq!(s.spend_kind.as_deref(), Some("asset_spend"));
         assert_eq!((s.spend_id, s.amount), (Some(313), Some(83_760_000_000)));
         assert_eq!(s.status.as_deref(), Some("approved"));
-        assert!(s.asset_kind.is_some(), "asset kind kept whole, schema-on-read");
-        assert_eq!(s.beneficiary.as_deref(), Some(&who[..]), "AccountId32 junction extracted");
-        assert!(s.beneficiary_location.is_some(), "and the raw location is kept");
-        assert_eq!((s.valid_from, s.expire_at), (Some(19_000_000), Some(19_500_000)));
+        assert!(
+            s.asset_kind.is_some(),
+            "asset kind kept whole, schema-on-read"
+        );
+        assert_eq!(
+            s.beneficiary.as_deref(),
+            Some(&who[..]),
+            "AccountId32 junction extracted"
+        );
+        assert!(
+            s.beneficiary_location.is_some(),
+            "and the raw location is kept"
+        );
+        assert_eq!(
+            (s.valid_from, s.expire_at),
+            (Some(19_000_000), Some(19_500_000))
+        );
     }
 
     #[test]
@@ -571,7 +607,10 @@ mod tests {
             serde_json::json!({"index": 313, "payment_id": 5551}),
         ))
         .unwrap());
-        assert_eq!((paid.kind.as_str(), paid.payment_id.as_deref()), ("paid", Some("5551")));
+        assert_eq!(
+            (paid.kind.as_str(), paid.payment_id.as_deref()),
+            ("paid", Some("5551"))
+        );
 
         let failed = one(facts_for_event(&ev(
             "treasury.PaymentFailed",
@@ -603,19 +642,45 @@ mod tests {
         // SNAPSHOT is the pot's balance reported at a point in the period.
         // Summing snapshots as flows double-counts the treasury twice a period.
         let cases: &[(&str, &str, Option<u128>, Option<&str>, serde_json::Value)] = &[
-            ("Deposit", "pot_deposit", Some(700), Some("flow"),
-                serde_json::json!({"value": 700})),
-            ("Burnt", "pot_burnt", Some(11), Some("flow"),
-                serde_json::json!({"burnt_funds": 11})),
-            ("Spending", "pot_spending", Some(90), Some("snapshot"),
-                serde_json::json!({"budget_remaining": 90})),
-            ("Rollover", "pot_rollover", Some(5), Some("snapshot"),
-                serde_json::json!({"rollover_balance": 5})),
-            ("UpdatedInactive", "pot_inactive_updated", None, None,
-                serde_json::json!({"reactivated": 1, "deactivated": 2})),
+            (
+                "Deposit",
+                "pot_deposit",
+                Some(700),
+                Some("flow"),
+                serde_json::json!({"value": 700}),
+            ),
+            (
+                "Burnt",
+                "pot_burnt",
+                Some(11),
+                Some("flow"),
+                serde_json::json!({"burnt_funds": 11}),
+            ),
+            (
+                "Spending",
+                "pot_spending",
+                Some(90),
+                Some("snapshot"),
+                serde_json::json!({"budget_remaining": 90}),
+            ),
+            (
+                "Rollover",
+                "pot_rollover",
+                Some(5),
+                Some("snapshot"),
+                serde_json::json!({"rollover_balance": 5}),
+            ),
+            (
+                "UpdatedInactive",
+                "pot_inactive_updated",
+                None,
+                None,
+                serde_json::json!({"reactivated": 1, "deactivated": 2}),
+            ),
         ];
         for (variant, kind, amount, figure, data) in cases {
-            let f = one(facts_for_event(&ev(&format!("treasury.{variant}"), data.clone())).unwrap());
+            let f =
+                one(facts_for_event(&ev(&format!("treasury.{variant}"), data.clone())).unwrap());
             assert_eq!(f.kind.as_str(), *kind);
             assert_eq!(f.amount, *amount, "{variant}");
             assert_eq!(f.figure_kind.as_deref(), *figure, "{variant}");
@@ -667,7 +732,10 @@ mod tests {
             "multiassetbounties.BountyCreated",
         ] {
             let e = ev(name, serde_json::json!({"index": 1}));
-            assert!(facts_for_event(&e).unwrap().is_empty(), "{name} must map to ∅");
+            assert!(
+                facts_for_event(&e).unwrap().is_empty(),
+                "{name} must map to ∅"
+            );
         }
         // …but an unknown event of a mapped instance halts loudly
         let unknown = ev("treasury.SomeFutureEvent", serde_json::json!({"index": 1}));
@@ -682,6 +750,8 @@ mod tests {
             serde_json::json!({"proposal_index": 1})
         ))
         .is_err());
-        assert!(facts_for_event(&ev("treasury.Paid", serde_json::json!({"payment_id": 1}))).is_err());
+        assert!(
+            facts_for_event(&ev("treasury.Paid", serde_json::json!({"payment_id": 1}))).is_err()
+        );
     }
 }

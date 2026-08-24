@@ -256,7 +256,9 @@ pub fn derive(
                 blocks_behind_decode: behind(decode, Some(c.height)),
                 updated_at: Some(c.updated_at),
                 seconds_since_update: Some(
-                    observed_at.signed_duration_since(c.updated_at).num_seconds(),
+                    observed_at
+                        .signed_duration_since(c.updated_at)
+                        .num_seconds(),
                 ),
                 blocking_halt,
             }
@@ -532,7 +534,11 @@ mod tests {
         assert_eq!(b.state.as_str(), "at_decode_frontier");
         assert!(r.reads_as.contains("never `current`"), "{}", r.reads_as);
         assert!(r.reads_as.contains("MUST NOT be added"), "{}", r.reads_as);
-        assert!(r.reads_as.contains("100 BLOCKS BEHIND RAW"), "{}", r.reads_as);
+        assert!(
+            r.reads_as.contains("100 BLOCKS BEHIND RAW"),
+            "{}",
+            r.reads_as
+        );
     }
 
     #[test]
@@ -545,7 +551,11 @@ mod tests {
         let r = derive("polkadot", &cps, &[], now());
         assert_eq!(r.modules[0].blocks_behind_decode, Some(-50));
         assert_eq!(r.modules[0].state, ModuleState::AtDecodeFrontier);
-        assert!(r.reads_as.contains("AHEAD of the decode frontier"), "{}", r.reads_as);
+        assert!(
+            r.reads_as.contains("AHEAD of the decode frontier"),
+            "{}",
+            r.reads_as
+        );
     }
 
     #[test]
@@ -581,8 +591,17 @@ mod tests {
     fn a_halt_with_no_checkpoint_still_appears_rather_than_being_dropped() {
         // Refused before completing a single height — the cold-start case, and
         // the one an operator most needs to see.
-        let r = derive("polkadot", &base(), &[halt("gov", 5, 0, "referenda.New")], now());
-        let g = r.modules.iter().find(|m| m.module == "gov").expect("gov listed");
+        let r = derive(
+            "polkadot",
+            &base(),
+            &[halt("gov", 5, 0, "referenda.New")],
+            now(),
+        );
+        let g = r
+            .modules
+            .iter()
+            .find(|m| m.module == "gov")
+            .expect("gov listed");
         assert_eq!(g.state, ModuleState::Halted);
         assert_eq!(g.height, None, "never ran is null, never 0");
         assert_eq!(g.blocks_behind_decode, None);
@@ -602,7 +621,11 @@ mod tests {
             ModuleState::AtDecodeFrontier,
             "with no frontier there is nothing to be behind, and inventing one would be worse"
         );
-        assert!(r.reads_as.contains("DECODE FRONTIER DOES NOT EXIST"), "{}", r.reads_as);
+        assert!(
+            r.reads_as.contains("DECODE FRONTIER DOES NOT EXIST"),
+            "{}",
+            r.reads_as
+        );
     }
 
     #[test]
@@ -622,7 +645,11 @@ mod tests {
         cps.push(cp("balances", 900, "2026-08-24T11:59:30Z"));
         let r = derive("polkadot", &cps, &[], now());
         let names: Vec<&str> = r.modules.iter().map(|m| m.module.as_str()).collect();
-        assert_eq!(names, vec!["balances"], "a bounded backfill chunk is not a follower");
+        assert_eq!(
+            names,
+            vec!["balances"],
+            "a bounded backfill chunk is not a follower"
+        );
     }
 
     #[test]
@@ -682,6 +709,9 @@ mod tests {
         let behind = r.behind_by_more_than(100);
         assert_eq!(behind.len(), 1);
         assert_eq!(behind[0].module, "gov");
-        assert!(r.behind_by_more_than(400).is_empty(), "the bound is exclusive");
+        assert!(
+            r.behind_by_more_than(400).is_empty(),
+            "the bound is exclusive"
+        );
     }
 }

@@ -169,7 +169,9 @@ pub fn channel_id_bytes(sender: u32, recipient: u32) -> [u8; 8] {
 /// enumerates the prefix instead, which is one call for the whole graph.
 pub fn channel_key(sender: u32, recipient: u32) -> Vec<u8> {
     let mut key = channels_prefix();
-    key.extend_from_slice(&StorageKeyHasher::Twox64Concat.hash(&channel_id_bytes(sender, recipient)));
+    key.extend_from_slice(
+        &StorageKeyHasher::Twox64Concat.hash(&channel_id_bytes(sender, recipient)),
+    );
     key
 }
 
@@ -227,13 +229,22 @@ fn edge_from_key(index: &StorageKeyIndex, item: &str, key: &[u8]) -> Result<(u32
         ));
     }
     let id = d.args.first().ok_or_else(|| {
-        format!("{HRMP_PALLET}.{item} key 0x{} decoded to zero arguments; a channel id is one argument", hex::encode(key))
+        format!(
+            "{HRMP_PALLET}.{item} key 0x{} decoded to zero arguments; a channel id is one argument",
+            hex::encode(key)
+        )
     })?;
     let sender = para_id_field(id, "sender").ok_or_else(|| {
-        format!("no readable `sender` in the channel id of key 0x{} (got {id})", hex::encode(key))
+        format!(
+            "no readable `sender` in the channel id of key 0x{} (got {id})",
+            hex::encode(key)
+        )
     })?;
     let recipient = para_id_field(id, "recipient").ok_or_else(|| {
-        format!("no readable `recipient` in the channel id of key 0x{} (got {id})", hex::encode(key))
+        format!(
+            "no readable `recipient` in the channel id of key 0x{} (got {id})",
+            hex::encode(key)
+        )
     })?;
     Ok((sender, recipient))
 }
@@ -266,8 +277,16 @@ fn expect_exact_fields(
     let obj = value.as_object().ok_or_else(|| {
         format!("{what} decoded to {value}, which is not a struct — this runtime's shape is not the one this reader was written against")
     })?;
-    let mut missing: Vec<&str> = expected.iter().copied().filter(|f| !obj.contains_key(*f)).collect();
-    let mut extra: Vec<&str> = obj.keys().map(|k| k.as_str()).filter(|k| !expected.contains(k)).collect();
+    let mut missing: Vec<&str> = expected
+        .iter()
+        .copied()
+        .filter(|f| !obj.contains_key(*f))
+        .collect();
+    let mut extra: Vec<&str> = obj
+        .keys()
+        .map(|k| k.as_str())
+        .filter(|k| !expected.contains(k))
+        .collect();
     if missing.is_empty() && extra.is_empty() {
         return Ok(());
     }
@@ -430,7 +449,9 @@ pub fn topology_digest(edges: &[ChannelEdge]) -> String {
 pub fn decode_session_index(index: &StorageKeyIndex, bytes: &[u8]) -> Result<u64, String> {
     let entry = index
         .entry(SESSION_PALLET, CURRENT_INDEX_ENTRY)
-        .ok_or_else(|| format!("this runtime declares no {SESSION_PALLET}.{CURRENT_INDEX_ENTRY}"))?;
+        .ok_or_else(|| {
+            format!("this runtime declares no {SESSION_PALLET}.{CURRENT_INDEX_ENTRY}")
+        })?;
     if !entry.hashers.is_empty() {
         return Err(format!(
             "{SESSION_PALLET}.{CURRENT_INDEX_ENTRY} declares {} hasher(s): this runtime makes it a MAP, and a plain 32-byte key would read the wrong bytes",
@@ -448,7 +469,9 @@ pub fn decode_session_index(index: &StorageKeyIndex, bytes: &[u8]) -> Result<u64
     // a newtype upstream.
     crate::balances::json_u128(newtype_inner(&v))
         .and_then(|n| u64::try_from(n).ok())
-        .ok_or_else(|| format!("Session.CurrentIndex decoded to {v}, which is not a session number"))
+        .ok_or_else(|| {
+            format!("Session.CurrentIndex decoded to {v}, which is not a session number")
+        })
 }
 
 #[cfg(test)]
@@ -461,7 +484,10 @@ mod tests {
         match std::fs::read(&path) {
             Ok(b) => Some(b),
             Err(_) => {
-                eprintln!("SKIP: real relay fixture metadata not present at {}", path.display());
+                eprintln!(
+                    "SKIP: real relay fixture metadata not present at {}",
+                    path.display()
+                );
                 None
             }
         }
@@ -482,7 +508,13 @@ mod tests {
         recipient_deposit: u128,
     ) -> Vec<u8> {
         let mut v = Vec::new();
-        for n in [max_capacity, max_total_size, max_message_size, msg_count, total_size] {
+        for n in [
+            max_capacity,
+            max_total_size,
+            max_message_size,
+            msg_count,
+            total_size,
+        ] {
             v.extend_from_slice(&n.to_le_bytes());
         }
         match mqc_head {
@@ -557,7 +589,11 @@ mod tests {
         // And the key really is prefix ++ twox64_concat(id), as upstream builds it.
         let key = channel_key(1000, 2034);
         assert_eq!(key[..32], HRMP_CHANNELS_PREFIX[..]);
-        assert_eq!(key[40..], channel_id_bytes(1000, 2034)[..], "the concat hasher keeps the id in the key");
+        assert_eq!(
+            key[40..],
+            channel_id_bytes(1000, 2034)[..],
+            "the concat hasher keeps the id in the key"
+        );
     }
 
     #[test]
@@ -580,7 +616,11 @@ mod tests {
             .entry(SESSION_PALLET, CURRENT_INDEX_ENTRY)
             .expect("the relay runtime declares Session.CurrentIndex");
         assert!(session.hashers.is_empty(), "a Plain entry has no hashers");
-        assert_eq!(current_index_key().len(), 32, "nothing is appended to a Plain key");
+        assert_eq!(
+            current_index_key().len(),
+            32,
+            "nothing is appended to a Plain key"
+        );
     }
 
     #[test]
@@ -601,7 +641,10 @@ mod tests {
         // are two channels, and a reader that folds them halves the graph.
         let reverse = channel_key(2034, 1000);
         assert_ne!(key, reverse);
-        assert_eq!(edge_from_key(&index, CHANNELS_ENTRY, &reverse).unwrap(), (2034, 1000));
+        assert_eq!(
+            edge_from_key(&index, CHANNELS_ENTRY, &reverse).unwrap(),
+            (2034, 1000)
+        );
     }
 
     #[test]
@@ -626,8 +669,21 @@ mod tests {
         // all 224 live channels.
         let Some(blob) = relay_metadata() else { return };
         let index = key_index(&blob).expect("key index");
-        let value = encode_channel(1000, 102400, 102400, 0, 0, None, 100_000_000_000, 100_000_000_000);
-        assert_eq!(value.len(), 53, "5*u32 + Option::None + 2*u128 fixed = 53 bytes");
+        let value = encode_channel(
+            1000,
+            102400,
+            102400,
+            0,
+            0,
+            None,
+            100_000_000_000,
+            100_000_000_000,
+        );
+        assert_eq!(
+            value.len(),
+            53,
+            "5*u32 + Option::None + 2*u128 fixed = 53 bytes"
+        );
 
         let edges = channels_from_entries(&index, &[(channel_key(1000, 2034), value)])
             .expect("a real HrmpChannel value decodes");
@@ -638,26 +694,44 @@ mod tests {
         assert_eq!(e.max_capacity, 1000);
         assert_eq!(e.max_total_size, 102400);
         assert_eq!(e.max_message_size, 102400);
-        assert_eq!(e.sender_deposit, 100_000_000_000, "not 0 — that is the compact misread");
-        assert_eq!(e.recipient_deposit, Some(100_000_000_000), "not 58 — that is the compact misread");
+        assert_eq!(
+            e.sender_deposit, 100_000_000_000,
+            "not 0 — that is the compact misread"
+        );
+        assert_eq!(
+            e.recipient_deposit,
+            Some(100_000_000_000),
+            "not 58 — that is the compact misread"
+        );
         assert_eq!(e.confirmed, None, "an open channel carries no `confirmed`");
 
         // The `Some(mqc_head)` shape is the other measured size, 85 bytes, and it
         // must decode too — with mqc_head dropped rather than stored.
-        let with_head =
-            encode_channel(25, 102400, 102400, 3, 900, Some([7u8; 32]), 0, 0);
+        let with_head = encode_channel(25, 102400, 102400, 3, 900, Some([7u8; 32]), 0, 0);
         assert_eq!(with_head.len(), 85, "the Some(H256) form is 85 bytes");
-        let edges = channels_from_entries(&index, &[(channel_key(2000, 2034), with_head)]).expect("decodes");
+        let edges = channels_from_entries(&index, &[(channel_key(2000, 2034), with_head)])
+            .expect("decodes");
         assert_eq!(edges[0].max_capacity, 25);
-        assert_eq!(edges[0].sender_deposit, 0, "a system channel's deposits really are zero");
+        assert_eq!(
+            edges[0].sender_deposit, 0,
+            "a system channel's deposits really are zero"
+        );
     }
 
     #[test]
     fn a_truncated_value_halts_rather_than_yielding_a_plausible_channel() {
         let Some(blob) = relay_metadata() else { return };
         let index = key_index(&blob).expect("key index");
-        let mut value =
-            encode_channel(1000, 102400, 102400, 0, 0, None, 100_000_000_000, 100_000_000_000);
+        let mut value = encode_channel(
+            1000,
+            102400,
+            102400,
+            0,
+            0,
+            None,
+            100_000_000_000,
+            100_000_000_000,
+        );
         value.truncate(40);
         let err = channels_from_entries(&index, &[(channel_key(1000, 2034), value)]).unwrap_err();
         assert!(err.contains("decode"), "{err}");
@@ -668,7 +742,8 @@ mod tests {
         let Some(blob) = relay_metadata() else { return };
         let index = key_index(&blob).expect("key index");
         let mut req_key = open_requests_prefix();
-        req_key.extend_from_slice(&StorageKeyHasher::Twox64Concat.hash(&channel_id_bytes(3000, 1000)));
+        req_key
+            .extend_from_slice(&StorageKeyHasher::Twox64Concat.hash(&channel_id_bytes(3000, 1000)));
         let value = encode_open_request(true, 0, 100_000_000_000, 102400, 1000, 102400);
 
         let edges = open_requests_from_entries(&index, &[(req_key, value)])
@@ -677,7 +752,11 @@ mod tests {
         let e = &edges[0];
         assert_eq!((e.sender, e.recipient), (3000, 1000));
         assert_eq!(e.state, STATE_REQUESTED);
-        assert_eq!(e.confirmed, Some(true), "the recipient has accepted; the boundary has not run");
+        assert_eq!(
+            e.confirmed,
+            Some(true),
+            "the recipient has accepted; the boundary has not run"
+        );
         assert_eq!(
             e.recipient_deposit, None,
             "a pending request has no recipient deposit — accept_open_channel has not supplied one"
@@ -697,15 +776,24 @@ mod tests {
         });
         let err = expect_exact_fields(&v, &CHANNEL_FIELDS, "HrmpChannel(1 -> 2)").unwrap_err();
         assert!(err.contains("recipient_deposit"), "{err}");
-        assert!(err.contains("HRMP_READER_VERSION"), "the halt says what to do: {err}");
+        assert!(
+            err.contains("HRMP_READER_VERSION"),
+            "the halt says what to do: {err}"
+        );
 
         let mut grown = v.as_object().unwrap().clone();
         grown.insert("recipient_deposit".into(), serde_json::json!(0));
         grown.insert("brand_new_field".into(), serde_json::json!(1));
-        let err =
-            expect_exact_fields(&serde_json::Value::Object(grown), &CHANNEL_FIELDS, "HrmpChannel(1 -> 2)")
-                .unwrap_err();
-        assert!(err.contains("brand_new_field"), "an added field halts too: {err}");
+        let err = expect_exact_fields(
+            &serde_json::Value::Object(grown),
+            &CHANNEL_FIELDS,
+            "HrmpChannel(1 -> 2)",
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("brand_new_field"),
+            "an added field halts too: {err}"
+        );
     }
 
     #[test]
@@ -737,7 +825,10 @@ mod tests {
         )
         .expect("distinct edges merge");
         assert_eq!(
-            merged.iter().map(|e| (e.sender, e.recipient)).collect::<Vec<_>>(),
+            merged
+                .iter()
+                .map(|e| (e.sender, e.recipient))
+                .collect::<Vec<_>>(),
             vec![(1000, 2034), (2034, 1000), (3000, 1000)]
         );
     }
@@ -746,7 +837,10 @@ mod tests {
     fn the_digest_covers_open_channels_only_and_ignores_ordering() {
         let a = topology_digest(&[open_edge(1000, 2034), open_edge(2034, 1000)]);
         let b = topology_digest(&[open_edge(2034, 1000), open_edge(1000, 2034)]);
-        assert_eq!(a, b, "the digest is sorted before hashing, so page order cannot move it");
+        assert_eq!(
+            a, b,
+            "the digest is sorted before hashing, so page order cannot move it"
+        );
 
         // A pending request is NOT topology: adding one must not move the digest,
         // because the digest's only consumer asks "did a channel open or close".
@@ -760,7 +854,10 @@ mod tests {
                 ..open_edge(3000, 1000)
             },
         ]);
-        assert_eq!(a, with_request, "a pending request must not move the topology digest");
+        assert_eq!(
+            a, with_request,
+            "a pending request must not move the topology digest"
+        );
 
         // …but a real open does.
         let with_open = topology_digest(&[
@@ -771,7 +868,10 @@ mod tests {
         assert_ne!(a, with_open, "an opened channel must move the digest");
 
         // Directionality survives into the digest.
-        assert_ne!(topology_digest(&[open_edge(1000, 2034)]), topology_digest(&[open_edge(2034, 1000)]));
+        assert_ne!(
+            topology_digest(&[open_edge(1000, 2034)]),
+            topology_digest(&[open_edge(2034, 1000)])
+        );
 
         // An empty graph has a stable digest rather than an empty string, so
         // "read, and there was nothing" is a value like any other.
