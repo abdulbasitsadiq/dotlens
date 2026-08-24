@@ -188,7 +188,7 @@ impl SubstrateSource {
         &self,
         keys: &[Vec<u8>],
         hash: subxt::utils::H256,
-    ) -> Result<Vec<(Vec<u8>, Option<Vec<u8>>)>, SourceError> {
+    ) -> Result<crate::RawStorageSnapshot, SourceError> {
         if keys.is_empty() {
             return Ok(vec![]);
         }

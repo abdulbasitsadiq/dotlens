@@ -16,6 +16,54 @@
 //! Invariant: decoding is a pure function of (bytes, runtime context, decoder
 //! version). No I/O, no clocks, no network in the decode path.
 
+// ============================================================================
+// THE THREE RAW-STORAGE SHAPES, and what "absent" means in each
+// ============================================================================
+//
+// All three are a `Vec` of `(key, …)` over raw SCALE bytes, and two of them are
+// THE SAME TYPE to the compiler — these are aliases, not newtypes, so nothing
+// here stops one being passed where the other is meant. They are not the same
+// FACT, and the whole difference is in how a missing value reads. Naming them is
+// the only place that distinction can live, because a tuple cannot carry a doc
+// comment and six of these seven sites carried none.
+
+/// A storage DIFF, as a fork reports it: `(key, value)` where **`None` is a
+/// DELETION**.
+///
+/// `None` says the key was REMOVED by whatever produced the diff. It does not
+/// say the key holds an empty value, and it does not say the key was never
+/// there. Read as either of those, a removed key is reported as a key set to
+/// nothing — the same class of mistake as reading a null count as a zero.
+///
+/// Produced by `chopsticks::parse_dry_run_raw_pairs` and
+/// `chopsticks::parse_run_block_diff`, whose test asserts exactly this: *"a null
+/// value is a deletion, not an empty value"*.
+pub type RawStorageDiff = Vec<(Vec<u8>, Option<Vec<u8>>)>;
+
+/// A storage SNAPSHOT, as a batched read returns it: `(key, value)` where
+/// **`None` is a key that does not exist at that block**.
+///
+/// Same type as [`RawStorageDiff`], opposite reading. Nothing was deleted here;
+/// the key was simply never set — and for the query that motivates this shape
+/// (every treasury account × every registered asset) an absent entry is a ZERO
+/// BALANCE and is meaningful data rather than a failure.
+///
+/// Produced by `source::SubstrateSource::storage_batch_at`.
+pub type RawStorageSnapshot = Vec<(Vec<u8>, Option<Vec<u8>>)>;
+
+/// Storage WRITES to inject into a fork: `(key, value)`, with no third option —
+/// this shape **cannot express a deletion**, and that is the point of naming it.
+///
+/// A fork harness SETS keys so that a block executes; nothing it does removes
+/// one. The `Option` the two shapes above carry would be a state this producer
+/// never reaches, so its absence is a claim rather than an omission.
+///
+/// Produced by `fork::ScheduledDispatch`. Note that not every `(key, value)`
+/// vector in the crate is this concept: `enumerate_entries` in `dotlens-node`
+/// has the same shape and is an enumerated READ, so it is deliberately left
+/// unaliased rather than given a name that would misdescribe it.
+pub type RawStorageWrites = Vec<(Vec<u8>, Vec<u8>)>;
+
 /// Live fetch side (subxt) — see `SubstrateSource`. Decode stays pure below.
 #[cfg(feature = "live")]
 pub mod source;

@@ -239,6 +239,10 @@ pub struct LabelRow {
 }
 
 /// Labels applying on `chain_id` (chain-scoped or '*').
+// The tuple is one query's WIRE FORM and is converted into `LabelRow` four lines
+// later — the domain shape already has a name, and naming the wire form too
+// would give a reader two names for one thing. Same call as `gov_pg.rs`'s two.
+#[allow(clippy::type_complexity)]
 pub async fn labels_for_chain(pool: &PgPool, chain_id: &str) -> Result<Vec<LabelRow>> {
     let rows: Vec<(Vec<u8>, String, String, String, Option<String>)> = sqlx::query_as(
         "select account_id, kind, chain_scope, label, ss58 from core.account_labels \

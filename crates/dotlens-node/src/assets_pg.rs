@@ -198,6 +198,8 @@ pub struct AssetRow {
     pub asset_type: Option<String>,
 }
 
+// Wire form for one query, converted into `AssetRow` below. See `labels.rs`.
+#[allow(clippy::type_complexity)]
 pub async fn assets_for_chain(pool: &PgPool, chain_id: &str) -> Result<Vec<AssetRow>> {
     let rows: Vec<(
         String,
@@ -1430,6 +1432,9 @@ pub struct TreasuryAccountRow {
     pub ss58: Option<String>,
 }
 
+// Wire form for one query, converted into `TreasuryAccountRow` below. See
+// `labels.rs`.
+#[allow(clippy::type_complexity)]
 pub async fn treasury_accounts_on_chain(
     pool: &PgPool,
     chain_id: &str,

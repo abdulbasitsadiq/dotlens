@@ -1117,7 +1117,7 @@ pub fn origin_bytes_for_scheduler(
 pub struct ScheduledDispatch {
     /// `(key, value)` pairs to inject. Always the agenda entry; plus the
     /// preimage and its request status when the call is too large to inline.
-    pub writes: Vec<(Vec<u8>, Vec<u8>)>,
+    pub writes: crate::RawStorageWrites,
     /// WHERE the agenda entry was written, and the decision that put it there.
     ///
     /// Slice 8's field was `at_agenda_height` and its doc said "`head + 1` … so
@@ -1211,7 +1211,7 @@ pub fn scheduled_dispatch_with_origin_bytes(
     agenda_key.extend_from_slice(&agenda.hashers[0].hash(&key_bytes));
 
     // ---- the call binding
-    let mut writes: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+    let mut writes: crate::RawStorageWrites = Vec::new();
     let (call_bytes_encoded, call_binding) = if call_bytes.len() <= BOUNDED_INLINE_LIMIT {
         let mut v = vec![shape.inline_index];
         Compact(call_bytes.len() as u32).encode_to(&mut v);
@@ -1495,7 +1495,7 @@ fn preimage_writes(
     call_bytes: &[u8],
     hash: &[u8; 32],
     len: u32,
-) -> Result<Vec<(Vec<u8>, Vec<u8>)>, ForkError> {
+) -> Result<crate::RawStorageWrites, ForkError> {
     if index.entry(PREIMAGE_PALLET, PREIMAGE_FOR_ENTRY).is_none() {
         return err(format!(
             "this call is {} bytes, which is more than the {BOUNDED_INLINE_LIMIT}-byte \

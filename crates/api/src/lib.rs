@@ -195,7 +195,18 @@ pub trait LabelIndex: Send + Sync {
 /// (adapter-owned parsing — the API crate stays family-agnostic, Invariant 4).
 pub type AccountParser = Arc<dyn Fn(&str) -> Result<Vec<u8>, String> + Send + Sync>;
 
+// THE FIVE `Memory*Index` ALLOWS BELOW ARE A POSITION, not a blanket.
+//
+// The rule this slice applied: alias when the shape is a DOMAIN CONCEPT that
+// appears in more than one place, `#[allow]` when it is local plumbing. These
+// five are plumbing. Each key tuple is one struct's private index into its own
+// `HashMap`, nothing outside the struct names it, and the row types it points at
+// (`AccountLabel`, `BalanceChangeRow`, …) are where the domain already has its
+// names. An alias here would add a hop to learn nothing — which is the same
+// argument the codebase already made five times before this slice existed
+// (`gov_pg.rs`, `api/src/lib.rs`'s two row-builders).
 #[derive(Default)]
+#[allow(clippy::type_complexity)]
 pub struct MemoryLabelIndex {
     /// key: (chain_scope, account_id) — '*' scope applies everywhere.
     inner: RwLock<HashMap<(String, Vec<u8>), Vec<AccountLabel>>>,
@@ -299,7 +310,10 @@ pub trait BalanceIndex: Send + Sync {
     ) -> Result<Vec<HoldingRow>, IndexError>;
 }
 
+// Plumbing: two private maps keyed `(chain, account, asset)`. See the note on
+// `MemoryLabelIndex`.
 #[derive(Default)]
+#[allow(clippy::type_complexity)]
 pub struct MemoryBalanceIndex {
     changes: RwLock<HashMap<(String, Vec<u8>, String), Vec<BalanceChangeRow>>>,
     anchors: RwLock<HashMap<(String, Vec<u8>, String), Vec<BalanceAnchorRow>>>,
@@ -2085,7 +2099,9 @@ pub trait TreasuryIndex: Send + Sync {
     async fn accounts(&self, network: &str) -> Result<Vec<TreasuryAccountRow>, IndexError>;
 }
 
+// Plumbing. See the note on `MemoryLabelIndex`.
 #[derive(Default)]
+#[allow(clippy::type_complexity)]
 pub struct MemoryTreasuryIndex {
     spends: RwLock<HashMap<(String, String, String, u64), SpendRow>>,
     events: RwLock<HashMap<(String, String), Vec<(Option<(String, u64)>, SpendEventRow)>>>,
@@ -2325,7 +2341,9 @@ pub trait BountyIndex: Send + Sync {
     ) -> Result<Vec<BountyEventRow>, IndexError>;
 }
 
+// Plumbing. See the note on `MemoryLabelIndex`.
 #[derive(Default)]
+#[allow(clippy::type_complexity)]
 pub struct MemoryBountyIndex {
     bounties: RwLock<HashMap<(String, String, u64, Option<u64>), BountyRow>>,
     events: RwLock<HashMap<(String, String), Vec<((u64, Option<u64>), BountyEventRow)>>>,
@@ -2907,7 +2925,18 @@ pub trait CoretimeIndex: Send + Sync {
     ) -> Result<Vec<u32>, IndexError>;
 }
 
+// Plumbing — but THIS ONE IS THE HONEST EXCEPTION, and it is recorded rather
+// than argued away. `rows` is a positional 6-tuple whose last two elements are
+// `core` and `para`, both `u32` and adjacent, so transposing them compiles
+// silently. That is a real hazard of the class this project cares about, and it
+// is the one of the ten allows where the lint was arguably telling the truth.
+//
+// The fix is a named struct, not a type alias — an alias would silence the lint
+// and leave the transposition exactly as reachable. That is a behaviour-adjacent
+// refactor of six destructuring sites and does not belong in a lint-cleanup
+// slice, so it is deferred DELIBERATELY and named here so it is findable.
 #[derive(Default)]
+#[allow(clippy::type_complexity)]
 pub struct MemoryCoretimeIndex {
     /// (chain, height, event_index) → (kind, core, para)
     rows: RwLock<Vec<(String, u64, u32, String, u32, u32)>>,

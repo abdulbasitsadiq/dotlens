@@ -329,7 +329,7 @@ impl ChopsticksClient {
         &self,
         call: &[u8],
         address: &[u8; 32],
-    ) -> Result<Vec<(Vec<u8>, Option<Vec<u8>>)>, ChopsticksError> {
+    ) -> Result<crate::RawStorageDiff, ChopsticksError> {
         let out = self
             .call(
                 DEV_DRY_RUN,
@@ -360,7 +360,7 @@ impl ChopsticksClient {
         parent: &str,
         header: &Value,
         extrinsics: &Value,
-    ) -> Result<Vec<(Vec<u8>, Option<Vec<u8>>)>, ChopsticksError> {
+    ) -> Result<crate::RawStorageDiff, ChopsticksError> {
         let out = self
             .call(
                 DEV_RUN_BLOCK,
@@ -396,7 +396,7 @@ impl ChopsticksClient {
 /// A `[key]` pair with no second element and a `[key, null]` pair mean the same
 /// thing — the key was DELETED — and both are accepted, because which one a
 /// JSON serializer emits for a trailing null is not a contract.
-pub fn parse_dry_run_raw_pairs(out: &Value) -> Result<Vec<(Vec<u8>, Option<Vec<u8>>)>, String> {
+pub fn parse_dry_run_raw_pairs(out: &Value) -> Result<crate::RawStorageDiff, String> {
     let arr = out.as_array().ok_or_else(|| {
         format!("raw:true should return an array of [key, value] pairs, got {out}")
     })?;
@@ -437,7 +437,7 @@ pub fn parse_dry_run_raw_pairs(out: &Value) -> Result<Vec<(Vec<u8>, Option<Vec<u
 /// the worst possible reading.
 ///
 /// Separated from the client so it can be tested without a running fork.
-pub fn parse_run_block_diff(out: &Value) -> Result<Vec<(Vec<u8>, Option<Vec<u8>>)>, String> {
+pub fn parse_run_block_diff(out: &Value) -> Result<crate::RawStorageDiff, String> {
     let phases = out
         .get("phases")
         .and_then(|p| p.as_array())
@@ -451,7 +451,7 @@ pub fn parse_run_block_diff(out: &Value) -> Result<Vec<(Vec<u8>, Option<Vec<u8>>
             )
         })?;
 
-    let mut out_pairs: Vec<(Vec<u8>, Option<Vec<u8>>)> = Vec::new();
+    let mut out_pairs: crate::RawStorageDiff = Vec::new();
     let mut saw_entry = false;
     for phase in phases {
         let Some(entries) = phase.get("storageDiff").and_then(|d| d.as_array()) else {

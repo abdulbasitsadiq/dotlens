@@ -615,7 +615,7 @@ impl ForkRunner for SubstrateForkRunner<'_> {
             None => call.clone(),
         };
 
-        let mut writes: Vec<(Vec<u8>, Option<Vec<u8>>)> = Vec::new();
+        let mut writes: adapter_substrate::RawStorageDiff = Vec::new();
         let mut override_keys: Vec<Vec<u8>> = Vec::new();
         for o in &prepared.overrides {
             let key = hex_bytes(&o.key)?;

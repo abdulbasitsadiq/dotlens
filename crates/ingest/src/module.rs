@@ -194,15 +194,41 @@ pub struct BlockMapError {
 /// duplicated lines there.
 pub enum Mapping<'a, F> {
     /// `Fn(&event) -> facts`. The row's event index is the event's own.
-    PerEvent(Box<dyn Fn(&CanonicalEvent) -> Result<Vec<F>, String> + Send + Sync + 'a>),
+    PerEvent(PerEventMapper<'a, F>),
     /// `Fn(&[event]) -> (event index, fact)`. The mapper CHOOSES each row's
     /// event index, because a fact about a relationship has to be keyed to one
     /// of its two ends and only the mapper knows which.
-    PerBlock(
-        #[allow(clippy::type_complexity)]
-        Box<dyn Fn(&[CanonicalEvent]) -> Result<Vec<(u32, F)>, BlockMapError> + Send + Sync + 'a>,
-    ),
+    PerBlock(PerBlockMapper<'a, F>),
 }
+
+// THE TWO ALIASES BELOW ARE THE SEAM'S CONTRACT, and naming them is a judgement
+// call with a real argument against it: the boxed type IS the contract, and an
+// alias puts one hop between a reader and it.
+//
+// What decided it: the enum previously carried `#[allow(clippy::type_complexity)]`
+// on ONE of its two variants and not the other, which is not a position anybody
+// took — the two are equally complex and the asymmetry was accidental. The
+// choice was therefore between adding a second `#[allow]` or removing the first.
+// Removing it also gives each shape somewhere to say what it is FOR, which the
+// variant doc could only do for the closure's signature and not for its
+// obligations.
+
+/// A mapper handed ONE event at a time, which cannot see its neighbours.
+///
+/// Refuses with a bare `String`: the runtime already knows which event it passed
+/// in, so the reason is the only thing the mapper can add.
+pub type PerEventMapper<'a, F> =
+    Box<dyn Fn(&CanonicalEvent) -> Result<Vec<F>, String> + Send + Sync + 'a>;
+
+/// A mapper handed the WHOLE block's events, returning `(event index, fact)`.
+///
+/// It chooses each row's event index because a fact about a RELATIONSHIP between
+/// two events has to be keyed to one of its two ends, and only the mapper knows
+/// which. For the same reason it refuses with [`BlockMapError`] rather than a
+/// string: a block-level refusal that named only the block would leave whoever
+/// reads it at 3am to find the row themselves.
+pub type PerBlockMapper<'a, F> =
+    Box<dyn Fn(&[CanonicalEvent]) -> Result<Vec<(u32, F)>, BlockMapError> + Send + Sync + 'a>;
 
 /// Where one block's facts land.
 ///
