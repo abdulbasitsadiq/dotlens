@@ -109,7 +109,52 @@ struct Backends {
     /// Kept for label sync/verify (they need direct SQL, not a trait).
     #[cfg(feature = "pg")]
     pool: Option<sqlx::PgPool>,
+    /// The SERVING pool, carried only so the API's index set can be built on it
+    /// at the serve site. Nothing else may touch it: its `statement_timeout` is
+    /// sized for a read a human is waiting on, not for an ingestion statement.
+    #[cfg(feature = "pg")]
+    serving_pool: Option<sqlx::PgPool>,
     persistent: bool,
+}
+
+/// Every backend, built over ONE pool.
+///
+/// Called TWICE — once with the ingestion pool for the workers and the one-shot
+/// commands, once with the serving pool for the API's index set. That is the
+/// point: two hand-maintained lists of sixteen indexes would drift the first
+/// time somebody added a seventeenth to one of them, and the drift would be
+/// silent because both would still compile. One constructor cannot.
+///
+/// `serving` is `None` on the second call — the serving copy has no serving
+/// copy of its own, and giving it one would invite somebody to build a third.
+#[cfg(feature = "pg")]
+fn pg_backends(pool: sqlx::PgPool, serving: Option<sqlx::PgPool>) -> Backends {
+    use api::pg::PgBlockIndex;
+    use dotlens_node::runtime_versions::PgRuntimeVersionSink;
+    use ingest::pg::{PgCheckpointStore, PgReceiptSink};
+
+    Backends {
+        checkpoints: Arc::new(PgCheckpointStore::new(pool.clone())),
+        receipts: Arc::new(PgReceiptSink::new(pool.clone())),
+        blocks: Arc::new(PgBlockIndex::new(pool.clone())),
+        labels: Arc::new(api::pg::PgLabelIndex::new(pool.clone())),
+        balances: Arc::new(api::pg::PgBalanceIndex::new(pool.clone())),
+        gov: Arc::new(api::pg::PgGovIndex::new(pool.clone())),
+        treasury: Arc::new(api::pg::PgTreasuryIndex::new(pool.clone())),
+        bounties: Arc::new(api::pg::PgBountyIndex::new(pool.clone())),
+        assets: Arc::new(api::pg::PgAssetIndex::new(pool.clone())),
+        sim: Arc::new(api::pg::PgSimIndex::new(pool.clone())),
+        xcm_sim: Arc::new(api::pg::PgXcmSimIndex::new(pool.clone())),
+        xcm: Arc::new(api::pg::PgXcmIndex::new(pool.clone())),
+        coretime: Arc::new(api::pg::PgCoretimeIndex::new(pool.clone())),
+        broker: Arc::new(api::pg::PgBrokerIndex::new(pool.clone())),
+        channels: Arc::new(api::pg::PgChannelIndex::new(pool.clone())),
+        freshness: Arc::new(api::pg::PgFreshnessIndex::new(pool.clone())),
+        runtime_versions: Arc::new(PgRuntimeVersionSink::new(pool.clone())),
+        pool: Some(pool),
+        serving_pool: serving,
+        persistent: true,
+    }
 }
 
 /// `status <chain> [behind-max-blocks]` — per-module freshness, and the exit
@@ -277,6 +322,8 @@ fn memory_backends() -> Backends {
         runtime_versions: Arc::new(NoopRuntimeVersionSink),
         #[cfg(feature = "pg")]
         pool: None,
+        #[cfg(feature = "pg")]
+        serving_pool: None,
         persistent: false,
     }
 }
@@ -753,14 +800,15 @@ async fn main() -> Result<()> {
 
     #[cfg(feature = "pg")]
     if let Ok(db_url) = std::env::var("DATABASE_URL") {
-        use api::pg::PgBlockIndex;
-        use dotlens_node::runtime_versions::PgRuntimeVersionSink;
-        use ingest::pg::{PgCheckpointStore, PgReceiptSink};
-        use sqlx::postgres::PgPoolOptions;
-
-        let pool = PgPoolOptions::new()
-            .max_connections(10)
-            .connect(&db_url)
+        // TWO pools over one URL (operational floor item 3). `ingest` writes and
+        // runs the migrations below; `serving` is the API's read path and
+        // nothing else, so a read flood cannot reach the connections the
+        // followers depend on. See `pools` for why the bounded-single-pool that
+        // ROADMAP calls "the cheap half" does not actually close that failure.
+        let dotlens_node::pools::Pools {
+            ingest: pool,
+            serving: serving_pool,
+        } = dotlens_node::pools::connect(&db_url)
             .await
             .context("connecting to postgres")?;
         sqlx::migrate!("../../migrations")
@@ -777,27 +825,7 @@ async fn main() -> Result<()> {
             .context("registry → DB sync")?;
         tracing::info!("registry synced to postgres");
 
-        backends = Some(Backends {
-            checkpoints: Arc::new(PgCheckpointStore::new(pool.clone())),
-            receipts: Arc::new(PgReceiptSink::new(pool.clone())),
-            blocks: Arc::new(PgBlockIndex::new(pool.clone())),
-            labels: Arc::new(api::pg::PgLabelIndex::new(pool.clone())),
-            balances: Arc::new(api::pg::PgBalanceIndex::new(pool.clone())),
-            gov: Arc::new(api::pg::PgGovIndex::new(pool.clone())),
-            treasury: Arc::new(api::pg::PgTreasuryIndex::new(pool.clone())),
-            bounties: Arc::new(api::pg::PgBountyIndex::new(pool.clone())),
-            assets: Arc::new(api::pg::PgAssetIndex::new(pool.clone())),
-            sim: Arc::new(api::pg::PgSimIndex::new(pool.clone())),
-            xcm_sim: Arc::new(api::pg::PgXcmSimIndex::new(pool.clone())),
-            xcm: Arc::new(api::pg::PgXcmIndex::new(pool.clone())),
-            coretime: Arc::new(api::pg::PgCoretimeIndex::new(pool.clone())),
-            broker: Arc::new(api::pg::PgBrokerIndex::new(pool.clone())),
-            channels: Arc::new(api::pg::PgChannelIndex::new(pool.clone())),
-            freshness: Arc::new(api::pg::PgFreshnessIndex::new(pool.clone())),
-            runtime_versions: Arc::new(PgRuntimeVersionSink::new(pool.clone())),
-            pool: Some(pool),
-            persistent: true,
-        });
+        backends = Some(pg_backends(pool, Some(serving_pool)));
     }
     if matches!(command, Command::Migrate) {
         // reachable only without pg feature or without DATABASE_URL
@@ -1175,21 +1203,36 @@ mismatched={} retirable_heights={}",
 
     // -- API ------------------------------------------------------------------
     let bind = env_or("API_BIND", "127.0.0.1:8080");
+    // THE API READS THROUGH THE SERVING POOL, NOT THE INGESTION ONE — which is
+    // the entire point of operational floor item 3. Several of these indexes are
+    // WRITE sinks on the worker side (`blocks` is `BlockIndexSink`'s inner
+    // value), so handing `backends`' own Arcs to the router would put every API
+    // read on the pool the followers depend on, and the split would buy nothing
+    // while looking done.
+    //
+    // Without `pg` there is one memory backend and nothing to split.
+    #[cfg(feature = "pg")]
+    let serving_backends: Option<Backends> =
+        backends.serving_pool.clone().map(|p| pg_backends(p, None));
+    #[cfg(not(feature = "pg"))]
+    let serving_backends: Option<Backends> = None;
+    let read = serving_backends.as_ref().unwrap_or(&backends);
+
     let app = api::router(AppState {
         registry,
-        blocks: backends.blocks.clone(),
-        labels: backends.labels.clone(),
-        balances: backends.balances.clone(),
-        gov: backends.gov.clone(),
-        treasury: backends.treasury.clone(),
-        bounties: backends.bounties.clone(),
-        assets: backends.assets.clone(),
-        sim: backends.sim.clone(),
-        xcm_sim: backends.xcm_sim.clone(),
-        xcm: backends.xcm.clone(),
-        coretime: backends.coretime.clone(),
-        broker: backends.broker.clone(),
-        channels: backends.channels.clone(),
+        blocks: read.blocks.clone(),
+        labels: read.labels.clone(),
+        balances: read.balances.clone(),
+        gov: read.gov.clone(),
+        treasury: read.treasury.clone(),
+        bounties: read.bounties.clone(),
+        assets: read.assets.clone(),
+        sim: read.sim.clone(),
+        xcm_sim: read.xcm_sim.clone(),
+        xcm: read.xcm.clone(),
+        coretime: read.coretime.clone(),
+        broker: read.broker.clone(),
+        channels: read.channels.clone(),
         // family-encoded address parsing is adapter-owned (Invariant 4); with
         // more families this becomes registry-driven dispatch
         parse_account: Arc::new(|s| {

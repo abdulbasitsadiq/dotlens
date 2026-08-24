@@ -6,6 +6,12 @@ pub mod compact;
 
 pub mod pipeline;
 
+/// Two pools over one database (Phase 3.5, operational floor item 3): reads and
+/// writes get reserved connections and separate timeouts, so a read flood
+/// cannot starve the followers into stale data.
+#[cfg(feature = "pg")]
+pub mod pools;
+
 #[cfg(feature = "pg")]
 pub mod registry_sync;
 

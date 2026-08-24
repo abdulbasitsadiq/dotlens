@@ -35,6 +35,55 @@ use std::sync::{Arc, RwLock};
 #[error("block index error: {0}")]
 pub struct IndexError(pub String);
 
+/// Prefix marking the one read failure that is OURS rather than the database's:
+/// a query cancelled by the serving `statement_timeout`.
+///
+/// A marker on our own message rather than a match on Postgres's English. The
+/// database's wording is localised by `lc_messages` and is not a contract; the
+/// SQLSTATE is, and it is read exactly once, in `From<sqlx::Error>` below.
+/// Matching the message downstream would be this project's "match SQLSTATE,
+/// never a name" rule broken one layer up.
+pub const TIMEOUT_REFUSAL: &str = "query cancelled by the serving statement timeout";
+
+impl IndexError {
+    /// Was this the serving timeout, rather than a database fault?
+    ///
+    /// The distinction matters to a caller: a timeout means *narrow the
+    /// question*, and everything else means *the answer is unavailable*. Without
+    /// it both render as one opaque failure and the caller cannot tell which of
+    /// the two actions is theirs to take.
+    pub fn timed_out(&self) -> bool {
+        self.0.starts_with(TIMEOUT_REFUSAL)
+    }
+}
+
+/// The ONE place a driver error becomes a read failure.
+///
+/// Every Postgres reader converts through here, so the classification cannot be
+/// forgotten at one call site out of sixty-three — which is the shape that
+/// leaves a rule true in most places and quietly false in one.
+///
+/// SQLSTATE `57014` is `query_canceled`, which is what `statement_timeout`
+/// raises. It is a REFUSAL and not a fault: the data is fine, the question was
+/// too expensive, and the message says which so a caller knows that narrowing
+/// the window is the fix rather than retrying the same thing harder.
+#[cfg(feature = "pg")]
+impl From<sqlx::Error> for IndexError {
+    fn from(e: sqlx::Error) -> Self {
+        if let Some(db) = e.as_database_error() {
+            if db.code().as_deref() == Some("57014") {
+                return IndexError(format!(
+                    "{TIMEOUT_REFUSAL}: the window asked for is too expensive to serve \
+                     under current load. Narrow it and retry — nothing is wrong with the \
+                     data, and no partial answer was returned in place of a whole one. \
+                     (operator: DOTLENS_SERVING_STATEMENT_TIMEOUT_SECS)"
+                ));
+            }
+        }
+        IndexError(e.to_string())
+    }
+}
+
 /// Storage abstraction the API reads blocks from. Inserts are idempotent:
 /// re-inserting an already-indexed (chain, height) is a no-op, never an error.
 #[async_trait]
@@ -3610,7 +3659,7 @@ pub mod pg {
             .bind(chain_id)
             .fetch_all(&self.pool)
             .await
-            .map_err(|e| IndexError(e.to_string()))?;
+            .map_err(IndexError::from)?;
             Ok(rows
                 .into_iter()
                 .map(|(module, height, updated_at)| super::freshness::CheckpointRow {
@@ -3649,7 +3698,7 @@ pub mod pg {
             .bind(chain_id)
             .fetch_all(&self.pool)
             .await
-            .map_err(|e| IndexError(e.to_string()))?;
+            .map_err(IndexError::from)?;
             Ok(rows
                 .into_iter()
                 .map(|r| super::freshness::HaltRow {
@@ -3701,7 +3750,7 @@ pub mod pg {
             .bind(chain_id)
             .fetch_all(&self.pool)
             .await
-            .map_err(|e| IndexError(e.to_string()))?;
+            .map_err(IndexError::from)?;
             Ok(rows.into_iter().map(reading_row).collect())
         }
 
@@ -3721,7 +3770,7 @@ pub mod pg {
             .bind(at.map(|h| h as i64))
             .fetch_optional(&self.pool)
             .await
-            .map_err(|e| IndexError(e.to_string()))?;
+            .map_err(IndexError::from)?;
             Ok(row.map(reading_row))
         }
 
@@ -3743,7 +3792,7 @@ pub mod pg {
                 .bind(block_height as i64)
                 .fetch_all(&self.pool)
                 .await
-                .map_err(|e| IndexError(e.to_string()))?;
+                .map_err(IndexError::from)?;
             Ok(rows
                 .into_iter()
                 .map(
@@ -3789,7 +3838,7 @@ pub mod pg {
             .bind(recipient as i64)
             .fetch_all(&self.pool)
             .await
-            .map_err(|e| IndexError(e.to_string()))?;
+            .map_err(IndexError::from)?;
             Ok(rows
                 .into_iter()
                 .map(|(h, s, state)| super::channels::EdgeObservation {
@@ -3850,7 +3899,7 @@ pub mod pg {
             .bind(hash)
             .fetch_all(&self.pool)
             .await
-            .map_err(|e| IndexError(e.to_string()))?;
+            .map_err(IndexError::from)?;
             Ok(rows.into_iter().map(|(c, h)| (c, h as u64)).collect())
         }
 
@@ -3865,7 +3914,7 @@ pub mod pg {
             .bind(hash)
             .fetch_all(&self.pool)
             .await
-            .map_err(|e| IndexError(e.to_string()))?;
+            .map_err(IndexError::from)?;
             Ok(rows
                 .into_iter()
                 .map(|(c, h, i)| (c, h as u64, i as u32))
@@ -3877,7 +3926,7 @@ pub mod pg {
             chain_id: &str,
             height: u64,
         ) -> Result<Option<CanonicalBlock>, IndexError> {
-            let err = |e: sqlx::Error| IndexError(e.to_string());
+            let err = |e: sqlx::Error| IndexError::from(e);
             let head: Option<(String, String, Option<DateTime<Utc>>, bool, i64, i32, String)> =
                 sqlx::query_as(
                     "select hash, parent_hash, timestamp, finalized, \
@@ -3954,7 +4003,7 @@ pub mod pg {
         }
 
         async fn insert(&self, block: CanonicalBlock) -> Result<(), IndexError> {
-            let err = |e: sqlx::Error| IndexError(e.to_string());
+            let err = |e: sqlx::Error| IndexError::from(e);
             let mut tx = self.pool.begin().await.map_err(err)?;
 
             // THE replacement rule (reorg safety, ARCHITECTURE §15): finalized
@@ -4082,7 +4131,7 @@ pub mod pg {
             let (n,): (i64,) = sqlx::query_as("select count(*) from core.blocks")
                 .fetch_one(&self.pool)
                 .await
-                .map_err(|e| IndexError(e.to_string()))?;
+                .map_err(IndexError::from)?;
             Ok(n as u64)
         }
     }
@@ -4128,7 +4177,7 @@ pub mod pg {
                 .bind(to)
                 .fetch_all(&self.pool)
                 .await
-                .map_err(|e| IndexError(e.to_string()))?;
+                .map_err(IndexError::from)?;
             Ok(rows
                 .into_iter()
                 .map(|(height, timestamp, event_index, delta, reason, cp)| {
@@ -4173,7 +4222,7 @@ pub mod pg {
             .bind(asset)
             .fetch_all(&self.pool)
             .await
-            .map_err(|e| IndexError(e.to_string()))?;
+            .map_err(IndexError::from)?;
             Ok(rows
                 .into_iter()
                 .map(|(height, free, reserved, total, frozen, spec, source, note, status)| {
@@ -4275,7 +4324,7 @@ pub mod pg {
             .bind(at_height.map(|h| h as i64))
             .fetch_all(&self.pool)
             .await
-            .map_err(|e| IndexError(e.to_string()))?;
+            .map_err(IndexError::from)?;
             Ok(rows
                 .into_iter()
                 .map(
@@ -4325,7 +4374,7 @@ pub mod pg {
     impl PgXcmIndex {
         fn row(r: &sqlx::postgres::PgRow) -> Result<super::XcmMessageRow, IndexError> {
             use sqlx::Row as _;
-            let err = |e: sqlx::Error| IndexError(e.to_string());
+            let err = |e: sqlx::Error| IndexError::from(e);
             Ok(super::XcmMessageRow {
                 chain_id: r.try_get("chain_id").map_err(err)?,
                 block_height: r.try_get::<i64, _>("block_height").map_err(err)? as u64,
@@ -4351,7 +4400,7 @@ pub mod pg {
 
         fn link(r: &sqlx::postgres::PgRow) -> Result<super::XcmLinkRow, IndexError> {
             use sqlx::Row as _;
-            let err = |e: sqlx::Error| IndexError(e.to_string());
+            let err = |e: sqlx::Error| IndexError::from(e);
             Ok(super::XcmLinkRow {
                 chain_id: r.try_get("chain_id").map_err(err)?,
                 block_height: r.try_get::<i64, _>("block_height").map_err(err)? as u64,
@@ -4403,7 +4452,7 @@ pub mod pg {
             .bind(limit as i64)
             .fetch_all(&self.pool)
             .await
-            .map_err(|e| IndexError(e.to_string()))?;
+            .map_err(IndexError::from)?;
             rows.iter().map(Self::row).collect()
         }
 
@@ -4431,7 +4480,7 @@ pub mod pg {
             .bind(ids)
             .fetch_all(&self.pool)
             .await
-            .map_err(|e| IndexError(e.to_string()))?;
+            .map_err(IndexError::from)?;
             rows.iter().map(Self::row).collect()
         }
 
@@ -4447,7 +4496,7 @@ pub mod pg {
             .bind(message_id)
             .fetch_all(&self.pool)
             .await
-            .map_err(|e| IndexError(e.to_string()))?;
+            .map_err(IndexError::from)?;
             rows.iter().map(Self::link).collect()
         }
     }
@@ -4493,7 +4542,7 @@ pub mod pg {
             .bind(to as i64)
             .fetch_all(&self.pool)
             .await
-            .map_err(|e| IndexError(e.to_string()))?;
+            .map_err(IndexError::from)?;
             Ok(rows
                 .into_iter()
                 .map(|(core, n, paras)| super::CoreOccupancyRow {
@@ -4526,7 +4575,7 @@ pub mod pg {
             .bind(to as i64)
             .fetch_all(&self.pool)
             .await
-            .map_err(|e| IndexError(e.to_string()))?;
+            .map_err(IndexError::from)?;
             Ok(rows
                 .into_iter()
                 .map(|(core, para, n)| super::coretime_delta::OccupancyCell {
@@ -4553,7 +4602,7 @@ pub mod pg {
             .bind(to as i64)
             .fetch_all(&self.pool)
             .await
-            .map_err(|e| IndexError(e.to_string()))?;
+            .map_err(IndexError::from)?;
             Ok(rows.into_iter().map(|(k, n)| (k, n as u64)).collect())
         }
 
@@ -4584,7 +4633,7 @@ pub mod pg {
             .bind(to as i64)
             .fetch_one(&self.pool)
             .await
-            .map_err(|e| IndexError(e.to_string()))?;
+            .map_err(IndexError::from)?;
             Ok(super::WindowCoverage {
                 blocks_indexed: blocks as u64,
                 heights_with_occupancy: with_rows as u64,
@@ -4605,7 +4654,7 @@ pub mod pg {
             .bind(height as i64)
             .fetch_optional(&self.pool)
             .await
-            .map_err(|e| IndexError(e.to_string()))?;
+            .map_err(IndexError::from)?;
             Ok(row.map(|(h, n, rv)| super::CoreConfigRow {
                 block_height: h as u64,
                 num_cores: n as u32,
@@ -4627,7 +4676,7 @@ pub mod pg {
             .bind(height as i64)
             .fetch_optional(&self.pool)
             .await
-            .map_err(|e| IndexError(e.to_string()))?;
+            .map_err(IndexError::from)?;
             Ok(row.map(|(h, n, rv)| super::CoreConfigRow {
                 block_height: h as u64,
                 num_cores: n as u32,
@@ -4651,7 +4700,7 @@ pub mod pg {
             .bind(to as i64)
             .fetch_one(&self.pool)
             .await
-            .map_err(|e| IndexError(e.to_string()))?;
+            .map_err(IndexError::from)?;
             Ok(row.0.map(|n| n as u32))
         }
 
@@ -4673,7 +4722,7 @@ pub mod pg {
             .bind(to as i64)
             .fetch_all(&self.pool)
             .await
-            .map_err(|e| IndexError(e.to_string()))?;
+            .map_err(IndexError::from)?;
             Ok(rows
                 .into_iter()
                 .map(|(rv, mv, n)| (rv as u64, mv as u32, n as u64))
@@ -4695,7 +4744,7 @@ pub mod pg {
             .bind(to as i64)
             .fetch_all(&self.pool)
             .await
-            .map_err(|e| IndexError(e.to_string()))?;
+            .map_err(IndexError::from)?;
             Ok(rows.into_iter().map(|(n,)| n as u32).collect())
         }
     }
@@ -4808,7 +4857,7 @@ pub mod pg {
             .bind(relay_height as i64)
             .fetch_all(&self.pool)
             .await
-            .map_err(|e| IndexError(e.to_string()))?;
+            .map_err(IndexError::from)?;
             Ok(rows.into_iter().map(assignment_row).collect())
         }
 
@@ -4824,7 +4873,7 @@ pub mod pg {
             .bind(chain_id)
             .fetch_optional(&self.pool)
             .await
-            .map_err(|e| IndexError(e.to_string()))?;
+            .map_err(IndexError::from)?;
             Ok(row.map(|(h, n, fc, rv)| super::BrokerConfigRow {
                 block_height: h as u64,
                 core_count: n as u32,
@@ -4930,7 +4979,7 @@ pub mod pg {
                 .bind(limit as i64)
                 .fetch_all(&self.pool)
                 .await
-                .map_err(|e| IndexError(e.to_string()))?;
+                .map_err(IndexError::from)?;
             Ok(rows.into_iter().map(broker_event_row).collect())
         }
 
@@ -4947,7 +4996,7 @@ pub mod pg {
                 .bind(limit as i64)
                 .fetch_all(&self.pool)
                 .await
-                .map_err(|e| IndexError(e.to_string()))?;
+                .map_err(IndexError::from)?;
             Ok(rows.into_iter().map(assignment_row).collect())
         }
     }
@@ -4975,7 +5024,7 @@ pub mod pg {
 
     fn sim_row(r: &sqlx::postgres::PgRow) -> Result<super::SimulationRow, IndexError> {
         use sqlx::Row as _;
-        let err = |e: sqlx::Error| IndexError(e.to_string());
+        let err = |e: sqlx::Error| IndexError::from(e);
         Ok(super::SimulationRow {
             chain_id: r.try_get("chain_id").map_err(err)?,
             at_height: r.try_get::<i64, _>("at_height").map_err(err)? as u64,
@@ -5049,7 +5098,7 @@ pub mod pg {
             .bind(tier)
             .fetch_optional(&self.pool)
             .await
-            .map_err(|e| IndexError(e.to_string()))?;
+            .map_err(IndexError::from)?;
             row.as_ref().map(sim_row).transpose()
         }
 
@@ -5079,7 +5128,7 @@ pub mod pg {
             .bind(limit as i64)
             .fetch_all(&self.pool)
             .await
-            .map_err(|e| IndexError(e.to_string()))?;
+            .map_err(IndexError::from)?;
 
             rows.iter().map(sim_row).collect()
         }
@@ -5105,7 +5154,7 @@ pub mod pg {
 
     fn xcm_sim_row(r: &sqlx::postgres::PgRow) -> Result<super::XcmSimulationRow, IndexError> {
         use sqlx::Row as _;
-        let err = |e: sqlx::Error| IndexError(e.to_string());
+        let err = |e: sqlx::Error| IndexError::from(e);
         Ok(super::XcmSimulationRow {
             chain_id: r.try_get("chain_id").map_err(err)?,
             at_height: r.try_get::<i64, _>("at_height").map_err(err)? as u64,
@@ -5165,7 +5214,7 @@ pub mod pg {
             .bind(tier)
             .fetch_optional(&self.pool)
             .await
-            .map_err(|e| IndexError(e.to_string()))?;
+            .map_err(IndexError::from)?;
             row.as_ref().map(xcm_sim_row).transpose()
         }
 
@@ -5192,7 +5241,7 @@ pub mod pg {
             .bind(limit as i64)
             .fetch_all(&self.pool)
             .await
-            .map_err(|e| IndexError(e.to_string()))?;
+            .map_err(IndexError::from)?;
             rows.iter().map(xcm_sim_row).collect()
         }
 
@@ -5224,7 +5273,7 @@ pub mod pg {
             .bind(limit as i64)
             .fetch_all(&self.pool)
             .await
-            .map_err(|e| IndexError(e.to_string()))?;
+            .map_err(IndexError::from)?;
             rows.iter().map(xcm_sim_row).collect()
         }
     }
@@ -5274,7 +5323,7 @@ pub mod pg {
             .bind(symbol)
             .fetch_all(&self.pool)
             .await
-            .map_err(|e| IndexError(e.to_string()))?;
+            .map_err(IndexError::from)?;
             Ok(rows
                 .into_iter()
                 .map(
@@ -5339,7 +5388,7 @@ pub mod pg {
             .bind(chain_id)
             .fetch_all(&self.pool)
             .await
-            .map_err(|e| IndexError(e.to_string()))?;
+            .map_err(IndexError::from)?;
             Ok(rows
                 .into_iter()
                 .map(
@@ -5408,7 +5457,7 @@ pub mod pg {
             .bind(absolute_key)
             .fetch_all(&self.pool)
             .await
-            .map_err(|e| IndexError(e.to_string()))?;
+            .map_err(IndexError::from)?;
             Ok(rows
                 .into_iter()
                 .map(
@@ -5488,7 +5537,7 @@ pub mod pg {
             .bind(chain_id)
             .fetch_all(&self.pool)
             .await
-            .map_err(|e| IndexError(e.to_string()))?;
+            .map_err(IndexError::from)?;
             Ok(rows
                 .into_iter()
                 .map(
@@ -5610,7 +5659,7 @@ pub mod pg {
             .bind(id as i64)
             .fetch_optional(&self.pool)
             .await
-            .map_err(|e| IndexError(e.to_string()))?;
+            .map_err(IndexError::from)?;
             Ok(row.map(referendum_from_row))
         }
 
@@ -5634,7 +5683,7 @@ pub mod pg {
                 .bind(id as i64)
                 .fetch_all(&self.pool)
                 .await
-                .map_err(|e| IndexError(e.to_string()))?;
+                .map_err(IndexError::from)?;
             Ok(rows
                 .into_iter()
                 .map(|(height, timestamp, event_index, kind, data)| super::ReferendumEventRow {
@@ -5663,7 +5712,7 @@ pub mod pg {
             .bind(limit as i64)
             .fetch_all(&self.pool)
             .await
-            .map_err(|e| IndexError(e.to_string()))?;
+            .map_err(IndexError::from)?;
             Ok(rows.into_iter().map(referendum_from_row).collect())
         }
 
@@ -5675,7 +5724,7 @@ pub mod pg {
             .bind(chain_id)
             .fetch_all(&self.pool)
             .await
-            .map_err(|e| IndexError(e.to_string()))?;
+            .map_err(IndexError::from)?;
             Ok(rows
                 .into_iter()
                 .map(|(pallet, track_id, name, params, spec_version)| super::GovTrackRow {
@@ -5715,7 +5764,7 @@ pub mod pg {
             .bind(call_hash)
             .fetch_optional(&self.pool)
             .await
-            .map_err(|e| IndexError(e.to_string()))?;
+            .map_err(IndexError::from)?;
             Ok(row.map(whitelisted_row))
         }
 
@@ -5736,7 +5785,7 @@ pub mod pg {
                 .bind(call_hash)
                 .fetch_all(&self.pool)
                 .await
-                .map_err(|e| IndexError(e.to_string()))?;
+                .map_err(IndexError::from)?;
             Ok(rows
                 .into_iter()
                 .map(|(h, i, kind, ok, err, data, rv)| super::WhitelistEventRow {
@@ -5783,7 +5832,7 @@ pub mod pg {
             .bind(limit as i64)
             .fetch_all(&self.pool)
             .await
-            .map_err(|e| IndexError(e.to_string()))?;
+            .map_err(IndexError::from)?;
             Ok(rows.into_iter().map(whitelisted_row).collect())
         }
 
@@ -5814,7 +5863,7 @@ pub mod pg {
             .bind(proposal_hash)
             .fetch_optional(&self.pool)
             .await
-            .map_err(|e| IndexError(e.to_string()))?;
+            .map_err(IndexError::from)?;
             Ok(row.map(
                 |(proposal_hash, len, decode_status, source, call_summary, decoded_call, note, spec, height)| {
                     super::PreimageRow {
@@ -5850,7 +5899,7 @@ pub mod pg {
             .bind(limit as i64)
             .fetch_all(&self.pool)
             .await
-            .map_err(|e| IndexError(e.to_string()))?;
+            .map_err(IndexError::from)?;
             Ok(rows.into_iter().map(vote_from_row).collect())
         }
 
@@ -5870,7 +5919,7 @@ pub mod pg {
             .bind(limit as i64)
             .fetch_all(&self.pool)
             .await
-            .map_err(|e| IndexError(e.to_string()))?;
+            .map_err(IndexError::from)?;
             Ok(rows.into_iter().map(vote_from_row).collect())
         }
 
@@ -5889,7 +5938,7 @@ pub mod pg {
             .bind(delegator)
             .fetch_all(&self.pool)
             .await
-            .map_err(|e| IndexError(e.to_string()))?;
+            .map_err(IndexError::from)?;
             Ok(rows
                 .into_iter()
                 .map(|(class, track_id, delegator, target, active, height)| {
@@ -5935,7 +5984,7 @@ pub mod pg {
             .bind(account)
             .fetch_all(&self.pool)
             .await
-            .map_err(|e| IndexError(e.to_string()))?;
+            .map_err(IndexError::from)?;
             Ok(rows
                 .into_iter()
                 .map(
@@ -6099,7 +6148,7 @@ pub mod pg {
             .bind(limit as i64)
             .fetch_all(&self.pool)
             .await
-            .map_err(|e| IndexError(e.to_string()))?;
+            .map_err(IndexError::from)?;
             Ok(rows.into_iter().map(spend_from_row).collect())
         }
 
@@ -6120,7 +6169,7 @@ pub mod pg {
             .bind(spend_id as i64)
             .fetch_optional(&self.pool)
             .await
-            .map_err(|e| IndexError(e.to_string()))?;
+            .map_err(IndexError::from)?;
             Ok(row.map(spend_from_row))
         }
 
@@ -6146,7 +6195,7 @@ pub mod pg {
             .bind(spend_id as i64)
             .fetch_all(&self.pool)
             .await
-            .map_err(|e| IndexError(e.to_string()))?;
+            .map_err(IndexError::from)?;
             Ok(rows.into_iter().map(spend_event_from_row).collect())
         }
 
@@ -6169,7 +6218,7 @@ pub mod pg {
             .bind(limit as i64)
             .fetch_all(&self.pool)
             .await
-            .map_err(|e| IndexError(e.to_string()))?;
+            .map_err(IndexError::from)?;
             Ok(rows.into_iter().map(spend_event_from_row).collect())
         }
 
@@ -6195,7 +6244,7 @@ pub mod pg {
             .bind(network)
             .fetch_all(&self.pool)
             .await
-            .map_err(|e| IndexError(e.to_string()))?;
+            .map_err(IndexError::from)?;
             Ok(rows
                 .into_iter()
                 .map(
@@ -6335,7 +6384,7 @@ pub mod pg {
             .bind(limit as i64)
             .fetch_all(&self.pool)
             .await
-            .map_err(|e| IndexError(e.to_string()))?;
+            .map_err(IndexError::from)?;
             Ok(rows.into_iter().map(bounty_from_row).collect())
         }
 
@@ -6356,7 +6405,7 @@ pub mod pg {
             .bind(child_key(child_id))
             .fetch_optional(&self.pool)
             .await
-            .map_err(|e| IndexError(e.to_string()))?;
+            .map_err(IndexError::from)?;
             Ok(row.map(bounty_from_row))
         }
 
@@ -6390,7 +6439,7 @@ pub mod pg {
             .bind(child_key(child_id))
             .fetch_all(&self.pool)
             .await
-            .map_err(|e| IndexError(e.to_string()))?;
+            .map_err(IndexError::from)?;
             Ok(rows
                 .into_iter()
                 .map(
@@ -6580,7 +6629,7 @@ async fn get_block(
             StatusCode::NOT_FOUND,
             format!("block {chain}/{height} not indexed"),
         ),
-        Err(e) => error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+        Err(e) => read_failure(e),
     }
 }
 
@@ -6604,7 +6653,7 @@ async fn get_labels(
             "labels": labels,
         }))
         .into_response(),
-        Err(e) => error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+        Err(e) => read_failure(e),
     }
 }
 
@@ -6659,11 +6708,11 @@ async fn get_balance_history(
             .await
         {
             Ok(c) => c,
-            Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+            Err(e) => return read_failure(e),
         };
         let anchors = match state.balances.anchors(&w.chain, &account_id, &asset).await {
             Ok(a) => a,
-            Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+            Err(e) => return read_failure(e),
         };
         segments.push(serde_json::json!({
             "chain": w.chain,
@@ -6943,11 +6992,11 @@ async fn get_gov_whitelisted_call(
     for w in windows {
         let row = match state.gov.whitelisted_call(&w.chain, &call_hash).await {
             Ok(r) => r,
-            Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+            Err(e) => return read_failure(e),
         };
         let events = match state.gov.whitelist_events(&w.chain, &call_hash).await {
             Ok(ev) => ev,
-            Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+            Err(e) => return read_failure(e),
         };
         // A later residency window wins outright — unlike a referendum, a
         // whitelisted call has no fields to coalesce, and the same hash
@@ -6960,7 +7009,7 @@ async fn get_gov_whitelisted_call(
         if preimage.is_none() {
             preimage = match state.gov.preimage(&w.chain, &call_hash).await {
                 Ok(p) => p.filter(|p| p.decode_status == "decoded"),
-                Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+                Err(e) => return read_failure(e),
             };
         }
         segments.push(serde_json::json!({
@@ -7034,7 +7083,7 @@ async fn list_gov_whitelist(
     for w in windows {
         let calls = match state.gov.list_whitelisted_calls(&w.chain, limit).await {
             Ok(c) => c,
-            Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+            Err(e) => return read_failure(e),
         };
         segments.push(serde_json::json!({
             "chain": w.chain,
@@ -7080,11 +7129,11 @@ async fn get_gov_referendum(
     for w in windows {
         let summary = match state.gov.referendum(&w.chain, &class, id).await {
             Ok(s) => s,
-            Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+            Err(e) => return read_failure(e),
         };
         let events = match state.gov.referendum_events(&w.chain, &class, id).await {
             Ok(ev) => ev,
-            Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+            Err(e) => return read_failure(e),
         };
         if let Some(s) = summary {
             merged = Some(match merged.take() {
@@ -7123,7 +7172,7 @@ async fn get_gov_referendum(
                     }
                 }
                 Ok(None) => {}
-                Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+                Err(e) => return read_failure(e),
             }
         }
     }
@@ -7143,7 +7192,7 @@ async fn get_gov_referendum(
                     sim_truncated |= rows.len() as u32 == SIM_PER_WINDOW;
                     simulations.extend(rows);
                 }
-                Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+                Err(e) => return read_failure(e),
             }
         }
     }
@@ -7339,7 +7388,7 @@ async fn get_coretime_occupancy(
         );
     }
 
-    let ise = |e: IndexError| error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string());
+    let ise = |e: IndexError| read_failure(e);
     let cores = match state.coretime.occupancy_by_core(&chain, from, to).await {
         Ok(c) => c,
         Err(e) => return ise(e),
@@ -7664,7 +7713,7 @@ async fn get_xcm_channels(
             );
         }
     };
-    let ise = |e: IndexError| error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string());
+    let ise = |e: IndexError| read_failure(e);
 
     let all = match state.channels.readings(&cfg.id).await {
         Ok(r) => r,
@@ -7805,7 +7854,7 @@ async fn get_xcm_channel_history(
         .await
     {
         Ok(o) => o,
-        Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+        Err(e) => return read_failure(e),
     };
     let history = channels::derive_history(&obs);
 
@@ -7889,7 +7938,7 @@ async fn get_coretime_delta(
         );
     }
 
-    let ise = |e: IndexError| error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string());
+    let ise = |e: IndexError| read_failure(e);
     let occupancy = match state
         .coretime
         .occupancy_by_core_and_para(&occ_chain.id, from, to)
@@ -8141,7 +8190,7 @@ async fn get_coretime_entitlement(
         .unwrap_or(ENTITLEMENT_DEFAULT_LIMIT)
         .clamp(1, ENTITLEMENT_MAX_LIMIT);
 
-    let ise = |e: IndexError| error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string());
+    let ise = |e: IndexError| read_failure(e);
     let (events, assignments) = if kind == "core" {
         (
             state.broker.events_for_core(&chain, id, limit).await,
@@ -8197,7 +8246,7 @@ async fn list_xcm_messages(
     let limit = q.limit.unwrap_or(25).clamp(1, 200) as u32;
     let rows = match state.xcm.messages(&chain, limit).await {
         Ok(r) => r,
-        Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+        Err(e) => return read_failure(e),
     };
     Json(serde_json::json!({
         "chain": chain,
@@ -8222,7 +8271,7 @@ async fn get_xcm_message(
     let id = normalize_call_hash(&message_id);
     let rows = match state.xcm.by_message_id(&id).await {
         Ok(r) => r,
-        Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+        Err(e) => return read_failure(e),
     };
     let sides: Vec<&str> = rows.iter().map(|r| r.side.as_str()).collect();
     // "one chain … and another" is a CLAIM, and on live data it can be false:
@@ -8313,7 +8362,7 @@ async fn get_xcm_journey(
         probed += 1;
         let found = match state.xcm.aliases(&id).await {
             Ok(l) => l,
-            Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+            Err(e) => return read_failure(e),
         };
         for l in found {
             for candidate in [&l.wire_hash, &l.topic] {
@@ -8340,7 +8389,7 @@ async fn get_xcm_journey(
 
     let mut rows = match state.xcm.by_message_ids(&ids).await {
         Ok(r) => r,
-        Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+        Err(e) => return read_failure(e),
     };
     // Block timestamp is the ONLY ordering two chains share. `is_none()` first
     // in the key puts undated steps LAST (Option's own Ord would put them
@@ -8892,7 +8941,7 @@ async fn get_simulations(
     let limit = q.limit.unwrap_or(10).clamp(1, 25) as u32;
     let rows = match state.sim.simulations(&chain, &hash, limit).await {
         Ok(r) => r,
-        Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+        Err(e) => return read_failure(e),
     };
     // FILTERED AFTER THE LIMIT, and said out loud rather than left to be found in
     // an EXPLAIN: `simulation_results_call_idx` does not carry `tier`, so a
@@ -8936,7 +8985,7 @@ async fn get_simulations(
                         {
                             Ok(b) => b,
                             Err(e) => {
-                                return error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+                                return read_failure(e)
                             }
                         }
                     }
@@ -8963,7 +9012,7 @@ async fn get_simulations(
             None => None,
             Some(_) => match state.xcm_sim.legs(&chain, &row.input_hash, 25).await {
                 Ok(l) => Some(l),
-                Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+                Err(e) => return read_failure(e),
             },
         };
         // NO SILENT DEFAULT HERE. `unwrap_or(json!({}))` would serve a
@@ -9042,7 +9091,7 @@ async fn get_xcm_simulations(
     let limit = q.limit.unwrap_or(10).clamp(1, 25) as u32;
     let rows = match state.xcm_sim.xcm_simulations(&chain, &hash, limit).await {
         Ok(r) => r,
-        Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+        Err(e) => return read_failure(e),
     };
 
     // The SAME difference the call side gets, over the same builder. Shipping it
@@ -9061,7 +9110,7 @@ async fn get_xcm_simulations(
                     .await
                 {
                     Ok(b) => b,
-                    Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+                    Err(e) => return read_failure(e),
                 }
             }
         };
@@ -9124,7 +9173,7 @@ async fn list_gov_referenda(
     for w in &windows {
         let rows = match state.gov.list_referenda(&w.chain, &class, limit).await {
             Ok(r) => r,
-            Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+            Err(e) => return read_failure(e),
         };
         for row in rows {
             let id = row.referendum_id;
@@ -9200,7 +9249,7 @@ async fn get_gov_referendum_votes(
     for w in &windows {
         let votes = match state.gov.referendum_votes(&w.chain, &class, id, limit).await {
             Ok(v) => v,
-            Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+            Err(e) => return read_failure(e),
         };
         truncated |= votes.len() as u64 >= limit;
         segments.push(serde_json::json!({
@@ -9277,17 +9326,17 @@ async fn get_gov_account_votes(
         let votes: Vec<VoteRow> = match state.gov.account_votes(&w.chain, &account_id, limit).await
         {
             Ok(v) => v.into_iter().filter(|r| keep(&r.class)).collect(),
-            Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+            Err(e) => return read_failure(e),
         };
         let delegations: Vec<DelegationRow> =
             match state.gov.account_delegations(&w.chain, &account_id).await {
                 Ok(d) => d.into_iter().filter(|r| keep(&r.class)).collect(),
-                Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+                Err(e) => return read_failure(e),
             };
         let anchors: Vec<VotingAnchorRow> =
             match state.gov.voting_anchors(&w.chain, &account_id).await {
                 Ok(a) => a.into_iter().filter(|r| keep(&r.class)).collect(),
-                Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+                Err(e) => return read_failure(e),
             };
         segments.push(serde_json::json!({
             "chain": w.chain,
@@ -9351,7 +9400,7 @@ async fn get_gov_tracks(
             }))
             .into_response()
         }
-        Err(e) => error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+        Err(e) => read_failure(e),
     }
 }
 
@@ -9466,7 +9515,7 @@ async fn list_treasury_spends(
             .await
         {
             Ok(r) => r,
-            Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+            Err(e) => return read_failure(e),
         };
         segments.push(serde_json::json!({
             "chain": w.chain,
@@ -9537,11 +9586,11 @@ async fn get_treasury_spend(
                 })
             }
             Ok(None) => {}
-            Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+            Err(e) => return read_failure(e),
         }
         let events = match state.treasury.spend_events(&w.chain, &instance, &kind, id).await {
             Ok(e) => e,
-            Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+            Err(e) => return read_failure(e),
         };
         segments.push(serde_json::json!({
             "chain": w.chain,
@@ -9728,7 +9777,7 @@ async fn get_treasury_pot(
     for w in &windows {
         let events = match state.treasury.pot_events(&w.chain, &instance, limit).await {
             Ok(e) => e,
-            Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+            Err(e) => return read_failure(e),
         };
         segments.push(serde_json::json!({
             "chain": w.chain,
@@ -9888,7 +9937,7 @@ async fn list_bounties(
             .await
         {
             Ok(r) => r,
-            Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+            Err(e) => return read_failure(e),
         };
         segments.push(serde_json::json!({
             "chain": w.chain,
@@ -9967,7 +10016,7 @@ async fn get_bounty(
                 })
             }
             Ok(None) => {}
-            Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+            Err(e) => return read_failure(e),
         }
         let events = match state
             .bounties
@@ -9975,7 +10024,7 @@ async fn get_bounty(
             .await
         {
             Ok(e) => e,
-            Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+            Err(e) => return read_failure(e),
         };
         segments.push(serde_json::json!({
             "chain": w.chain,
@@ -10047,7 +10096,7 @@ async fn list_assets(State(state): State<AppState>, Path(chain): Path<String>) -
             "assets": assets,
         }))
         .into_response(),
-        Err(e) => error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+        Err(e) => read_failure(e),
     }
 }
 
@@ -10096,7 +10145,7 @@ async fn get_treasury_holdings(
 ) -> Response {
     let accounts = match state.treasury.accounts(&network).await {
         Ok(a) => a,
-        Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+        Err(e) => return read_failure(e),
     };
 
     // group by chain, preserving the (chain, role, label) order the index gave
@@ -10131,11 +10180,11 @@ async fn get_treasury_holdings(
 
         let holdings = match state.balances.holdings(chain, &ids, None).await {
             Ok(h) => h,
-            Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+            Err(e) => return read_failure(e),
         };
         let assets = match state.assets.assets(chain).await {
             Ok(a) => a,
-            Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+            Err(e) => return read_failure(e),
         };
         let asset_by_key: HashMap<&str, &AssetRow> =
             assets.iter().map(|a| (a.asset_key.as_str(), a)).collect();
@@ -10291,7 +10340,7 @@ async fn get_asset_identity(
 ) -> Response {
     let reps = match state.assets.representations(&q.key).await {
         Ok(r) => r,
-        Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+        Err(e) => return read_failure(e),
     };
 
     // DECIMALS ARE THE ADDABILITY TEST, and it is checked here rather than
@@ -10395,7 +10444,7 @@ async fn get_treasury_consolidated(
     }
     let accounts = match state.treasury.accounts(&network).await {
         Ok(a) => a,
-        Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+        Err(e) => return read_failure(e),
     };
 
     let mut chains: Vec<String> = Vec::new();
@@ -10458,11 +10507,11 @@ async fn get_treasury_consolidated(
 
         let holdings = match state.balances.holdings(chain, &ids, None).await {
             Ok(h) => h,
-            Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+            Err(e) => return read_failure(e),
         };
         let assets = match state.assets.assets(chain).await {
             Ok(a) => a,
-            Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+            Err(e) => return read_failure(e),
         };
         let by_key: HashMap<&str, &AssetRow> =
             assets.iter().map(|a| (a.asset_key.as_str(), a)).collect();
@@ -10889,6 +10938,38 @@ fn error(status: StatusCode, message: String) -> Response {
     (status, Json(serde_json::json!({ "error": message }))).into_response()
 }
 
+/// Render a read failure, distinguishing a REFUSAL from a FAULT.
+///
+/// A query cancelled by the serving `statement_timeout` is not the database
+/// being broken — the data is fine and the question was too expensive. Those are
+/// different facts and they ask the caller for different things: **narrow the
+/// window** versus **the answer is unavailable, try later**. Collapsing both
+/// into one opaque 500 leaves the caller unable to tell which of the two actions
+/// is theirs to take, and a monitor unable to tell load from breakage.
+///
+/// `503` rather than `504`: nothing upstream timed out, WE declined to spend
+/// more of a shared resource on one question. That is a capacity refusal, which
+/// is what 503 means.
+///
+/// Generic over `Display` rather than taking `IndexError`, because these call
+/// sites bind whatever their match arm produced and a signature that only
+/// accepted one error type would push the others back to a hand-written 500 —
+/// which is how a rule ends up true in forty-seven places and false in two.
+///
+/// It matches with `contains` and not `starts_with`, and that is not
+/// interchangeable here: `IndexError`'s `Display` prefixes `"block index
+/// error: "`, so the marker is never at position zero by the time it reaches
+/// this function. `IndexError::timed_out` inspects the inner string directly and
+/// can use `starts_with`; this one cannot. Both are pinned by tests.
+fn read_failure<E: std::fmt::Display>(e: E) -> Response {
+    let message = e.to_string();
+    if message.contains(TIMEOUT_REFUSAL) {
+        error(StatusCode::SERVICE_UNAVAILABLE, message)
+    } else {
+        error(StatusCode::INTERNAL_SERVER_ERROR, message)
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -10896,6 +10977,52 @@ pub(crate) mod tests {
     use axum::http::Request;
     use std::path::Path as FsPath;
     use tower::util::ServiceExt;
+
+    /// An `IndexError` shaped exactly as `From<sqlx::Error>` builds one for
+    /// SQLSTATE 57014. The MESSAGE is not what these tests pin — that mapping
+    /// needs a real cancelled query and lives in the pg integration test. What
+    /// they pin is that the classification downstream reads the marker the
+    /// producer writes, using the shared constant on both sides rather than two
+    /// hand-written strings that could drift apart.
+    fn timeout_error() -> IndexError {
+        IndexError(format!("{TIMEOUT_REFUSAL}: the window asked for is too expensive"))
+    }
+
+    #[test]
+    fn a_serving_timeout_is_a_refusal_and_everything_else_is_a_fault() {
+        assert_eq!(
+            read_failure(timeout_error()).status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "a query we declined to keep spending on is a capacity refusal, not a fault"
+        );
+        assert_eq!(
+            read_failure(IndexError("connection reset by peer".into())).status(),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "an actual database fault must NOT be dressed up as a refusal — that would \
+             tell a caller to narrow a window that was never the problem"
+        );
+    }
+
+    #[test]
+    fn the_marker_is_not_at_position_zero_by_the_time_it_reaches_read_failure() {
+        // THE ONE THAT WOULD SHIP SILENTLY. `IndexError`'s Display prefixes
+        // "block index error: ", so a `starts_with` in `read_failure` would
+        // classify every timeout as a fault and the refusal would never be
+        // reachable — a gate nobody has checked, in the shape where it still
+        // compiles and still returns a plausible status code.
+        let rendered = timeout_error().to_string();
+        assert!(
+            !rendered.starts_with(TIMEOUT_REFUSAL),
+            "if this ever becomes true, read_failure's `contains` can be tightened; \
+             until then `starts_with` there is a silent bug: {rendered}"
+        );
+        assert!(rendered.contains(TIMEOUT_REFUSAL));
+        // ...while the inner string DOES start with it, which is what
+        // `timed_out` inspects. The two predicates look interchangeable and are
+        // not.
+        assert!(timeout_error().timed_out());
+        assert!(!IndexError("connection reset by peer".into()).timed_out());
+    }
 
     /// A `VersionedLocation` and a `VersionedXcm` in the shapes this decoder
     /// really produces — the attribution below compares them by exact rendering,
