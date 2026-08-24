@@ -479,17 +479,17 @@ fn reads_as(
         s.push_str(match declared {
             Some(d) if d.iter().all(|m| is_reserved_module(m)) => {
                 "THIS CHAIN'S SEED DECLARES NO DOMAIN MODULE — only frontiers. Nothing below \
-                 is missing; there is nothing to be behind. ",
+                 is missing; there is nothing to be behind. "
             }
             Some(_) => {
                 "NO MODULE HAS A CHECKPOINT OR A RECORDED HALT ON THIS CHAIN, though its seed \
                  declares some — read the `never_run` rows below as 'not started', never as \
-                 'nothing to report'. ",
+                 'nothing to report'. "
             }
             None => {
                 "NO MODULE HAS A CHECKPOINT OR A RECORDED HALT ON THIS CHAIN. This reader was \
                  not told what SHOULD be running here, so an empty list below is the absence \
-                 of an OBSERVATION and not the absence of a problem. ",
+                 of an OBSERVATION and not the absence of a problem. "
             }
         });
     }
@@ -695,7 +695,11 @@ fn not_covered(
                      the same way and for the same reason: a bounded chunk is not a follower.",
                     reserved.join(" and "),
                     if reserved.len() == 1 { "is" } else { "are" },
-                    if reserved.len() == 1 { "it is one of" } else { "they are" },
+                    if reserved.len() == 1 {
+                        "it is one of"
+                    } else {
+                        "they are"
+                    },
                     opt_height(frontiers.raw),
                     opt_height(frontiers.decode),
                 ));
@@ -975,7 +979,11 @@ mod tests {
             .with_declared(&declared(&["balances", "gov", "xcm"]));
 
         let names: Vec<&str> = r.modules.iter().map(|m| m.module.as_str()).collect();
-        assert_eq!(names, vec!["balances", "gov", "xcm"], "declared rows are added");
+        assert_eq!(
+            names,
+            vec!["balances", "gov", "xcm"],
+            "declared rows are added"
+        );
 
         let gov = r.modules.iter().find(|m| m.module == "gov").expect("gov");
         assert_eq!(gov.state, ModuleState::NeverRun);
@@ -1090,7 +1098,11 @@ mod tests {
             .with_declared(&declared(&["balances", "gov"]));
 
         let bal = r.modules.iter().find(|m| m.module == "balances").unwrap();
-        assert_eq!(bal.state, ModuleState::Halted, "a declared module can be halted");
+        assert_eq!(
+            bal.state,
+            ModuleState::Halted,
+            "a declared module can be halted"
+        );
         assert_eq!(bal.declared, Some(true));
         assert!(bal.blocking_halt.is_some());
         assert_eq!(r.halted().len(), 1, "the helper still selects it");
@@ -1130,7 +1142,11 @@ mod tests {
             vec!["balances", "extrinsics"],
             "the frontiers are the yardstick, not modules"
         );
-        assert_eq!(r.frontiers.decode, Some(900), "and it is still reported here");
+        assert_eq!(
+            r.frontiers.decode,
+            Some(900),
+            "and it is still reported here"
+        );
         assert!(
             r.not_covered.iter().any(|s| s.contains("FRONTIERS")),
             "the omission must be stated where a reader would otherwise call it a gap: {:?}",

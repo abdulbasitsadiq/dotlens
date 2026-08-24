@@ -11272,8 +11272,8 @@ async fn get_freshness(State(state): State<AppState>, Path(chain): Path<String>)
         Err(e) => return read_failure(e),
     };
 
-    let report = freshness::derive(&cfg.id, &checkpoints, &halts, Utc::now())
-        .with_declared(&cfg.modules);
+    let report =
+        freshness::derive(&cfg.id, &checkpoints, &halts, Utc::now()).with_declared(&cfg.modules);
 
     // A 500, deliberately not a defaulted body: an empty object served with a
     // 200 would render as a chain with no modules and no gaps, which is the one
