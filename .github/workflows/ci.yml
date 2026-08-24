@@ -86,11 +86,14 @@ jobs:
           # this, every branch writes ~1-2 GB and they evict each other (and
           # main) out of the 10 GB per-repo cache budget.
           #
-          # MEASURED CONSEQUENCE, so a later session does not assume this is
-          # working: no push to `main` has happened yet, so NO CACHE EXISTS and
-          # every run so far restored nothing. Cold is 6 billable minutes (see
-          # the cost note at the foot of this file), which is why that is fine.
-          # The cache earns its keep as the workspace grows, not today.
+          # MEASURED, so a later session does not assume this works: until
+          # `main` had run once NO CACHE EXISTED, and every branch run was
+          # structurally cold. That is no longer true — main run 32742967387
+          # saved 369 MB (test) + 162 MB (check), and dispatch run 32743494710
+          # restored it "full match: true", cutting test 4.2min -> 1.9min and
+          # check 1.2min -> 0.3min. Both real numbers are at the foot of this
+          # file. Note 531 MB total, not the 1-2 GB per job guessed above:
+          # `save-if` is buying headroom, not rescuing a budget.
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: no test may reach the network
@@ -162,21 +165,31 @@ jobs:
 # 3,000); Linux is the 1x multiplier and service containers add nothing. Billing
 # rounds each JOB up to the whole minute, so two jobs cost two roundings.
 #
-# MEASURED 2026-08-24 over the first three runs, and the estimates this comment
-# used to carry were WRONG BY 5x IN THE EXPENSIVE DIRECTION (~30 min/push cold
-# guessed; ~6 measured). Run 1 (32741280632) is the reference:
+# MEASURED 2026-08-24 over all five verification runs, and the estimates this
+# comment used to carry were WRONG BY 5x IN THE EXPENSIVE DIRECTION (~30
+# min/push cold guessed; ~6 measured). Run 1 (32741280632) is the cold
+# reference:
 #
 #   test --workspace --all-features          3m 54s   -> 4 billable
 #   check --workspace --no-default-features  1m 20s   -> 2 billable
 #   run time 5m 14s                                   => 6 min/push
 #
-# All three runs were COLD — `save-if` restricts saving to `main`, and no push
-# to `main` has happened yet, so nothing has ever been restored. The other two
-# runs agree within seconds (3m23/1m09 and 3m34/1m24), so 6 min/push is the
-# COLD figure and warm can only be cheaper. The floor is 2 minutes whatever
-# happens: two jobs, each rounded up.
+# The first four runs were all COLD, because `save-if` restricts saving to
+# `main` and main had not run yet. They agree within seconds — test 3.3-4.2min,
+# check 1.1-1.4min — so 6-7 min/push is the COLD figure.
 #
-# ~6 min/push against 2,000/month is ~330 pushes. The budget is not a
+# WARM IS NOW MEASURED TOO, and is no longer an inference. Dispatch run
+# 32743494710 restored a full cache hit:
+#
+#                     test        check       billable/push
+#   cold (no cache)   3.3-4.2min  1.1-1.4min  6-7 min
+#   warm (full hit)   1.9 min     0.3 min     3 min
+#
+# The floor is 2 minutes whatever happens: two jobs, each rounded up.
+#
+# ~3 min/push warm against 2,000/month is ~660 pushes; even all-cold is ~330.
+# The whole of this pipeline's verification — five runs, four cold, including
+# both deliberate break tests — cost 28 billable minutes. The budget is not a
 # constraint on this project at this size, and the levers below are recorded
 # for when that stops being true rather than because it is close.
 #
