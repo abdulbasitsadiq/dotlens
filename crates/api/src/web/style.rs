@@ -27,15 +27,19 @@
 //! no `prefers-color-scheme` block here and no `[data-theme=dark]`: one theme,
 //! stated, until the ledger dark values exist.
 //!
-//! # NO EXTERNAL FONT REQUEST
+//! # NO EXTERNAL FONT REQUEST — AND NOW NO FALLBACK EITHER
 //!
 //! `style/candidate-a-ledger.html` pulls Schibsted Grotesk from Google Fonts and
 //! Server Mono from jsDelivr, which is right for a mockup and wrong for the
 //! product: it would be the first third-party request on a surface whose whole
-//! pitch is that you can verify what it tells you. Both faces are OFL and
-//! belong self-hosted in the repo; until they are, the stacks below fall back
-//! through IBM Plex Mono → `ui-monospace` and `system-ui`, which degrades the
-//! typography and nothing else. Named as a follow-up rather than left implicit.
+//! pitch is that you can verify what it tells you.
+//!
+//! **Both faces are now VENDORED and served from this origin** — see `fonts.rs`
+//! for the licences and for why the URLs carry a revision. The stacks below keep
+//! their fallbacks, but they are a degradation path rather than the normal case:
+//! composition A shipped rendering in `system-ui` and generic monospace, which
+//! is roughly the worst-case reading of a design whose whole character is its
+//! typography.
 
 /// `text/css` for the whole surface.
 pub const CSS: &str = r#"
@@ -58,6 +62,25 @@ pub const CSS: &str = r#"
   --row-h:30px; --gutter:32px; --card-pad:20px; --tap-min:44px;
   --safe-top:env(safe-area-inset-top,0px);
   --safe-bottom:env(safe-area-inset-bottom,0px);
+}
+
+/* ------------------------------------------------------------------ faces
+   Self-hosted, OFL 1.1, served from this origin — never a CDN. `fonts.rs`
+   carries the licence provenance and the revision argument.
+
+   `font-display:swap` and never `block`: a data page may not render invisible
+   text while a face downloads. The fallback stacks below stay in the tokens as
+   a degradation path. */
+@font-face{
+  font-family:"Server Mono";
+  src:url("/assets/fonts/server-mono-1.woff2") format("woff2");
+  font-weight:400;font-style:normal;font-display:swap;
+}
+@font-face{
+  /* VARIABLE weight axis, which is why 400/500/600/700 cost one file. */
+  font-family:"Schibsted Grotesk";
+  src:url("/assets/fonts/schibsted-grotesk-1.woff2") format("woff2");
+  font-weight:400 700;font-style:normal;font-display:swap;
 }
 
 /* ------------------------------------------------------------------ reset */

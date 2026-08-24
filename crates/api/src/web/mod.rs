@@ -70,6 +70,7 @@
 //! ever have fallen into: **the freshness strip and the data panels are two
 //! different facts and are never merged into one "last updated" line.**
 
+mod fonts;
 mod style;
 
 use crate::AppState;
@@ -102,6 +103,12 @@ pub fn routes() -> Router<AppState> {
         .route("/", get(home))
         .route("/network/{network}", get(network_home))
         .route("/assets/dotlens.css", get(stylesheet))
+        // The faces, at revisioned paths so `immutable` is honest rather than a
+        // trap. `fonts.rs` explains why, and a test pins these paths against the
+        // `src` in the stylesheet — a renamed route falls back to `system-ui`
+        // silently, which is the one failure `cargo test` would never notice.
+        .route(fonts::SERVER_MONO_PATH, get(fonts::server_mono))
+        .route(fonts::SCHIBSTED_GROTESK_PATH, get(fonts::schibsted_grotesk))
 }
 
 // ===========================================================================
@@ -342,6 +349,13 @@ fn shell(title: &str, current: Nav, head: Markup, body: Markup) -> Markup {
                 meta charset="utf-8";
                 meta name="viewport" content="width=device-width, initial-scale=1";
                 title { (title) " · dotlens" }
+                // PRELOADED, and `crossorigin` is required even same-origin:
+                // a font is always fetched in CORS mode, so a preload without it
+                // is a second request rather than a warm cache. Without these
+                // the page paints in the fallback stack and then reflows when
+                // the faces land, which is the "swap" in `font-display:swap`.
+                link rel="preload" href=(fonts::SERVER_MONO_PATH) as="font" type="font/woff2" crossorigin;
+                link rel="preload" href=(fonts::SCHIBSTED_GROTESK_PATH) as="font" type="font/woff2" crossorigin;
                 link rel="stylesheet" href="/assets/dotlens.css";
             }
             body {
