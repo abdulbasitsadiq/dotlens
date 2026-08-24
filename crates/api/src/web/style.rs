@@ -258,6 +258,15 @@ tr:last-child td{border-bottom:0}
   .page-title{font-size:21px}
   td,th{padding-top:11px;padding-bottom:11px}
   .nav-in{min-height:auto;padding-top:10px;padding-bottom:10px}
+  /* STYLE.md v1.1 §14 "Touch targets >=44px": `--row-h` covers the ROWS and
+     `--tap-min` was on the nav links ONLY, so the wordmark and every "to"
+     link kept their pointer-density 20-26px box at touch density. Measured
+     at 390px, not reasoned about: six affordances failed the rule.
+     `min-height` alone is not enough on an inline anchor, whose box is its
+     line box — it has to be laid out as a flex box before a height applies.
+     The 4px grid, the hairlines and the radii do not move (§14's proviso). */
+  .logo,.strip-to,.panel-to{display:inline-flex;align-items:center;
+     min-height:var(--tap-min)}
 }
 
 /* STYLE.md's hard ban: information conveyed by hover alone. Hover may only
@@ -268,6 +277,13 @@ tr:last-child td{border-bottom:0}
      revealed by hover, which is the rule. What changes without a pointer is
      that link AFFORDANCE cannot be hover-discovered, so it is always drawn. */
   a{text-decoration:underline}
+  /* §14's touch minimum is a statement about the INPUT DEVICE, not the
+     viewport: a tablet at 768px sits above the narrow breakpoint and still
+     has no pointer, so the width-scoped rule above would leave it at 20px.
+     Measured: `(hover:none)` is false at 768px in a desktop browser, which
+     is exactly why width alone cannot answer this. */
+  .logo,.strip-to,.panel-to,.nav-links a{display:inline-flex;align-items:center;
+     min-height:var(--tap-min)}
 }
 
 /* Motion is feedback only, <=150ms (STYLE.md principle 8), and respects the

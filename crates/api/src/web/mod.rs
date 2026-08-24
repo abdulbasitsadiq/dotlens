@@ -252,7 +252,12 @@ impl Panel<'_> {
 /// anything, and the row count is exact.
 ///
 /// An unreadable segment proves nothing and is treated as capped.
-fn count_or_more(rows: usize, limit: u64, segments: &[serde_json::Value], count_key: &str) -> String {
+fn count_or_more(
+    rows: usize,
+    limit: u64,
+    segments: &[serde_json::Value],
+    count_key: &str,
+) -> String {
     let any_capped = segments.iter().any(|s| match s[count_key].as_u64() {
         Some(n) => n >= limit,
         None => true,
@@ -616,7 +621,11 @@ async fn freshness_strip(state: &AppState, network: &str) -> Markup {
         let view: FreshnessView = match read(res).await {
             Ok(v) => v,
             Err(w) => {
-                unread.push(format!("{chain} \u{2014} status {} \u{2014} {}", w.status.as_u16(), w.message));
+                unread.push(format!(
+                    "{chain} \u{2014} status {} \u{2014} {}",
+                    w.status.as_u16(),
+                    w.message
+                ));
                 continue;
             }
         };
@@ -1409,7 +1418,12 @@ async fn bounties_panel(state: &AppState, network: &str) -> Markup {
     // `bounties_indexed`, not `spends_indexed` — the two endpoints spell their
     // per-segment count differently, and passing the wrong key would read every
     // segment as unreadable and pin the magnitude at `50+`.
-    let magnitude = count_or_more(view.bounties.len(), LIMIT, &view.segments, "bounties_indexed");
+    let magnitude = count_or_more(
+        view.bounties.len(),
+        LIMIT,
+        &view.segments,
+        "bounties_indexed",
+    );
     let body = html! {
         div class="panel-body" {
             p {
@@ -1492,10 +1506,16 @@ mod tests {
     #[test]
     fn a_count_is_exact_only_when_no_window_reached_its_cap() {
         // every window stopped short of the cap, so the merge dropped nothing.
-        assert_eq!(count_or_more(13, 50, &segs(&[9, 4]), "bounties_indexed"), "13");
+        assert_eq!(
+            count_or_more(13, 50, &segs(&[9, 4]), "bounties_indexed"),
+            "13"
+        );
         assert_eq!(count_or_more(0, 50, &segs(&[0]), "bounties_indexed"), "0");
         // the merged total reaching the cap proves nothing on its own.
-        assert_eq!(count_or_more(50, 50, &segs(&[25, 25]), "bounties_indexed"), "50+");
+        assert_eq!(
+            count_or_more(50, 50, &segs(&[25, 25]), "bounties_indexed"),
+            "50+"
+        );
     }
 
     /// THE FIRST BUG A REVIEW CAUGHT: every list handler queries EACH residency
@@ -1503,7 +1523,10 @@ mod tests {
     /// exactly 50 can merge down to 47 — capped, and reported as an exact 47.
     #[test]
     fn one_capped_window_makes_the_merged_total_inexact_however_small_it_is() {
-        assert_eq!(count_or_more(7, 50, &segs(&[50, 3]), "bounties_indexed"), "50+");
+        assert_eq!(
+            count_or_more(7, 50, &segs(&[50, 3]), "bounties_indexed"),
+            "50+"
+        );
     }
 
     /// THE SECOND BUG, and it was worse: refusing any count across more than one
@@ -1513,8 +1536,14 @@ mod tests {
     /// "we did not look" wearing a number.
     #[test]
     fn two_uncapped_windows_still_give_an_exact_count() {
-        assert_eq!(count_or_more(1, 50, &segs(&[1, 0]), "bounties_indexed"), "1");
-        assert_eq!(count_or_more(0, 50, &segs(&[0, 0]), "bounties_indexed"), "0");
+        assert_eq!(
+            count_or_more(1, 50, &segs(&[1, 0]), "bounties_indexed"),
+            "1"
+        );
+        assert_eq!(
+            count_or_more(0, 50, &segs(&[0, 0]), "bounties_indexed"),
+            "0"
+        );
     }
 
     /// A segment whose count cannot be read proves nothing, so it is treated as
@@ -1752,6 +1781,53 @@ mod tests {
         // the sticky identifier column reachable at all.
         assert!(style::CSS.contains("min-width:max-content"));
         assert!(style::CSS.contains("--tap-min"));
+    }
+
+    /// STYLE.md v1.1 §14, *"Touch targets >=44px"*. The sibling test above
+    /// asserts only that `--tap-min` EXISTS, and it passed while six
+    /// affordances sat at 20-26px, because the token was applied to the nav
+    /// links alone — a token being defined is not a token being applied.
+    /// Measured at 390px in a browser, which is the only way this was ever
+    /// going to be found.
+    ///
+    /// Rows are covered separately by `--row-h:44px` in the same block.
+    #[test]
+    fn every_link_affordance_meets_the_tap_minimum_at_touch_density() {
+        // the narrow block, which is where §14 sets touch density.
+        let narrow = style::CSS
+            .split("@media (max-width:639px){")
+            .nth(1)
+            .expect("§8 narrow breakpoint");
+        let narrow = &narrow[..narrow.find("\n}").expect("the block closes")];
+
+        assert!(narrow.contains("--row-h:44px"), "the ROWS: {narrow}");
+        for affordance in [".logo", ".strip-to", ".panel-to"] {
+            assert!(
+                narrow.contains(affordance),
+                "{affordance} is a touch target and is not in the narrow block"
+            );
+        }
+        assert!(
+            narrow.contains("min-height:var(--tap-min)"),
+            "a height, not just the token: {narrow}"
+        );
+        // an inline anchor's box is its LINE box, so min-height does nothing
+        // until it is laid out as a flex box. Without this the rule is present
+        // and inert, which is the failure mode this test exists to catch.
+        assert!(narrow.contains("display:inline-flex"), "{narrow}");
+
+        // AND the no-pointer path, because the minimum is a claim about the
+        // INPUT DEVICE: a tablet at 768px is above the narrow breakpoint and
+        // still has no pointer. Width alone leaves it at 20px.
+        let touch = style::CSS
+            .split("@media (hover:none){")
+            .nth(1)
+            .expect("§8 the no-pointer path");
+        let touch = &touch[..touch.find("\n}").expect("the block closes")];
+        for affordance in [".logo", ".strip-to", ".panel-to", ".nav-links a"] {
+            assert!(touch.contains(affordance), "{affordance}: {touch}");
+        }
+        assert!(touch.contains("min-height:var(--tap-min)"), "{touch}");
     }
 
     /// TOKENS.md §0's layout invariant, *"learned the hard way"*: without both
