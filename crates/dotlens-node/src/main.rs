@@ -58,6 +58,7 @@
 //!   dotlens-node sync-broker-config <chain> [height]   # read + DATE the entitlement denominator
 //!   dotlens-node sync-channels <chain> [height]        # read + DATE the HRMP channel graph
 //!   dotlens-node channels-range <chain> <from> <to>    # one channel reading per session boundary
+//!   dotlens-node status <chain> [behind-max-blocks]    # per-module freshness; exits 2 halted, 1 behind
 //!
 //! Per-module followers are opt-in flags: LIVE_INGEST, DECODE_FOLLOW,
 //! BALANCES_FOLLOW, GOV_FOLLOW, VOTES_FOLLOW, TREASURY_FOLLOW, BOUNTIES_FOLLOW,
@@ -103,11 +104,142 @@ struct Backends {
     coretime: Arc<dyn api::CoretimeIndex>,
     broker: Arc<dyn api::BrokerIndex>,
     channels: Arc<dyn api::ChannelIndex>,
+    freshness: Arc<dyn api::FreshnessIndex>,
     runtime_versions: Arc<dyn RuntimeVersionSink>,
     /// Kept for label sync/verify (they need direct SQL, not a trait).
     #[cfg(feature = "pg")]
     pool: Option<sqlx::PgPool>,
     persistent: bool,
+}
+
+/// `status <chain> [behind-max-blocks]` — per-module freshness, and the exit
+/// code an alert actually consumes.
+///
+/// ROADMAP's operational floor item 2: *"You need to know a module halted before
+/// a consumer tells you."* A cron line reading the exit code is the smallest
+/// thing that achieves that for a solo operator.
+///
+/// ```text
+///   0  nothing to act on
+///   1  a module is further behind the decode frontier than the bound you gave
+///   2  a module is HALTED — a human is needed, nothing moves on its own
+/// ```
+///
+/// 2 outranks 1 because the actions differ: behind resolves itself, halted does
+/// not.
+///
+/// **`behind-max-blocks` HAS NO DEFAULT, and the omission is the design.** What
+/// counts as too far behind depends on the chain's block time, whether a
+/// backfill is running and what the operator promised — there is no number this
+/// program can know. Defaulting one would put a bound nobody chose underneath an
+/// alert somebody trusts, which is the same refusal the coretime readers make
+/// when they decline to pick a window. Omit it and lag is REPORTED but never
+/// alerted on; halts still exit 2, because a halt needs no threshold to be bad.
+async fn run_status(backends: &Backends, chain: &str, behind_max: Option<u64>) -> Result<()> {
+    let checkpoints = backends
+        .freshness
+        .checkpoints(chain)
+        .await
+        .map_err(|e| anyhow::anyhow!("read checkpoints: {e}"))?;
+    let halts = backends
+        .freshness
+        .halts(chain)
+        .await
+        .map_err(|e| anyhow::anyhow!("read halts: {e}"))?;
+
+    let report = api::freshness::derive(chain, &checkpoints, &halts, chrono::Utc::now());
+
+    if env_or("DOTLENS_STATUS_JSON", "0") == "1" {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        println!("chain: {}", report.chain_id);
+        println!(
+            "  raw frontier:    {}",
+            opt(report.frontiers.raw.map(|v| v as i64))
+        );
+        println!(
+            "  decode frontier: {}   (behind raw: {})",
+            opt(report.frontiers.decode.map(|v| v as i64)),
+            opt(report.frontiers.decode_behind_raw)
+        );
+        println!(
+            "  chain head:      NOT READ  (behind chain: {})",
+            opt(report.frontiers.raw_behind_chain)
+        );
+        println!();
+        for m in &report.modules {
+            println!(
+                "  {:<16} {:<18} height {:>12}  behind decode {:>10}  age {}s",
+                m.module,
+                m.state.as_str(),
+                opt(m.height.map(|v| v as i64)),
+                opt(m.blocks_behind_decode),
+                opt(m.seconds_since_update),
+            );
+            if let Some(h) = &m.blocking_halt {
+                println!(
+                    "      BLOCKED AT #{} event {} ({}) — {}",
+                    h.height, h.event_index, h.event, h.reason
+                );
+                println!(
+                    "      spec_version {} mapper_version {} seen {}x since {}",
+                    h.runtime_version, h.mapper_version, h.seen_count, h.first_seen_at
+                );
+            }
+        }
+        println!();
+        println!("reads as: {}", report.reads_as);
+        println!();
+        println!("not covered:");
+        for line in &report.not_covered {
+            println!("  - {line}");
+        }
+    }
+
+    let halted = report.halted();
+    if !halted.is_empty() {
+        let names: Vec<&str> = halted.iter().map(|m| m.module.as_str()).collect();
+        eprintln!("HALTED: {} — a human is needed", names.join(", "));
+        return exit_with(2);
+    }
+    if let Some(bound) = behind_max {
+        let behind = report.behind_by_more_than(bound);
+        if !behind.is_empty() {
+            let names: Vec<&str> = behind.iter().map(|m| m.module.as_str()).collect();
+            eprintln!("BEHIND by more than {bound} blocks: {}", names.join(", "));
+            return exit_with(1);
+        }
+    } else {
+        eprintln!(
+            "note: no behind-max-blocks given, so lag was reported but not alerted on. \
+             Halts still exit 2."
+        );
+    }
+    Ok(())
+}
+
+/// Render an optional number without letting absence read as zero.
+///
+/// "We did not look" must never render as "there is nothing there" — this
+/// project's second-most-repeated defect, caught four times at field level. A
+/// column of right-aligned numbers with a `0` where a `null` belongs is exactly
+/// where it would happen next.
+fn opt(v: Option<i64>) -> String {
+    match v {
+        Some(v) => v.to_string(),
+        None => "-".to_string(),
+    }
+}
+
+/// Flush before exiting, because `process::exit` runs no destructors and a
+/// buffered last line is the one that names the halted module.
+fn exit_with(code: i32) -> Result<()> {
+    use std::io::Write;
+    let _ = std::io::stdout().flush();
+    let _ = std::io::stderr().flush();
+    // No trailing semicolon: `exit` returns `!`, which coerces to the return
+    // type. With one, the block would end in `()` instead.
+    std::process::exit(code)
 }
 
 fn memory_backends() -> Backends {
@@ -127,6 +259,7 @@ fn memory_backends() -> Backends {
         coretime: Arc::new(api::MemoryCoretimeIndex::new()),
         broker: Arc::new(api::MemoryBrokerIndex::new()),
         channels: Arc::new(api::MemoryChannelIndex::new()),
+        freshness: Arc::new(api::MemoryFreshnessIndex::new()),
         runtime_versions: Arc::new(NoopRuntimeVersionSink),
         #[cfg(feature = "pg")]
         pool: None,
@@ -170,6 +303,9 @@ enum Command {
     SyncBrokerConfig { chain: String, height: Option<u64> },
     SyncChannels { chain: String, height: Option<u64> },
     ChannelsRange { chain: String, from: u64, to: u64 },
+    /// Per-module freshness for one chain. `behind_max` is the operator's
+    /// staleness bound and has NO DEFAULT on purpose — see `run_status`.
+    Status { chain: String, behind_max: Option<u64> },
     SyncBountyAccounts,
     AnchorVoting { chain: String, account: String, track: u32, height: Option<u64> },
     SyncTracks,
@@ -436,6 +572,15 @@ fn parse_args() -> Result<Command> {
                 range("usage: dotlens-node channels-range <chain> <from> <to>")?;
             Ok(Command::ChannelsRange { chain, from, to })
         }
+        Some("status") => {
+            let usage = "usage: dotlens-node status <chain> [behind-max-blocks]";
+            let chain = args.get(1).context(usage)?.clone();
+            let behind_max = match args.get(2) {
+                Some(b) => Some(b.parse::<u64>().context(usage)?),
+                None => None,
+            };
+            Ok(Command::Status { chain, behind_max })
+        }
         Some("sync-bounty-accounts") => Ok(Command::SyncBountyAccounts),
         Some("anchor-voting") => {
             let usage = "usage: dotlens-node anchor-voting <chain> <account> <track> [height]";
@@ -634,6 +779,7 @@ async fn main() -> Result<()> {
             coretime: Arc::new(api::pg::PgCoretimeIndex::new(pool.clone())),
             broker: Arc::new(api::pg::PgBrokerIndex::new(pool.clone())),
             channels: Arc::new(api::pg::PgChannelIndex::new(pool.clone())),
+            freshness: Arc::new(api::pg::PgFreshnessIndex::new(pool.clone())),
             runtime_versions: Arc::new(PgRuntimeVersionSink::new(pool.clone())),
             pool: Some(pool),
             persistent: true,
@@ -829,6 +975,9 @@ mismatched={} retirable_heights={}",
     }
     if let Command::ChannelsRange { chain, from, to } = &command {
         return run_channels_range(&registry, &backends, raw.as_ref(), chain, *from, *to).await;
+    }
+    if let Command::Status { chain, behind_max } = &command {
+        return run_status(&backends, chain, *behind_max).await;
     }
     if matches!(command, Command::SyncBountyAccounts) {
         #[cfg(feature = "pg")]

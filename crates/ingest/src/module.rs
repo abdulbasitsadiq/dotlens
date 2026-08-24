@@ -122,6 +122,50 @@ macro_rules! impl_module_error {
 }
 pub(crate) use impl_module_error;
 
+/// One mapper refusal, in the coordinates whoever reads it at 3am will need.
+pub struct Halt<'a> {
+    pub chain_id: &'a str,
+    /// The `indexer_state.module` key, so the halt joins straight to the
+    /// checkpoint it is blocking.
+    pub module: &'a str,
+    pub height: u64,
+    pub event_index: u32,
+    /// "pallet.Variant", verbatim from the decoded event.
+    pub event: &'a str,
+    /// The mapper's own sentence, in the module's own editorial voice.
+    pub reason: &'a str,
+    /// Lineage. An unmapped variant is usually a runtime upgrade arriving —
+    /// Phase 2 slice 6 met five unmapped pallet-balances variants at once, three
+    /// of which move money — so the spec version is the first thing anyone will
+    /// want and the most annoying to reconstruct afterwards.
+    pub runtime_version: u32,
+    pub mapper_version: u32,
+}
+
+// The recorder itself is a defaulted method on `CheckpointStore` (see
+// `crate::CheckpointStore::record_halt`) rather than a field here.
+//
+// WHY IT IS NOT A FIELD ON `ModuleRun`, and this was measured rather than
+// assumed: a field would have to be fed from the per-module `*Deps` structs,
+// and there are 76 `Deps { … }` literals across the workspace — 25 in
+// `dotlens-node`, 15 in the pg integration test, the rest in ingest's own unit
+// tests. Every one would need editing to add a field that almost all of them
+// would set to `None`.
+//
+// WHY THE CHECKPOINT STORE IS THE RIGHT HOME ANYWAY, independent of that count.
+// A halt is meaningful ONLY against the checkpoint: migration 0028 stores no
+// `active` flag precisely because "is this halt still blocking" is
+// `halt.height > indexer_state.last_height`. The two tables are keyed the same
+// way `(chain_id, module)`, live in the same schema, and answer one question
+// between them — "how far has this module got, and why did it stop". One handle
+// for both is cohesion, not conflation.
+//
+// WHAT IT COSTS, stated because a defaulted trait method is a gate that can
+// silently never fire (C2): a store that forgets to override `record_halt`
+// records nothing and nothing complains. The Pg override is therefore pinned by
+// its own integration test, and the memory store overrides it too so unit tests
+// can reach the path at all.
+
 /// Why a BLOCK-level mapper refused, in the coordinates the halt message needs.
 ///
 /// A per-event mapper is handed one event and returns a `String`, because the
@@ -262,36 +306,58 @@ where
             continue;
         };
 
+        // The refusal is captured rather than `?`-ed straight out, because
+        // RECORDING it is async and the mappers are sync closures. The halt
+        // itself is unchanged: nothing is written, nothing is advanced, and the
+        // module's own error is what leaves this function.
         let rows: Vec<(u32, F)> = match &run.map {
             Mapping::PerEvent(map) => {
                 let mut rows = Vec::new();
+                let mut refusal = None;
                 for ev in &block.events {
-                    let facts = map(ev).map_err(|reason| {
-                        E::mapper_failed(
-                            chain_id.to_string(),
-                            height,
-                            ev.index,
-                            ev.name.clone(),
-                            reason,
-                        )
-                    })?;
-                    for f in facts {
-                        rows.push((ev.index, f));
+                    match map(ev) {
+                        Ok(facts) => {
+                            for f in facts {
+                                rows.push((ev.index, f));
+                            }
+                        }
+                        Err(reason) => {
+                            refusal = Some((ev.index, ev.name.clone(), reason));
+                            break;
+                        }
                     }
+                }
+                if let Some((event_index, event, reason)) = refusal {
+                    return Err(halt(
+                        run,
+                        chain_id,
+                        height,
+                        block.runtime_version,
+                        event_index,
+                        event,
+                        reason,
+                    )
+                    .await);
                 }
                 rows
             }
             // Same halt, same wording, same "writes nothing and advances
             // nothing" — the only difference is who names the offending event.
-            Mapping::PerBlock(map) => map(&block.events).map_err(|e| {
-                E::mapper_failed(
-                    chain_id.to_string(),
-                    height,
-                    e.event_index,
-                    e.event,
-                    e.reason,
-                )
-            })?,
+            Mapping::PerBlock(map) => match map(&block.events) {
+                Ok(rows) => rows,
+                Err(e) => {
+                    return Err(halt(
+                        run,
+                        chain_id,
+                        height,
+                        block.runtime_version,
+                        e.event_index,
+                        e.event,
+                        e.reason,
+                    )
+                    .await)
+                }
+            },
         };
         if !rows.is_empty() {
             run.sink
@@ -311,6 +377,54 @@ where
         processed += 1;
     }
     Ok(processed)
+}
+
+/// Record the refusal if there is anywhere to record it, then build the module's
+/// own error.
+///
+/// **A recorder that fails does not change the halt.** The module still stops,
+/// still writes nothing and still advances nothing, and the returned error is
+/// the mapper's — unchanged. Letting a storage failure alter what the worker
+/// does would mean an unreachable database could turn "this variant is unmapped"
+/// into some other outcome, which inverts the whole point: the loud halt is the
+/// safety property, and recording it is bookkeeping ON TOP of that property, not
+/// a step in it. The failure to record is itself logged at `error`, because a
+/// status surface that has quietly stopped being fed is worse than one that was
+/// never wired up.
+async fn halt<F, E>(
+    run: &ModuleRun<'_, F>,
+    chain_id: &str,
+    height: u64,
+    runtime_version: u32,
+    event_index: u32,
+    event: String,
+    reason: String,
+) -> E
+where
+    E: ModuleError,
+{
+    let h = Halt {
+        chain_id,
+        module: run.module,
+        height,
+        event_index,
+        event: &event,
+        reason: &reason,
+        runtime_version,
+        mapper_version: run.mapper_version,
+    };
+    if let Err(e) = run.checkpoints.record_halt(&h).await {
+        tracing::error!(
+            module = run.module,
+            chain = %chain_id,
+            height,
+            event = %event,
+            error = %e,
+            "COULD NOT RECORD THE HALT — the module has still stopped, but a status \
+             query will show it as behind rather than halted"
+        );
+    }
+    E::mapper_failed(chain_id.to_string(), height, event_index, event, reason)
 }
 
 async fn advance<F>(

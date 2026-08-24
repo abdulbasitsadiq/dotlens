@@ -318,6 +318,75 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_halt_is_recorded_with_the_coordinates_a_human_needs() {
+        // The recording path has to be REACHED by a test or it is a gate nobody
+        // has checked: the trait method it rides on is defaulted, so a store
+        // that never overrode it would record nothing and nothing would fail.
+        let mut src = HashMap::new();
+        src.insert(1, vec![ev(0, "mock.Bad", serde_json::json!({}))]);
+        let checkpoints = MemoryCheckpointStore::new();
+        let sink = MemSink::default();
+        let deps = BalancesDeps {
+            checkpoints: &checkpoints,
+            source: &MemSource(src),
+            sink: &sink,
+        };
+
+        let err = balances_range("mock", &MockMapper, &deps, 1, 1).await.unwrap_err();
+        assert!(matches!(err, BalancesWorkerError::Mapper { height: 1, .. }));
+
+        let halts = checkpoints.recorded_halts();
+        assert_eq!(halts.len(), 1, "one refusal, one row");
+        let h = &halts[0];
+        assert_eq!(h.chain_id, "mock");
+        assert_eq!(
+            h.module, MODULE_BALANCES,
+            "the halt must be keyed by the same string as the checkpoint it blocks, \
+             or the join that decides whether it is still blocking finds nothing"
+        );
+        assert_eq!(h.height, 1);
+        assert_eq!(h.event, "mock.Bad", "the variant, not a normalised code");
+        assert_eq!(h.seen_count, 1);
+        assert!(!h.reason.is_empty(), "the mapper's own sentence, per-module voice");
+
+        // Recording must not have changed the halt itself.
+        assert!(sink.0.lock().unwrap().is_empty(), "still writes nothing");
+        assert!(
+            checkpoints.get("mock", MODULE_BALANCES).await.unwrap().is_none(),
+            "still advances nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_follower_meeting_one_refusal_many_times_converges_on_one_row() {
+        // `run_follow` retries forever on a linear backoff, so one unmapped
+        // variant is re-derived every tick until a human edits a mapper. An
+        // append-per-observation recorder would grow without bound while
+        // carrying one bit; this pins the upsert instead.
+        let mut src = HashMap::new();
+        src.insert(1, vec![ev(0, "mock.Bad", serde_json::json!({}))]);
+        let checkpoints = MemoryCheckpointStore::new();
+        let sink = MemSink::default();
+        let deps = BalancesDeps {
+            checkpoints: &checkpoints,
+            source: &MemSource(src),
+            sink: &sink,
+        };
+
+        for _ in 0..3 {
+            assert!(balances_range("mock", &MockMapper, &deps, 1, 1).await.is_err());
+        }
+
+        let halts = checkpoints.recorded_halts();
+        assert_eq!(halts.len(), 1, "three observations, still one halt");
+        assert_eq!(
+            halts[0].seen_count, 3,
+            "the observation WINDOW is what tells you a halt is live rather than \
+             historical, so the repeats are counted rather than discarded"
+        );
+    }
+
+    #[tokio::test]
     async fn tick_chases_the_decode_checkpoint() {
         let mut src = HashMap::new();
         for h in 5..=9 {

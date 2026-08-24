@@ -16,6 +16,10 @@ use chrono::{DateTime, Utc};
 /// see the module header for why that is the design and not a convenience.
 pub mod channels;
 pub mod coretime_delta;
+/// Per-module freshness — the lag stack, the four states and the halt, derived
+/// as a PURE function so the operator surface and the per-response object
+/// cannot drift apart.
+pub mod freshness;
 pub mod search;
 
 pub use coretime_delta::{
@@ -3483,6 +3487,84 @@ impl ChannelIndex for MemoryChannelIndex {
     }
 }
 
+// ------------------------------------------------------------------- freshness
+
+/// Reads the two tables per-module freshness is derived from.
+///
+/// It returns ROWS and never a verdict: the verdict is
+/// [`freshness::derive`], which has no database in it, so the operator surface
+/// and the per-response object compute the same answer from the same function.
+/// A backend that "helpfully" filtered or pre-classified here would be the
+/// second implementation of that rule, and two implementations of one rule
+/// diverge — the addability rule had already drifted `<= 1` vs `== 1` before
+/// anybody noticed.
+#[async_trait]
+pub trait FreshnessIndex: Send + Sync {
+    /// EVERY `core.indexer_state` row for the chain, frontiers included. Taken
+    /// whole rather than filtered, because a caller that filters decides which
+    /// modules exist and would report its own filter as the chain's silence.
+    async fn checkpoints(
+        &self,
+        chain_id: &str,
+    ) -> Result<Vec<freshness::CheckpointRow>, IndexError>;
+
+    /// Every `core.module_halts` row for the chain, resolved ones included.
+    /// Whether a halt still blocks is derived against the checkpoint and is
+    /// deliberately not stored, so this reader cannot pre-filter on it.
+    async fn halts(&self, chain_id: &str) -> Result<Vec<freshness::HaltRow>, IndexError>;
+}
+
+/// In-memory freshness rows, for DB-less runs and tests.
+#[derive(Default)]
+pub struct MemoryFreshnessIndex {
+    checkpoints: RwLock<Vec<(String, freshness::CheckpointRow)>>,
+    halts: RwLock<Vec<(String, freshness::HaltRow)>>,
+}
+
+impl MemoryFreshnessIndex {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn insert_checkpoint(&self, chain_id: &str, row: freshness::CheckpointRow) {
+        self.checkpoints
+            .write()
+            .expect("freshness checkpoints lock")
+            .push((chain_id.to_string(), row));
+    }
+
+    pub fn insert_halt(&self, chain_id: &str, row: freshness::HaltRow) {
+        self.halts
+            .write()
+            .expect("freshness halts lock")
+            .push((chain_id.to_string(), row));
+    }
+}
+
+#[async_trait]
+impl FreshnessIndex for MemoryFreshnessIndex {
+    async fn checkpoints(
+        &self,
+        chain_id: &str,
+    ) -> Result<Vec<freshness::CheckpointRow>, IndexError> {
+        let rows = self.checkpoints.read().map_err(|e| IndexError(e.to_string()))?;
+        Ok(rows
+            .iter()
+            .filter(|(c, _)| c == chain_id)
+            .map(|(_, r)| r.clone())
+            .collect())
+    }
+
+    async fn halts(&self, chain_id: &str) -> Result<Vec<freshness::HaltRow>, IndexError> {
+        let rows = self.halts.read().map_err(|e| IndexError(e.to_string()))?;
+        Ok(rows
+            .iter()
+            .filter(|(c, _)| c == chain_id)
+            .map(|(_, r)| r.clone())
+            .collect())
+    }
+}
+
 // -------------------------------------------------------------------- pg impl
 
 #[cfg(feature = "pg")]
@@ -3492,6 +3574,99 @@ pub mod pg {
     use canonical::{CanonicalBlock, CanonicalEvent, CanonicalTransaction, Lineage};
     use chrono::{DateTime, Utc};
     use sqlx::PgPool;
+
+    /// Per-module freshness rows: `core.indexer_state` (0001) and
+    /// `core.module_halts` (0028).
+    ///
+    /// NO INDEX IS NEEDED BY EITHER QUERY, and that is 0028's own argument
+    /// rather than an omission. Both select by `chain_id`, which is the leading
+    /// column of each table's PRIMARY KEY, in the primary key's own order —
+    /// `(chain_id, module)` and `(chain_id, module, height, event_index)`. An
+    /// index arrives with its reader; so does the refusal to add a redundant
+    /// one.
+    pub struct PgFreshnessIndex {
+        pool: PgPool,
+    }
+
+    impl PgFreshnessIndex {
+        pub fn new(pool: PgPool) -> Self {
+            Self { pool }
+        }
+    }
+
+    #[async_trait]
+    impl super::FreshnessIndex for PgFreshnessIndex {
+        async fn checkpoints(
+            &self,
+            chain_id: &str,
+        ) -> Result<Vec<super::freshness::CheckpointRow>, IndexError> {
+            // No `where module in (…)`: the frontier rows and the domain rows
+            // come back together because the derivation needs both, and a
+            // filter here would decide which modules exist.
+            let rows: Vec<(String, i64, DateTime<Utc>)> = sqlx::query_as(
+                "select module, last_height, updated_at \
+                 from core.indexer_state where chain_id = $1 order by module",
+            )
+            .bind(chain_id)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| IndexError(e.to_string()))?;
+            Ok(rows
+                .into_iter()
+                .map(|(module, height, updated_at)| super::freshness::CheckpointRow {
+                    module,
+                    height: height as u64,
+                    updated_at,
+                })
+                .collect())
+        }
+
+        async fn halts(
+            &self,
+            chain_id: &str,
+        ) -> Result<Vec<super::freshness::HaltRow>, IndexError> {
+            // Resolved halts are returned too. "Still blocking" is
+            // `height > last_height` and is derived, so filtering here would be
+            // the stored `active` flag that 0028 refused, one layer up.
+            let rows: Vec<(
+                String,
+                i64,
+                i32,
+                String,
+                String,
+                i64,
+                i32,
+                DateTime<Utc>,
+                DateTime<Utc>,
+                i64,
+            )> = sqlx::query_as(
+                "select module, height, event_index, event, reason, \
+                        runtime_version, mapper_version, \
+                        first_seen_at, last_seen_at, seen_count \
+                 from core.module_halts where chain_id = $1 \
+                 order by module, height, event_index",
+            )
+            .bind(chain_id)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| IndexError(e.to_string()))?;
+            Ok(rows
+                .into_iter()
+                .map(|r| super::freshness::HaltRow {
+                    module: r.0,
+                    height: r.1 as u64,
+                    event_index: r.2 as u32,
+                    event: r.3,
+                    reason: r.4,
+                    runtime_version: r.5 as u64,
+                    mapper_version: r.6 as u32,
+                    first_seen_at: r.7,
+                    last_seen_at: r.8,
+                    seen_count: r.9 as u64,
+                })
+                .collect())
+        }
+    }
 
     /// Postgres-backed HRMP channel graph over `xcm.channel_readings` /
     /// `xcm.channel_snapshots` (Phase 3, slice 16).

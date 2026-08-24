@@ -102,6 +102,45 @@ pub fn backfill_chunks(from: u64, to: u64, workers: u64) -> Vec<(u64, u64)> {
 mod tests {
     use super::backfill_chunks;
 
+    /// `api::freshness` names the two frontier checkpoints by string, and so does
+    /// `ingest`. It has to: `api` does not depend on `ingest` and must not start,
+    /// because the dependency direction runs generic ← protocol.
+    ///
+    /// Two definitions of one value is the shape that drifts — this project has
+    /// already watched two implementations of the addability rule diverge to
+    /// `<= 1` and `== 1` without a test noticing. `dotlens-node` is the only
+    /// crate that can see both sides, so the equality is pinned here.
+    ///
+    /// If this fails, the freshness reader is silently measuring every module
+    /// against a frontier that does not exist: `blocks_behind_decode` goes null
+    /// everywhere and every module reads `at_decode_frontier`, which is the
+    /// flattering direction.
+    #[test]
+    fn the_frontier_module_keys_are_the_same_string_on_both_sides() {
+        assert_eq!(
+            api::freshness::MODULE_DECODE,
+            ingest::decode::MODULE_DECODE,
+            "the decode frontier's checkpoint key"
+        );
+        assert_eq!(
+            api::freshness::MODULE_RAW,
+            ingest::live::MODULE_LIVE,
+            "the raw-ingest frontier's checkpoint key"
+        );
+    }
+
+    /// The freshness reader excludes backfill chunks by prefix, and the prefix it
+    /// excludes has to be the one `ingest` actually writes.
+    #[test]
+    fn the_backfill_chunk_prefix_the_reader_excludes_is_the_one_ingest_writes() {
+        assert!(
+            ingest::live::MODULE_BACKFILL.starts_with("raw_backfill"),
+            "api::freshness filters on the literal prefix `raw_backfill`; a rename \
+             here would put every bounded backfill chunk back on the status surface \
+             as a permanently behind row"
+        );
+    }
+
     #[test]
     fn chunks_are_contiguous_exhaustive_and_deterministic() {
         for (from, to, workers) in [(1u64, 10u64, 3u64), (0, 999_999, 8), (5, 5, 4), (1, 2, 8)] {
