@@ -85,6 +85,12 @@ jobs:
           # Feature branches RESTORE the cache but never write one. Without
           # this, every branch writes ~1-2 GB and they evict each other (and
           # main) out of the 10 GB per-repo cache budget.
+          #
+          # MEASURED CONSEQUENCE, so a later session does not assume this is
+          # working: no push to `main` has happened yet, so NO CACHE EXISTS and
+          # every run so far restored nothing. Cold is 6 billable minutes (see
+          # the cost note at the foot of this file), which is why that is fine.
+          # The cache earns its keep as the workspace grows, not today.
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: no test may reach the network
@@ -156,12 +162,23 @@ jobs:
 # 3,000); Linux is the 1x multiplier and service containers add nothing. Billing
 # rounds each JOB up to the whole minute, so two jobs cost two roundings.
 #
-# ESTIMATES, not measurements — the first run's summary page gives the real
-# numbers and this comment should be corrected against them:
-#   warm cache (the common case): test ~6, check ~2            => ~8 min/push
-#   cold cache (Cargo.lock moved, or a new toolchain):         => ~30 min/push
-# At a slice per session and a handful of pushes each, that is a few hundred
-# minutes a month against 2,000. Sustainable with room to spare.
+# MEASURED 2026-08-24 over the first three runs, and the estimates this comment
+# used to carry were WRONG BY 5x IN THE EXPENSIVE DIRECTION (~30 min/push cold
+# guessed; ~6 measured). Run 1 (32741280632) is the reference:
+#
+#   test --workspace --all-features          3m 54s   -> 4 billable
+#   check --workspace --no-default-features  1m 20s   -> 2 billable
+#   run time 5m 14s                                   => 6 min/push
+#
+# All three runs were COLD — `save-if` restricts saving to `main`, and no push
+# to `main` has happened yet, so nothing has ever been restored. The other two
+# runs agree within seconds (3m23/1m09 and 3m34/1m24), so 6 min/push is the
+# COLD figure and warm can only be cheaper. The floor is 2 minutes whatever
+# happens: two jobs, each rounded up.
+#
+# ~6 min/push against 2,000/month is ~330 pushes. The budget is not a
+# constraint on this project at this size, and the levers below are recorded
+# for when that stops being true rather than because it is close.
 #
 # The levers, in the order to reach for them if that stops being true:
 #   1. `paths-ignore` above (already on) — README-only pushes cost nothing.
