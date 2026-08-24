@@ -1408,9 +1408,9 @@ pub struct ForwardedProgram {
 /// The highest `V<n>` variant an enum declares (`VersionedLocation`,
 /// `VersionedXcm`). Read from the registry so the choice follows the runtime
 /// rather than a constant that ages.
-fn newest_version_variant<'a>(
-    variants: &'a [scale_info::Variant<scale_info::form::PortableForm>],
-) -> Option<&'a scale_info::Variant<scale_info::form::PortableForm>> {
+fn newest_version_variant(
+    variants: &[scale_info::Variant<scale_info::form::PortableForm>],
+) -> Option<&scale_info::Variant<scale_info::form::PortableForm>> {
     variants
         .iter()
         .filter_map(|v| {
@@ -1535,7 +1535,7 @@ fn variant_names(variants: &[scale_info::Variant<scale_info::form::PortableForm>
 
 /// The single field inside a newtype-ish variant (`Ok(x)`, `Some(x)`,
 /// `Module(e)`).
-fn variant_inner<'a>(v: &'a scale_value::Variant<u32>) -> Option<&'a Value<u32>> {
+fn variant_inner(v: &scale_value::Variant<u32>) -> Option<&Value<u32>> {
     match &v.values {
         Composite::Unnamed(items) => items.first(),
         Composite::Named(items) => items.first().map(|(_, v)| v),

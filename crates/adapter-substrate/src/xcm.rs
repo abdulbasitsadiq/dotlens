@@ -585,7 +585,7 @@ pub fn location_counterparty(dest: &serde_json::Value) -> Option<String> {
 /// boundary. Matching on the network name would call that message bridged.
 /// (Verified against staging-xcm 24.0.0 `v4/junction.rs` and `v5/junction.rs`.)
 fn global_consensus(v: &serde_json::Value) -> Option<String> {
-    fn find<'a>(v: &'a serde_json::Value) -> Option<&'a serde_json::Value> {
+    fn find(v: &serde_json::Value) -> Option<&serde_json::Value> {
         match v {
             serde_json::Value::Object(map) => {
                 for (k, val) in map {

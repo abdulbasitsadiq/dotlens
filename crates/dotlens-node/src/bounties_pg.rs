@@ -542,7 +542,7 @@ pub async fn sync_bounty_accounts(
         let prefix = chain.ss58_prefix.unwrap_or(42);
         let mut tx = pool.begin().await.context("begin bounty account sync")?;
         for (instance, bounty_id, child_id, status) in bounties {
-            let child = (child_id > PARENT_SENTINEL).then(|| child_id as u64);
+            let child = (child_id > PARENT_SENTINEL).then_some(child_id as u64);
             let Some((account, derivation)) =
                 bounty_account(&pallet_id, &instance, bounty_id as u64, child)
             else {

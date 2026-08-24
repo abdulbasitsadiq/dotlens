@@ -3589,7 +3589,10 @@ async fn next_session_boundary(
     // on Polkadot today) and DOUBLES rather than assuming one, because session
     // length is a runtime parameter and not a constant this code may rely on.
     let mut lo = after;
-    let mut hi = ceiling;
+    // Deliberately uninitialised: the bracket loop below has no exit that does
+    // not set it, and giving it a starting value here made `ceiling` look like a
+    // fallback the search could fall through to. It cannot.
+    let mut hi;
     let mut step: u64 = 2400;
     loop {
         let probe = after.saturating_add(step).min(ceiling);
@@ -3903,6 +3906,13 @@ async fn preimage_ctx(
 
 /// Fetch one preimage from state, archive the raw value, verify the hash,
 /// decode the call tree, record the row. Returns the decode_status recorded.
+// 8/7, and four of the eight (`pool`, `receipts`, `source`, `raw`) are BACKENDS
+// rather than arguments. The codebase's own answer to that is a `*Deps` struct —
+// `BalancesDeps` and its siblings — and applying it here is the right fix. It is
+// not taken in a lint-cleanup slice because it is a signature change to a live
+// ingestion path with no test of its own, which is exactly the kind of thing
+// this slice is structured to keep out of a 1,019-hunk diff.
+#[allow(clippy::too_many_arguments)]
 #[cfg(all(feature = "pg", feature = "live"))]
 async fn fetch_and_record_preimage(
     pool: &sqlx::PgPool,

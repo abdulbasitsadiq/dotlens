@@ -2218,7 +2218,7 @@ impl TreasuryIndex for MemoryTreasuryIndex {
                     .collect()
             })
             .unwrap_or_default();
-        rows.sort_by(|a, b| (b.height, b.event_index).cmp(&(a.height, a.event_index)));
+        rows.sort_by_key(|r| std::cmp::Reverse((r.height, r.event_index)));
         rows.truncate(limit as usize);
         Ok(rows)
     }
@@ -2653,7 +2653,7 @@ impl GovIndex for MemoryGovIndex {
             .filter(|((c, cl, _), _)| c == chain_id && cl == class)
             .map(|(_, r)| r.clone())
             .collect();
-        rows.sort_by(|a, b| b.referendum_id.cmp(&a.referendum_id));
+        rows.sort_by_key(|r| std::cmp::Reverse(r.referendum_id));
         rows.truncate(limit as usize);
         Ok(rows)
     }
@@ -3431,7 +3431,7 @@ impl MemoryBrokerIndex {
             .filter(|(c, r)| c == chain_id && pred(r))
             .map(|(_, r)| r.clone())
             .collect();
-        out.sort_by(|a, b| (b.block_height, b.event_index).cmp(&(a.block_height, a.event_index)));
+        out.sort_by_key(|r| std::cmp::Reverse((r.block_height, r.event_index)));
         out.truncate(limit as usize);
         Ok(out)
     }

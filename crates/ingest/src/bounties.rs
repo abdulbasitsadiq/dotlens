@@ -173,10 +173,10 @@ fn run<'a>(mapper: &'a dyn BountyMapper, deps: &'a BountyDeps<'a>) -> ModuleRun<
     }
 }
 
-/// Map heights `from..=to`. Behind the frontier: reprocess freely (insert-ignore
-/// + guarded upsert converge, and the accumulating `paid_out` is guarded by the
-/// fact insert), checkpoint untouched. Past it: rows first, checkpoint last
-/// (crash = re-map, never skip).
+/// Map heights `from..=to`. Behind the frontier: reprocess freely
+/// (insert-ignore + guarded upsert converge, and the accumulating `paid_out` is
+/// guarded by the fact insert), checkpoint untouched. Past it: rows first,
+/// checkpoint last (crash = re-map, never skip).
 pub async fn bounties_range(
     chain_id: &str,
     mapper: &dyn BountyMapper,

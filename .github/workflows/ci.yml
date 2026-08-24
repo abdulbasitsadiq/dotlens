@@ -160,25 +160,44 @@ jobs:
       - name: check dotlens-node with live but not pg
         run: cargo check -p dotlens-node --no-default-features --features live
 
-# ---------------------------------------------------------------------------
-# THERE IS NO `lint` JOB, AND ITS ABSENCE IS A MEASUREMENT, NOT AN OVERSIGHT.
-# One was authored and deleted before the first push, because on this tree both
-# halves of it are red on arrival (measured 2026-08-24, rust 1.97.1):
-#
-#   cargo fmt --all --check                          992 diff hunks, 58 files
-#   cargo clippy --workspace --all-features -D warn  39 warnings, 5 targets
-#     (14 type_complexity, 4 doc_lazy_continuation, then a long tail)
-#
-# A gate that is red on arrival teaches you to ignore red, which costs more
-# than the gate was worth. The cleanup is its own slice; add this job back in
-# the SAME commit that lands it, never before. VERIFY-phase3.5-ci.md, "the
-# lint decision", carries the full breakdown.
+  # ---------------------------------------------------------------------------
+  # THIS JOB WAS AUTHORED, DELETED, AND IS BACK IN THE COMMIT THAT MADE IT PASS.
+  #
+  # It was deleted before CI's first push because both halves were red on
+  # arrival on this tree (measured 2026-08-24, rust 1.97.1): 992 fmt hunks
+  # across 58 files, and 39 clippy warnings across 5 targets. A gate that is red
+  # on arrival teaches you to ignore red, which costs more than the gate is
+  # worth — so the rule was "add it back in the SAME commit that lands the
+  # cleanup, never before", and this is that commit. Both commands are observed
+  # passing locally on the tree this job ships with.
+  lint:
+    name: fmt + clippy
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+      - name: toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - run: cargo fmt --all --check
+      # Separate steps on purpose: a formatting diff and a lint failure are
+      # different problems and should not be reported as one red job.
+      #
+      # AND THEY ARE NOT INDEPENDENT, which the cleanup slice found the hard
+      # way: rustfmt collapsing a block-bodied closure to an expression closure
+      # CREATED a clippy warning that had not existed before the sweep. Running
+      # fmt first is what surfaced it while the tree was still being swept. If
+      # this job ever goes red on clippy right after a formatting change, that
+      # is the mechanism, not a flake.
+      - run: cargo clippy --workspace --all-features -- -D warnings
 
 # COST, and whether it is sustainable.
 #
 # Private repos on GitHub Free include 2,000 Linux minutes/month (Pro and Team:
 # 3,000); Linux is the 1x multiplier and service containers add nothing. Billing
-# rounds each JOB up to the whole minute, so two jobs cost two roundings.
+# rounds each JOB up to the whole minute, so three jobs cost three roundings.
 #
 # MEASURED 2026-08-24 over all five verification runs, and the estimates this
 # comment used to carry were WRONG BY 5x IN THE EXPENSIVE DIRECTION (~30
@@ -200,7 +219,13 @@ jobs:
 #   cold (no cache)   3.3-4.2min  1.1-1.4min  6-7 min
 #   warm (full hit)   1.9 min     0.3 min     3 min
 #
-# The floor is 2 minutes whatever happens: two jobs, each rounded up.
+# The floor is 3 minutes whatever happens: three jobs, each rounded up.
+#
+# `lint` IS UNMEASURED AS THIS LANDS. It is a check-shaped job with no Postgres
+# and no test binaries, so it should sit near `check`'s 0.3 warm / 1.2 cold
+# minutes — but that is an inference and the numbers above are not. Replace this
+# paragraph with the real figure after the first push, the way every other
+# number in this file was.
 #
 # ~3 min/push warm against 2,000/month is ~660 pushes; even all-cold is ~330.
 # The whole of this pipeline's verification — five runs, four cold, including

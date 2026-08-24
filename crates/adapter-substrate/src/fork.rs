@@ -1892,7 +1892,7 @@ pub fn decode_diff(
         };
         out.push(DiffEntry {
             key: format!("0x{}", hex::encode(&pair.key)),
-            from_override: override_keys.iter().any(|k| *k == pair.key),
+            from_override: override_keys.contains(&pair.key),
             from_harness: pair.from_harness,
             change,
             before: pair.before.as_ref().map(|b| render_value(index, vt, b)),
@@ -2168,7 +2168,7 @@ pub fn read_extrinsic_outcome(
         n == "system.extrinsicsuccess" || n == "system.extrinsicfailed"
     });
     match verdict {
-        Some((name, data)) if name.to_ascii_lowercase() == "system.extrinsicfailed" => (
+        Some((name, data)) if name.eq_ignore_ascii_case("system.extrinsicfailed") => (
             ForkStatus::DispatchFailed,
             Some(serde_json::json!({
                 "raw": data.get("dispatch_error").cloned().unwrap_or_else(|| data.clone())
@@ -2232,7 +2232,7 @@ pub fn read_dispatch_outcome(
                         .and_then(|e| e.as_array())
                         .and_then(|a| a.first())
                         .cloned()
-                        .unwrap_or_else(|| serde_json::json!(null));
+                        .unwrap_or(serde_json::Value::Null);
                     return (
                         ForkStatus::DispatchFailed,
                         Some(serde_json::json!({ "raw": inner })),

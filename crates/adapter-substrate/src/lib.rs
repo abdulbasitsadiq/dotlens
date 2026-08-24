@@ -204,7 +204,7 @@ pub fn decode_block(
 
     let timestamp = env
         .timestamp_ms
-        .and_then(|ms| chrono::DateTime::<chrono::Utc>::from_timestamp_millis(ms));
+        .and_then(chrono::DateTime::<chrono::Utc>::from_timestamp_millis);
 
     let transactions = env
         .extrinsics

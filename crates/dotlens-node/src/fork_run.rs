@@ -873,7 +873,7 @@ impl ForkRunner for SubstrateForkRunner<'_> {
                         None => None,
                     };
                     pairs.push(fork::DiffPair {
-                        from_harness: harness_keys.iter().any(|k| *k == key),
+                        from_harness: harness_keys.contains(&key),
                         before_read: e
                             .get("before_read")
                             .and_then(|v| v.as_bool())
@@ -959,6 +959,13 @@ impl SubstrateForkRunner<'_> {
     /// difference is this slice's subject: the events key carries the whole
     /// block because `apply_extrinsic` appends to the list already there, while
     /// every other key carries the extrinsic's own writes. See the module header.
+    // 8/7. The seven are not a bag that wants a struct: `writes`,
+    // `override_keys`, `dispatch` and `extrinsic` are four INDEPENDENT inputs to
+    // one block's execution, and bundling them would create a type whose only
+    // meaning is "the arguments to drive". The lint's real signal — a function
+    // accumulating unrelated state — is not what is happening here; if this
+    // reaches ten, revisit rather than raise the allow.
+    #[allow(clippy::too_many_arguments)]
     async fn drive(
         &self,
         harness: &mut Harness,
@@ -1082,8 +1089,13 @@ impl SubstrateForkRunner<'_> {
             )),
             "diff": entries,
             "harness_keys": dispatch
-                .map(|d| d.writes.iter().map(|(k, _)| format!("0x{}", hex::encode(k))).collect())
-                .unwrap_or_else(Vec::new),
+                .map(|d| {
+                    d.writes
+                        .iter()
+                        .map(|(k, _)| format!("0x{}", hex::encode(k)))
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default(),
             "overridden_keys": override_keys.iter()
                 .map(|k| format!("0x{}", hex::encode(k)))
                 .collect::<Vec<_>>(),

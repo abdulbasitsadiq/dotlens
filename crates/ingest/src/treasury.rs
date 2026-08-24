@@ -160,9 +160,9 @@ fn run<'a>(mapper: &'a dyn TreasuryMapper, deps: &'a TreasuryDeps<'a>) -> Module
     }
 }
 
-/// Map heights `from..=to`. Behind the frontier: reprocess freely (insert-ignore
-/// + guarded upsert converge), checkpoint untouched. Past it: rows first,
-/// checkpoint last (crash = re-map, never skip).
+/// Map heights `from..=to`. Behind the frontier: reprocess freely
+/// (insert-ignore + guarded upsert converge), checkpoint untouched. Past it:
+/// rows first, checkpoint last (crash = re-map, never skip).
 pub async fn treasury_range(
     chain_id: &str,
     mapper: &dyn TreasuryMapper,
