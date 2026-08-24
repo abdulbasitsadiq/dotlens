@@ -57,7 +57,12 @@ use chrono::{DateTime, Utc};
 
 /// Bumped when the derivation below changes shape or meaning, so a stored or
 /// cached report can be identified and rebuilt. Lineage, per Invariant 3.
-pub const FRESHNESS_READER_VERSION: u32 = 1;
+///
+/// `2` (Phase 3.5, the freshness route): every module row gained `declared`, and
+/// [`ChainFreshness::with_declared`] made `never_run` reachable for the first
+/// time. Both change the SHAPE and the module SET, so a v1 report and a v2
+/// report over identical tables are not the same object.
+pub const FRESHNESS_READER_VERSION: u32 = 2;
 
 /// The `indexer_state.module` key of the raw-ingest frontier.
 ///
@@ -70,6 +75,25 @@ pub const MODULE_RAW: &str = "raw_blocks";
 /// The `indexer_state.module` key of the decode frontier. A second definition of
 /// `ingest::decode::MODULE_DECODE` — see [`MODULE_RAW`].
 pub const MODULE_DECODE: &str = "blocks";
+
+/// Is this `indexer_state.module` key a FRONTIER, or a bounded backfill chunk,
+/// rather than a domain follower?
+///
+/// **It is used in BOTH directions and that is the whole reason it exists as a
+/// function.** [`derive`] excludes these rows from the module list, because the
+/// frontiers are the yardstick and not entries measured against themselves; and
+/// [`ChainFreshness::with_declared`] must exclude the same NAMES from the seed's
+/// list, because **every chain seed legitimately declares a module called
+/// `blocks` and that is also [`MODULE_DECODE`]'s key.** Widening without this
+/// filter would add `blocks` as a `never_run` domain module while the frontier
+/// it actually names sits populated three fields above it, in the same payload.
+///
+/// Two hand-written copies of this predicate would drift the first time a fourth
+/// reserved key appeared, and the drift would be silent because both sides would
+/// still compile.
+fn is_reserved_module(name: &str) -> bool {
+    name == MODULE_RAW || name == MODULE_DECODE || name.starts_with("raw_backfill")
+}
 
 /// One row of `core.indexer_state`, as this reader needs it.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
@@ -147,6 +171,18 @@ pub struct ModuleFreshness {
     /// with a later refusal recorded at 320 is stopped by 150, and naming 320
     /// sends whoever reads it at 3am to the wrong block.
     pub blocking_halt: Option<HaltRow>,
+    /// Does this chain's registry seed declare this module?
+    ///
+    /// **`None` means THE CALLER DID NOT SAY — it does not mean "no".** The
+    /// operator CLI has no registry and leaves it null; the HTTP route has one
+    /// and fills it via [`ChainFreshness::with_declared`]. Rendering "not
+    /// declared" for "nobody told me" would be this project's second-most-
+    /// repeated defect one field further out.
+    ///
+    /// `Some(false)` is a real and interesting state rather than a leftover: the
+    /// module has a checkpoint or a halt on this chain, and the seed no longer
+    /// lists it. That is a registry question, not a pipeline one.
+    pub declared: Option<bool>,
 }
 
 /// The frontiers every module is measured against.
@@ -197,6 +233,86 @@ impl ChainFreshness {
             })
             .collect()
     }
+
+    /// Widen this report with the module list the chain's REGISTRY SEED declares.
+    ///
+    /// **THIS IS WHAT MAKES [`ModuleState::NeverRun`] REACHABLE**, and until this
+    /// slice nothing produced it. [`derive`] cannot: a module that has never
+    /// started has no row in either table it reads, so from the checkpoints alone
+    /// it is indistinguishable from a module nobody ever intended to run. Only
+    /// the registry knows the difference — and this file has no database, no
+    /// config and no registry in it on purpose, so the knowledge arrives here as
+    /// an argument rather than as a lookup.
+    ///
+    /// **Widening is NOT the filtering the module header refuses.** A caller that
+    /// FILTERS the checkpoint rows decides which modules exist and would report
+    /// its own filter as the chain's silence. A caller that DECLARES adds rows
+    /// this reader would otherwise have to leave out, and every added row says so
+    /// in the payload: `state = never_run`, a null `height` (never `0`), and
+    /// `declared = true`.
+    ///
+    /// **`reads_as` and `not_covered` are RECOMPUTED, not appended to.** Both are
+    /// statements about the module list, and the module list has just changed. A
+    /// `not_covered` line still saying *"this reader … cannot list what was never
+    /// started"* beside a `never_run` row would be false about the payload it sits
+    /// in — this project's oldest defect — and appending the correction after the
+    /// claim rather than substituting it is the second-oldest.
+    ///
+    /// **Call it ONCE.** Chaining it leaves rows added by the first list present
+    /// and stamped `declared: false` by the second, which the payload's own prose
+    /// describes as "it has run or refused here under a seed that no longer lists
+    /// it" — false of a row that never ran. `#[must_use]` catches the other half
+    /// of the same mistake, discarding the result.
+    #[must_use]
+    pub fn with_declared(mut self, declared: &[String]) -> Self {
+        for name in declared {
+            // The frontiers are the yardstick, not modules — and a seed
+            // declaring `blocks` means the decode frontier, which is already
+            // reported as `frontiers.decode`. See `is_reserved_module`.
+            if is_reserved_module(name) {
+                continue;
+            }
+            if !self.modules.iter().any(|m| &m.module == name) {
+                self.modules.push(ModuleFreshness {
+                    module: name.clone(),
+                    state: ModuleState::NeverRun,
+                    height: None,
+                    blocks_behind_decode: None,
+                    updated_at: None,
+                    seconds_since_update: None,
+                    blocking_halt: None,
+                    declared: Some(true),
+                });
+            }
+        }
+        // Set on EVERY row, including the ones just pushed (which are declared by
+        // construction) and the ones that were already here (which may not be).
+        for m in &mut self.modules {
+            m.declared = Some(declared.iter().any(|d| d == &m.module));
+        }
+        self.modules.sort_by(|a, b| a.module.cmp(&b.module));
+        self.reads_as = reads_as(&self.frontiers, &self.modules, Some(declared));
+        self.not_covered = not_covered(&self.frontiers, &self.modules, Some(declared));
+        self
+    }
+
+    /// Modules the chain's seed declares that have never produced a height.
+    ///
+    /// **It sits beside [`Self::halted`] and [`Self::behind_by_more_than`]
+    /// because without it a fully-unstarted chain reads GREEN to anything that
+    /// alerts.** Both of those return empty for a chain whose every declared
+    /// module is `never_run`, and empty from both is exactly what a monitor
+    /// treats as healthy — the state an operator most needs would have been the
+    /// only one with no accessor.
+    ///
+    /// Always empty unless [`Self::with_declared`] has been called, because
+    /// nothing else can produce the state.
+    pub fn never_run(&self) -> Vec<&ModuleFreshness> {
+        self.modules
+            .iter()
+            .filter(|m| m.state == ModuleState::NeverRun)
+            .collect()
+    }
 }
 
 /// Subtract two frontiers without lying about either end.
@@ -235,11 +351,7 @@ pub fn derive(
     // it beside the followers would put a permanent red row on the surface.
     let mut modules: Vec<ModuleFreshness> = checkpoints
         .iter()
-        .filter(|c| {
-            c.module != MODULE_RAW
-                && c.module != MODULE_DECODE
-                && !c.module.starts_with("raw_backfill")
-        })
+        .filter(|c| !is_reserved_module(&c.module))
         .map(|c| {
             let blocking_halt = blocking_halt_for(&c.module, c.height, halts);
             let state = if blocking_halt.is_some() {
@@ -261,6 +373,9 @@ pub fn derive(
                         .num_seconds(),
                 ),
                 blocking_halt,
+                // This reader has no registry. `with_declared` fills it, and
+                // null means "nobody told me" rather than "no".
+                declared: None,
             }
         })
         .collect();
@@ -270,12 +385,29 @@ pub fn derive(
     // is precisely the cold-start case an operator most needs to see, and
     // dropping it would make the worst state the most invisible one.
     for h in halts {
-        if h.module == MODULE_RAW || h.module == MODULE_DECODE {
+        // The SAME predicate `derive`'s checkpoint filter and `with_declared`
+        // use. It was hand-rolled here and was two-thirds of it — a
+        // `raw_backfill:100-200` refusal would have been pushed as a permanently
+        // red follower row, which is the exact thing the checkpoint filter above
+        // excludes bounded chunks to prevent.
+        if is_reserved_module(&h.module) {
             continue;
         }
         if modules.iter().any(|m| m.module == h.module) {
             continue;
         }
+        // THE LOWEST refusal for this module, not the first one the caller
+        // happened to hand us. The checkpointed path uses `min_by_key` and this
+        // one took input order, so a module with refusals at 320 and 150 would
+        // name 320 here and 150 there — "sends whoever reads it at 3am to the
+        // wrong block", on the very field whose doc says so. It was correct only
+        // by the Postgres backend's `order by`, which made a file that says it
+        // has no database in it depend on one.
+        let blocking = halts
+            .iter()
+            .filter(|c| c.module == h.module)
+            .min_by_key(|c| (c.height, c.event_index))
+            .unwrap_or(h);
         modules.push(ModuleFreshness {
             module: h.module.clone(),
             state: ModuleState::Halted,
@@ -283,7 +415,8 @@ pub fn derive(
             blocks_behind_decode: None,
             updated_at: None,
             seconds_since_update: None,
-            blocking_halt: Some(h.clone()),
+            blocking_halt: Some(blocking.clone()),
+            declared: None,
         });
     }
 
@@ -296,8 +429,10 @@ pub fn derive(
         raw_behind_chain: None,
     };
 
-    let reads_as = reads_as(&frontiers, &modules);
-    let not_covered = not_covered(&frontiers, &modules);
+    // `None`: this reader was told nothing about what SHOULD be running.
+    // `with_declared` recomputes both with the seed's list when it is.
+    let reads_as = reads_as(&frontiers, &modules, None);
+    let not_covered = not_covered(&frontiers, &modules, None);
 
     ChainFreshness {
         chain_id: chain_id.to_string(),
@@ -328,8 +463,36 @@ fn blocking_halt_for(module: &str, checkpoint: u64, halts: &[HaltRow]) -> Option
 /// Built from the SAME values the payload is built from — never from a parallel
 /// summary — because a `reads_as` line false about the object beside it is this
 /// project's oldest and most repeated defect, at seven recurrences by slice 10.
-fn reads_as(frontiers: &Frontiers, modules: &[ModuleFreshness]) -> String {
+fn reads_as(
+    frontiers: &Frontiers,
+    modules: &[ModuleFreshness],
+    declared: Option<&[String]>,
+) -> String {
     let mut s = String::new();
+
+    // AN EMPTY MODULE LIST IS THE ONE ROW THIS CANNOT DRAW, and a blank space
+    // under healthy frontiers reads as "all clear" — the container-level form of
+    // this project's second-most-repeated defect, and the same one the operator
+    // CLI already guards. Said FIRST, because everything after it would
+    // otherwise be a reassuring paragraph about nothing.
+    if modules.is_empty() {
+        s.push_str(match declared {
+            Some(d) if d.iter().all(|m| is_reserved_module(m)) => {
+                "THIS CHAIN'S SEED DECLARES NO DOMAIN MODULE — only frontiers. Nothing below \
+                 is missing; there is nothing to be behind. ",
+            }
+            Some(_) => {
+                "NO MODULE HAS A CHECKPOINT OR A RECORDED HALT ON THIS CHAIN, though its seed \
+                 declares some — read the `never_run` rows below as 'not started', never as \
+                 'nothing to report'. ",
+            }
+            None => {
+                "NO MODULE HAS A CHECKPOINT OR A RECORDED HALT ON THIS CHAIN. This reader was \
+                 not told what SHOULD be running here, so an empty list below is the absence \
+                 of an OBSERVATION and not the absence of a problem. ",
+            }
+        });
+    }
 
     match (frontiers.raw, frontiers.decode) {
         (None, None) => {
@@ -351,8 +514,8 @@ fn reads_as(frontiers: &Frontiers, modules: &[ModuleFreshness]) -> String {
                 "Every module's lag is measured against the DECODE frontier. THE \
                  RAW-INGEST FRONTIER HAS NO CHECKPOINT, so `decode_behind_raw` is null \
                  and nothing here can say how far decode itself is from the chain — \
-                 read `at_decode_frontier` below as a statement about this pipeline's \
-                 own progress and nothing more. ",
+                 read ANY `at_decode_frontier` row below as a statement about this \
+                 pipeline's own progress and nothing more. ",
             );
         }
         _ => {
@@ -369,7 +532,7 @@ fn reads_as(frontiers: &Frontiers, modules: &[ModuleFreshness]) -> String {
     if let Some(d) = frontiers.decode_behind_raw {
         if d > 0 {
             s.push_str(&format!(
-                "DECODE IS {d} BLOCKS BEHIND RAW INGESTION, so every `at_decode_frontier` \
+                "DECODE IS {d} BLOCKS BEHIND RAW INGESTION, so ANY `at_decode_frontier` row \
                  below is at least that far from the chain. "
             ));
         } else if d < 0 {
@@ -432,7 +595,25 @@ fn reads_as(frontiers: &Frontiers, modules: &[ModuleFreshness]) -> String {
 }
 
 /// What this reader cannot answer, named rather than left silent.
-fn not_covered(frontiers: &Frontiers, modules: &[ModuleFreshness]) -> Vec<String> {
+///
+/// `declared` is the chain's seed list when the caller had one. It is the LIST
+/// and not a boolean, because two of these entries have to say different things
+/// depending on what the list actually contains — a review found both of them
+/// shipping a claim that was false about the very payload they sat in:
+///
+/// - the `blocks`/`raw_blocks` entry explained an omission that had not occurred
+///   when the seed declared no reserved name at all;
+/// - the no-decode-frontier entry said every module's `state` "reflects only
+///   their own halt records", which stops being true the moment widening can put
+///   a `never_run` row there — whose state reflects the REGISTRY.
+///
+/// A report over a chain whose seed declares nothing and a report nobody told
+/// anything are also different facts, and a boolean collapses them.
+fn not_covered(
+    frontiers: &Frontiers,
+    modules: &[ModuleFreshness],
+    declared: Option<&[String]>,
+) -> Vec<String> {
     let mut out = vec![
         "raw_behind_chain: THE CHAIN'S OWN HEAD IS NOT READ. Every number here is \
          measured against dotlens's own raw-ingest frontier, so a raw follower that \
@@ -457,22 +638,87 @@ fn not_covered(frontiers: &Frontiers, modules: &[ModuleFreshness]) -> Vec<String
     }
 
     if frontiers.decode.is_none() {
-        out.push(
+        out.push(if declared.is_some() {
+            // `never_run` rows come from the REGISTRY, not from halt records, so
+            // the un-widened wording is false the moment widening is possible.
+            "No decode frontier, so nothing below is placed relative to one. Each `state` \
+             is either `never_run` — which this reader knows from the chain's seed and not \
+             from either table it reads — or that module's own halt record."
+                .to_string()
+        } else {
             "No decode frontier, so no module below can be placed relative to one; \
              their `state` reflects only their own halt records."
-                .to_string(),
-        );
+                .to_string()
+        });
     }
 
     out.push(
-        "Modules with no checkpoint row AND no recorded halt do not appear at all. This \
-         reader lists what has run or refused, and cannot list what was never started — \
-         which chains SHOULD be running which modules is registry data, not checkpoint \
-         data."
+        "A refusal recorded at or BELOW a module's checkpoint is not shown: the module has \
+         since passed it. The rows are kept — this reader reports only what still blocks, \
+         so a module that refused repeatedly last week and recovered reads exactly like one \
+         that never refused."
             .to_string(),
     );
 
+    match declared {
+        Some(declared) => {
+            out.push(
+                "Every module this chain's registry seed declares appears below: one that has \
+                 never started is `never_run` with a NULL height rather than absent. A row \
+                 carrying `declared: false` is the other case — it has run or refused here \
+                 under a seed that no longer lists it, which is a registry question and not a \
+                 pipeline one."
+                    .to_string(),
+            );
+            out.push(
+                "Declaring a module is not the same as it being able to answer. This reader \
+                 reports how far a module's CHECKPOINT has got and says nothing about whether \
+                 a mapper exists for every pallet that module will meet — an unmapped variant \
+                 is a future halt, not a state visible here before it fires."
+                    .to_string(),
+            );
+            // ONLY when the seed actually declares a reserved name. Emitting it
+            // unconditionally explained an omission that had not occurred, and
+            // pointed at `frontiers.decode` on chains where that field is null.
+            let reserved: Vec<&str> = declared
+                .iter()
+                .filter(|d| is_reserved_module(d))
+                .map(|d| d.as_str())
+                .collect();
+            if !reserved.is_empty() {
+                out.push(format!(
+                    "This chain's seed declares {}, which {} NOT missing from the list below \
+                     — {} the raw-ingest and decode FRONTIERS, reported under `frontiers` \
+                     (currently raw {}, decode {}). The frontiers are what every module here \
+                     is measured against, so listing them as modules would measure them \
+                     against themselves. A declared name beginning `raw_backfill` is excluded \
+                     the same way and for the same reason: a bounded chunk is not a follower.",
+                    reserved.join(" and "),
+                    if reserved.len() == 1 { "is" } else { "are" },
+                    if reserved.len() == 1 { "it is one of" } else { "they are" },
+                    opt_height(frontiers.raw),
+                    opt_height(frontiers.decode),
+                ));
+            }
+        }
+        None => out.push(
+            "Modules with no checkpoint row AND no recorded halt do not appear at all, and \
+             every `declared` field below is null for the same reason. This reader lists \
+             what has run or refused; it was not told what SHOULD be running, which is \
+             registry data rather than checkpoint data."
+                .to_string(),
+        ),
+    }
+
     out
+}
+
+/// A height for prose, where absence must read as absence.
+fn opt_height(h: Option<u64>) -> String {
+    match h {
+        Some(v) => v.to_string(),
+        None => "not started".to_string(),
+    }
 }
 
 #[cfg(test)]
@@ -713,5 +959,312 @@ mod tests {
             r.behind_by_more_than(400).is_empty(),
             "the bound is exclusive"
         );
+    }
+
+    // ------------------------------------------------- with_declared (the route)
+
+    fn declared(names: &[&str]) -> Vec<String> {
+        names.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn a_declared_module_that_never_started_is_never_run_and_not_absent() {
+        let mut cps = base();
+        cps.push(cp("balances", 900, "2026-08-24T11:59:30Z"));
+        let r = derive("polkadot", &cps, &[], now())
+            .with_declared(&declared(&["balances", "gov", "xcm"]));
+
+        let names: Vec<&str> = r.modules.iter().map(|m| m.module.as_str()).collect();
+        assert_eq!(names, vec!["balances", "gov", "xcm"], "declared rows are added");
+
+        let gov = r.modules.iter().find(|m| m.module == "gov").expect("gov");
+        assert_eq!(gov.state, ModuleState::NeverRun);
+        // NULL, never 0 — the whole reason this state exists as a state.
+        assert_eq!(gov.height, None);
+        assert_eq!(gov.blocks_behind_decode, None);
+        assert_eq!(gov.updated_at, None);
+        assert_eq!(gov.seconds_since_update, None);
+        assert_eq!(gov.declared, Some(true));
+    }
+
+    /// Without a registry this state is UNREACHABLE, which is why nothing
+    /// produced it before this slice. The assertion is the pair, not the arm.
+    #[test]
+    fn never_run_is_unreachable_without_the_declared_list_and_reachable_with_it() {
+        let cps = base();
+        let bare = derive("polkadot", &cps, &[], now());
+        assert!(
+            !bare
+                .modules
+                .iter()
+                .any(|m| m.state == ModuleState::NeverRun),
+            "derive alone cannot know a module was supposed to run"
+        );
+        let widened = bare.with_declared(&declared(&["gov"]));
+        assert_eq!(widened.modules[0].state, ModuleState::NeverRun);
+    }
+
+    #[test]
+    fn a_module_that_ran_under_a_seed_no_longer_listing_it_reports_declared_false() {
+        let mut cps = base();
+        cps.push(cp("balances", 900, "2026-08-24T11:59:30Z"));
+        // the seed lists gov and NOT balances
+        let r = derive("polkadot", &cps, &[], now()).with_declared(&declared(&["gov"]));
+
+        let bal = r.modules.iter().find(|m| m.module == "balances").unwrap();
+        assert_eq!(
+            bal.declared,
+            Some(false),
+            "it ran here; the registry no longer says it should"
+        );
+        // and it is still REPORTED — an undeclared module is not filtered away,
+        // which would be the caller deciding which modules exist.
+        assert_eq!(bal.state, ModuleState::AtDecodeFrontier);
+        assert!(
+            r.not_covered.iter().any(|s| s.contains("declared: false")),
+            "the state must be named where it can occur: {:?}",
+            r.not_covered
+        );
+    }
+
+    #[test]
+    fn declared_is_null_before_widening_because_null_is_not_no() {
+        let mut cps = base();
+        cps.push(cp("balances", 900, "2026-08-24T11:59:30Z"));
+        let r = derive("polkadot", &cps, &[], now());
+        assert_eq!(r.modules[0].declared, None);
+        assert!(
+            r.not_covered
+                .iter()
+                .any(|s| s.contains("was not told what SHOULD be running")),
+            "{:?}",
+            r.not_covered
+        );
+    }
+
+    /// A3: a prose fix is done only when the old text is GONE. The un-widened
+    /// line says this reader "cannot list what was never started" — beside a
+    /// `never_run` row that would be false about the payload it sits in.
+    #[test]
+    fn widening_substitutes_the_coverage_line_rather_than_appending_to_it() {
+        let cps = base();
+        let bare = derive("polkadot", &cps, &[], now());
+        assert!(bare
+            .not_covered
+            .iter()
+            .any(|s| s.contains("was not told what SHOULD be running")));
+
+        let widened = bare.with_declared(&declared(&["gov"]));
+        assert!(
+            !widened
+                .not_covered
+                .iter()
+                .any(|s| s.contains("was not told what SHOULD be running")),
+            "the superseded claim must be GONE, not sitting beside its correction: {:?}",
+            widened.not_covered
+        );
+        assert!(widened
+            .not_covered
+            .iter()
+            .any(|s| s.contains("never_run` with a NULL height")));
+    }
+
+    #[test]
+    fn widening_recomputes_reads_as_so_it_names_the_never_run_modules() {
+        let cps = base();
+        let r = derive("polkadot", &cps, &[], now()).with_declared(&declared(&["gov", "xcm"]));
+        assert!(
+            r.reads_as.contains("NEVER RUN"),
+            "the arm was dead until this slice: {}",
+            r.reads_as
+        );
+        assert!(r.reads_as.contains("gov"), "{}", r.reads_as);
+        assert!(r.reads_as.contains("xcm"), "{}", r.reads_as);
+    }
+
+    #[test]
+    fn widening_keeps_a_halt_visible_and_does_not_overwrite_its_state() {
+        let mut cps = base();
+        cps.push(cp("balances", 100, "2026-08-24T10:00:00Z"));
+        let r = derive("polkadot", &cps, &[halt("balances", 150, 7, "x")], now())
+            .with_declared(&declared(&["balances", "gov"]));
+
+        let bal = r.modules.iter().find(|m| m.module == "balances").unwrap();
+        assert_eq!(bal.state, ModuleState::Halted, "a declared module can be halted");
+        assert_eq!(bal.declared, Some(true));
+        assert!(bal.blocking_halt.is_some());
+        assert_eq!(r.halted().len(), 1, "the helper still selects it");
+    }
+
+    #[test]
+    fn widening_with_an_empty_seed_list_is_not_the_same_as_not_widening() {
+        let mut cps = base();
+        cps.push(cp("balances", 900, "2026-08-24T11:59:30Z"));
+        let r = derive("polkadot", &cps, &[], now()).with_declared(&[]);
+        // "this chain declares nothing" is a STATEMENT; it is not "nobody told me".
+        assert_eq!(r.modules[0].declared, Some(false));
+        assert!(r
+            .not_covered
+            .iter()
+            .any(|s| s.contains("never_run` with a NULL height")));
+    }
+
+    /// EVERY chain seed declares a module called `blocks`, and that string is
+    /// also `MODULE_DECODE`. Without the reserved-name filter, widening reports
+    /// the decode frontier as a never-run domain module in the same payload that
+    /// shows it populated — a line false about the object beside it.
+    #[test]
+    fn a_seed_declaring_blocks_does_not_resurrect_the_decode_frontier_as_a_module() {
+        let mut cps = base();
+        cps.push(cp("balances", 900, "2026-08-24T11:59:30Z"));
+        let r = derive("polkadot", &cps, &[], now()).with_declared(&declared(&[
+            "blocks",
+            "raw_blocks",
+            "extrinsics",
+            "balances",
+        ]));
+
+        let names: Vec<&str> = r.modules.iter().map(|m| m.module.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["balances", "extrinsics"],
+            "the frontiers are the yardstick, not modules"
+        );
+        assert_eq!(r.frontiers.decode, Some(900), "and it is still reported here");
+        assert!(
+            r.not_covered.iter().any(|s| s.contains("FRONTIERS")),
+            "the omission must be stated where a reader would otherwise call it a gap: {:?}",
+            r.not_covered
+        );
+
+        // AND THE PAIR, without which the assertion above cannot fail: a seed
+        // that declares no reserved name must NOT carry the explanation, because
+        // there is no omission to explain.
+        let plain =
+            derive("polkadot", &cps, &[], now()).with_declared(&declared(&["balances", "gov"]));
+        assert!(
+            !plain.not_covered.iter().any(|s| s.contains("FRONTIERS")),
+            "nothing was omitted, so nothing may be explained away: {:?}",
+            plain.not_covered
+        );
+    }
+
+    /// The un-widened wording said every state "reflects only their own halt
+    /// records". Widening makes that false — a `never_run` state comes from the
+    /// registry — and `hydration` (declared modules, nothing indexed) is the
+    /// shipped payload that would have carried the false line.
+    #[test]
+    fn the_no_decode_frontier_line_is_true_in_both_the_widened_and_bare_cases() {
+        let bare = derive("polkadot", &[], &[], now());
+        assert!(bare
+            .not_covered
+            .iter()
+            .any(|s| s.contains("reflects only their own halt records")));
+
+        let widened = derive("polkadot", &[], &[], now()).with_declared(&declared(&["gov"]));
+        assert!(
+            !widened
+                .not_covered
+                .iter()
+                .any(|s| s.contains("reflects only their own halt records")),
+            "there is a never_run row below, whose state came from the seed: {:?}",
+            widened.not_covered
+        );
+        assert!(widened
+            .not_covered
+            .iter()
+            .any(|s| s.contains("knows from the chain's seed")));
+    }
+
+    /// A bounded backfill chunk is not a follower, and a halt recorded against
+    /// one must not become a permanently red module row.
+    #[test]
+    fn a_halt_against_a_backfill_chunk_or_a_frontier_is_not_a_module() {
+        let r = derive(
+            "polkadot",
+            &base(),
+            &[
+                halt("raw_backfill:100-200", 150, 1, "x"),
+                halt(MODULE_RAW, 150, 1, "x"),
+                halt("balances", 950, 1, "x"),
+            ],
+            now(),
+        );
+        let names: Vec<&str> = r.modules.iter().map(|m| m.module.as_str()).collect();
+        assert_eq!(names, vec!["balances"], "{names:?}");
+    }
+
+    /// The checkpointed path takes the LOWEST refusal; the no-checkpoint path
+    /// took whatever the caller listed first, so the two disagreed and the
+    /// answer depended on Postgres's `order by` — in a file whose header says it
+    /// has no database in it.
+    #[test]
+    fn a_halt_with_no_checkpoint_still_names_the_lowest_refusal_not_the_first_listed() {
+        let r = derive(
+            "polkadot",
+            &base(),
+            // deliberately NOT in height order
+            &[halt("gov", 320, 0, "later"), halt("gov", 150, 4, "earlier")],
+            now(),
+        );
+        let gov = r.modules.iter().find(|m| m.module == "gov").expect("gov");
+        assert_eq!(gov.state, ModuleState::Halted);
+        assert_eq!(gov.height, None, "it refused before completing a height");
+        let blocking = gov.blocking_halt.as_ref().expect("blocking");
+        assert_eq!(
+            (blocking.height, blocking.event_index),
+            (150, 4),
+            "naming 320 sends whoever reads it at 3am to the wrong block"
+        );
+    }
+
+    /// Without this selector a fully-unstarted chain returns empty from BOTH
+    /// existing accessors, which is what a monitor reads as healthy.
+    #[test]
+    fn never_run_has_a_selector_so_an_unstarted_chain_does_not_read_green() {
+        let r = derive("polkadot", &base(), &[], now())
+            .with_declared(&declared(&["gov", "xcm", "balances"]));
+        assert!(r.halted().is_empty());
+        assert!(r.behind_by_more_than(0).is_empty());
+        assert_eq!(
+            r.never_run().len(),
+            3,
+            "the state an operator most needs must be selectable"
+        );
+    }
+
+    #[test]
+    fn an_empty_module_list_says_nothing_has_run_rather_than_leaving_a_blank() {
+        // frontiers are healthy, and NO domain module exists
+        let bare = derive("polkadot", &base(), &[], now());
+        assert!(bare.modules.is_empty());
+        assert!(
+            bare.reads_as.contains("NO MODULE HAS A CHECKPOINT"),
+            "a blank list under healthy frontiers reads as all-clear: {}",
+            bare.reads_as
+        );
+
+        // a seed declaring ONLY frontier names is a different fact again
+        let only_frontiers =
+            derive("polkadot", &base(), &[], now()).with_declared(&declared(&["blocks"]));
+        assert!(only_frontiers.modules.is_empty());
+        assert!(
+            only_frontiers
+                .reads_as
+                .contains("DECLARES NO DOMAIN MODULE"),
+            "{}",
+            only_frontiers.reads_as
+        );
+    }
+
+    #[test]
+    fn widening_is_idempotent_and_stays_sorted() {
+        let mut cps = base();
+        cps.push(cp("xcm", 900, "2026-08-24T11:59:30Z"));
+        let once = derive("polkadot", &cps, &[], now()).with_declared(&declared(&["gov", "xcm"]));
+        let twice = once.clone().with_declared(&declared(&["gov", "xcm"]));
+        assert_eq!(once, twice, "re-widening the same list is a no-op");
+        let names: Vec<&str> = twice.modules.iter().map(|m| m.module.as_str()).collect();
+        assert_eq!(names, vec!["gov", "xcm"]);
     }
 }

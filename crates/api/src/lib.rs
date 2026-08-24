@@ -5,7 +5,7 @@
 use async_trait::async_trait;
 use axum::{
     extract::{Path, Query, State},
-    http::StatusCode,
+    http::{header::CACHE_CONTROL, StatusCode},
     response::{IntoResponse, Json, Response},
     routing::get,
     Router,
@@ -6709,6 +6709,7 @@ pub struct AppState {
     pub coretime: Arc<dyn CoretimeIndex>,
     pub broker: Arc<dyn BrokerIndex>,
     pub channels: Arc<dyn ChannelIndex>,
+    pub freshness: Arc<dyn FreshnessIndex>,
     pub parse_account: AccountParser,
 }
 
@@ -6783,6 +6784,13 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/v1/search", get(get_search))
         .route("/v1/domains/{network}/{domain}", get(resolve_domain))
+        // CHAIN-scoped, because a checkpoint is keyed `(chain_id, module)` and
+        // there is no network-level answer to compose out of them that is not
+        // just a list. The all-chains variant a homepage strip will want is
+        // deliberately NOT here: it is N queries per load with N growing from
+        // the registry, so it wants its own thought about fan-out rather than
+        // arriving as a convenience.
+        .route("/v1/freshness/{chain}", get(get_freshness))
         .with_state(state)
 }
 
@@ -11212,6 +11220,78 @@ async fn resolve_domain(
     }
 }
 
+/// `GET /v1/freshness/{chain}` — how far behind every module on one chain is.
+///
+/// **THE SURFACE HALF of ROADMAP 3.5's operational floor item 2, whose READER
+/// shipped without one.** `freshness::derive` had exactly one non-test caller —
+/// the operator CLI — while the phase's exit criterion asks that *"every surface
+/// states the FRESHNESS of each module it reads"*. A surface reads this.
+///
+/// # IT IS A SEPARATE RESOURCE, NOT A BLOCK ON EVERY RESPONSE (ARCHITECTURE §9a.1)
+///
+/// A freshness report is provisional in §9a rule 2's sense — it changes when the
+/// INDEX advances, not when the chain moves — so attaching one to every payload
+/// would have capped every response in the product at a short TTL and deleted
+/// `immutable` from the whole API. That is a product position rather than a
+/// caching detail: PRODUCT's year-1 policy rests on *"cost scales with UNIQUE
+/// queries rather than total traffic"*.
+///
+/// **The consequence for whoever renders this is a rule, not a nicety.** A page
+/// showing a cached payload beside this object must render BOTH and merge
+/// NEITHER: the payload says what was true *at its own anchor heights* and
+/// carries its own `as_of`; this says how far the index has got. One "last
+/// updated" line spanning the two would be a claim neither of them makes.
+///
+/// # WHAT THIS ROUTE KNOWS THAT THE CLI DOES NOT: THE REGISTRY
+///
+/// Hence `with_declared`. A module the chain's seed declares and has never
+/// started is `never_run` here and simply ABSENT from the CLI's report, because
+/// a module that never ran has no row in either table the reader reads. That
+/// state had no producer at all before this slice.
+///
+/// # CACHE-CONTROL
+///
+/// `no-store`, and it is the first cache header in the product — §9a is a
+/// contract with no implementation anywhere yet, and **this slice does not
+/// implement it.** The header here is local and unambiguous: a stale freshness
+/// report is precisely the failure this endpoint exists to prevent, so it may
+/// not be held anywhere, by anyone, for any length of time.
+async fn get_freshness(State(state): State<AppState>, Path(chain): Path<String>) -> Response {
+    let Some(cfg) = state.registry.chain(&chain) else {
+        return error(StatusCode::NOT_FOUND, format!("unknown chain '{chain}'"));
+    };
+    // Both reads are taken whole and unfiltered — the trait says why, and a
+    // handler that narrowed them would be the second implementation of a rule
+    // this file keeps in exactly one place.
+    let checkpoints = match state.freshness.checkpoints(&cfg.id).await {
+        Ok(v) => v,
+        Err(e) => return read_failure(e),
+    };
+    let halts = match state.freshness.halts(&cfg.id).await {
+        Ok(v) => v,
+        Err(e) => return read_failure(e),
+    };
+
+    let report = freshness::derive(&cfg.id, &checkpoints, &halts, Utc::now())
+        .with_declared(&cfg.modules);
+
+    // A 500, deliberately not a defaulted body: an empty object served with a
+    // 200 would render as a chain with no modules and no gaps, which is the one
+    // reading this endpoint must never produce. Same call the simulation
+    // surface makes for the same reason.
+    let body = match serde_json::to_value(&report) {
+        Ok(v) => v,
+        Err(e) => {
+            return error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("serialize freshness: {e}"),
+            )
+        }
+    };
+
+    ([(CACHE_CONTROL, "no-store")], Json(body)).into_response()
+}
+
 fn error(status: StatusCode, message: String) -> Response {
     (status, Json(serde_json::json!({ "error": message }))).into_response()
 }
@@ -13032,6 +13112,54 @@ pub(crate) mod tests {
             },
         );
 
+        // Freshness rows for the fixture chain, shaped so the route test can
+        // reach four different states in one response rather than one each.
+        // `governance`, `treasury`, `accounts`, `extrinsics` and `events` are
+        // DECLARED by the seed and deliberately left without rows, so they
+        // arrive as `never_run`; `coretime` is the opposite case, a checkpoint
+        // for a module this chain's seed does NOT declare.
+        let freshness = Arc::new(MemoryFreshnessIndex::new());
+        for (module, height, at) in [
+            (freshness::MODULE_RAW, 19_000_040u64, "2026-08-24T11:59:50Z"),
+            (freshness::MODULE_DECODE, 19_000_010, "2026-08-24T11:59:40Z"),
+            ("balances", 19_000_010, "2026-08-24T11:59:30Z"),
+            ("xcm", 19_000_000, "2026-08-24T09:00:00Z"),
+            ("coretime", 19_000_010, "2026-08-24T11:59:30Z"),
+        ] {
+            freshness.insert_checkpoint(
+                "polkadot-asset-hub",
+                freshness::CheckpointRow {
+                    module: module.to_string(),
+                    height,
+                    updated_at: DateTime::parse_from_rfc3339(at)
+                        .expect("ts")
+                        .with_timezone(&Utc),
+                },
+            );
+        }
+        // A halt for a module with NO checkpoint row — the cold-start case the
+        // reader refuses to drop, and the one an operator most needs to see.
+        freshness.insert_halt(
+            "polkadot-asset-hub",
+            freshness::HaltRow {
+                module: "assets".to_string(),
+                height: 19_000_005,
+                event_index: 3,
+                event: "assets.Blocked".to_string(),
+                reason: "unmapped pallet-assets event — mapper update required".to_string(),
+                runtime_version: 2_003_002,
+                mapper_version: 4,
+                first_seen_at: DateTime::parse_from_rfc3339("2026-08-24T11:00:00Z")
+                    .expect("ts")
+                    .with_timezone(&Utc),
+                last_seen_at: DateTime::parse_from_rfc3339("2026-08-24T11:59:00Z")
+                    .expect("ts")
+                    .with_timezone(&Utc),
+                seen_count: 12,
+            },
+        );
+        let freshness: Arc<dyn FreshnessIndex> = freshness;
+
         AppState {
             registry,
             blocks,
@@ -13047,6 +13175,7 @@ pub(crate) mod tests {
             coretime,
             broker,
             channels,
+            freshness,
             parse_account: Arc::new(|s| {
                 adapter_substrate::accounts::parse_account(s).map(|a| a.to_vec())
             }),
@@ -15788,5 +15917,236 @@ pub(crate) mod tests {
                 "{uri} must carry no throughput field"
             );
         }
+    }
+
+    // ------------------------------------------------------ /v1/freshness/{chain}
+
+    #[tokio::test]
+    async fn freshness_reports_every_state_and_never_run_comes_from_the_registry() {
+        let app = router(test_state().await);
+        let (status, body) = get_json(&app, "/v1/freshness/polkadot-asset-hub").await;
+        assert_eq!(status, StatusCode::OK);
+
+        assert_eq!(body["chain_id"], "polkadot-asset-hub");
+        assert_eq!(body["reader_version"], 2);
+        assert_eq!(body["frontiers"]["raw"], 19_000_040u64);
+        assert_eq!(body["frontiers"]["decode"], 19_000_010u64);
+        assert_eq!(body["frontiers"]["decode_behind_raw"], 30);
+        // Still not read — a NULL field and a named gap, not a silence.
+        assert!(body["frontiers"]["raw_behind_chain"].is_null());
+
+        let state_of = |name: &str| -> String {
+            body["modules"]
+                .as_array()
+                .expect("modules")
+                .iter()
+                .find(|m| m["module"] == name)
+                .unwrap_or_else(|| panic!("{name} missing from {:?}", body["modules"]))["state"]
+                .as_str()
+                .expect("state")
+                .to_string()
+        };
+
+        assert_eq!(state_of("balances"), "at_decode_frontier");
+        assert_eq!(state_of("xcm"), "behind");
+        assert_eq!(state_of("assets"), "halted");
+        // DECLARED by the seed, no checkpoint and no halt. Unreachable without
+        // the registry, which is the reason this route exists rather than the
+        // CLI being enough.
+        assert_eq!(state_of("governance"), "never_run");
+        assert_eq!(state_of("treasury"), "never_run");
+
+        // THE SET, not a hand-picked five: `with_declared`'s contract is
+        // {seed modules} ∪ {modules with rows}, minus the frontiers. Listing a
+        // subset would not notice a module the widening silently dropped.
+        let mut got: Vec<&str> = body["modules"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["module"].as_str().unwrap())
+            .collect();
+        got.sort_unstable();
+        assert_eq!(
+            got,
+            vec![
+                "accounts",
+                "assets",
+                "balances",
+                "coretime",
+                "events",
+                "extrinsics",
+                "governance",
+                "treasury",
+                "xcm",
+            ],
+            "seed ∪ rows, minus the frontiers"
+        );
+
+        // `coretime` has a checkpoint here and is NOT in this chain's seed —
+        // the other direction, and the only thing that exercises the
+        // `declared: false` line in `not_covered`.
+        let coretime = body["modules"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["module"] == "coretime")
+            .unwrap();
+        assert_eq!(coretime["declared"], false);
+        assert_eq!(coretime["state"], "at_decode_frontier");
+    }
+
+    #[tokio::test]
+    async fn freshness_nulls_are_never_zero_and_a_halt_names_its_own_block() {
+        let app = router(test_state().await);
+        let (_, body) = get_json(&app, "/v1/freshness/polkadot-asset-hub").await;
+        let module = |name: &str| -> serde_json::Value {
+            body["modules"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|m| m["module"] == name)
+                .cloned()
+                .unwrap()
+        };
+
+        let gov = module("governance");
+        assert!(gov["height"].is_null(), "never_run has no height, not 0");
+        assert!(gov["blocks_behind_decode"].is_null());
+        assert!(gov["seconds_since_update"].is_null());
+        assert_eq!(gov["declared"], true);
+
+        let assets = module("assets");
+        assert_eq!(assets["blocking_halt"]["height"], 19_000_005u64);
+        assert_eq!(assets["blocking_halt"]["event"], "assets.Blocked");
+        assert!(
+            assets["height"].is_null(),
+            "it refused before completing a height"
+        );
+    }
+
+    /// The frontier keys are not domain modules, and every seed declares
+    /// `blocks`. If widening resurrected it, the payload would show the decode
+    /// frontier as never-run three fields below itself reading 19,000,010.
+    #[tokio::test]
+    async fn freshness_does_not_list_the_frontiers_as_modules() {
+        let app = router(test_state().await);
+        let (_, body) = get_json(&app, "/v1/freshness/polkadot-asset-hub").await;
+        let names: Vec<&str> = body["modules"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["module"].as_str().unwrap())
+            .collect();
+        assert!(!names.contains(&"blocks"), "{names:?}");
+        assert!(!names.contains(&"raw_blocks"), "{names:?}");
+        // The seed DOES declare `blocks`, so the omission is real and must be
+        // explained. The pair that makes this assertion able to fail lives in
+        // freshness.rs, where a seed declaring no reserved name must NOT carry
+        // the explanation.
+        assert!(
+            body["not_covered"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|s| s.as_str().unwrap().contains("FRONTIERS")),
+            "and the omission is stated: {:?}",
+            body["not_covered"]
+        );
+    }
+
+    #[tokio::test]
+    async fn freshness_404s_an_unknown_chain_rather_than_reporting_it_as_idle() {
+        let app = router(test_state().await);
+        let (status, body) = get_json(&app, "/v1/freshness/not-a-chain").await;
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "an empty report would read as 'this chain has stopped'"
+        );
+        assert!(body["error"].as_str().unwrap().contains("not-a-chain"));
+    }
+
+    /// ARCHITECTURE §9a.1: this resource is why data responses stay cacheable,
+    /// so it may not itself be held anywhere.
+    #[tokio::test]
+    async fn freshness_is_no_store_because_a_stale_freshness_report_is_the_failure() {
+        let app = router(test_state().await);
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/freshness/polkadot-asset-hub")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(
+            res.headers()
+                .get(axum::http::header::CACHE_CONTROL)
+                .and_then(|v| v.to_str().ok()),
+            Some("no-store")
+        );
+    }
+
+    /// A chain with nothing indexed must say "nothing has run here", never
+    /// render as a chain whose modules are all fine.
+    #[tokio::test]
+    async fn freshness_on_an_unindexed_chain_says_nothing_has_run() {
+        let app = router(test_state().await);
+        let (status, body) = get_json(&app, "/v1/freshness/hydration").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body["frontiers"]["raw"].is_null());
+        assert!(body["frontiers"]["decode"].is_null());
+        assert!(
+            body["reads_as"]
+                .as_str()
+                .unwrap()
+                .contains("NOTHING HAS RUN ON THIS CHAIN"),
+            "{}",
+            body["reads_as"]
+        );
+        // and its declared modules are present as never_run rather than absent
+        let names: Vec<&str> = body["modules"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["module"].as_str().unwrap())
+            .collect();
+        assert!(names.contains(&"balances"), "{names:?}");
+        assert!(names.contains(&"xcm"), "{names:?}");
+
+        // A1 END TO END: hydration declares `blocks`, so the frontier
+        // explanation IS emitted — and it must not point at `frontiers.decode`
+        // as though that field held a height, because on this chain it is null.
+        // A review caught this line claiming otherwise in this exact payload.
+        let lines: Vec<&str> = body["not_covered"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| s.as_str().unwrap())
+            .collect();
+        let frontier_line = lines
+            .iter()
+            .find(|s| s.contains("FRONTIERS"))
+            .expect("hydration declares `blocks`");
+        assert!(
+            frontier_line.contains("decode not started"),
+            "it may not cite a height this payload does not have: {frontier_line}"
+        );
+        // and the sibling line must agree with it rather than contradict it
+        assert!(
+            lines
+                .iter()
+                .any(|s| s.contains("knows from the chain's seed")),
+            "the never_run rows come from the registry, not from halt records: {lines:?}"
+        );
+        assert!(
+            !lines
+                .iter()
+                .any(|s| s.contains("reflects only their own halt records")),
+            "the superseded claim must be gone, not sitting beside its correction: {lines:?}"
+        );
     }
 }

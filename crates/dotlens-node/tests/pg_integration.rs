@@ -6057,6 +6057,7 @@ fn app_over(pool: &PgPool, registry: std::sync::Arc<Registry>) -> api::AppState 
         coretime: Arc::new(api::pg::PgCoretimeIndex::new(pool.clone())),
         broker: Arc::new(api::pg::PgBrokerIndex::new(pool.clone())),
         channels: Arc::new(api::pg::PgChannelIndex::new(pool.clone())),
+        freshness: Arc::new(api::pg::PgFreshnessIndex::new(pool.clone())),
         parse_account: Arc::new(|s| {
             adapter_substrate::accounts::parse_account(s).map(|a| a.to_vec())
         }),

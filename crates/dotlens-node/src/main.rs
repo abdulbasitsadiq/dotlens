@@ -1492,6 +1492,7 @@ mismatched={} retirable_heights={}",
         coretime: read.coretime.clone(),
         broker: read.broker.clone(),
         channels: read.channels.clone(),
+        freshness: read.freshness.clone(),
         // family-encoded address parsing is adapter-owned (Invariant 4); with
         // more families this becomes registry-driven dispatch
         parse_account: Arc::new(|s| {
