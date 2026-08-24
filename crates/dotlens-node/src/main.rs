@@ -81,7 +81,7 @@
 use anyhow::{Context, Result};
 use api::{AppState, BlockIndex, MemoryBlockIndex};
 use dotlens_node::pipeline::ingest_fixtures;
-use ingest::live::{NoopRuntimeVersionSink, RuntimeVersionSink};
+use ingest::live::{ChainHeadSink, NoopChainHeadSink, NoopRuntimeVersionSink, RuntimeVersionSink};
 use ingest::{CheckpointStore, MemoryCheckpointStore, NoopReceiptSink, ReceiptSink};
 use raw_store::{FsRawStore, RawStore};
 use registry::Registry;
@@ -112,6 +112,10 @@ struct Backends {
     /// shapes and a second construction path is a second thing to keep true.
     #[cfg_attr(not(feature = "live"), allow(dead_code))]
     runtime_versions: Arc<dyn RuntimeVersionSink>,
+    /// Written by the live follower only (`live::tick`), so it is `live`-gated
+    /// for the same reason and in the same shape as `runtime_versions` above.
+    #[cfg_attr(not(feature = "live"), allow(dead_code))]
+    chain_head: Arc<dyn ChainHeadSink>,
     /// Kept for label sync/verify (they need direct SQL, not a trait).
     #[cfg(feature = "pg")]
     pool: Option<sqlx::PgPool>,
@@ -157,6 +161,7 @@ fn pg_backends(pool: sqlx::PgPool, serving: Option<sqlx::PgPool>) -> Backends {
         channels: Arc::new(api::pg::PgChannelIndex::new(pool.clone())),
         freshness: Arc::new(api::pg::PgFreshnessIndex::new(pool.clone())),
         runtime_versions: Arc::new(PgRuntimeVersionSink::new(pool.clone())),
+        chain_head: Arc::new(ingest::pg::PgChainHeadSink::new(pool.clone())),
         pool: Some(pool),
         serving_pool: serving,
         persistent: true,
@@ -197,8 +202,16 @@ async fn run_status(backends: &Backends, chain: &str, behind_max: Option<u64>) -
         .halts(chain)
         .await
         .map_err(|e| anyhow::anyhow!("read halts: {e}"))?;
+    // Read here rather than defaulted to `None`. `derive` takes the head as an
+    // argument precisely so a caller cannot forget it and get a report whose
+    // own prose says no head has ever been observed on a database that has one.
+    let head = backends
+        .freshness
+        .chain_head(chain)
+        .await
+        .map_err(|e| anyhow::anyhow!("read chain head: {e}"))?;
 
-    let report = api::freshness::derive(chain, &checkpoints, &halts, chrono::Utc::now());
+    let report = api::freshness::derive(chain, &checkpoints, &halts, head, chrono::Utc::now());
 
     if env_or("DOTLENS_STATUS_JSON", "0") == "1" {
         println!("{}", serde_json::to_string_pretty(&report)?);
@@ -213,10 +226,27 @@ async fn run_status(backends: &Backends, chain: &str, behind_max: Option<u64>) -
             opt(report.frontiers.decode.map(|v| v as i64)),
             opt(report.frontiers.decode_behind_raw)
         );
-        println!(
-            "  chain head:      NOT READ  (behind chain: {})",
-            opt(report.frontiers.raw_behind_chain)
-        );
+        // SUBSTITUTED in slice 1b: this line read "NOT READ" and the head is now
+        // recorded. The age is printed on the SAME line as the delta and never
+        // without it — a delta against an observation nobody refreshed falls
+        // toward 0, which reads as "level with the chain" and is the flattering
+        // direction. There is no threshold here and no colour: what counts as
+        // too old is the operator's, exactly as `behind-max-blocks` is.
+        match report.frontiers.chain_head {
+            // RECORDED, not observed: a follower reads the head every tick even
+            // with nowhere to put it, so this is a statement about the table and
+            // not about whether anybody looked.
+            None => println!(
+                "  chain head:      NEVER RECORDED  (no follower, no completed tick, or a \
+                 refused head write — not distinguishable here)"
+            ),
+            Some(h) => println!(
+                "  chain head:      {} (finalized)   raw behind chain: {}   observed {}s ago",
+                h.finalized_height,
+                opt(report.frontiers.raw_behind_chain),
+                h.age_seconds,
+            ),
+        }
         println!();
         // An EMPTY module list is the one row this table cannot draw, and a
         // blank space under a green exit code reads as "all clear" — which is
@@ -326,6 +356,7 @@ fn memory_backends() -> Backends {
         channels: Arc::new(api::MemoryChannelIndex::new()),
         freshness: Arc::new(api::MemoryFreshnessIndex::new()),
         runtime_versions: Arc::new(NoopRuntimeVersionSink),
+        chain_head: Arc::new(NoopChainHeadSink),
         #[cfg(feature = "pg")]
         pool: None,
         #[cfg(feature = "pg")]
@@ -1549,6 +1580,7 @@ fn spawn_live_followers(
                 checkpoints: backends.checkpoints.as_ref(),
                 receipts: backends.receipts.as_ref(),
                 runtime_versions: backends.runtime_versions.as_ref(),
+                chain_head: backends.chain_head.as_ref(),
             };
             ingest::live::follow(&chain_id, &source, &deps, poll).await;
         });
@@ -1598,11 +1630,17 @@ async fn run_backfill(
             // each worker owns its connection + failover rotation
             let source =
                 SubstrateSource::new(&chain_id, endpoints).map_err(|e| anyhow::anyhow!(e))?;
+            // EXPLICITLY the noop, not the real sink. `ingest_range` records no
+            // head today, and this is the construction site that makes sure it
+            // never starts: a backfill chunk observes no head, and a head dated
+            // to whenever somebody last ran a backfill is worse than none.
+            let no_head = NoopChainHeadSink;
             let deps = ingest::live::IngestDeps {
                 raw: raw.as_ref(),
                 checkpoints: checkpoints.as_ref(),
                 receipts: receipts.as_ref(),
                 runtime_versions: runtime_versions.as_ref(),
+                chain_head: &no_head,
             };
             let module = format!("{}:{a}-{b}", ingest::live::MODULE_BACKFILL);
             let n = ingest::live::ingest_range(&chain_id, &source, &deps, &module, a, b, &mut None)

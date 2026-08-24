@@ -15,7 +15,10 @@ use crate::{
     should_process, Checkpoint, CheckpointError, CheckpointStore, IngestOutcome, ReceiptSink,
 };
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 use raw_store::{keys, RawStore};
+use std::collections::HashMap;
+use std::sync::Mutex;
 use std::time::Duration;
 
 #[derive(Debug, thiserror::Error)]
@@ -97,6 +100,152 @@ impl RuntimeVersionSink for NoopRuntimeVersionSink {
     }
 }
 
+// ----------------------------------------------------------- chain head sink
+
+/// Where the head this worker already reads gets durably recorded
+/// (`core.chain_head`, migration 0029).
+///
+/// # WHY THIS IS ITS OWN SINK AND NOT A METHOD ON `CheckpointStore`
+///
+/// A checkpoint means PROCESSED UP TO and a head means OBSERVED AT, and the two
+/// verbs want opposite guards: `CheckpointStore::advance` refuses a
+/// non-advancing write and deliberately does not move `updated_at` unless the
+/// height moves, which is exactly what a head must do on every tick. 0029
+/// rejects the conflation at the table; accepting it at the trait would leave
+/// the conflation in place one layer up.
+///
+/// The shape it copies is [`RuntimeVersionSink`]: a fact the live worker
+/// observes in passing, handed to a durable sink, with a Noop for DB-less runs.
+///
+/// # WHAT A DROPPED OBSERVATION COSTS, AND WHY IT IS SAFE TO DROP
+///
+/// [`NoopChainHeadSink`] discards it, and a `record` that fails is logged and
+/// stepped over rather than failing the tick — see [`tick`]. Both are safe for
+/// one reason and only that reason: **the loss renders as NULL or as an ageing
+/// row, never as zero.** The freshness reader reports "no chain head has ever
+/// been RECORDED here" or "this observation is N seconds old", so a dropped head
+/// cannot render as being level with the chain.
+///
+/// **It is not, however, DISTINGUISHABLE.** A discarded head and a chain nobody
+/// has ever followed produce the same null, and the reader says exactly that
+/// rather than picking one. The wording is `RECORDED` and never `OBSERVED`
+/// throughout, because the follower did observe it — the observation is what was
+/// thrown away.
+#[async_trait]
+pub trait ChainHeadSink: Send + Sync {
+    /// Record that at `observed_at` the source reported `finalized_height` as
+    /// this chain's finalized head.
+    ///
+    /// **LATEST WRITE WINS, INCLUDING DOWNWARD.** `finalized_height` rotates
+    /// endpoints and a lagging one legitimately reports a lower head than the
+    /// previous call did. Taking `greatest()` would manufacture a monotonic head
+    /// no single observation supports; the reader renders the delta signed
+    /// instead and says so in the payload.
+    ///
+    /// Primitives rather than a shared struct, because the READER of this row
+    /// lives in `api` and `api` does not depend on `ingest` — the dependency
+    /// runs generic ← protocol. A struct defined twice is the shape that drifts;
+    /// three primitives cannot. The two SQL statements are pinned against each
+    /// other by a write-then-read integration test rather than by a constant.
+    async fn record(
+        &self,
+        chain_id: &str,
+        finalized_height: u64,
+        observed_at: DateTime<Utc>,
+    ) -> Result<(), SinkError>;
+}
+
+/// For DB-less runs, and for the backfill, which observes no head at all.
+///
+/// **NOTHING LOGS THE DISCARDED HEAD** — an earlier draft of this comment said
+/// "observable in logs only", which was false about the code beside it. The
+/// observation is dropped without a trace, and what makes that acceptable is the
+/// READ side rather than a log line: the freshness report says no chain head has
+/// ever been RECORDED on this chain, which is true, and which is not the same
+/// sentence as "nobody looked". [`ChainHeadSink`] carries the argument.
+///
+/// The consequence worth knowing: **a run with no database can never surface a
+/// head**, because the writer here and `api::MemoryFreshnessIndex` are unrelated
+/// stores with nothing between them. That is the same shape the checkpoint
+/// stores already have and it is not this slice's to change.
+#[derive(Default)]
+pub struct NoopChainHeadSink;
+
+#[async_trait]
+impl ChainHeadSink for NoopChainHeadSink {
+    async fn record(&self, _: &str, _: u64, _: DateTime<Utc>) -> Result<(), SinkError> {
+        Ok(())
+    }
+}
+
+/// One recorded observation, as the memory sink keeps it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RecordedHead {
+    pub finalized_height: u64,
+    pub observed_at: DateTime<Utc>,
+    /// How many times `record` has been called for this chain.
+    ///
+    /// **It is here because the height cannot prove what has to be proved.** The
+    /// case that matters is a CAUGHT-UP follower still refreshing the head, and
+    /// in that case the height is unchanged by construction — only a counter (or
+    /// the timestamp, which a fast test may not advance) can tell a tick that
+    /// re-observed the same head from a tick that never looked.
+    pub writes: u64,
+}
+
+/// In-memory head observations — a TEST DOUBLE, and nothing else uses it.
+///
+/// It is deliberately not described as the DB-less backend: the DB-less wiring
+/// takes [`NoopChainHeadSink`], because nothing reads this store (the freshness
+/// reader lives in `api` and cannot see it). Saying otherwise would name a
+/// caller that does not exist.
+#[derive(Default)]
+pub struct MemoryChainHeadSink {
+    rows: Mutex<HashMap<String, RecordedHead>>,
+}
+
+impl MemoryChainHeadSink {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The latest observation for `chain_id`, or `None` when none was recorded.
+    pub fn get(&self, chain_id: &str) -> Option<RecordedHead> {
+        self.rows
+            .lock()
+            .expect("chain head lock")
+            .get(chain_id)
+            .copied()
+    }
+}
+
+#[async_trait]
+impl ChainHeadSink for MemoryChainHeadSink {
+    async fn record(
+        &self,
+        chain_id: &str,
+        finalized_height: u64,
+        observed_at: DateTime<Utc>,
+    ) -> Result<(), SinkError> {
+        let mut rows = self.rows.lock().map_err(|e| SinkError(e.to_string()))?;
+        let entry = rows
+            .entry(chain_id.to_string())
+            .or_insert(RecordedHead {
+                finalized_height,
+                observed_at,
+                writes: 0,
+            });
+        // LATEST WINS, INCLUDING DOWNWARD — the same rule as the Postgres
+        // upsert, written the same way here so the two backends cannot disagree
+        // about what "the head" means. No `max`: a lower finalized head from a
+        // lagging endpoint is a real observation, and the reader is signed.
+        entry.finalized_height = finalized_height;
+        entry.observed_at = observed_at;
+        entry.writes += 1;
+        Ok(())
+    }
+}
+
 /// Substrate metadata blobs start with the magic b"meta" then a version byte.
 /// Returns None (never guesses) if the blob doesn't look like that.
 pub fn metadata_version_byte(blob: &[u8]) -> Option<u8> {
@@ -124,6 +273,10 @@ pub struct IngestDeps<'a> {
     pub checkpoints: &'a dyn CheckpointStore,
     pub receipts: &'a dyn ReceiptSink,
     pub runtime_versions: &'a dyn RuntimeVersionSink,
+    /// Written by [`tick`] only. `ingest_range` never touches it: a bounded
+    /// backfill chunk observes no head, and recording one from a range command
+    /// would date the chain's head to whenever somebody last ran a backfill.
+    pub chain_head: &'a dyn ChainHeadSink,
 }
 
 /// Checkpoint module for the live/backfill RAW pipeline. Distinct from the
@@ -229,6 +382,31 @@ pub async fn tick(
     last_runtime_version: &mut Option<u32>,
 ) -> Result<u64, LiveError> {
     let target = source.finalized_height().await?;
+
+    // RECORDED HERE, BEFORE THE CAUGHT-UP EARLY RETURN BELOW, AND THE ORDER IS
+    // THE POINT. A follower with nothing to ingest takes that return on every
+    // tick, and a caught-up follower is precisely when this row is the only
+    // evidence it is still alive: the whole failure this observation exists to
+    // expose is a dead follower whose frozen head makes `raw_behind_chain` fall
+    // to 0 and read as "caught up with the chain". Recording after the return
+    // would freeze the head exactly when the pipeline looked healthiest.
+    //
+    // A FAILURE HERE IS LOGGED AND STEPPED OVER RATHER THAN FAILING THE TICK.
+    // Raw ingestion is the load-bearing job (Invariant 1) and a monitoring write
+    // must not be able to stop it. The drop is not silent: the row stops being
+    // refreshed, its age grows, and the freshness report renders that age beside
+    // the delta — so this failure surfaces on the surface it feeds. Continuing
+    // also drives `raw_behind_chain` NEGATIVE as the frontier climbs past the
+    // frozen head, which the reader reports signed and explains as an
+    // observation being behind us.
+    if let Err(e) = deps.chain_head.record(chain_id, target, Utc::now()).await {
+        tracing::warn!(
+            chain = %chain_id, head = target, error = %e,
+            "chain head observation not recorded — ingestion continues; \
+             the freshness report will show this observation ageing"
+        );
+    }
+
     let from = match deps.checkpoints.get(chain_id, MODULE_LIVE).await? {
         Some(cp) if cp.last_height >= target => return Ok(0), // nothing new
         Some(cp) => cp.last_height + 1,
@@ -389,11 +567,13 @@ mod tests {
         let checkpoints = MemoryCheckpointStore::new();
         let receipts = MemReceipts::default();
         let versions = MemRuntimeSink::default();
+        let heads = MemoryChainHeadSink::new();
         let deps = IngestDeps {
             raw: &raw,
             checkpoints: &checkpoints,
             receipts: &receipts,
             runtime_versions: &versions,
+            chain_head: &heads,
         };
 
         let mut rv = None;
@@ -440,11 +620,13 @@ mod tests {
         let checkpoints = MemoryCheckpointStore::new();
         let receipts = MemReceipts::default();
         let versions = MemRuntimeSink::default();
+        let heads = MemoryChainHeadSink::new();
         let deps = IngestDeps {
             raw: &raw,
             checkpoints: &checkpoints,
             receipts: &receipts,
             runtime_versions: &versions,
+            chain_head: &heads,
         };
 
         // first tick: no checkpoint → tip only (history is backfill's job)
@@ -472,11 +654,13 @@ mod tests {
         let checkpoints = MemoryCheckpointStore::new();
         let receipts = MemReceipts::default();
         let versions = MemRuntimeSink::default();
+        let heads = MemoryChainHeadSink::new();
         let deps = IngestDeps {
             raw: &raw,
             checkpoints: &checkpoints,
             receipts: &receipts,
             runtime_versions: &versions,
+            chain_head: &heads,
         };
         let mut rv = None;
         assert_eq!(tick("mockchain", &source, &deps, &mut rv).await.unwrap(), 1); // at tip=5
@@ -493,6 +677,147 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(cp.last_height, 9);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Always fails. Proves the head write cannot stop ingestion.
+    #[derive(Default)]
+    struct FailingChainHeadSink;
+
+    #[async_trait]
+    impl ChainHeadSink for FailingChainHeadSink {
+        async fn record(&self, _: &str, _: u64, _: DateTime<Utc>) -> Result<(), SinkError> {
+            Err(SinkError("chain_head write refused".into()))
+        }
+    }
+
+    /// **THE ORDERING THAT IS THE POINT OF THE SLICE.** `tick` returns early
+    /// when the checkpoint is already at the finalized head, and that early
+    /// return is taken on nearly every tick of a healthy follower. If the head
+    /// were recorded after it, the observation would stop being refreshed
+    /// exactly when the pipeline is caught up — and a frozen head makes
+    /// `raw_behind_chain` read 0, which is "level with the chain", the
+    /// flattering direction.
+    ///
+    /// The height cannot show this: it is unchanged by construction on a
+    /// caught-up tick. The WRITE COUNT can.
+    #[tokio::test]
+    async fn a_caught_up_tick_still_records_the_head_because_that_is_when_it_matters() {
+        let source = MockSource::new(7);
+        let (raw, dir) = tmp_raw("head-early-return");
+        let checkpoints = MemoryCheckpointStore::new();
+        let receipts = MemReceipts::default();
+        let versions = MemRuntimeSink::default();
+        let heads = MemoryChainHeadSink::new();
+        let deps = IngestDeps {
+            raw: &raw,
+            checkpoints: &checkpoints,
+            receipts: &receipts,
+            runtime_versions: &versions,
+            chain_head: &heads,
+        };
+
+        let mut rv = None;
+        assert_eq!(tick("mockchain", &source, &deps, &mut rv).await.unwrap(), 1);
+        let first = heads.get("mockchain").expect("recorded on the first tick");
+        assert_eq!(first.finalized_height, 7);
+        assert_eq!(first.writes, 1);
+
+        // Nothing new: this tick takes `return Ok(0)`.
+        assert_eq!(tick("mockchain", &source, &deps, &mut rv).await.unwrap(), 0);
+        let second = heads.get("mockchain").expect("still recorded");
+        assert_eq!(
+            second.finalized_height, 7,
+            "the head has not moved, and that is the case being tested"
+        );
+        assert_eq!(
+            second.writes, 2,
+            "a caught-up follower is precisely when this row is the only evidence it is alive"
+        );
+
+        // And a head that goes DOWN is stored as observed, not maxed away: a
+        // lagging endpoint is a real observation and the reader is signed.
+        *source.finalized.lock().unwrap() = 3;
+        assert_eq!(tick("mockchain", &source, &deps, &mut rv).await.unwrap(), 0);
+        let third = heads.get("mockchain").expect("still recorded");
+        assert_eq!(
+            third.finalized_height, 3,
+            "greatest() would invent a monotonic head no observation supports"
+        );
+        assert_eq!(third.writes, 3);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Raw ingestion is the load-bearing job (Invariant 1) and a monitoring
+    /// write must not be able to stop it. The drop is not silent — the row stops
+    /// being refreshed and the freshness report renders that age — so the
+    /// failure surfaces on the surface it feeds.
+    #[tokio::test]
+    async fn a_head_sink_that_refuses_does_not_stop_ingestion() {
+        let source = MockSource::new(9);
+        let (raw, dir) = tmp_raw("head-fails");
+        let checkpoints = MemoryCheckpointStore::new();
+        let receipts = MemReceipts::default();
+        let versions = MemRuntimeSink::default();
+        let heads = FailingChainHeadSink;
+        let deps = IngestDeps {
+            raw: &raw,
+            checkpoints: &checkpoints,
+            receipts: &receipts,
+            runtime_versions: &versions,
+            chain_head: &heads,
+        };
+
+        let mut rv = None;
+        assert_eq!(
+            tick("mockchain", &source, &deps, &mut rv).await.unwrap(),
+            1,
+            "the tick must succeed and ingest"
+        );
+        *source.finalized.lock().unwrap() = 12;
+        assert_eq!(tick("mockchain", &source, &deps, &mut rv).await.unwrap(), 3);
+        let cp = checkpoints
+            .get("mockchain", MODULE_LIVE)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(cp.last_height, 12);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// `ingest_range` records NO head, and the construction site that keeps it
+    /// that way is the backfill's explicit `NoopChainHeadSink`. A bounded chunk
+    /// observes no head, and a head dated to whenever somebody last ran a
+    /// backfill would be worse than none.
+    #[tokio::test]
+    async fn a_range_ingest_records_no_head_at_all() {
+        let source = MockSource::new(10);
+        let (raw, dir) = tmp_raw("head-range");
+        let checkpoints = MemoryCheckpointStore::new();
+        let receipts = MemReceipts::default();
+        let versions = MemRuntimeSink::default();
+        let heads = MemoryChainHeadSink::new();
+        let deps = IngestDeps {
+            raw: &raw,
+            checkpoints: &checkpoints,
+            receipts: &receipts,
+            runtime_versions: &versions,
+            chain_head: &heads,
+        };
+
+        let mut rv = None;
+        let n = ingest_range("mockchain", &source, &deps, MODULE_BACKFILL, 1, 5, &mut rv)
+            .await
+            .unwrap();
+        assert_eq!(n, 5);
+        assert_eq!(
+            heads.get("mockchain"),
+            None,
+            "a backfill chunk has no head to observe"
+        );
 
         let _ = std::fs::remove_dir_all(dir);
     }

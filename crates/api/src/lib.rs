@@ -3656,6 +3656,23 @@ pub trait FreshnessIndex: Send + Sync {
     /// Whether a halt still blocks is derived against the checkpoint and is
     /// deliberately not stored, so this reader cannot pre-filter on it.
     async fn halts(&self, chain_id: &str) -> Result<Vec<freshness::HaltRow>, IndexError>;
+
+    /// The `core.chain_head` row (migration 0029) — what the live follower last
+    /// observed — or `None` when nothing has ever recorded one for this chain.
+    ///
+    /// **NO DEFAULT IMPLEMENTATION.** One returning `Ok(None)` would be a gate
+    /// that never fires: a backend that forgot to override it would serve
+    /// "no head has ever been observed here" over a table that has one, forever,
+    /// and every test would still pass. Both shipped backends implement it and a
+    /// write-then-read integration test pins them against each other.
+    ///
+    /// It returns the ROW and not an age, for the same reason the other two
+    /// return rows: the age is a function of the clock the report is derived at,
+    /// and `freshness::derive` is the one place that clock exists.
+    async fn chain_head(
+        &self,
+        chain_id: &str,
+    ) -> Result<Option<freshness::HeadObservation>, IndexError>;
 }
 
 /// In-memory freshness rows, for DB-less runs and tests.
@@ -3663,6 +3680,10 @@ pub trait FreshnessIndex: Send + Sync {
 pub struct MemoryFreshnessIndex {
     checkpoints: RwLock<Vec<(String, freshness::CheckpointRow)>>,
     halts: RwLock<Vec<(String, freshness::HaltRow)>>,
+    /// A MAP, not a list, because `core.chain_head` is one row per chain and the
+    /// newest observation replaces it. A list would make the answer depend on
+    /// which end a reader picked, and the two backends would disagree.
+    heads: RwLock<HashMap<String, freshness::HeadObservation>>,
 }
 
 impl MemoryFreshnessIndex {
@@ -3682,6 +3703,16 @@ impl MemoryFreshnessIndex {
             .write()
             .expect("freshness halts lock")
             .push((chain_id.to_string(), row));
+    }
+
+    /// Latest wins, including downward — the same rule migration 0029's upsert
+    /// applies, because a lagging endpoint reporting a lower finalized head is a
+    /// real observation and the reader's delta is signed.
+    pub fn set_chain_head(&self, chain_id: &str, row: freshness::HeadObservation) {
+        self.heads
+            .write()
+            .expect("freshness heads lock")
+            .insert(chain_id.to_string(), row);
     }
 }
 
@@ -3709,6 +3740,14 @@ impl FreshnessIndex for MemoryFreshnessIndex {
             .filter(|(c, _)| c == chain_id)
             .map(|(_, r)| r.clone())
             .collect())
+    }
+
+    async fn chain_head(
+        &self,
+        chain_id: &str,
+    ) -> Result<Option<freshness::HeadObservation>, IndexError> {
+        let heads = self.heads.read().map_err(|e| IndexError(e.to_string()))?;
+        Ok(heads.get(chain_id).copied())
     }
 }
 
@@ -3814,6 +3853,35 @@ pub mod pg {
                     seen_count: r.9 as u64,
                 })
                 .collect())
+        }
+
+        /// One row or none, by primary key. `fetch_optional`, never
+        /// `fetch_one().unwrap_or_default()`: a chain nothing has ever followed
+        /// must come back as "no observation", never as a head of 0 observed at
+        /// the epoch, which is "we did not look" rendering as a fact.
+        ///
+        /// The WRITER of this row is `ingest::pg::PgChainHeadSink`, in the crate
+        /// on the other side of the dependency boundary (`api` does not depend
+        /// on `ingest`). The two SQL statements are the only shared definition,
+        /// and a write-then-read integration test is what pins them — the same
+        /// job the `MODULE_RAW`/`MODULE_LIVE` equality test does for the two
+        /// checkpoint keys.
+        async fn chain_head(
+            &self,
+            chain_id: &str,
+        ) -> Result<Option<super::freshness::HeadObservation>, IndexError> {
+            let row: Option<(i64, DateTime<Utc>)> = sqlx::query_as(
+                "select finalized_height, observed_at \
+                 from core.chain_head where chain_id = $1",
+            )
+            .bind(chain_id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(IndexError::from)?;
+            Ok(row.map(|(h, at)| super::freshness::HeadObservation {
+                finalized_height: h as u64,
+                observed_at: at,
+            }))
         }
     }
 
@@ -11242,6 +11310,17 @@ async fn resolve_domain(
 /// carries its own `as_of`; this says how far the index has got. One "last
 /// updated" line spanning the two would be a claim neither of them makes.
 ///
+/// # THE CHAIN HEAD IS DATED, AND THE PAGE MUST RENDER THE DATE
+///
+/// `frontiers.chain_head` is what the live follower last RECORDED, not a live
+/// reading — a read path makes no RPC call. So `raw_behind_chain` is a delta
+/// against a dated observation, and if the follower died, the head froze at the
+/// same instant the raw frontier did: the delta falls toward **0** while nothing
+/// is catching up. **Never render the delta without
+/// `chain_head.age_seconds`**, and never draw a "live" indicator on it. It is
+/// also the FINALIZED head; the best block is ahead of it by the finality lag
+/// and no checkpoint records that.
+///
 /// # WHAT THIS ROUTE KNOWS THAT THE CLI DOES NOT: THE REGISTRY
 ///
 /// Hence `with_declared`. A module the chain's seed declares and has never
@@ -11260,9 +11339,11 @@ async fn get_freshness(State(state): State<AppState>, Path(chain): Path<String>)
     let Some(cfg) = state.registry.chain(&chain) else {
         return error(StatusCode::NOT_FOUND, format!("unknown chain '{chain}'"));
     };
-    // Both reads are taken whole and unfiltered — the trait says why, and a
+    // Every read below is taken whole and unfiltered — the trait says why, and a
     // handler that narrowed them would be the second implementation of a rule
-    // this file keeps in exactly one place.
+    // this file keeps in exactly one place. (This said "Both" until the head
+    // landed and made it three. A count in prose goes stale the next time
+    // something is added; the same mistake is what `reads_as` stopped making.)
     let checkpoints = match state.freshness.checkpoints(&cfg.id).await {
         Ok(v) => v,
         Err(e) => return read_failure(e),
@@ -11271,9 +11352,17 @@ async fn get_freshness(State(state): State<AppState>, Path(chain): Path<String>)
         Ok(v) => v,
         Err(e) => return read_failure(e),
     };
+    // A third read, and it is a REFUSAL on error rather than a `None`: falling
+    // back to `None` would serve a report whose own prose says no head has ever
+    // been observed on this chain, which is a claim about the pipeline made from
+    // a failed query. Same shape as the two reads above.
+    let head = match state.freshness.chain_head(&cfg.id).await {
+        Ok(v) => v,
+        Err(e) => return read_failure(e),
+    };
 
-    let report =
-        freshness::derive(&cfg.id, &checkpoints, &halts, Utc::now()).with_declared(&cfg.modules);
+    let report = freshness::derive(&cfg.id, &checkpoints, &halts, head, Utc::now())
+        .with_declared(&cfg.modules);
 
     // A 500, deliberately not a defaulted body: an empty object served with a
     // 200 would render as a chain with no modules and no gaps, which is the one
@@ -13156,6 +13245,20 @@ pub(crate) mod tests {
                     .expect("ts")
                     .with_timezone(&Utc),
                 seen_count: 12,
+            },
+        );
+        // The chain's own head (slice 1b). Deliberately NOT level with the raw
+        // frontier: a zero delta is also what a missing row would produce once
+        // `raw_behind_chain` stops being permanently null, so a fixture that
+        // happened to be level could not tell the two apart. `hydration` is the
+        // opposite arm — no head at all — and its test asserts that.
+        freshness.set_chain_head(
+            "polkadot-asset-hub",
+            freshness::HeadObservation {
+                finalized_height: 19_000_100,
+                observed_at: DateTime::parse_from_rfc3339("2026-08-24T11:59:55Z")
+                    .expect("ts")
+                    .with_timezone(&Utc),
             },
         );
         let freshness: Arc<dyn FreshnessIndex> = freshness;
@@ -15928,12 +16031,25 @@ pub(crate) mod tests {
         assert_eq!(status, StatusCode::OK);
 
         assert_eq!(body["chain_id"], "polkadot-asset-hub");
-        assert_eq!(body["reader_version"], 2);
+        assert_eq!(body["reader_version"], 3);
         assert_eq!(body["frontiers"]["raw"], 19_000_040u64);
         assert_eq!(body["frontiers"]["decode"], 19_000_010u64);
         assert_eq!(body["frontiers"]["decode_behind_raw"], 30);
-        // Still not read — a NULL field and a named gap, not a silence.
-        assert!(body["frontiers"]["raw_behind_chain"].is_null());
+        // The top of the stack, end to end: a dated observation, the delta
+        // against it, and the age that makes the delta readable. The age is not
+        // asserted as a VALUE — this report is derived at `Utc::now()` and the
+        // fixture's timestamp is fixed, so the number grows with the calendar.
+        // What must hold is that it is present and is a number.
+        assert_eq!(
+            body["frontiers"]["chain_head"]["finalized_height"],
+            19_000_100u64
+        );
+        assert_eq!(body["frontiers"]["raw_behind_chain"], 60);
+        assert!(
+            body["frontiers"]["chain_head"]["age_seconds"].is_i64(),
+            "a head without an age is the object no consumer may be handed: {:?}",
+            body["frontiers"]["chain_head"]
+        );
 
         let state_of = |name: &str| -> String {
             body["modules"]
@@ -16147,6 +16263,27 @@ pub(crate) mod tests {
                 .iter()
                 .any(|s| s.contains("reflects only their own halt records")),
             "the superseded claim must be gone, not sitting beside its correction: {lines:?}"
+        );
+
+        // THE OTHER ARM OF THE HEAD, end to end. No follower has ever recorded
+        // one here, so the whole object is null and the delta is null with it —
+        // never a 0, which would read as "level with the chain".
+        assert!(
+            body["frontiers"]["chain_head"].is_null(),
+            "{:?}",
+            body["frontiers"]
+        );
+        assert!(body["frontiers"]["raw_behind_chain"].is_null());
+        assert!(
+            lines
+                .iter()
+                .any(|s| s.contains("NO CHAIN HEAD HAS EVER BEEN RECORDED")),
+            "{lines:?}"
+        );
+        // and the qualifier that only belongs beside a real head is absent
+        assert!(
+            !lines.iter().any(|s| s.contains("not the chain's best block")),
+            "{lines:?}"
         );
     }
 }

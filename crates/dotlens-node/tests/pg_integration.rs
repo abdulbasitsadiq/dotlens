@@ -12,6 +12,7 @@ use api::pg::PgBlockIndex;
 use api::{BlockIndex, FreshnessIndex, MemoryFreshnessIndex};
 use dotlens_node::pipeline::ingest_fixtures;
 use dotlens_node::registry_sync::sync_registry;
+use ingest::live::ChainHeadSink;
 use ingest::module::Halt;
 use ingest::pg::{PgCheckpointStore, PgReceiptSink};
 use ingest::{should_process, Checkpoint, CheckpointStore, IngestOutcome, ReceiptSink};
@@ -337,11 +338,14 @@ async fn live_raw_pipeline_persists_lineage_and_resumes() {
     let checkpoints = PgCheckpointStore::new(db.pool.clone());
     let receipts = PgReceiptSink::new(db.pool.clone());
     let versions = dotlens_node::runtime_versions::PgRuntimeVersionSink::new(db.pool.clone());
+    // `ingest_range` records no head; the noop is what keeps it that way.
+    let no_head = ingest::live::NoopChainHeadSink;
     let deps = ingest::live::IngestDeps {
         raw: &raw,
         checkpoints: &checkpoints,
         receipts: &receipts,
         runtime_versions: &versions,
+        chain_head: &no_head,
     };
     let source = MockSource { finalized: 10 };
 
@@ -407,6 +411,7 @@ async fn live_raw_pipeline_persists_lineage_and_resumes() {
         checkpoints: &checkpoints2,
         receipts: &receipts,
         runtime_versions: &versions2,
+        chain_head: &no_head,
     };
     let source2 = MockSource { finalized: 15 };
     let n = ingest::live::ingest_range(
@@ -491,11 +496,13 @@ async fn decode_worker_lands_canonical_rows_in_pg() {
     let checkpoints = PgCheckpointStore::new(db.pool.clone());
     let receipts = PgReceiptSink::new(db.pool.clone());
     let versions = dotlens_node::runtime_versions::PgRuntimeVersionSink::new(db.pool.clone());
+    let no_head = ingest::live::NoopChainHeadSink;
     let live_deps = ingest::live::IngestDeps {
         raw: &raw,
         checkpoints: &checkpoints,
         receipts: &receipts,
         runtime_versions: &versions,
+        chain_head: &no_head,
     };
     let source = MockSource { finalized: 6 };
     ingest::live::ingest_range(
@@ -5844,27 +5851,98 @@ async fn a_halt_upserts_on_its_coordinates_and_stops_blocking_without_being_dele
         .await
         .expect("kusama halt");
 
+    // --- the chain head, across the crate boundary (slice 1b) ---------------
+    //
+    // THE WRITER IS IN `ingest` AND THE READER IS IN `api`, and the two SQL
+    // statements naming `core.chain_head` are the only shared definition — `api`
+    // does not depend on `ingest`, so no constant can be shared and no test can
+    // pin one. THIS ROUND TRIP IS THE PIN. If either statement names a column
+    // the other does not, nothing else in the suite notices.
+    let head_sink = ingest::pg::PgChainHeadSink::new(db.pool.clone());
+    let seen_at = chrono::DateTime::parse_from_rfc3339("2026-08-24T11:59:55Z")
+        .expect("ts")
+        .with_timezone(&chrono::Utc);
+    head_sink
+        .record(CHAIN, 500, seen_at)
+        .await
+        .expect("head observed");
+    head_sink
+        .record("kusama", 42, seen_at)
+        .await
+        .expect("another chain's head");
+
     // --- the readers, and what they must not return -------------------------
     let idx = api::pg::PgFreshnessIndex::new(db.pool.clone());
     let checkpoints = idx.checkpoints(CHAIN).await.expect("checkpoints");
     let halts = idx.halts(CHAIN).await.expect("halts");
+    let head = idx.chain_head(CHAIN).await.expect("chain head");
     assert!(
         checkpoints.iter().all(|c| c.height != 7) && halts.iter().all(|h| h.height != 9),
         "both readers filter by chain_id: {checkpoints:?} {halts:?}"
     );
     assert_eq!(idx.checkpoints("kusama").await.unwrap().len(), 1);
     assert_eq!(idx.halts("kusama").await.unwrap().len(), 1);
+    assert_eq!(
+        idx.chain_head("kusama")
+            .await
+            .unwrap()
+            .expect("kusama's own head")
+            .finalized_height,
+        42,
+        "the head reader filters by chain_id too"
+    );
+    assert!(
+        idx.chain_head("never-followed")
+            .await
+            .expect("a chain with no row is not an error")
+            .is_none(),
+        "no observation must come back as None, never as a head of 0 at the epoch"
+    );
 
     let observed = chrono::Utc::now();
-    let report = freshness::derive(CHAIN, &checkpoints, &halts, observed);
+    let report = freshness::derive(CHAIN, &checkpoints, &halts, head, observed);
 
     assert_eq!(report.frontiers.raw, Some(400));
     assert_eq!(report.frontiers.decode, Some(300));
     assert_eq!(report.frontiers.decode_behind_raw, Some(100));
+    let head_frontier = report.frontiers.chain_head.expect("head in the report");
+    assert_eq!(head_frontier.finalized_height, 500);
     assert_eq!(
-        report.frontiers.raw_behind_chain, None,
-        "the chain's own head is not read"
+        head_frontier.observed_at, seen_at,
+        "the timestamp round-trips through timestamptz unchanged"
     );
+    assert_eq!(
+        report.frontiers.raw_behind_chain,
+        Some(100),
+        "raw is at 400 and the head we last saw was 500"
+    );
+
+    // THE ONE THING ONLY A REAL DATABASE SHOWS: this upsert is UNCONDITIONAL,
+    // unlike `indexer_state`'s, which is guarded `last_height < excluded` and
+    // returns `Regression` on a non-advancing write. A head that has not moved
+    // must still refresh `observed_at`, and a head that moved DOWN — a lagging
+    // endpoint — must replace the row rather than being maxed away.
+    let later = chrono::DateTime::parse_from_rfc3339("2026-08-24T12:00:25Z")
+        .expect("ts")
+        .with_timezone(&chrono::Utc);
+    head_sink
+        .record(CHAIN, 450, later)
+        .await
+        .expect("a lower head is still an observation");
+    let lowered = idx.chain_head(CHAIN).await.unwrap().expect("still there");
+    assert_eq!(lowered.finalized_height, 450);
+    assert_eq!(lowered.observed_at, later);
+    let regressed = freshness::derive(CHAIN, &checkpoints, &halts, Some(lowered), observed);
+    assert_eq!(
+        regressed.frontiers.raw_behind_chain,
+        Some(50),
+        "still positive here; the SIGNED case is unit-tested in freshness.rs"
+    );
+    // and put the row back, so the parity comparison below is over one state
+    head_sink
+        .record(CHAIN, 500, seen_at)
+        .await
+        .expect("restore the observation");
     let names: Vec<&str> = report.modules.iter().map(|m| m.module.as_str()).collect();
     assert_eq!(
         names,
@@ -5919,6 +5997,7 @@ async fn a_halt_upserts_on_its_coordinates_and_stops_blocking_without_being_dele
         CHAIN,
         &idx.checkpoints(CHAIN).await.unwrap(),
         &idx.halts(CHAIN).await.unwrap(),
+        idx.chain_head(CHAIN).await.unwrap(),
         observed,
     );
     let balances = &after.modules[0];
@@ -5976,10 +6055,18 @@ async fn a_halt_upserts_on_its_coordinates_and_stops_blocking_without_being_dele
     for row in idx.checkpoints("kusama").await.unwrap() {
         mem.insert_checkpoint("kusama", row);
     }
+    // The head too, and BOTH chains' — a memory backend that ignored `chain_id`
+    // would otherwise agree with Postgres here by accident.
+    for chain in [CHAIN, "kusama"] {
+        if let Some(row) = idx.chain_head(chain).await.unwrap() {
+            mem.set_chain_head(chain, row);
+        }
+    }
     let from_memory = freshness::derive(
         CHAIN,
         &mem.checkpoints(CHAIN).await.unwrap(),
         &mem.halts(CHAIN).await.unwrap(),
+        mem.chain_head(CHAIN).await.unwrap(),
         observed,
     );
     assert_eq!(

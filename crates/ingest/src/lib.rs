@@ -247,6 +247,7 @@ impl CheckpointStore for MemoryCheckpointStore {
 
 #[cfg(feature = "pg")]
 pub mod pg {
+    use super::live::{ChainHeadSink, SinkError};
     use super::{Checkpoint, CheckpointError, ReceiptError, ReceiptSink};
     use async_trait::async_trait;
     use chrono::{DateTime, Utc};
@@ -365,6 +366,62 @@ pub mod pg {
                     attempted: cp.last_height,
                 });
             }
+            Ok(())
+        }
+    }
+
+    /// The chain's own finalized head, as the live follower observed it
+    /// (`core.chain_head`, migration 0029).
+    ///
+    /// **UNCONDITIONAL UPSERT: the newest observation replaces the row, height
+    /// included, in either direction.** That is deliberately the opposite of
+    /// `PgCheckpointStore::advance`, which is guarded
+    /// `where last_height < excluded.last_height` and therefore both refuses a
+    /// non-advancing write and leaves `updated_at` frozen when the height does
+    /// not move. A head that has not moved since the last tick is the normal
+    /// case, and refreshing its `observed_at` anyway is the entire point: the
+    /// freshness reader reports that age beside `raw_behind_chain`, because a
+    /// dead follower leaves a frozen head whose delta falls to 0 and reads as
+    /// "caught up with the chain".
+    ///
+    /// No `greatest()` on the height either. Endpoints rotate and a lagging one
+    /// reports a lower finalized head; taking the maximum would invent a
+    /// monotonic head no single observation supports. The reader renders the
+    /// delta signed instead. 0029's header carries the full argument.
+    ///
+    /// NO INDEX: the only reader is `where chain_id = $1`, the primary key
+    /// itself.
+    pub struct PgChainHeadSink {
+        pool: PgPool,
+    }
+
+    impl PgChainHeadSink {
+        pub fn new(pool: PgPool) -> Self {
+            Self { pool }
+        }
+    }
+
+    #[async_trait]
+    impl ChainHeadSink for PgChainHeadSink {
+        async fn record(
+            &self,
+            chain_id: &str,
+            finalized_height: u64,
+            observed_at: DateTime<Utc>,
+        ) -> Result<(), SinkError> {
+            sqlx::query(
+                "insert into core.chain_head (chain_id, finalized_height, observed_at) \
+                 values ($1, $2, $3) \
+                 on conflict (chain_id) do update \
+                 set finalized_height = excluded.finalized_height, \
+                     observed_at = excluded.observed_at",
+            )
+            .bind(chain_id)
+            .bind(finalized_height as i64)
+            .bind(observed_at)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| SinkError(e.to_string()))?;
             Ok(())
         }
     }

@@ -22,11 +22,45 @@
 //! all of them independently:
 //!
 //! ```text
-//!   the chain           ← NOT KNOWN HERE. No RPC in a read path; see `not_covered`.
+//!   the chain           ← the FINALIZED head, as the live follower last OBSERVED
+//!                          it. A dated observation, never a live read.
 //!     raw_blocks        ← how far raw ingestion has followed
 //!       blocks          ← how far decode has got from raw
 //!         balances …    ← how far this module has got from decode
 //! ```
+//!
+//! # THE HEAD IS AN OBSERVATION, AND ITS AGE IS PART OF THE ANSWER
+//!
+//! The top of that stack arrived in Phase 3.5 slice 1b and it is the only step
+//! that is not a checkpoint. `live::tick` already reads the finalized head every
+//! tick as a loop bound; it now records what it saw, and this reader is handed
+//! that row. **It is still not an RPC call: a read path must not make one.**
+//!
+//! Which means the number is dated, and **the date is not decoration.** If the
+//! live follower dies, the recorded head freezes with it — and the raw frontier
+//! froze at the same instant, so `raw_behind_chain` reads **0**, which is
+//! "we are level with the chain": wrong, and wrong in the flattering direction,
+//! which is the direction this project checks first. A figure derived from an
+//! observation nobody refreshed is the exact failure this endpoint exists to
+//! prevent.
+//!
+//! So the head is reported as an OBJECT — height, when it was observed, and how
+//! old that is — and never as a bare delta. `frontiers.chain_head.age_seconds`
+//! is the field that makes `raw_behind_chain` readable, and the two are rendered
+//! together for the same reason the two lags below are rendered separately.
+//!
+//! **It is the FINALIZED head, not the best block.** The RAW-INGEST frontier
+//! follows only finalized heights, so the finalized head is the correct
+//! yardstick for it — but a delta of 0 means "level with the finalized head",
+//! never "at the tip". `not_covered` says so, because a page would otherwise
+//! draw a live dot on it. (The tip worker does read the best block, and
+//! deliberately keeps no checkpoint, so nothing here can be measured against it.)
+//!
+//! **RECORDED, not observed.** A follower reads the head on every tick whether
+//! or not it has anywhere to put it, so a null here means nothing was WRITTEN —
+//! by a run with no database, by a follower that has never completed a tick, or
+//! by a head write that is being refused. Those are different 3am actions and
+//! this reader cannot tell them apart; it says so rather than picking one.
 //!
 //! A module sitting exactly on the decode frontier while decode is 40,000 blocks
 //! behind raw is NOT current, and calling it current would be wrong in the
@@ -62,7 +96,14 @@ use chrono::{DateTime, Utc};
 /// [`ChainFreshness::with_declared`] made `never_run` reachable for the first
 /// time. Both change the SHAPE and the module SET, so a v1 report and a v2
 /// report over identical tables are not the same object.
-pub const FRESHNESS_READER_VERSION: u32 = 2;
+///
+/// `3` (Phase 3.5, the chain head): [`Frontiers`] gained [`HeadFrontier`] and
+/// `raw_behind_chain` stopped being permanently null. [`derive`] takes a fourth
+/// input — a v2 report was derived from two tables and a v3 report is derived
+/// from three — and the top of the lag stack now exists, so a v2 report and a v3
+/// report over the same checkpoints are not the same object even when no head
+/// has been observed: the v3 one says why.
+pub const FRESHNESS_READER_VERSION: u32 = 3;
 
 /// The `indexer_state.module` key of the raw-ingest frontier.
 ///
@@ -101,6 +142,21 @@ pub struct CheckpointRow {
     pub module: String,
     pub height: u64,
     pub updated_at: DateTime<Utc>,
+}
+
+/// The `core.chain_head` row (migration 0029): what the live follower last saw.
+///
+/// **A dated observation, and it carries no age**, because an age is a function
+/// of the clock the REPORT is derived at and this is the row as stored. [`derive`]
+/// computes the age into [`HeadFrontier`]. Storing one would be storing a derived
+/// thing, and the copy would be the one without lineage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub struct HeadObservation {
+    /// The FINALIZED head, never the best block — see the module header.
+    pub finalized_height: u64,
+    /// When the follower LOOKED, not when the height last CHANGED. Migration
+    /// 0029 rewrites this on every tick, including ticks with nothing to ingest.
+    pub observed_at: DateTime<Utc>,
 }
 
 /// One row of `core.module_halts` (migration 0028).
@@ -185,6 +241,26 @@ pub struct ModuleFreshness {
     pub declared: Option<bool>,
 }
 
+/// The chain's own head, with the age of the observation attached.
+///
+/// **The three fields travel together and the type is what enforces it.** They
+/// were flat fields on [`Frontiers`] for about an hour, and that shape makes
+/// "a height with no age" representable — which is precisely the object a
+/// consumer must never be handed, because a bare delta against an unrefreshed
+/// observation is this reader's own worst failure mode. Nesting them also makes
+/// every `reads_as` branch reachable rather than leaving one arm that can only
+/// be an impossible combination, and an unreachable arm is an arm nobody has
+/// checked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub struct HeadFrontier {
+    pub finalized_height: u64,
+    pub observed_at: DateTime<Utc>,
+    /// How old the observation is at this report's own `observed_at`. SIGNED and
+    /// unclamped, like `seconds_since_update`: a skewed clock reads negative
+    /// rather than being flattened to 0.
+    pub age_seconds: i64,
+}
+
 /// The frontiers every module is measured against.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct Frontiers {
@@ -193,8 +269,26 @@ pub struct Frontiers {
     /// SIGNED, for the same reason as `blocks_behind_decode`: decode advances
     /// past raw gaps too.
     pub decode_behind_raw: Option<i64>,
-    /// Always `None` in this reader, and present so its absence is a FIELD
-    /// rather than a silence. See `not_covered`.
+    /// The chain's own head as the live follower last observed it.
+    ///
+    /// `None` means NO CHAIN HEAD HAS EVER BEEN RECORDED on this chain — no
+    /// follower has run, none has completed a tick, or the head write is being
+    /// refused — and never that the chain has no head. RECORDED rather than
+    /// observed: the follower reads one every tick regardless.
+    pub chain_head: Option<HeadFrontier>,
+    /// How far the RAW-INGEST frontier is behind that head.
+    ///
+    /// SIGNED, and the negative case is not exotic. `finalized_height` rotates
+    /// endpoints, so a later endpoint reporting a LOWER finalized head replaces
+    /// the row and leaves the frontier above it; and a head write that fails
+    /// while ingestion continues — which is deliberate, a monitoring write may
+    /// not stop the pipeline — leaves the frontier climbing past a frozen row.
+    /// Saturating to 0 would make "the recording is behind us" indistinguishable
+    /// from "we are level".
+    ///
+    /// **NEVER READ IT WITHOUT `chain_head.age_seconds`.** It is a delta against
+    /// a dated observation, and if the follower stopped, the head stopped with
+    /// it and this number falls toward 0 while nothing is catching up.
     pub raw_behind_chain: Option<i64>,
 }
 
@@ -334,10 +428,25 @@ fn behind(ahead: Option<u64>, behind_of: Option<u64>) -> Option<i64> {
 /// taken whole rather than filtered by the caller, because a caller that filters
 /// decides which modules exist, and this reader would then report a module's
 /// absence as its own blind spot.
+///
+/// `head` is the `core.chain_head` row, or `None` when nothing has ever recorded
+/// one for this chain.
+///
+/// **IT IS A PARAMETER AND NOT A `with_head` BUILDER, and the difference is a
+/// correctness one rather than a taste one.** [`ChainFreshness::with_declared`]
+/// is a builder because the registry is a source this file deliberately cannot
+/// reach; the head is a row from the same `FreshnessIndex` the other two
+/// arguments come from, so there is no caller that legitimately has the rows and
+/// not the head. As a builder, a caller who simply forgot would get
+/// `chain_head: null` and a `not_covered` line reading *"no head has ever been
+/// observed"* — a sentence false about a database that has one, which is this
+/// project's oldest defect wearing an omission. A fourth argument makes every
+/// call site state its answer.
 pub fn derive(
     chain_id: &str,
     checkpoints: &[CheckpointRow],
     halts: &[HaltRow],
+    head: Option<HeadObservation>,
     observed_at: DateTime<Utc>,
 ) -> ChainFreshness {
     let at = |m: &str| checkpoints.iter().find(|c| c.module == m);
@@ -422,11 +531,22 @@ pub fn derive(
 
     modules.sort_by(|a, b| a.module.cmp(&b.module));
 
+    // The age is computed against THIS report's clock, which is why the stored
+    // row does not carry one.
+    let chain_head = head.map(|h| HeadFrontier {
+        finalized_height: h.finalized_height,
+        observed_at: h.observed_at,
+        age_seconds: observed_at
+            .signed_duration_since(h.observed_at)
+            .num_seconds(),
+    });
+
     let frontiers = Frontiers {
         raw,
         decode,
         decode_behind_raw: behind(raw, decode),
-        raw_behind_chain: None,
+        raw_behind_chain: behind(chain_head.map(|h| h.finalized_height), raw),
+        chain_head,
     };
 
     // `None`: this reader was told nothing about what SHOULD be running.
@@ -494,13 +614,89 @@ fn reads_as(
         });
     }
 
+    // THE TOP OF THE STACK, AND IT IS THE ONE STEP MEASURED AGAINST A DATED
+    // OBSERVATION RATHER THAN A CHECKPOINT. Every value quoted below is read
+    // off `frontiers` itself rather than off a parallel summary — building a
+    // sentence from a second source is how a line ends up false about the
+    // object beside it, which is this project's oldest and most repeated defect.
+    match (frontiers.chain_head, frontiers.raw_behind_chain) {
+        (None, _) => {
+            s.push_str(
+                "NO CHAIN HEAD HAS EVER BEEN RECORDED HERE, so nothing in this report is \
+                 placed against the chain at all — every figure below is about dotlens's \
+                 own progress and says nothing about how far that is from the network. \
+                 RECORDED, not observed: a follower reads the head on every tick, and a \
+                 run with nowhere to put it discards it. No follower, no completed tick, \
+                 and a refused head write all leave this null rather than zero, and they \
+                 are not distinguishable here. ",
+            );
+        }
+        (Some(h), None) => {
+            s.push_str(&format!(
+                "The finalized head last OBSERVED here is {}, seen {}s before this report. \
+                 There is no raw-ingest frontier to place against it, so `raw_behind_chain` \
+                 is null rather than the head's own value: nothing has been ingested for \
+                 anything to be behind. ",
+                h.finalized_height, h.age_seconds
+            ));
+        }
+        (Some(h), Some(d)) if d > 0 => {
+            s.push_str(&format!(
+                "THE RAW FRONTIER IS {d} BLOCKS BEHIND THE FINALIZED HEAD DOTLENS LAST \
+                 OBSERVED ({}), AND THAT OBSERVATION IS {}s OLD. The head is not read live, \
+                 so this delta is only as current as its age — if the follower stopped, the \
+                 head stopped with it and this number stops growing rather than growing \
+                 faster. ",
+                h.finalized_height, h.age_seconds
+            ));
+        }
+        (Some(h), Some(d)) if d < 0 => {
+            s.push_str(&format!(
+                "The raw frontier reads {} BLOCKS AHEAD of the last recorded head ({}, seen \
+                 {}s ago), which is a RECORDING being behind us rather than the chain being \
+                 behind us. Two things produce it: endpoints rotate, so one reporting a lower \
+                 finalized head than an earlier observation replaces the row with its own; \
+                 and a head write that is failing while ingestion carries on — deliberately, \
+                 because a monitoring write may not stop the pipeline — leaves the frontier \
+                 climbing past a frozen row. It is reported signed rather than clamped, \
+                 because a 0 here would be indistinguishable from level. ",
+                -d, h.finalized_height, h.age_seconds
+            ));
+        }
+        (Some(h), Some(_)) => {
+            s.push_str(&format!(
+                "THE RAW FRONTIER IS LEVEL WITH THE FINALIZED HEAD DOTLENS LAST OBSERVED \
+                 ({}), AND THAT OBSERVATION IS {}s OLD. Level with a dated observation is \
+                 not the same as caught up with the chain: the follower that records the \
+                 head is the follower that advances the frontier, so if it stopped, both \
+                 froze together and this zero is what a stopped pipeline looks like. READ \
+                 THE AGE BESIDE THE ZERO, NEVER THE ZERO ALONE. ",
+                h.finalized_height, h.age_seconds
+            ));
+        }
+    }
+
     match (frontiers.raw, frontiers.decode) {
         (None, None) => {
-            s.push_str(
-                "NOTHING HAS RUN ON THIS CHAIN. Neither the raw-ingest nor the decode \
-                 frontier has a checkpoint, so every module below is reported against \
-                 no yardstick at all — read this as 'not started', never as 'idle'. ",
-            );
+            // TWO WORDINGS, because a recorded head makes the absolute one
+            // false: a follower that looked HAS run. Slice 1b substituted the
+            // head into the arms it changed and left this one, which is A3 in
+            // its documented shape — fixing the case and leaving the class alive
+            // one arm over.
+            s.push_str(match frontiers.chain_head {
+                None => {
+                    "NOTHING HAS RUN ON THIS CHAIN. Neither the raw-ingest nor the decode \
+                     frontier has a checkpoint, so every module below is reported against \
+                     no yardstick at all — read this as 'not started', never as 'idle'. "
+                }
+                Some(_) => {
+                    "A FOLLOWER HAS LOOKED HERE AND NOTHING HAS BEEN STORED. The head above is \
+                     its observation, but neither the raw-ingest nor the decode frontier has a \
+                     checkpoint, so every module below is reported against no yardstick at all. \
+                     Read this as 'looking but not keeping' — a fetch or a raw write is \
+                     failing — never as 'not started' and never as 'idle'. "
+                }
+            });
         }
         (_, None) => {
             s.push_str(
@@ -519,12 +715,18 @@ fn reads_as(
             );
         }
         _ => {
+            // SUBSTITUTED in slice 1b, not appended to: this line said "The two
+            // are reported separately", and with the head recorded there are
+            // three steps in the stack. Counting them in prose is what made it
+            // go stale, so it no longer counts them.
             s.push_str(
                 "Every module's lag is measured against the DECODE frontier, which is \
-                 itself measured against the raw-ingest frontier. The two are reported \
-                 separately and MUST NOT be added: a module at the decode frontier is \
-                 not up to date if decode is far behind raw, which is why the state \
-                 word is `at_decode_frontier` and never `current`. ",
+                 itself measured against the raw-ingest frontier, which is measured \
+                 against the chain head under `frontiers` when one has been observed. \
+                 Each step is reported separately and MUST NOT be added to another: a \
+                 module at the decode frontier is not up to date if decode is far behind \
+                 raw, which is why the state word is `at_decode_frontier` and never \
+                 `current`. ",
             );
         }
     }
@@ -614,19 +816,76 @@ fn not_covered(
     modules: &[ModuleFreshness],
     declared: Option<&[String]>,
 ) -> Vec<String> {
-    let mut out = vec![
-        "raw_behind_chain: THE CHAIN'S OWN HEAD IS NOT READ. Every number here is \
-         measured against dotlens's own raw-ingest frontier, so a raw follower that \
-         stopped an hour ago makes the whole stack look internally consistent and \
-         current. Closing this needs the live follower to record the head it observed; \
-         it is not read here because a read path must not make an RPC call."
+    // SUBSTITUTED in slice 1b. The line that stood here said "THE CHAIN'S OWN
+    // HEAD IS NOT READ", which the head observation makes false — and appending
+    // the correction beside the claim rather than replacing it is this project's
+    // second-oldest defect. The replacement states what the number that now
+    // exists does NOT cover, which is a different gap rather than none.
+    //
+    // THREE ARMS, NOT TWO, AND THE THIRD IS THE ONE A REVIEW FOUND. Gating only
+    // on `chain_head` shipped a line describing "this delta … falls toward 0" in
+    // a payload where `raw_behind_chain` is NULL — false about the object beside
+    // it, and contradicting `reads_as` two fields away. It is reachable without
+    // effort: `tick` records the head BEFORE it ingests, so a chain whose fetch
+    // is failing refreshes the head forever and never writes a `raw_blocks`
+    // checkpoint. That is exactly the payload an operator would be staring at.
+    let mut out = vec![match (frontiers.chain_head, frontiers.raw_behind_chain) {
+        (None, _) => "raw_behind_chain: NO CHAIN HEAD HAS EVER BEEN RECORDED HERE, so it is \
+                 null and every number here is measured against dotlens's own raw-ingest \
+                 frontier — a raw follower that stopped an hour ago makes the whole stack look \
+                 internally consistent and current. THREE DIFFERENT THINGS REACH THIS STATE and \
+                 they render identically: no follower has run on this chain, one has run but \
+                 never completed a tick, or one is ticking normally and its head write is being \
+                 refused (it logs that and keeps ingesting, by design). This reader cannot go \
+                 and look, because a read path must not make an RPC call."
             .to_string(),
+        (Some(_), None) => "raw_behind_chain: NULL BECAUSE THERE IS NO RAW-INGEST FRONTIER TO \
+                 SUBTRACT FROM, not because the head is unknown — `frontiers.chain_head` holds \
+                 one. A head on its own is not a measure of anything: it says a follower \
+                 looked, not that anything was stored."
+            .to_string(),
+        (Some(_), Some(_)) => "raw_behind_chain: THE HEAD IS AS OF WHEN THE FOLLOWER LAST \
+                 LOOKED, NOT AS OF NOW — `frontiers.chain_head.observed_at`, and its age in \
+                 `frontiers.chain_head.age_seconds`. A read path makes no RPC call, so this \
+                 delta can only ever be a comparison against a dated observation. If the \
+                 follower died, the head froze with it AND the raw frontier froze at the same \
+                 instant, so this number falls toward 0 and reads as 'level with the chain' \
+                 while nothing is catching up. Read the two together; the delta alone is not \
+                 an answer. Unlike a module checkpoint, this row is rewritten on every tick \
+                 even when the head has not moved, so the age is the age of the LOOK and never \
+                 the age of the last new block."
+            .to_string(),
+    }];
+
+    // ONLY where a delta actually exists. Stated beside a null `raw_behind_chain`
+    // it would qualify a number the payload does not carry.
+    if frontiers.raw_behind_chain.is_some() {
+        out.push(
+            "`frontiers.chain_head.finalized_height` is the FINALIZED head, not the chain's \
+             best block. The RAW-INGEST frontier follows only finalized heights, which is why \
+             it is the right yardstick for it — but `raw_behind_chain: 0` means 'level with \
+             the finalized head' and never 'at the tip'. The best block is ahead of it by the \
+             finality lag, and no CHECKPOINT records it: the tip worker reads it and \
+             deliberately keeps none, so this reader cannot state that distance."
+                .to_string(),
+        );
+        out.push(
+            "`frontiers.raw` is a HIGH-WATER MARK and this delta measures only its distance \
+             from the head. Neither says anything about the heights BELOW it: a follower's \
+             first tick starts at the tip, so a chain seeded a minute ago reports \
+             `raw_behind_chain: 0` while holding one block of history. Depth is backfill's \
+             job and no figure here reports it."
+                .to_string(),
+        );
+    }
+
+    out.push(
         "BEHIND does not distinguish 'catching up' from 'stopped without recording a \
          halt'. One observation cannot: both are a checkpoint that is not at the \
          frontier. `seconds_since_update` is the only signal, and it is reported as a \
          number rather than thresholded, because the threshold is the operator's."
             .to_string(),
-    ];
+    );
 
     if modules.iter().any(|m| m.seconds_since_update.is_some()) {
         out.push(
@@ -771,7 +1030,7 @@ mod tests {
     fn the_two_lags_are_separate_and_the_state_word_never_says_current() {
         let mut cps = base();
         cps.push(cp("balances", 900, "2026-08-24T11:59:30Z"));
-        let r = derive("polkadot-asset-hub", &cps, &[], now());
+        let r = derive("polkadot-asset-hub", &cps, &[], None, now());
 
         let b = &r.modules[0];
         assert_eq!(b.state, ModuleState::AtDecodeFrontier);
@@ -798,7 +1057,7 @@ mod tests {
         // reading, and the defect slice 16 shipped one field over.
         let mut cps = base();
         cps.push(cp("balances", 950, "2026-08-24T11:59:30Z"));
-        let r = derive("polkadot", &cps, &[], now());
+        let r = derive("polkadot", &cps, &[], None, now());
         assert_eq!(r.modules[0].blocks_behind_decode, Some(-50));
         assert_eq!(r.modules[0].state, ModuleState::AtDecodeFrontier);
         assert!(
@@ -818,7 +1077,7 @@ mod tests {
         later.last_seen_at = ts("2026-08-24T11:59:59Z");
         let halts = vec![later, halt("balances", 150, 7, "balances.BurnedDebt")];
 
-        let r = derive("polkadot", &cps, &halts, now());
+        let r = derive("polkadot", &cps, &halts, None, now());
         let b = &r.modules[0];
         assert_eq!(b.state, ModuleState::Halted);
         let h = b.blocking_halt.as_ref().expect("blocking halt");
@@ -832,7 +1091,13 @@ mod tests {
         // row; the comparison is what makes it stop counting.
         let mut cps = base();
         cps.push(cp("balances", 200, "2026-08-24T11:59:30Z"));
-        let r = derive("polkadot", &cps, &[halt("balances", 150, 7, "x")], now());
+        let r = derive(
+            "polkadot",
+            &cps,
+            &[halt("balances", 150, 7, "x")],
+            None,
+            now(),
+        );
         assert_eq!(r.modules[0].state, ModuleState::Behind);
         assert!(r.modules[0].blocking_halt.is_none());
     }
@@ -845,6 +1110,7 @@ mod tests {
             "polkadot",
             &base(),
             &[halt("gov", 5, 0, "referenda.New")],
+            None,
             now(),
         );
         let g = r
@@ -863,7 +1129,7 @@ mod tests {
             cp(MODULE_RAW, 1000, "2026-08-24T11:59:50Z"),
             cp("balances", 400, "2026-08-24T11:00:00Z"),
         ];
-        let r = derive("polkadot", &cps, &[], now());
+        let r = derive("polkadot", &cps, &[], None, now());
         assert_eq!(r.frontiers.decode, None);
         assert_eq!(r.modules[0].blocks_behind_decode, None);
         assert_eq!(
@@ -880,7 +1146,7 @@ mod tests {
 
     #[test]
     fn nothing_run_at_all_says_not_started_rather_than_idle() {
-        let r = derive("polkadot", &[], &[], now());
+        let r = derive("polkadot", &[], &[], None, now());
         assert!(r.modules.is_empty());
         assert!(r.reads_as.contains("NOTHING HAS RUN"), "{}", r.reads_as);
         assert_eq!(r.frontiers.raw, None);
@@ -893,7 +1159,7 @@ mod tests {
         cps.push(cp("raw_backfill", 10, "2026-08-24T11:00:00Z"));
         cps.push(cp("raw_backfill:100-200", 150, "2026-08-24T11:00:00Z"));
         cps.push(cp("balances", 900, "2026-08-24T11:59:30Z"));
-        let r = derive("polkadot", &cps, &[], now());
+        let r = derive("polkadot", &cps, &[], None, now());
         let names: Vec<&str> = r.modules.iter().map(|m| m.module.as_str()).collect();
         assert_eq!(
             names,
@@ -908,7 +1174,7 @@ mod tests {
         cps.push(cp("xcm", 900, "2026-08-24T11:59:30Z"));
         cps.push(cp("balances", 900, "2026-08-24T11:59:30Z"));
         cps.push(cp("gov", 900, "2026-08-24T11:59:30Z"));
-        let r = derive("polkadot", &cps, &[], now());
+        let r = derive("polkadot", &cps, &[], None, now());
         let names: Vec<&str> = r.modules.iter().map(|m| m.module.as_str()).collect();
         assert_eq!(names, vec!["balances", "gov", "xcm"]);
     }
@@ -917,7 +1183,7 @@ mod tests {
     fn no_recorded_halt_is_never_reported_as_proof_that_nothing_stopped() {
         let mut cps = base();
         cps.push(cp("balances", 400, "2026-08-24T09:00:00Z"));
-        let r = derive("polkadot", &cps, &[], now());
+        let r = derive("polkadot", &cps, &[], None, now());
         assert_eq!(r.modules[0].state, ModuleState::Behind);
         assert!(
             r.reads_as.contains("not a guarantee"),
@@ -928,20 +1194,361 @@ mod tests {
     }
 
     #[test]
-    fn the_chain_head_is_a_null_field_and_a_named_gap_rather_than_a_silence() {
+    fn an_unobserved_chain_head_is_a_null_field_and_a_named_gap_rather_than_a_silence() {
         let mut cps = base();
         cps.push(cp("balances", 900, "2026-08-24T11:59:30Z"));
-        let r = derive("polkadot", &cps, &[], now());
-        assert_eq!(r.frontiers.raw_behind_chain, None);
+        let r = derive("polkadot", &cps, &[], None, now());
+        assert_eq!(r.frontiers.chain_head, None);
+        assert_eq!(
+            r.frontiers.raw_behind_chain, None,
+            "no observation means no delta — never 0"
+        );
         assert!(
-            r.not_covered.iter().any(|s| s.contains("raw_behind_chain")),
+            r.not_covered
+                .iter()
+                .any(|s| s.contains("NO CHAIN HEAD HAS EVER BEEN RECORDED")),
             "the absent top of the stack must be named: {:?}",
             r.not_covered
+        );
+        assert!(
+            r.reads_as.contains("NO CHAIN HEAD HAS EVER BEEN RECORDED"),
+            "{}",
+            r.reads_as
         );
         // Every not_covered line must name something the payload actually has,
         // or omits — the oldest defect class here is a line false about the
         // object beside it.
         assert!(r.not_covered.iter().any(|s| s.contains("updated_at")));
+    }
+
+    // --------------------------------------------------- the chain head (1b)
+
+    fn head(finalized_height: u64, at: &str) -> HeadObservation {
+        HeadObservation {
+            finalized_height,
+            observed_at: ts(at),
+        }
+    }
+
+    /// **THE SLICE'S WHOLE POINT.** A dead follower freezes the head and the raw
+    /// frontier at the same instant, so the delta reads 0 — "level with the
+    /// chain" — which is wrong in the flattering direction. The zero is correct;
+    /// what makes it readable is the age beside it, and the payload must carry
+    /// both and say so.
+    #[test]
+    fn a_head_level_with_the_raw_frontier_reads_its_age_and_never_the_zero_alone() {
+        let mut cps = base();
+        cps.push(cp("balances", 900, "2026-08-24T11:59:30Z"));
+        // raw is at 1000 and the head we last saw was 1000 — an HOUR ago.
+        let r = derive(
+            "polkadot",
+            &cps,
+            &[],
+            Some(head(1000, "2026-08-24T11:00:00Z")),
+            now(),
+        );
+
+        let h = r.frontiers.chain_head.expect("head observed");
+        assert_eq!(h.finalized_height, 1000);
+        assert_eq!(h.observed_at, ts("2026-08-24T11:00:00Z"));
+        assert_eq!(h.age_seconds, 3600);
+        assert_eq!(r.frontiers.raw_behind_chain, Some(0));
+
+        assert!(
+            r.reads_as.contains("READ THE AGE BESIDE THE ZERO"),
+            "a stale head must not read as caught up: {}",
+            r.reads_as
+        );
+        assert!(
+            r.reads_as.contains("3600s OLD"),
+            "the age has to be IN the sentence, not merely in a field: {}",
+            r.reads_as
+        );
+    }
+
+    /// Signed, never saturated: the head is recorded before the heights below it
+    /// are ingested, and `finalized_height` rotates endpoints, so a lower head
+    /// than the frontier is a normal observation. `0` here would be
+    /// indistinguishable from level — the defect slice 16 shipped one field over.
+    #[test]
+    fn a_head_below_our_own_raw_frontier_is_signed_rather_than_saturated() {
+        let r = derive(
+            "polkadot",
+            &base(),
+            &[],
+            Some(head(900, "2026-08-24T11:59:00Z")),
+            now(),
+        );
+        assert_eq!(r.frontiers.raw_behind_chain, Some(-100));
+        assert!(r.reads_as.contains("100 BLOCKS AHEAD"), "{}", r.reads_as);
+        assert!(
+            r.reads_as.contains("a RECORDING being behind us"),
+            "the direction of the error is the reader's, not the chain's: {}",
+            r.reads_as
+        );
+        // BOTH causes named, and the second is the one the code deliberately
+        // creates: `tick` logs a failed head write and keeps ingesting, so the
+        // frontier climbs past a frozen row. An earlier draft named a cause that
+        // produces the OPPOSITE sign.
+        assert!(r.reads_as.contains("endpoints rotate"), "{}", r.reads_as);
+        assert!(
+            r.reads_as.contains("head write that is failing"),
+            "{}",
+            r.reads_as
+        );
+    }
+
+    #[test]
+    fn a_raw_frontier_behind_the_head_reports_the_delta_and_the_observation_age_together() {
+        let r = derive(
+            "polkadot",
+            &base(),
+            &[],
+            Some(head(1500, "2026-08-24T11:59:55Z")),
+            now(),
+        );
+        assert_eq!(r.frontiers.raw_behind_chain, Some(500));
+        assert_eq!(r.frontiers.chain_head.expect("head").age_seconds, 5);
+        assert!(
+            r.reads_as.contains("500 BLOCKS BEHIND THE FINALIZED HEAD"),
+            "{}",
+            r.reads_as
+        );
+        assert!(
+            r.reads_as.contains("5s OLD"),
+            "the delta is only as current as its age: {}",
+            r.reads_as
+        );
+    }
+
+    /// A3: a prose fix is done only when the old text is GONE. The line that
+    /// stood here said "THE CHAIN'S OWN HEAD IS NOT READ", and shipping it beside
+    /// an observed head would be the claim and its correction back to back.
+    /// **The assertion is the PAIR** — without both halves neither can fail.
+    #[test]
+    fn the_head_coverage_line_is_substituted_rather_than_appended_to() {
+        let bare = derive("polkadot", &base(), &[], None, now());
+        assert!(bare
+            .not_covered
+            .iter()
+            .any(|s| s.contains("NO CHAIN HEAD HAS EVER BEEN RECORDED")));
+        assert!(
+            !bare
+                .not_covered
+                .iter()
+                .any(|s| s.contains("AS OF WHEN THE FOLLOWER LAST LOOKED")),
+            "there is no observation to be dated: {:?}",
+            bare.not_covered
+        );
+
+        let observed = derive(
+            "polkadot",
+            &base(),
+            &[],
+            Some(head(1000, "2026-08-24T11:59:55Z")),
+            now(),
+        );
+        assert!(
+            !observed
+                .not_covered
+                .iter()
+                .any(|s| s.contains("NO CHAIN HEAD HAS EVER BEEN RECORDED")),
+            "the superseded claim must be GONE, not sitting beside its correction: {:?}",
+            observed.not_covered
+        );
+        assert!(observed
+            .not_covered
+            .iter()
+            .any(|s| s.contains("AS OF WHEN THE FOLLOWER LAST LOOKED")));
+        // And the CLASS, not just the case: nothing anywhere may still assert
+        // that the head is not read.
+        assert!(
+            !observed
+                .not_covered
+                .iter()
+                .any(|s| s.contains("HEAD IS NOT READ")),
+            "{:?}",
+            observed.not_covered
+        );
+        assert!(!observed.reads_as.contains("HEAD IS NOT READ"));
+    }
+
+    /// The two lines that QUALIFY the delta may appear only where the delta
+    /// exists — gating them on the head instead put "a delta of 0 means level
+    /// with the finalized head" into a payload whose `raw_behind_chain` is null.
+    /// **Three cases, because two of them agree and the third is the one that
+    /// was wrong.**
+    #[test]
+    fn the_delta_caveats_are_gated_on_the_delta_and_not_on_the_head() {
+        let both = derive(
+            "polkadot",
+            &base(),
+            &[],
+            Some(head(1000, "2026-08-24T11:59:55Z")),
+            now(),
+        );
+        assert!(
+            both.not_covered
+                .iter()
+                .any(|s| s.contains("not the chain's best block")),
+            "a page would otherwise draw a live dot on it: {:?}",
+            both.not_covered
+        );
+        assert!(
+            both.not_covered
+                .iter()
+                .any(|s| s.contains("HIGH-WATER MARK")),
+            "a chain seeded a minute ago reads level with the chain: {:?}",
+            both.not_covered
+        );
+
+        let no_head = derive("polkadot", &base(), &[], None, now());
+        assert!(
+            !no_head
+                .not_covered
+                .iter()
+                .any(|s| s.contains("not the chain's best block")),
+            "{:?}",
+            no_head.not_covered
+        );
+
+        // THE CASE A REVIEW FOUND: a head, and no frontier to subtract it from.
+        let head_only = derive(
+            "polkadot",
+            &[],
+            &[],
+            Some(head(1500, "2026-08-24T11:59:55Z")),
+            now(),
+        );
+        assert_eq!(head_only.frontiers.raw_behind_chain, None);
+        for line in &head_only.not_covered {
+            assert!(
+                !line.contains("not the chain's best block") && !line.contains("HIGH-WATER MARK"),
+                "a qualifier about a null number: {line}"
+            );
+            assert!(
+                !line.contains("falls toward 0"),
+                "there is no number here to fall: {line}"
+            );
+        }
+    }
+
+    /// A head on its own is not a measure of anything, and the payload has to say
+    /// so in BOTH prose fields rather than only in `reads_as`. Reachable without
+    /// effort: `tick` records the head BEFORE it ingests, so a chain whose fetch
+    /// is failing refreshes the head forever and never writes a `raw_blocks`
+    /// checkpoint.
+    #[test]
+    fn a_head_with_no_raw_frontier_nulls_the_delta_rather_than_using_the_heads_own_value() {
+        let cps = vec![cp(MODULE_DECODE, 900, "2026-08-24T11:59:40Z")];
+        let r = derive(
+            "polkadot",
+            &cps,
+            &[],
+            Some(head(1500, "2026-08-24T11:59:55Z")),
+            now(),
+        );
+        assert_eq!(r.frontiers.raw, None);
+        assert_eq!(
+            r.frontiers.raw_behind_chain, None,
+            "nothing has been ingested for anything to be behind — 1500 would be a fabrication"
+        );
+        assert_eq!(r.frontiers.chain_head.expect("head").finalized_height, 1500);
+        assert!(
+            r.reads_as
+                .contains("no raw-ingest frontier to place against it"),
+            "{}",
+            r.reads_as
+        );
+        assert!(
+            r.not_covered
+                .iter()
+                .any(|s| s.contains("NO RAW-INGEST FRONTIER TO SUBTRACT FROM")),
+            "`not_covered` is where the false line sat, so it is what must be asserted: {:?}",
+            r.not_covered
+        );
+    }
+
+    /// A3, one arm over. `NOTHING HAS RUN ON THIS CHAIN` predates the head and is
+    /// false beside one: a follower that looked HAS run. The pair is the point —
+    /// the absolute wording must survive where it is still true.
+    #[test]
+    fn a_recorded_head_with_no_frontiers_says_looking_but_not_keeping_not_nothing_has_run() {
+        let looked = derive(
+            "polkadot",
+            &[],
+            &[],
+            Some(head(1500, "2026-08-24T11:59:55Z")),
+            now(),
+        );
+        assert!(
+            !looked.reads_as.contains("NOTHING HAS RUN ON THIS CHAIN"),
+            "a follower recorded a head 5 seconds ago: {}",
+            looked.reads_as
+        );
+        assert!(
+            looked
+                .reads_as
+                .contains("A FOLLOWER HAS LOOKED HERE AND NOTHING HAS BEEN STORED"),
+            "{}",
+            looked.reads_as
+        );
+
+        let never = derive("polkadot", &[], &[], None, now());
+        assert!(
+            never.reads_as.contains("NOTHING HAS RUN ON THIS CHAIN"),
+            "and the original wording stays where it is still true: {}",
+            never.reads_as
+        );
+    }
+
+    /// Unclamped, like `seconds_since_update`: a skewed clock reads negative
+    /// rather than being flattened to 0, because 0 would say the observation is
+    /// current.
+    #[test]
+    fn an_observation_dated_after_this_report_reads_a_negative_age_rather_than_zero() {
+        let r = derive(
+            "polkadot",
+            &base(),
+            &[],
+            Some(head(1000, "2026-08-24T12:00:30Z")),
+            now(),
+        );
+        assert_eq!(r.frontiers.chain_head.expect("head").age_seconds, -30);
+    }
+
+    /// The stack has three steps now and the prose no longer counts them — it
+    /// said "The two are reported separately" and would have gone stale the
+    /// moment the head landed. Counting in prose is what made it fragile.
+    #[test]
+    fn the_stack_prose_forbids_adding_the_steps_without_counting_them() {
+        let r = derive(
+            "polkadot",
+            &base(),
+            &[],
+            Some(head(1000, "2026-08-24T11:59:55Z")),
+            now(),
+        );
+        assert!(r.reads_as.contains("MUST NOT be added"), "{}", r.reads_as);
+        assert!(
+            !r.reads_as.contains("The two are reported separately"),
+            "a count in prose goes stale the next time a step is added: {}",
+            r.reads_as
+        );
+        assert!(
+            r.reads_as.contains("measured against the chain head"),
+            "{}",
+            r.reads_as
+        );
+    }
+
+    #[test]
+    fn the_reader_version_says_the_shape_changed() {
+        // A v2 report and a v3 report over identical checkpoints are not the
+        // same object: `frontiers` gained `chain_head`.
+        assert_eq!(FRESHNESS_READER_VERSION, 3);
+        let r = derive("polkadot", &base(), &[], None, now());
+        assert_eq!(r.reader_version, 3);
     }
 
     #[test]
@@ -950,7 +1557,13 @@ mod tests {
         cps.push(cp("balances", 100, "2026-08-24T10:00:00Z"));
         cps.push(cp("gov", 500, "2026-08-24T11:59:00Z"));
         cps.push(cp("xcm", 900, "2026-08-24T11:59:00Z"));
-        let r = derive("polkadot", &cps, &[halt("balances", 150, 7, "x")], now());
+        let r = derive(
+            "polkadot",
+            &cps,
+            &[halt("balances", 150, 7, "x")],
+            None,
+            now(),
+        );
 
         assert_eq!(r.halted().len(), 1);
         assert_eq!(r.halted()[0].module, "balances");
@@ -975,7 +1588,7 @@ mod tests {
     fn a_declared_module_that_never_started_is_never_run_and_not_absent() {
         let mut cps = base();
         cps.push(cp("balances", 900, "2026-08-24T11:59:30Z"));
-        let r = derive("polkadot", &cps, &[], now())
+        let r = derive("polkadot", &cps, &[], None, now())
             .with_declared(&declared(&["balances", "gov", "xcm"]));
 
         let names: Vec<&str> = r.modules.iter().map(|m| m.module.as_str()).collect();
@@ -1000,7 +1613,7 @@ mod tests {
     #[test]
     fn never_run_is_unreachable_without_the_declared_list_and_reachable_with_it() {
         let cps = base();
-        let bare = derive("polkadot", &cps, &[], now());
+        let bare = derive("polkadot", &cps, &[], None, now());
         assert!(
             !bare
                 .modules
@@ -1017,7 +1630,7 @@ mod tests {
         let mut cps = base();
         cps.push(cp("balances", 900, "2026-08-24T11:59:30Z"));
         // the seed lists gov and NOT balances
-        let r = derive("polkadot", &cps, &[], now()).with_declared(&declared(&["gov"]));
+        let r = derive("polkadot", &cps, &[], None, now()).with_declared(&declared(&["gov"]));
 
         let bal = r.modules.iter().find(|m| m.module == "balances").unwrap();
         assert_eq!(
@@ -1039,7 +1652,7 @@ mod tests {
     fn declared_is_null_before_widening_because_null_is_not_no() {
         let mut cps = base();
         cps.push(cp("balances", 900, "2026-08-24T11:59:30Z"));
-        let r = derive("polkadot", &cps, &[], now());
+        let r = derive("polkadot", &cps, &[], None, now());
         assert_eq!(r.modules[0].declared, None);
         assert!(
             r.not_covered
@@ -1056,7 +1669,7 @@ mod tests {
     #[test]
     fn widening_substitutes_the_coverage_line_rather_than_appending_to_it() {
         let cps = base();
-        let bare = derive("polkadot", &cps, &[], now());
+        let bare = derive("polkadot", &cps, &[], None, now());
         assert!(bare
             .not_covered
             .iter()
@@ -1080,7 +1693,8 @@ mod tests {
     #[test]
     fn widening_recomputes_reads_as_so_it_names_the_never_run_modules() {
         let cps = base();
-        let r = derive("polkadot", &cps, &[], now()).with_declared(&declared(&["gov", "xcm"]));
+        let r =
+            derive("polkadot", &cps, &[], None, now()).with_declared(&declared(&["gov", "xcm"]));
         assert!(
             r.reads_as.contains("NEVER RUN"),
             "the arm was dead until this slice: {}",
@@ -1094,7 +1708,7 @@ mod tests {
     fn widening_keeps_a_halt_visible_and_does_not_overwrite_its_state() {
         let mut cps = base();
         cps.push(cp("balances", 100, "2026-08-24T10:00:00Z"));
-        let r = derive("polkadot", &cps, &[halt("balances", 150, 7, "x")], now())
+        let r = derive("polkadot", &cps, &[halt("balances", 150, 7, "x")], None, now())
             .with_declared(&declared(&["balances", "gov"]));
 
         let bal = r.modules.iter().find(|m| m.module == "balances").unwrap();
@@ -1112,7 +1726,7 @@ mod tests {
     fn widening_with_an_empty_seed_list_is_not_the_same_as_not_widening() {
         let mut cps = base();
         cps.push(cp("balances", 900, "2026-08-24T11:59:30Z"));
-        let r = derive("polkadot", &cps, &[], now()).with_declared(&[]);
+        let r = derive("polkadot", &cps, &[], None, now()).with_declared(&[]);
         // "this chain declares nothing" is a STATEMENT; it is not "nobody told me".
         assert_eq!(r.modules[0].declared, Some(false));
         assert!(r
@@ -1129,7 +1743,7 @@ mod tests {
     fn a_seed_declaring_blocks_does_not_resurrect_the_decode_frontier_as_a_module() {
         let mut cps = base();
         cps.push(cp("balances", 900, "2026-08-24T11:59:30Z"));
-        let r = derive("polkadot", &cps, &[], now()).with_declared(&declared(&[
+        let r = derive("polkadot", &cps, &[], None, now()).with_declared(&declared(&[
             "blocks",
             "raw_blocks",
             "extrinsics",
@@ -1156,8 +1770,8 @@ mod tests {
         // AND THE PAIR, without which the assertion above cannot fail: a seed
         // that declares no reserved name must NOT carry the explanation, because
         // there is no omission to explain.
-        let plain =
-            derive("polkadot", &cps, &[], now()).with_declared(&declared(&["balances", "gov"]));
+        let plain = derive("polkadot", &cps, &[], None, now())
+            .with_declared(&declared(&["balances", "gov"]));
         assert!(
             !plain.not_covered.iter().any(|s| s.contains("FRONTIERS")),
             "nothing was omitted, so nothing may be explained away: {:?}",
@@ -1171,13 +1785,13 @@ mod tests {
     /// shipped payload that would have carried the false line.
     #[test]
     fn the_no_decode_frontier_line_is_true_in_both_the_widened_and_bare_cases() {
-        let bare = derive("polkadot", &[], &[], now());
+        let bare = derive("polkadot", &[], &[], None, now());
         assert!(bare
             .not_covered
             .iter()
             .any(|s| s.contains("reflects only their own halt records")));
 
-        let widened = derive("polkadot", &[], &[], now()).with_declared(&declared(&["gov"]));
+        let widened = derive("polkadot", &[], &[], None, now()).with_declared(&declared(&["gov"]));
         assert!(
             !widened
                 .not_covered
@@ -1204,6 +1818,7 @@ mod tests {
                 halt(MODULE_RAW, 150, 1, "x"),
                 halt("balances", 950, 1, "x"),
             ],
+            None,
             now(),
         );
         let names: Vec<&str> = r.modules.iter().map(|m| m.module.as_str()).collect();
@@ -1221,6 +1836,7 @@ mod tests {
             &base(),
             // deliberately NOT in height order
             &[halt("gov", 320, 0, "later"), halt("gov", 150, 4, "earlier")],
+            None,
             now(),
         );
         let gov = r.modules.iter().find(|m| m.module == "gov").expect("gov");
@@ -1238,7 +1854,7 @@ mod tests {
     /// existing accessors, which is what a monitor reads as healthy.
     #[test]
     fn never_run_has_a_selector_so_an_unstarted_chain_does_not_read_green() {
-        let r = derive("polkadot", &base(), &[], now())
+        let r = derive("polkadot", &base(), &[], None, now())
             .with_declared(&declared(&["gov", "xcm", "balances"]));
         assert!(r.halted().is_empty());
         assert!(r.behind_by_more_than(0).is_empty());
@@ -1252,7 +1868,7 @@ mod tests {
     #[test]
     fn an_empty_module_list_says_nothing_has_run_rather_than_leaving_a_blank() {
         // frontiers are healthy, and NO domain module exists
-        let bare = derive("polkadot", &base(), &[], now());
+        let bare = derive("polkadot", &base(), &[], None, now());
         assert!(bare.modules.is_empty());
         assert!(
             bare.reads_as.contains("NO MODULE HAS A CHECKPOINT"),
@@ -1262,7 +1878,7 @@ mod tests {
 
         // a seed declaring ONLY frontier names is a different fact again
         let only_frontiers =
-            derive("polkadot", &base(), &[], now()).with_declared(&declared(&["blocks"]));
+            derive("polkadot", &base(), &[], None, now()).with_declared(&declared(&["blocks"]));
         assert!(only_frontiers.modules.is_empty());
         assert!(
             only_frontiers
@@ -1277,7 +1893,8 @@ mod tests {
     fn widening_is_idempotent_and_stays_sorted() {
         let mut cps = base();
         cps.push(cp("xcm", 900, "2026-08-24T11:59:30Z"));
-        let once = derive("polkadot", &cps, &[], now()).with_declared(&declared(&["gov", "xcm"]));
+        let once =
+            derive("polkadot", &cps, &[], None, now()).with_declared(&declared(&["gov", "xcm"]));
         let twice = once.clone().with_declared(&declared(&["gov", "xcm"]));
         assert_eq!(once, twice, "re-widening the same list is a no-op");
         let names: Vec<&str> = twice.modules.iter().map(|m| m.module.as_str()).collect();
