@@ -41,6 +41,12 @@ parity-scale-codec = "3"
 bs58 = "0.5"
 dotenvy = "0.15"
 axum = "0.8"
+# HTML templating for the web surface (Phase 3.5). Compile-time checked and
+# escaping by default, which is the property that matters: a page that
+# interpolates chain data into markup must not be able to inject it. 0.27 is
+# the first release built on `axum-core 0.5`, which is what axum 0.8 uses — a
+# two-version graph here would be a trait-impl failure, not a warning.
+maud = { version = "0.27", features = ["axum"] }
 tower = { version = "0.5", features = ["util"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

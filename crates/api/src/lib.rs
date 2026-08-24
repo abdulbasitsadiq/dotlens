@@ -21,6 +21,14 @@ pub mod coretime_delta;
 /// cannot drift apart.
 pub mod freshness;
 pub mod search;
+/// The HTML surface (Phase 3.5) — composition A, "the Ledger".
+///
+/// It consumes the JSON handlers in this file IN PROCESS rather than reading
+/// any index, so a page cannot render a figure the API would not. Its module
+/// header carries the argument. **Deliberately not feature-gated**: it adds one
+/// dependency and no build shape, and a `#[cfg]` here would be a fourth column
+/// in the build matrix for no gain.
+pub mod web;
 
 pub use coretime_delta::{
     Check, CoreDelta, DeltaInput, DeltaReport, EntitlementRow, OccupancyCell, PARTS_WHOLE_CORE,
@@ -6859,6 +6867,11 @@ pub fn router(state: AppState) -> Router {
         // the registry, so it wants its own thought about fan-out rather than
         // arriving as a convenience.
         .route("/v1/freshness/{chain}", get(get_freshness))
+        // The HTML surface: `/`, `/network/{network}` and the stylesheet.
+        // Merged as a unit so this list stays a list of the API, and so the
+        // whole surface can be removed in one line. It shares this router's
+        // state and calls the handlers above in process — see `web`.
+        .merge(web::routes())
         .with_state(state)
 }
 
@@ -16287,5 +16300,196 @@ pub(crate) mod tests {
                 .any(|s| s.contains("not the chain's best block")),
             "{lines:?}"
         );
+    }
+
+    // ------------------------------------------- the HTML surface (Phase 3.5)
+    //
+    // These drive the REAL router, because the claim being proven is about a
+    // rendered page and its headers. Every assertion below is one of
+    // `PREP-phase3.5-homepage.md` §7's ten rules, or C2/C8/§9a.1.
+
+    async fn get_html(app: &Router, uri: &str) -> (StatusCode, String, String) {
+        let res = app
+            .clone()
+            .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let status = res.status();
+        let ctype = res
+            .headers()
+            .get(axum::http::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        let cache = res
+            .headers()
+            .get(axum::http::header::CACHE_CONTROL)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        let body = axum::body::to_bytes(res.into_body(), 4_000_000)
+            .await
+            .unwrap();
+        let html = String::from_utf8(body.to_vec()).expect("utf-8");
+        (status, html, format!("{ctype}|{cache}"))
+    }
+
+    #[tokio::test]
+    async fn the_homepage_renders_the_single_registered_network_without_defaulting_one() {
+        let app = router(test_state().await);
+        let (status, html, meta) = get_html(&app, "/").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(meta.contains("text/html"), "{meta}");
+        // The seeds carry exactly one network, so `/` renders it rather than
+        // asking. The multi-network arm is the one that refuses.
+        // No byte-slicing of the body in the failure message: the page carries
+        // multi-byte characters and `&html[..400]` would panic on a char
+        // boundary, turning a failed assertion into a different failure.
+        assert!(html.contains("polkadot"), "{html}");
+        assert!(html.contains("<!DOCTYPE html>"));
+    }
+
+    /// ARCHITECTURE §9a.1: the page carries a freshness strip, which is a
+    /// provisional marker by definition, so it may not be held anywhere. This
+    /// is the composition inheriting the WEAKER header, never the stronger.
+    #[tokio::test]
+    async fn the_homepage_is_no_store_because_it_carries_a_freshness_strip() {
+        let app = router(test_state().await);
+        let (_, _, meta) = get_html(&app, "/").await;
+        assert!(meta.contains("no-store"), "{meta}");
+    }
+
+    /// §7 rule 8: a halted module names the variant AND the height that halted
+    /// it — "naming 320 sends whoever reads it at 3am to the wrong block."
+    #[tokio::test]
+    async fn a_halted_module_is_named_on_the_strip_with_its_block_and_its_variant() {
+        let app = router(test_state().await);
+        let (_, html, _) = get_html(&app, "/").await;
+        assert!(html.contains("HALTED"), "the strip must be loud");
+        assert!(html.contains("a human is needed"), "{html:?}");
+        assert!(html.contains("assets"), "the module");
+        assert!(html.contains("19000005"), "the block it stopped at");
+        assert!(html.contains("assets.Blocked"), "the unmapped variant");
+    }
+
+    /// ARCHITECTURE §9a.1 one level in: the delta and the age of the observation
+    /// it was measured against are rendered TOGETHER. A dead follower freezes
+    /// both the head and the frontier, so the delta falls toward 0 while nothing
+    /// is catching up — the age is the only thing that says so.
+    #[tokio::test]
+    async fn the_strip_never_shows_the_chain_head_delta_without_its_age() {
+        let app = router(test_state().await);
+        let (_, html, _) = get_html(&app, "/").await;
+        assert!(
+            html.contains("oldest chain-head observation"),
+            "the strip must name WHICH observation bounds the page"
+        );
+        // the fixture: raw 19_000_040 against a head of 19_000_100.
+        assert!(html.contains("raw 60 behind"), "the delta");
+        assert!(html.contains("observed"), "and its age, on the same line");
+        assert!(html.contains("s ago"));
+    }
+
+    /// PATTERNS A2 at CONTAINER level: nothing renders as a blank cell.
+    ///
+    /// **The fixture DOES have treasury positions** — an earlier version of this
+    /// comment said it did not, and the test passed through its other disjunct.
+    /// So what this proves is the WITHHELD path, not the empty one: the fixture
+    /// carries a position whose total is suppressed, and it must render as a
+    /// refusal carrying a reason rather than as a dash or a zero. The empty-list
+    /// arm is unit-tested in `web` against a hand-built view, where it is
+    /// reachable.
+    #[tokio::test]
+    async fn a_suppressed_total_renders_as_a_refusal_with_a_reason_not_as_a_dash() {
+        let app = router(test_state().await);
+        let (_, html, _) = get_html(&app, "/").await;
+        assert!(
+            !html.contains("<tbody></tbody>"),
+            "a blank table body is 'we did not look' rendering as 'there is nothing there'"
+        );
+        assert!(html.contains("total withheld"), "the refusal");
+        assert!(
+            html.contains("legs have an unknown size") || html.contains("disagree on decimals"),
+            "and the REASON, which is what makes it actionable"
+        );
+    }
+
+    /// §8 DO 2 and ROADMAP:315 — *"the dashboard discovers chains from the
+    /// REGISTRY … never by naming an id. That is Invariant 2 reaching the UI."*
+    /// The page asks the registry what a network declares; it does not switch on
+    /// a chain id anywhere, and this is the predicate that makes the fourth
+    /// state reachable.
+    #[tokio::test]
+    async fn panel_composition_asks_the_registry_rather_than_naming_a_chain() {
+        let state = test_state().await;
+        assert!(
+            web::network_declares(&state, "polkadot", "governance"),
+            "the seeds declare it, so the panel renders data"
+        );
+        assert!(
+            !web::network_declares(&state, "polkadot", "staking"),
+            "no seed declares staking, so its panel takes the FOURTH STATE \
+             rather than 404ing or vanishing"
+        );
+        assert!(
+            !web::network_declares(&state, "not-a-network", "governance"),
+            "and an unknown network declares nothing"
+        );
+    }
+
+    /// §7 rule 9: `not_covered` is a PANEL element, not a footer. The research
+    /// found no prior art for this in ten walked references, so there is nothing
+    /// to copy and nothing to soften toward.
+    #[tokio::test]
+    async fn coverage_lines_render_inside_the_panel_they_are_about() {
+        let app = router(test_state().await);
+        let (_, html, _) = get_html(&app, "/").await;
+        assert!(html.contains("class=\"notes\""), "the panel-level element");
+        assert!(html.contains("what this does not cover"));
+        // and it is INSIDE a panel: the notes block must appear before the page
+        // footer, not in it.
+        let notes = html.find("class=\"notes\"").expect("notes");
+        let foot = html.find("class=\"foot\"").expect("foot");
+        assert!(notes < foot, "coverage moved into the footer");
+    }
+
+    /// C8: every panel title links to its own full page, which is the mechanism
+    /// that makes "choose what NOT to show" tractable. Where the page does not
+    /// exist yet the link is the JSON endpoint — a real destination, never a
+    /// dead link and never a "coming soon" (§8 DO-NOT 2).
+    #[tokio::test]
+    async fn every_panel_offers_a_destination_and_none_of_them_is_a_placeholder() {
+        let app = router(test_state().await);
+        let (_, html, _) = get_html(&app, "/").await;
+        assert!(html.contains("/v1/treasury/polkadot/consolidated"));
+        assert!(html.contains("/v1/bounties/polkadot"));
+        assert!(
+            !html.to_lowercase().contains("coming soon"),
+            "an empty promise is the thing the fourth state replaces"
+        );
+    }
+
+    /// An unknown network must not render an empty page: an empty page reads as
+    /// "this network has nothing", which is a claim about the network. Same
+    /// polarity as `/v1/treasury/{network}/consolidated`, deliberately.
+    #[tokio::test]
+    async fn an_unknown_network_404s_and_names_the_ones_that_exist() {
+        let app = router(test_state().await);
+        let (status, html, _) = get_html(&app, "/network/not-a-network").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert!(html.contains("unknown network"));
+        assert!(html.contains("polkadot"), "it names what exists");
+    }
+
+    #[tokio::test]
+    async fn the_stylesheet_is_served_as_css_and_may_be_cached() {
+        let app = router(test_state().await);
+        let (status, css, meta) = get_html(&app, "/assets/dotlens.css").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(meta.contains("text/css"), "{meta}");
+        // Compiled in, so it changes only when the binary does — the one thing
+        // on this surface that is safe to hold.
+        assert!(meta.contains("max-age"), "{meta}");
+        assert!(css.contains("--accent:#7B0DAF"));
     }
 }
