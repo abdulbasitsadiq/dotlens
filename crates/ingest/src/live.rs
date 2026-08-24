@@ -228,13 +228,11 @@ impl ChainHeadSink for MemoryChainHeadSink {
         observed_at: DateTime<Utc>,
     ) -> Result<(), SinkError> {
         let mut rows = self.rows.lock().map_err(|e| SinkError(e.to_string()))?;
-        let entry = rows
-            .entry(chain_id.to_string())
-            .or_insert(RecordedHead {
-                finalized_height,
-                observed_at,
-                writes: 0,
-            });
+        let entry = rows.entry(chain_id.to_string()).or_insert(RecordedHead {
+            finalized_height,
+            observed_at,
+            writes: 0,
+        });
         // LATEST WINS, INCLUDING DOWNWARD — the same rule as the Postgres
         // upsert, written the same way here so the two backends cannot disagree
         // about what "the head" means. No `max`: a lower finalized head from a

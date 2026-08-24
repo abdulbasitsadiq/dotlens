@@ -16282,7 +16282,9 @@ pub(crate) mod tests {
         );
         // and the qualifier that only belongs beside a real head is absent
         assert!(
-            !lines.iter().any(|s| s.contains("not the chain's best block")),
+            !lines
+                .iter()
+                .any(|s| s.contains("not the chain's best block")),
             "{lines:?}"
         );
     }

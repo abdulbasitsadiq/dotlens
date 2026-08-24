@@ -1708,8 +1708,14 @@ mod tests {
     fn widening_keeps_a_halt_visible_and_does_not_overwrite_its_state() {
         let mut cps = base();
         cps.push(cp("balances", 100, "2026-08-24T10:00:00Z"));
-        let r = derive("polkadot", &cps, &[halt("balances", 150, 7, "x")], None, now())
-            .with_declared(&declared(&["balances", "gov"]));
+        let r = derive(
+            "polkadot",
+            &cps,
+            &[halt("balances", 150, 7, "x")],
+            None,
+            now(),
+        )
+        .with_declared(&declared(&["balances", "gov"]));
 
         let bal = r.modules.iter().find(|m| m.module == "balances").unwrap();
         assert_eq!(
