@@ -7,10 +7,12 @@
 
 #![cfg(feature = "pg")]
 
+use api::freshness::{self, ModuleState};
 use api::pg::PgBlockIndex;
-use api::BlockIndex;
+use api::{BlockIndex, FreshnessIndex, MemoryFreshnessIndex};
 use dotlens_node::pipeline::ingest_fixtures;
 use dotlens_node::registry_sync::sync_registry;
+use ingest::module::Halt;
 use ingest::pg::{PgCheckpointStore, PgReceiptSink};
 use ingest::{should_process, Checkpoint, CheckpointStore, IngestOutcome, ReceiptSink};
 use raw_store::{FsRawStore, RawStore};
@@ -4954,6 +4956,212 @@ async fn channel_readings_are_immutable_and_a_missing_reading_is_not_an_empty_gr
     // A chain with no readings at all is EMPTY here, and the endpoint's
     // `reads_as` is what tells the two apart — not this method.
     assert!(channels.readings("polkadot-asset-hub").await.unwrap().is_empty());
+
+    db.drop_db().await;
+}
+
+// ------------------------------------------------------------ module freshness
+
+/// The halt is an OBSERVATION; the checkpoint owns whether it still blocks.
+///
+/// This is the test migration 0028's central decision stands or falls on. There
+/// is no `active` column and no `resolved_at`, so "the module got past it" has
+/// to show up as a state change with **no row deleted and no flag written** —
+/// purely from `halt.height > indexer_state.last_height` being false now. If
+/// that ever stops holding, the alternative is a stored flag that disagrees with
+/// the checkpoint the first time a mapper is fixed and a `*-range` re-run
+/// advances past a row nobody remembered to clear.
+///
+/// It also pins the three things only a real database can show:
+///   * the upsert converges on ONE row per coordinate (the follower re-derives
+///     the same refusal every tick, forever, on a linear backoff),
+///   * both readers actually filter by `chain_id`, and
+///   * the Postgres and in-memory backends produce the SAME `ChainFreshness`,
+///     which is the whole point of `derive` being pure — the operator surface
+///     and Phase 3.5's per-response object must not be two implementations of
+///     one rule.
+#[tokio::test]
+async fn a_halt_upserts_on_its_coordinates_and_stops_blocking_without_being_deleted() {
+    let Some(db) = TestDb::create().await else { return };
+    const CHAIN: &str = "polkadot";
+
+    let store = PgCheckpointStore::new(db.pool.clone());
+    let cp = |chain: &str, module: &str, height: u64| Checkpoint {
+        chain_id: chain.into(),
+        module: module.into(),
+        last_height: height,
+        last_hash: format!("0x{height:x}"),
+        updated_at: chrono::Utc::now(),
+    };
+    // The stack, in the one table that already holds it: raw ahead of decode,
+    // decode ahead of both modules.
+    store.advance(cp(CHAIN, freshness::MODULE_RAW, 400)).await.expect("raw frontier");
+    store.advance(cp(CHAIN, freshness::MODULE_DECODE, 300)).await.expect("decode frontier");
+    store.advance(cp(CHAIN, "balances", 100)).await.expect("balances checkpoint");
+    store.advance(cp(CHAIN, "gov", 100)).await.expect("gov checkpoint");
+    // A bounded backfill chunk is not a follower and must not appear as one.
+    store.advance(cp(CHAIN, "raw_backfill:0-100", 100)).await.expect("backfill chunk");
+    // A second chain, to prove both readers filter rather than returning the lot.
+    store.advance(cp("kusama", "balances", 7)).await.expect("kusama checkpoint");
+
+    let halt = |chain: &'static str, module: &'static str, height: u64, event_index: u32| Halt {
+        chain_id: chain,
+        module,
+        height,
+        event_index,
+        event: "balances.Unmapped",
+        reason: "unmapped balances variant — a gap in MONEY, so the module stops",
+        runtime_version: 1_002_006,
+        mapper_version: 4,
+    };
+
+    // --- the follower meets one refusal, over and over ------------------------
+    store.record_halt(&halt(CHAIN, "balances", 150, 2)).await.expect("first observation");
+    let (first_seen, last_seen, seen): (
+        chrono::DateTime<chrono::Utc>,
+        chrono::DateTime<chrono::Utc>,
+        i64,
+    ) = sqlx::query_as(
+        "select first_seen_at, last_seen_at, seen_count from core.module_halts \
+         where chain_id = $1 and module = 'balances' and height = 150",
+    )
+    .bind(CHAIN)
+    .fetch_one(&db.pool)
+    .await
+    .expect("one row after the first observation");
+    assert_eq!(seen, 1);
+
+    store.record_halt(&halt(CHAIN, "balances", 150, 2)).await.expect("second observation");
+    let rows: Vec<(chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>, i64)> =
+        sqlx::query_as(
+            "select first_seen_at, last_seen_at, seen_count from core.module_halts \
+             where chain_id = $1 and module = 'balances'",
+        )
+        .bind(CHAIN)
+        .fetch_all(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1, "a repeat is an update, never a second row");
+    assert_eq!(rows[0].2, 2, "seen_count counts observations");
+    assert_eq!(rows[0].0, first_seen, "first_seen_at never moves");
+    assert!(rows[0].1 >= last_seen, "last_seen_at only moves forward");
+
+    // --- two halts for one module, recorded oldest-observed first ------------
+    // `gov` refuses at 150, and later a `gov-range` job refuses at 320. The
+    // NEWEST observation is the one at 320; the one actually blocking is 150,
+    // because the runtime processes in order and can never reach 320. A reader
+    // taking `max(last_seen_at)` would send whoever reads this at 3am to a block
+    // the module cannot have got to.
+    store.record_halt(&halt(CHAIN, "gov", 150, 0)).await.expect("gov halt at 150");
+    store.record_halt(&halt(CHAIN, "gov", 320, 1)).await.expect("gov halt at 320, seen later");
+
+    // A halt on the other chain, for the same module name.
+    store.record_halt(&halt("kusama", "balances", 9, 0)).await.expect("kusama halt");
+
+    // --- the readers, and what they must not return -------------------------
+    let idx = api::pg::PgFreshnessIndex::new(db.pool.clone());
+    let checkpoints = idx.checkpoints(CHAIN).await.expect("checkpoints");
+    let halts = idx.halts(CHAIN).await.expect("halts");
+    assert!(
+        checkpoints.iter().all(|c| c.height != 7) && halts.iter().all(|h| h.height != 9),
+        "both readers filter by chain_id: {checkpoints:?} {halts:?}"
+    );
+    assert_eq!(idx.checkpoints("kusama").await.unwrap().len(), 1);
+    assert_eq!(idx.halts("kusama").await.unwrap().len(), 1);
+
+    let observed = chrono::Utc::now();
+    let report = freshness::derive(CHAIN, &checkpoints, &halts, observed);
+
+    assert_eq!(report.frontiers.raw, Some(400));
+    assert_eq!(report.frontiers.decode, Some(300));
+    assert_eq!(report.frontiers.decode_behind_raw, Some(100));
+    assert_eq!(report.frontiers.raw_behind_chain, None, "the chain's own head is not read");
+    let names: Vec<&str> = report.modules.iter().map(|m| m.module.as_str()).collect();
+    assert_eq!(
+        names,
+        vec!["balances", "gov"],
+        "the two frontiers are the yardstick and a backfill chunk is a bounded job — \
+         neither is a follower: {names:?}"
+    );
+
+    let balances = &report.modules[0];
+    assert_eq!(balances.state, ModuleState::Halted);
+    let blocking = balances.blocking_halt.as_ref().expect("the refusal that stops it");
+    assert_eq!(blocking.height, 150);
+    assert_eq!(blocking.seen_count, 2, "the observation window survives the round trip");
+    assert_eq!(blocking.runtime_version, 1_002_006, "lineage: which runtime refused");
+    assert_eq!(
+        balances.blocks_behind_decode,
+        Some(200),
+        "halted does not stop the lag being reported"
+    );
+
+    let gov = &report.modules[1];
+    assert_eq!(gov.state, ModuleState::Halted);
+    assert_eq!(
+        gov.blocking_halt.as_ref().map(|h| h.height),
+        Some(150),
+        "the LOWEST refusal above the checkpoint, never the most recently observed"
+    );
+    assert!(report.reads_as.contains("HALTED"), "{}", report.reads_as);
+    assert!(
+        report.reads_as.contains("DECODE IS 100 BLOCKS BEHIND RAW INGESTION"),
+        "the two lags are stated separately and never summed: {}",
+        report.reads_as
+    );
+
+    // --- the mapper is fixed, the module runs past it, NOTHING IS DELETED ----
+    store.advance(cp(CHAIN, "balances", 200)).await.expect("past the halt");
+    let after = freshness::derive(
+        CHAIN,
+        &idx.checkpoints(CHAIN).await.unwrap(),
+        &idx.halts(CHAIN).await.unwrap(),
+        observed,
+    );
+    let balances = &after.modules[0];
+    assert_eq!(balances.state, ModuleState::Behind, "resolved by the checkpoint alone");
+    assert!(balances.blocking_halt.is_none());
+    assert_eq!(balances.blocks_behind_decode, Some(100));
+    let (still,): (i64,) = sqlx::query_as(
+        "select count(*) from core.module_halts where chain_id = $1 and module = 'balances'",
+    )
+    .bind(CHAIN)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(still, 1, "no row was deleted and no flag was written — that is the design");
+
+    // What an alert acts on, which is what `status` exits 2 and 1 on.
+    assert_eq!(after.halted().iter().map(|m| m.module.as_str()).collect::<Vec<_>>(), vec!["gov"]);
+    assert_eq!(
+        after.behind_by_more_than(50).iter().map(|m| m.module.as_str()).collect::<Vec<_>>(),
+        vec!["balances"]
+    );
+    assert!(after.behind_by_more_than(100).is_empty(), "the bound is exclusive");
+
+    // --- the two backends must not be two implementations of one rule -------
+    let mem = MemoryFreshnessIndex::new();
+    // Inserted in REVERSE, so the equality below is `derive`'s sort doing the
+    // work rather than the two backends happening to agree on insertion order.
+    for row in idx.checkpoints(CHAIN).await.unwrap().into_iter().rev() {
+        mem.insert_checkpoint(CHAIN, row);
+    }
+    for row in idx.halts(CHAIN).await.unwrap().into_iter().rev() {
+        mem.insert_halt(CHAIN, row);
+    }
+    for row in idx.checkpoints("kusama").await.unwrap() {
+        mem.insert_checkpoint("kusama", row);
+    }
+    let from_memory = freshness::derive(
+        CHAIN,
+        &mem.checkpoints(CHAIN).await.unwrap(),
+        &mem.halts(CHAIN).await.unwrap(),
+        observed,
+    );
+    assert_eq!(
+        from_memory, after,
+        "the DB-less backend and Postgres must produce the same report from the same rows"
+    );
 
     db.drop_db().await;
 }

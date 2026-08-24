@@ -167,6 +167,20 @@ async fn run_status(backends: &Backends, chain: &str, behind_max: Option<u64>) -
             opt(report.frontiers.raw_behind_chain)
         );
         println!();
+        // An EMPTY module list is the one row this table cannot draw, and a
+        // blank space under a green exit code reads as "all clear" — which is
+        // the `opt()` defect one level up: absence rendering as absence of a
+        // problem. It is reached by a typo'd chain id as easily as by a chain
+        // nothing has ever run on, and the exit code deliberately stays 0
+        // either way: which chains SHOULD be running is registry data, and this
+        // reader says so in `not_covered` rather than guessing.
+        if report.modules.is_empty() {
+            println!(
+                "  (no module has a checkpoint or a recorded halt on this chain — \
+                 that is 'nothing has run here', NOT 'everything is fine'; check \
+                 the chain id)"
+            );
+        }
         for m in &report.modules {
             println!(
                 "  {:<16} {:<18} height {:>12}  behind decode {:>10}  age {}s",
