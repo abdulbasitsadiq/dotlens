@@ -105,6 +105,12 @@ struct Backends {
     broker: Arc<dyn api::BrokerIndex>,
     channels: Arc<dyn api::ChannelIndex>,
     freshness: Arc<dyn api::FreshnessIndex>,
+    /// Read only by the live followers and the backfill, both of which are
+    /// `#[cfg(feature = "live")]` — so with `live` off this field is built and
+    /// never looked at, which is honest rather than dead. Gated instead of
+    /// deleted because the sink is chosen at construction time in both feature
+    /// shapes and a second construction path is a second thing to keep true.
+    #[cfg_attr(not(feature = "live"), allow(dead_code))]
     runtime_versions: Arc<dyn RuntimeVersionSink>,
     /// Kept for label sync/verify (they need direct SQL, not a trait).
     #[cfg(feature = "pg")]
@@ -1628,6 +1634,19 @@ fn spawn_tip_followers(_: &Arc<Registry>, _: &Arc<Backends>, _: &Arc<dyn RawStor
 /// Balances followers: chase each chain's decode checkpoint, mapping canonical
 /// events into balance deltas. Pure mapping over Pg — no network, `pg` only.
 /// Eligibility is registry data: the chain must enable the `balances` module.
+// WHY `cfg_attr` AND NOT `_registry`, here and at the nine siblings below.
+// Each of these ten reads `registry` only INSIDE its `#[cfg(feature = "pg")]`
+// block, so with `pg` off the parameter really is unused — and rustc's own
+// suggestion, renaming it to `_registry`, would be wrong in the build that
+// matters: it would read as "deliberately ignored" in the default build, where
+// it is the thing the loop iterates. The attribute says the true thing instead
+// — unused ONLY in the feature shape where the body vanishes — and it costs
+// nothing at codegen.
+//
+// THIS IS NOT A NEW DECISION. `spawn_bounties_followers` has carried exactly
+// this attribute since it was written; the other nine were the omission, which
+// is why the minimal build has printed nine identical warnings ever since.
+#[cfg_attr(not(feature = "pg"), allow(unused_variables))]
 fn spawn_balances_followers(registry: &Arc<Registry>, backends: &Arc<Backends>) {
     if !env_flag("BALANCES_FOLLOW") {
         tracing::info!("balances follower disabled (set BALANCES_FOLLOW=1 to enable)");
@@ -1675,6 +1694,9 @@ fn spawn_balances_followers(registry: &Arc<Registry>, backends: &Arc<Backends>) 
 /// referenda events into referendum timelines. Pure mapping over Pg — no
 /// network, `pg` only. Eligibility is registry data: the chain must enable
 /// the `governance` module.
+// Unused only with `pg` off, where the body below vanishes. See
+// `spawn_balances_followers`.
+#[cfg_attr(not(feature = "pg"), allow(unused_variables))]
 fn spawn_gov_followers(registry: &Arc<Registry>, backends: &Arc<Backends>) {
     if !env_flag("GOV_FOLLOW") {
         tracing::info!("gov follower disabled (set GOV_FOLLOW=1 to enable)");
@@ -1760,6 +1782,9 @@ async fn run_gov_range(_: &Registry, _: &Backends, _: &str, _: u64, _: u64) -> R
 /// conviction-voting / ranked-collective events into vote + delegation facts.
 /// Pure mapping over Pg — no network, `pg` only. Eligibility is registry data:
 /// the chain must enable the `governance` module.
+// Unused only with `pg` off, where the body below vanishes. See
+// `spawn_balances_followers`.
+#[cfg_attr(not(feature = "pg"), allow(unused_variables))]
 fn spawn_votes_followers(registry: &Arc<Registry>, backends: &Arc<Backends>) {
     if !env_flag("VOTES_FOLLOW") {
         tracing::info!("votes follower disabled (set VOTES_FOLLOW=1 to enable)");
@@ -1955,6 +1980,9 @@ async fn run_anchor_voting(
 /// treasury-pallet events into spend facts and pot flows. Pure mapping over Pg
 /// — no network, `pg` only. Eligibility is registry data: the chain must enable
 /// the `treasury` module.
+// Unused only with `pg` off, where the body below vanishes. See
+// `spawn_balances_followers`.
+#[cfg_attr(not(feature = "pg"), allow(unused_variables))]
 fn spawn_treasury_followers(registry: &Arc<Registry>, backends: &Arc<Backends>) {
     if !env_flag("TREASURY_FOLLOW") {
         tracing::info!("treasury follower disabled (set TREASURY_FOLLOW=1 to enable)");
@@ -2186,6 +2214,9 @@ async fn run_bounties_range(
 /// that maps nothing. That is correct rather than wasteful: whether a chain
 /// carries the pallet is a fact about its runtime, not a fact for a seed file
 /// to assert, and the day Collectives gains one it is already covered.
+// Unused only with `pg` off, where the body below vanishes. See
+// `spawn_balances_followers`.
+#[cfg_attr(not(feature = "pg"), allow(unused_variables))]
 fn spawn_whitelist_followers(registry: &Arc<Registry>, backends: &Arc<Backends>) {
     if !env_flag("WHITELIST_FOLLOW") {
         tracing::info!("whitelist follower disabled (set WHITELIST_FOLLOW=1 to enable)");
@@ -2236,6 +2267,9 @@ fn spawn_whitelist_followers(registry: &Arc<Registry>, backends: &Arc<Backends>)
 
 /// XCM followers, gated on the `xcm` module — which relay, Asset Hub,
 /// Collectives, People and Hydration all declare.
+// Unused only with `pg` off, where the body below vanishes. See
+// `spawn_balances_followers`.
+#[cfg_attr(not(feature = "pg"), allow(unused_variables))]
 fn spawn_xcm_followers(registry: &Arc<Registry>, backends: &Arc<Backends>) {
     if !env_flag("XCM_FOLLOW") {
         tracing::info!("xcm follower disabled (set XCM_FOLLOW=1 to enable)");
@@ -2289,6 +2323,9 @@ fn spawn_xcm_followers(registry: &Arc<Registry>, backends: &Arc<Backends>) {
 /// this project has paid for before — the follower silently never starts, and an
 /// empty occupancy table is indistinguishable from a network where no core did
 /// any work.
+// Unused only with `pg` off, where the body below vanishes. See
+// `spawn_balances_followers`.
+#[cfg_attr(not(feature = "pg"), allow(unused_variables))]
 fn spawn_coretime_followers(registry: &Arc<Registry>, backends: &Arc<Backends>) {
     if !env_flag("CORETIME_FOLLOW") {
         tracing::info!("coretime follower disabled (set CORETIME_FOLLOW=1 to enable)");
@@ -2349,6 +2386,9 @@ fn spawn_coretime_followers(registry: &Arc<Registry>, backends: &Arc<Backends>) 
 /// `broker_events`, and an empty entitlement table reads exactly like a network
 /// where nobody bought a core — which is a claim about the market rather than
 /// about our coverage.
+// Unused only with `pg` off, where the body below vanishes. See
+// `spawn_balances_followers`.
+#[cfg_attr(not(feature = "pg"), allow(unused_variables))]
 fn spawn_broker_followers(registry: &Arc<Registry>, backends: &Arc<Backends>) {
     if !env_flag("BROKER_FOLLOW") {
         tracing::info!("broker follower disabled (set BROKER_FOLLOW=1 to enable)");
@@ -2396,6 +2436,9 @@ fn spawn_broker_followers(registry: &Arc<Registry>, backends: &Arc<Backends>) {
 /// because the two workers write different tables under different versions and
 /// running one without the other is a legitimate thing to want (re-deriving
 /// links after a rule change, without touching a single observation row).
+// Unused only with `pg` off, where the body below vanishes. See
+// `spawn_balances_followers`.
+#[cfg_attr(not(feature = "pg"), allow(unused_variables))]
 fn spawn_xcm_correlate_followers(registry: &Arc<Registry>, backends: &Arc<Backends>) {
     if !env_flag("XCM_CORRELATE_FOLLOW") {
         tracing::info!(
