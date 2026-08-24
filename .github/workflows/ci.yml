@@ -133,7 +133,7 @@ jobs:
   # pg_integration.rs is `#![cfg(feature = "pg")]`, so under
   # --no-default-features the file compiles to nothing.
   check-no-default-features:
-    name: check --workspace --no-default-features
+    name: check the build matrix
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -144,6 +144,21 @@ jobs:
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo check --workspace --no-default-features
+
+      # THE MIDDLE OF THE MATRIX, which the two ends cannot see.
+      # `--all-features` and `--no-default-features` exercise both-on and
+      # both-off. `dotlens-node` has TWO features and `main.rs` carries
+      # `#[cfg(all(feature = "pg", feature = "live"))]` items — so a one-feature
+      # build is a real shape, and it is precisely where an item gated on the
+      # conjunction goes missing while both ends still compile.
+      #
+      # Steps rather than a third job on purpose: this rides the cache the step
+      # above just warmed and adds seconds, where a job would add a whole
+      # billable minute of rounding. Named steps keep the failure attributable.
+      - name: check dotlens-node with pg but not live
+        run: cargo check -p dotlens-node --no-default-features --features pg
+      - name: check dotlens-node with live but not pg
+        run: cargo check -p dotlens-node --no-default-features --features live
 
 # ---------------------------------------------------------------------------
 # THERE IS NO `lint` JOB, AND ITS ABSENCE IS A MEASUREMENT, NOT AN OVERSIGHT.
