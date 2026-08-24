@@ -1,0 +1,183 @@
+name: CI
+
+# ROADMAP Phase 3.5, "THE OPERATIONAL FLOOR", item 1. The verification matrix
+# below is not a default — it is the matrix that catches the defect classes this
+# project actually ships:
+#
+#   cargo test  --workspace --all-features          the suite
+#   cargo check --workspace --no-default-features   THE ONE THAT MATTERS MOST
+#
+# The second half is the one that earns its minutes. Build-matrix breaks that
+# `--all-features` cannot see shipped in slices 8, 9 and 13 and were found only
+# at verification; four of slice 16's five review blockers were mechanical and
+# would have been caught here. "The failure this guards against is not
+# ignorance; it is being tired."
+
+# Every branch push. There is deliberately NO `pull_request` trigger: a PR from
+# a branch in THIS repo would run the same commit a second time, and this is a
+# private repo on a minutes budget (see the cost note at the bottom of the file).
+# Add `pull_request` only when a PR can come from a fork, which for a solo
+# project it cannot.
+on:
+  push:
+    branches: ['**']
+    paths-ignore:
+      - '**/*.md'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# A newer push to the same ref cancels the run it supersedes. For a solo
+# operator pushing fixups this is the single largest minutes saving available.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # Incremental artifacts are never reused across runs and would only inflate
+  # the cache we pay to restore.
+  CARGO_INCREMENTAL: 0
+  RUST_BACKTRACE: 1
+
+jobs:
+  # ---------------------------------------------------------------------------
+  test:
+    name: test --workspace --all-features
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    services:
+      postgres:
+        # 16-ALPINE, not 16, and the difference is not cosmetic: docker-compose
+        # runs alpine, and musl vs glibc is a COLLATION difference. Text
+        # ordering must not differ between the machine that develops and the
+        # machine that gates, or `ORDER BY` in a reader is tested against one
+        # collation and shipped against another.
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: dotlens
+          POSTGRES_PASSWORD: dotlens
+          POSTGRES_DB: dotlens
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U dotlens"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    env:
+      # pg_integration.rs creates and DROPS a throwaway database per test, so
+      # this is an admin URL. POSTGRES_USER is the image's bootstrap superuser,
+      # which is what makes `create database` work without extra grants.
+      DATABASE_URL: postgres://dotlens:dotlens@localhost:5432/dotlens
+    steps:
+      - uses: actions/checkout@v6
+
+      # rust-toolchain.toml pins the channel and already lists rustfmt+clippy,
+      # so rustup installs the right thing without a third-party action.
+      - name: toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+      - run: cargo --version && rustc --version
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # Feature branches RESTORE the cache but never write one. Without
+          # this, every branch writes ~1-2 GB and they evict each other (and
+          # main) out of the 10 GB per-repo cache budget.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: no test may reach the network
+        run: bash .github/scripts/no-network-in-tests.sh
+
+      # `--nocapture` is REQUIRED, not decoration: the test harness captures
+      # stdout/stderr for passing tests, and the pg tests' "SKIP:" line is
+      # printed by a test that then passes. Without it the skip is invisible and
+      # the guard below has nothing to read.
+      - name: cargo test --workspace --all-features
+        run: |
+          set -o pipefail
+          cargo test --workspace --all-features -- --nocapture 2>&1 | tee /tmp/test.log
+
+      # THE POSTGRES TESTS MUST HAVE RUN, NOT SKIPPED.
+      # pg_integration.rs skips loudly without DATABASE_URL and every skipped
+      # test still PASSES, so a broken service container would leave the run
+      # green over a quarter of the suite. A green tick that means "we did not
+      # look" is the exact failure this project refuses everywhere else.
+      - name: the postgres tests must have run
+        run: |
+          set -uo pipefail
+          if ! grep -q 'pg_integration' /tmp/test.log; then
+            echo "::error::the pg_integration test binary did not run at all"
+            exit 1
+          fi
+          n=$(grep -c 'SKIP: DATABASE_URL not set' /tmp/test.log || true)
+          if [ "${n:-0}" -ne 0 ]; then
+            echo "::error::$n postgres integration tests SKIPPED — this run would have been green over a quarter of the suite"
+            exit 1
+          fi
+          echo "postgres integration tests ran. Per-binary results:"
+          grep -E 'Running |test result:' /tmp/test.log || true
+
+  # ---------------------------------------------------------------------------
+  # THE GATE THAT MATTERS MOST. It has no Postgres service and needs none:
+  # pg_integration.rs is `#![cfg(feature = "pg")]`, so under
+  # --no-default-features the file compiles to nothing.
+  check-no-default-features:
+    name: check --workspace --no-default-features
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+      - name: toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - run: cargo check --workspace --no-default-features
+
+  # ---------------------------------------------------------------------------
+  # REMOVABLE BLOCK — see VERIFY-phase3.5-ci.md, "the lint decision".
+  # This job was authored in an environment with no Rust toolchain, so neither
+  # command below has been observed to pass on this tree. Run both locally
+  # BEFORE the first push. If either fails, DELETE THIS JOB rather than
+  # mass-reformatting the workspace — a formatting sweep is its own slice and
+  # must not ride along inside a CI commit.
+  lint:
+    name: fmt + clippy
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+      - name: toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - run: cargo fmt --all --check
+      # Separate steps on purpose: a formatting diff and a lint failure are
+      # different problems and should not be reported as one red job.
+      - run: cargo clippy --workspace --all-features -- -D warnings
+  # ---------------------------------------------------------------------------
+  # END REMOVABLE BLOCK
+
+# COST, and whether it is sustainable.
+#
+# Private repos on GitHub Free include 2,000 Linux minutes/month (Pro and Team:
+# 3,000); Linux is the 1x multiplier and service containers add nothing. Billing
+# rounds each JOB up to the whole minute, so three jobs cost three roundings.
+#
+# ESTIMATES, not measurements — the first run's summary page gives the real
+# numbers and this comment should be corrected against them:
+#   warm cache (the common case): test ~6, check ~2, lint ~4  => ~12 min/push
+#   cold cache (Cargo.lock moved, or a new toolchain):         => ~45 min/push
+# At a slice per session and a handful of pushes each, that is a few hundred
+# minutes a month against 2,000. Sustainable with room to spare.
+#
+# The levers, in the order to reach for them if that stops being true:
+#   1. `paths-ignore` above (already on) — README-only pushes cost nothing.
+#   2. `concurrency` above (already on)  — superseded pushes are cancelled.
+#   3. Drop `lint` to a main-only or scheduled job.
+#   4. Merge the three jobs into one so the toolchain+checkout setup is paid
+#      once — costs parallel feedback and makes "which gate failed" harder to
+#      read, which is why it is last.
