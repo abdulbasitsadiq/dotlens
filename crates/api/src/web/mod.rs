@@ -1829,6 +1829,16 @@ mod tests {
         // until it is laid out as a flex box. Without this the rule is present
         // and inert, which is the failure mode this test exists to catch.
         assert!(narrow.contains("display:inline-flex"), "{narrow}");
+        // AND the links INSIDE table cells, which the list above cannot reach.
+        // This case did not exist to be measured until a populated table was
+        // rendered: every panel had only ever shown its refusal row, so the
+        // only anchors on the page were the header and "to" links. With real
+        // rows at 390px the spend ids measured 25x14 in a 44px cell while this
+        // whole test was green — the same lesson one level down.
+        assert!(
+            narrow.contains("td>a::after"),
+            "a link in a table cell is a touch target too: {narrow}"
+        );
 
         // AND the no-pointer path, because the minimum is a claim about the
         // INPUT DEVICE: a tablet at 768px is above the narrow breakpoint and
@@ -1842,6 +1852,21 @@ mod tests {
             assert!(touch.contains(affordance), "{affordance}: {touch}");
         }
         assert!(touch.contains("min-height:var(--tap-min)"), "{touch}");
+        assert!(touch.contains("td>a::after"), "{touch}");
+
+        // The overlay needs a containing block or it resolves against whatever
+        // is positioned further up and covers far more than its cell. `td` is
+        // given `position:relative` in the BASE rule rather than here, ahead of
+        // `.sticky1`, so the sticky first column keeps winning.
+        let td_rule = style::CSS
+            .split("td{padding:7px var(--card-pad);")
+            .nth(1)
+            .expect("the base td rule");
+        let td_rule = &td_rule[..td_rule.find('}').expect("the rule closes")];
+        assert!(
+            td_rule.contains("position:relative"),
+            "the overlay has no containing block: {td_rule}"
+        );
     }
 
     /// TOKENS.md §0's layout invariant, *"learned the hard way"*: without both

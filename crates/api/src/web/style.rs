@@ -205,6 +205,12 @@ th{font-size:11px;letter-spacing:.4px;text-transform:uppercase;color:var(--t2);
 th.num{text-align:right}
 td{padding:7px var(--card-pad);border-bottom:1px solid var(--line);
    font-size:13.5px;vertical-align:baseline;height:var(--row-h);
+   /* the containing block for the touch-target overlay in the narrow and
+      no-pointer blocks below. Declared HERE, ahead of `.sticky1`, so that
+      rule still wins for the first column — a sticky box is a containing
+      block too, so the overlay works in both columns without redeclaring
+      stickiness inside a media query. No visual effect on its own. */
+   position:relative;
    /* §8: a data table SCROLLS, it does not reflow. Without this the cells
       wrap at 390px, the table never exceeds the viewport, `.scroll` never
       overflows and the sticky first column never engages. */
@@ -290,6 +296,16 @@ tr:last-child td{border-bottom:0}
      The 4px grid, the hairlines and the radii do not move (§14's proviso). */
   .logo,.strip-to,.panel-to{display:inline-flex;align-items:center;
      min-height:var(--tap-min)}
+  /* A LINK INSIDE A TABLE CELL is the case the rule above cannot reach, and
+     it did not exist to be measured until a populated table was rendered:
+     every panel had only ever shown its refusal row. At 390px with real rows
+     the spend ids render a 25x14 box inside a cell that is already 44px.
+     `inline-flex` + `min-height` — the fix the affordances above needed —
+     would push that cell to ~66px and spend the density TOKENS §5 asks for,
+     so the HIT AREA is expanded to the cell the link already sits in rather
+     than the box being grown. Assumes ONE link per cell: a second would sit
+     under the first one's overlay. */
+  td>a::after{content:"";position:absolute;inset:0}
 }
 
 /* STYLE.md's hard ban: information conveyed by hover alone. Hover may only
@@ -307,6 +323,16 @@ tr:last-child td{border-bottom:0}
      is exactly why width alone cannot answer this. */
   .logo,.strip-to,.panel-to,.nav-links a{display:inline-flex;align-items:center;
      min-height:var(--tap-min)}
+  /* A LINK INSIDE A TABLE CELL is the case the rule above cannot reach, and
+     it did not exist to be measured until a populated table was rendered:
+     every panel had only ever shown its refusal row. At 390px with real rows
+     the spend ids render a 25x14 box inside a cell that is already 44px.
+     `inline-flex` + `min-height` — the fix the affordances above needed —
+     would push that cell to ~66px and spend the density TOKENS §5 asks for,
+     so the HIT AREA is expanded to the cell the link already sits in rather
+     than the box being grown. Assumes ONE link per cell: a second would sit
+     under the first one's overlay. */
+  td>a::after{content:"";position:absolute;inset:0}
 }
 
 /* Motion is feedback only, <=150ms (STYLE.md principle 8), and respects the
